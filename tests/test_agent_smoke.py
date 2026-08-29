@@ -11,6 +11,7 @@ try:
 except ModuleNotFoundError:
     make = None
 
+from kagriculture_agent.constants import CROPS as DOMAIN_CROPS
 from scripts.run_local import run_episode
 
 
@@ -276,7 +277,7 @@ def test_production_agent_changes_state_and_reports_matching_reward(tmp_path: Pa
     buy_order = custom_states[buy_step]["action"]["market"][0]
     assert buy_order[0] == "BUY_SEED"
     assert buy_after["private"]["seeds"][buy_order[1]] == buy_before["private"]["seeds"][buy_order[1]] + buy_order[2]
-    assert buy_after["farms"][0]["money"] == buy_before["farms"][0]["money"] - 10 * buy_order[2]
+    assert buy_after["farms"][0]["money"] == buy_before["farms"][0]["money"] - DOMAIN_CROPS[buy_order[1]]["seed"] * buy_order[2]
 
     plant_step = next(step for step, state in enumerate(custom_states[1:], start=1) if state["action"]["farmer"][0] == "PLANT")
     plant_before = custom_states[plant_step - 1]["observation"]

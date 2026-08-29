@@ -13,17 +13,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from kagriculture_agent.constants import CROPS
 from main import agent
 
 
 OPPONENTS = ("pass", "random", "starter")
-RANDOM_CROP_SEED_COSTS = {
-    "WHEAT": 10,
-    "CARROT": 20,
-    "TOMATO": 50,
-    "STRAWBERRY": 100,
-    "MELON": 80,
-}
 
 
 def _deterministic_random_agent(seed: int):
@@ -41,7 +35,7 @@ def _deterministic_random_agent(seed: int):
         farmer_ops = ["NORTH", "SOUTH", "EAST", "WEST", "WATER", "HARVEST", "PASS"]
         market = []
         money = farm.get("money", 0)
-        affordable = [crop for crop, cost in RANDOM_CROP_SEED_COSTS.items() if cost <= money]
+        affordable = [crop for crop, data in CROPS.items() if data["seed"] <= money]
         if affordable and rng.random() < 0.1:
             market.append(["BUY_SEED", rng.choice(affordable), 1])
 
