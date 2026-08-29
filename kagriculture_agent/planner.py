@@ -1,4 +1,13 @@
-"""Small, deterministic daily task planner for the Kaggriculture agent."""
+"""Small, deterministic daily task planner for the Kaggriculture agent.
+
+The public planner functions accept either a flat test state or the canonical
+mapping returned by :func:`kagriculture_agent.observation.parse_observation`.
+The normalized contract is ``day``, ``board_size``, ``tiles``, ``animals``,
+``structures``, ``seeds``, ``inventory``, ``workers``, and ``market``.  In the
+canonical form, these come from ``farm.tiles``, ``farm.animals``,
+``farm.structures``, ``private.seeds``, ``private.shed``, and ``market``;
+board size is derived from the square tile grid when it is not explicit.
+"""
 
 from __future__ import annotations
 
@@ -46,6 +55,70 @@ def _day(state: Any, memory: EpisodeMemory | Any) -> int:
         return max(0, int(value))
     except (TypeError, ValueError, OverflowError):
         return 0
+
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _hand_counts(value: Any) -> dict[str, int]:
+    if isinstance(value, Mapping):
+        return {
+            str(item): int(quantity)
+            for item, quantity in value.items()
+            if isinstance(quantity, (int, float)) and not isinstance(quantity, bool) and quantity > 0
+        }
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        counts: dict[str, int] = {}
+        for item in value:
+            if isinstance(item, str):
+                counts[item] = counts.get(item, 0) + 1
+        return counts
+    return {}
+
+
+def _grid_size(tiles: Any) -> int | None:
+    if not isinstance(tiles, Sequence) or isinstance(tiles, (str, bytes)):
+        return None
+    widths = [len(row) for row in tiles if isinstance(row, Sequence) and not isinstance(row, (str, bytes))]
+    size = max([len(tiles), *widths], default=0)
+    return size if size > 0 else None
+
+
+def normalize_planner_state(state: Any) -> dict[str, Any]:
+    """Adapt flat and ``parse_observation`` states to the planner contract."""
+    source = dict(state) if isinstance(state, Mapping) else {}
+    farm = _mapping(source.get("farm"))
+    private = _mapping(source.get("private"))
+    market = _mapping(source.get("market"))
+    tiles = source.get("tiles", farm.get("tiles", []))
+    hands = _hand_counts(farm.get("hands", source.get("hands", {})))
+    seeds = source.get("seeds", private.get("seeds", farm.get("seeds")))
+    if not isinstance(seeds, Mapping) or not seeds:
+        seeds = hands
+    inventory = source.get("inventory")
+    if not isinstance(inventory, Mapping) or not inventory:
+        inventory = private.get("shed")
+    if not isinstance(inventory, Mapping) or not inventory:
+        inventory = hands
+    board_size = source.get("board_size")
+    try:
+        board_size = int(board_size)
+    except (TypeError, ValueError, OverflowError):
+        board_size = _grid_size(tiles)
+    if not board_size or board_size < 1:
+        board_size = 1
+    source.update({
+        "board_size": board_size,
+        "tiles": tiles,
+        "animals": source.get("animals", farm.get("animals", private.get("animals", []))),
+        "structures": source.get("structures", farm.get("structures", private.get("structures", []))),
+        "seeds": dict(seeds) if isinstance(seeds, Mapping) else {},
+        "inventory": dict(inventory) if isinstance(inventory, Mapping) else {},
+        "workers": source.get("workers", farm.get("workers", [])),
+        "market": market,
+    })
+    return source
 
 
 def _tiles(state: Any) -> list[tuple[Position, Any]]:
@@ -261,6 +334,7 @@ def _shed_target(state: Any, board_size: int) -> Position:
 
 def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Task]:
     """Build a stable one-day plan from a typed or mapping-shaped state."""
+    state = normalize_planner_state(state)
     memory = memory or EpisodeMemory()
     day = _day(state, memory)
     try:
@@ -373,6 +447,7 @@ def _route_positions(start: Position | None, target: Position | None, board_size
 
 def assign_tasks(plan: Iterable[Task], workers: Iterable[Any], state: Any) -> list[WorkerAssignment]:
     """Assign at most one exclusive task per worker with deterministic priorities."""
+    state = normalize_planner_state(state)
     day = _day(state, EpisodeMemory())
     try:
         board_size = max(1, int(_get(state, "board_size", 1)))
@@ -400,7 +475,8 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any], state: Any) -> li
 
     def choose(task: Task) -> tuple[int, str, Position | None] | None:
         candidates = [info for info in infos if info[0] in available]
-        if logistics_pending and farmer is not None and task.kind not in _SHED_WORK:
+        non_farmer_available = any(info[0] in available and info[1] != "FARMER" for info in infos)
+        if logistics_pending and farmer is not None and non_farmer_available and task.kind not in _SHED_WORK:
             candidates = [info for info in candidates if info[0] != farmer[0]]
         if task.kind in _BASIC_NEEDS and reserved_basic[0] in available:
             candidates = [info for info in candidates if info[0] == reserved_basic[0]] or candidates

@@ -1,4 +1,5 @@
 from kagriculture_agent.planner import assign_tasks, build_daily_plan
+from kagriculture_agent.observation import parse_observation
 from kagriculture_agent.routing import (
     distance,
     nearest_target,
@@ -155,6 +156,27 @@ def test_daily_plan_includes_structure_animal_weed_plant_shed_and_sell_work():
     assert {"STRUCTURE", "ANIMAL", "WEED", "PLANT", "SHED", "SELL"} <= kinds
 
 
+def test_daily_plan_accepts_parse_observation_canonical_nested_state():
+    tiles = [["LOCKED" for _ in range(5)] for _ in range(5)]
+    tiles[0][0] = None
+    tiles[1][1] = {"crop": "WHEAT", "planted_day": 0, "yield_units": 1, "needs_water": True}
+    tiles[1][2] = "WEED"
+    parsed = parse_observation({
+        "day": 2,
+        "farms": [{
+            "tiles": tiles,
+            "hands": ["WHEAT"],
+            "farmer": [0, 0],
+            "animals": [{"position": [0, 1], "species": "GOOSE", "fed": False}],
+            "structures": [{"position": [0, 2], "kind": "COOP", "built": False}],
+        }],
+        "private": {"seeds": {"WHEAT": 2}, "shed": {"WHEAT": 4}},
+        "market": {"prices": {"WHEAT": 7}},
+    })
+    kinds = {task.kind for task in build_daily_plan(parsed, EpisodeMemory())}
+    assert {"WATER", "FEED", "STRUCTURE", "WEED", "PLANT", "SHED", "SELL"} <= kinds
+
+
 def test_assign_tasks_deduplicates_exclusive_tiles_and_reserves_basic_needs():
     plan = [
         Task("WATER", pos(1, 1), 100, 2, 5),
@@ -169,6 +191,20 @@ def test_assign_tasks_deduplicates_exclusive_tiles_and_reserves_basic_needs():
     assert len(assignments) == 2
     assert [assignment.task.kind for assignment in assignments].count("WATER") == 1
     assert any(assignment.task.kind == "WATER" for assignment in assignments)
+    assert [assignment.task.kind for assignment in assignments] == ["WATER", "PLANT"]
+
+
+def test_assign_tasks_lets_farmer_fallback_to_urgent_needs_without_helpers():
+    worker = {"index": 0, "role": "FARMER", "position": pos(0, 0)}
+    plan = [
+        Task("WATER", pos(1, 1), 100, 2, 1),
+        Task("SHED", pos(2, 2), 85, 2, 10),
+        Task("SELL", pos(2, 2), 75, 2, 10),
+    ]
+    assignments = assign_tasks(plan, [worker], _state(day=2, workers=[worker]))
+    assert len(assignments) == 1
+    assert assignments[0].worker_index == 0
+    assert assignments[0].task.kind == "WATER"
 
 
 def test_assign_tasks_keeps_farmer_for_shed_logistics():
