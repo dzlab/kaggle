@@ -467,7 +467,7 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
             except (KeyError, TypeError, ValueError):
                 value = 0
             if value > 0:
-                _add(plan, "SELL", shed_target, 75, day, value)
+                plan.append(Task("SELL", shed_target, 75, day, value, sell_all=True))
 
     return plan
 

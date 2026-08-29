@@ -24,6 +24,7 @@ class Task:
     priority: int
     deadline: Deadline
     value: float
+    sell_all: bool = False
 
 
 @dataclass
