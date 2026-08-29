@@ -86,6 +86,10 @@ def _item_params(item: str, params: Mapping[str, Any] | None) -> dict[str, Any]:
 def market_price(item: str, inventory: float, params: Mapping[str, Any] | None = None) -> int:
     """Return the engine's nearest-dollar, one-dollar-floored market quote."""
     p = _item_params(item, params)
+    return _market_price_from_parameters(p, inventory)
+
+
+def _market_price_from_parameters(p: Mapping[str, Any], inventory: float) -> int:
     base, I0, T = _number(p["base"]), _number(p["I0"]), _number(p["T"])
     below = _number(inventory) < I0
     func = p["below_func"] if below else p["above_func"]
@@ -104,15 +108,33 @@ def sell_batch_value(item: str, quantity: int, inventory: float, params: Mapping
     reduced to a bounded nonnegative integer.  A one-dollar sale does not add
     market supply, matching the published engine.
     """
-    return sum(_sale_quotes(item, quantity, inventory, params))
+    remaining = min(_whole(quantity), DEFAULT_SHED_CAPACITY)
+    resolved = _market_parameters(params)
+    p = resolved[item]
+    if isinstance(params, Mapping) and "base" in params:
+        p = dict(p)
+        p.update(params)
+    current = _number(inventory)
+    total = 0
+    for _ in range(remaining):
+        quote = _market_price_from_parameters(p, current)
+        total += quote
+        if quote > PRICE_FLOOR:
+            current += 1
+    return total
 
 
 def _sale_quotes(item: str, quantity: int, inventory: float, params: Mapping[str, Any] | None = None) -> list[int]:
-    remaining = min(_whole(quantity), 1_000_000)
+    remaining = min(_whole(quantity), DEFAULT_SHED_CAPACITY)
+    resolved = _market_parameters(params)
+    p = resolved[item]
+    if isinstance(params, Mapping) and "base" in params:
+        p = dict(p)
+        p.update(params)
     current = _number(inventory)
     quotes = []
     for _ in range(remaining):
-        quote = market_price(item, current, params)
+        quote = _market_price_from_parameters(p, current)
         quotes.append(quote)
         if quote > PRICE_FLOOR:
             current += 1
@@ -178,6 +200,21 @@ def _quote(item: str, inventory: float, prices: Mapping[str, Any] | None) -> int
     return market_price(item, inventory)
 
 
+def _forecast_sale_quotes(
+    item: str,
+    quantity: int,
+    inventory: float,
+    prices: Mapping[str, Any] | None,
+    params: Mapping[str, Any] | None,
+    fixed_price_mode: bool,
+) -> list[int]:
+    """Return per-unit sale quotes; exact market simulation is the default."""
+    if fixed_price_mode and isinstance(prices, Mapping) and item in prices:
+        quote = max(PRICE_FLOOR, int(round(_nonnegative(prices[item]))))
+        return [quote] * min(_whole(quantity), DEFAULT_SHED_CAPACITY)
+    return _sale_quotes(item, quantity, inventory, params)
+
+
 def _cash_terms(
     *, revenue: float, material_cost: float, worker_cost: float, land_cost: float,
     movement_turns: int, action_turns: int, horizon: int, overflow_units: int,
@@ -205,6 +242,7 @@ def forecast_crop(
     movement_turns: int = 0, action_turns: int = 0, held_inventory: int = 0,
     shed_cap: int = DEFAULT_SHED_CAPACITY, shed_capacity: int | None = None,
     params: Mapping[str, Any] | None = None,
+    fixed_price_mode: bool = False,
 ) -> dict[str, Any]:
     """Forecast one planted crop with exact watering, fertilizer, and decay rules."""
     if crop not in CROPS:
@@ -234,7 +272,8 @@ def forecast_crop(
         # The interpreter accepts actions first and decays the plant afterward.
         # This matters on the first lifespan step: a harvest on that turn gets
         # the pre-decay buffer rather than a prematurely decayed one.
-        if harvest_day is not None and day == _whole(harvest_day) and units:
+        harvestable = harvest_day is not None and _whole(harvest_day) - start_day >= cd["first_yield_day"]
+        if harvestable and day == _whole(harvest_day) and units:
             harvested += units
             units = 0
             if not cd["ongoing"]:
@@ -267,18 +306,19 @@ def forecast_crop(
                     if count == cd["max_yield"]:
                         lifespan_step = (day + 2) * turns_per_day
     output_units = harvested + units
+    saleable_units = harvested if not cd["ongoing"] else output_units
     base_inventory = _number(market_inventory, MARKET_I0)
-    quote = _quote(crop, base_inventory, prices) if isinstance(prices, Mapping) and crop in prices else market_price(crop, base_inventory, params)
-    crop_quotes = [quote] * output_units if isinstance(prices, Mapping) and crop in prices else _sale_quotes(crop, output_units, base_inventory, params)
+    crop_quotes = _forecast_sale_quotes(crop, saleable_units, base_inventory, prices, params, fixed_price_mode)
     revenue = sum(crop_quotes)
     fertilizer_used = len(fertilizer & forecast_days)
-    fertilizer_price = _quote("FERTILIZER", base_inventory, prices) if isinstance(prices, Mapping) and "FERTILIZER" in prices else market_price("FERTILIZER", base_inventory, params)
+    fertilizer_price = (_quote("FERTILIZER", base_inventory, prices) if fixed_price_mode else market_price("FERTILIZER", base_inventory, params))
     fertilizer_cost = max(0, fertilizer_used - _whole(fertilizer_owned)) * fertilizer_price
     cap = _whole(shed_capacity if shed_capacity is not None else shed_cap, DEFAULT_SHED_CAPACITY)
     overflow_units = max(0, _whole(held_inventory) + output_units - cap)
     result = {
         "kind": "crop", "crop": crop, "start_day": start_day, "horizon": horizon,
         "units": output_units, "units_before_decay": units_before_decay,
+        "saleable_units": saleable_units,
         "harvested_units": harvested, "decayed_units": decayed,
         "fertilizer_days_active": active_fertilizer & set(range(start_day, start_day + horizon)),
         "seed_cost": 0 if seed_owned else cd["seed"],
@@ -304,6 +344,7 @@ def forecast_animal(
     movement_turns: int = 0, action_turns: int = 0, held_inventory: int = 0,
     shed_cap: int = DEFAULT_SHED_CAPACITY, shed_capacity: int | None = None,
     params: Mapping[str, Any] | None = None,
+    fixed_price_mode: bool = False,
 ) -> dict[str, Any]:
     """Forecast one animal with one-wheat feed, care bonuses, caps, and manure."""
     if animal not in ANIMALS:
@@ -351,10 +392,10 @@ def forecast_animal(
     product = ad["product"]
     base_inventory = _number(market_inventory, MARKET_I0)
     output_units = harvested_units + held_units
-    product_quote = _quote(product, base_inventory, prices) if isinstance(prices, Mapping) and product in prices else market_price(product, base_inventory, params)
-    fertilizer_quote = _quote("FERTILIZER", base_inventory, prices) if isinstance(prices, Mapping) and "FERTILIZER" in prices else market_price("FERTILIZER", base_inventory, params)
-    product_quotes = [product_quote] * output_units if isinstance(prices, Mapping) and product in prices else _sale_quotes(product, output_units, base_inventory, params)
-    fertilizer_quotes = [fertilizer_quote] * fertilizer_units if isinstance(prices, Mapping) and "FERTILIZER" in prices else _sale_quotes("FERTILIZER", fertilizer_units, base_inventory, params)
+    product_quotes = _forecast_sale_quotes(product, output_units, base_inventory, prices, params, fixed_price_mode)
+    fertilizer_quotes = _forecast_sale_quotes("FERTILIZER", fertilizer_units, base_inventory, prices, params, fixed_price_mode)
+    product_quote = product_quotes[0] if product_quotes else market_price(product, base_inventory, params)
+    fertilizer_quote = fertilizer_quotes[0] if fertilizer_quotes else market_price("FERTILIZER", base_inventory, params)
     revenue = sum(product_quotes) + sum(fertilizer_quotes)
     feed_quote = _quote("WHEAT", base_inventory, prices) if isinstance(prices, Mapping) and "WHEAT" in prices else market_price("WHEAT", base_inventory, params)
     feed_cost = feed_units * feed_quote

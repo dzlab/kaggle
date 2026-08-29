@@ -121,6 +121,17 @@ def test_sell_batch_uses_each_pre_sale_quote_and_only_positive_price_supply():
     assert sell_batch_value("WHEAT", -3, 0, params) == 0
 
 
+def test_sell_batch_has_a_realistic_shed_sized_bound():
+    params = {
+        "WHEAT": {
+            "base": 100, "I0": 0, "T": 10,
+            "below_func": "linear", "below_target": 1,
+            "above_func": "linear", "above_target": 1,
+        }
+    }
+    assert sell_batch_value("WHEAT", 1_000, 0, params) == sell_batch_value("WHEAT", 100, 0, params)
+
+
 def test_project_inventory_after_town_counts_shop_multiplicity_and_center_demand():
     inventory = {item: 100 for item in PRODUCTS}
     projected = project_inventory_after_town(
@@ -184,6 +195,16 @@ def test_crop_harvest_happens_before_first_decay_turn():
     assert wheat["decayed_units"] == 0
 
 
+def test_crop_does_not_sell_immature_or_unharvested_one_time_units():
+    immature = forecast_crop("WHEAT", horizon=1, watering_days={0}, harvest_day=0)
+    no_harvest = forecast_crop("WHEAT", horizon=1, watering_days={0})
+    assert immature["units"] == 1
+    assert immature["saleable_units"] == 0
+    assert immature["revenue"] == 0
+    assert no_harvest["saleable_units"] == 0
+    assert no_harvest["revenue"] == 0
+
+
 def test_crop_fertilizer_cost_ignores_applications_after_horizon():
     wheat = forecast_crop(
         "WHEAT", horizon=5, watering_days={0, 1, 2, 3, 4},
@@ -201,12 +222,36 @@ def test_forecast_crop_accounts_for_floor_risk_across_sequential_sales():
         }
     }
     wheat = forecast_crop(
-        "WHEAT", horizon=5, watering_days={0, 1, 2, 3, 4},
+        "WHEAT", horizon=6, watering_days={0, 1, 2, 3, 4, 5}, harvest_day=5,
         market_inventory=0, params=params,
     )
     assert wheat["units"] == 4
     assert wheat["floor_units"] == 3
     assert wheat["price_floor_risk"] == pytest.approx(0.75)
+
+
+def test_forecast_crop_keeps_sequential_quotes_with_prices_and_params():
+    params = {
+        "WHEAT": {
+            "base": 100, "I0": 0, "T": 10,
+            "below_func": "linear", "below_target": 1,
+            "above_func": "linear", "above_target": 10,
+        }
+    }
+    wheat = forecast_crop(
+        "WHEAT", horizon=5, watering_days={0, 1, 2, 3, 4},
+        market_inventory=0, prices={"WHEAT": 100}, params=params,
+    )
+    assert wheat["saleable_units"] == 0
+    assert wheat["revenue"] == 0
+
+    harvested = forecast_crop(
+        "WHEAT", horizon=6, watering_days={0, 1, 2, 3, 4, 5},
+        harvest_day=5, market_inventory=0, prices={"WHEAT": 100}, params=params,
+    )
+    assert harvested["saleable_units"] == 4
+    assert harvested["revenue"] == 103
+    assert harvested["floor_units"] == 3
 
 
 def test_forecast_one_time_crop_stops_after_harvest():
