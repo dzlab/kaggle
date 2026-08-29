@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 from pathlib import Path
 from typing import Any
@@ -12,12 +13,55 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from kaggle_environments import make
-
 from main import agent
 
 
 OPPONENTS = ("pass", "random", "starter")
+RANDOM_CROP_SEED_COSTS = {
+    "WHEAT": 10,
+    "CARROT": 20,
+    "TOMATO": 50,
+    "STRAWBERRY": 100,
+    "MELON": 80,
+}
+
+
+def _deterministic_random_agent(seed: int):
+    """Return a seeded, random-style opponent with legal action shapes."""
+    rng = random.Random(seed)
+
+    def random_agent(obs: dict[str, Any]) -> dict[str, Any]:
+        farms = obs.get("farms", [])
+        player = obs.get("player", 0)
+        private = obs.get("private", {}) or {}
+        farm = farms[player] if isinstance(farms, list) and 0 <= player < len(farms) else None
+        if not isinstance(farm, dict):
+            return {"farmer": ["PASS"], "hands": [], "market": []}
+
+        farmer_ops = ["NORTH", "SOUTH", "EAST", "WEST", "WATER", "HARVEST", "PASS"]
+        market = []
+        money = farm.get("money", 0)
+        affordable = [crop for crop, cost in RANDOM_CROP_SEED_COSTS.items() if cost <= money]
+        if affordable and rng.random() < 0.1:
+            market.append(["BUY_SEED", rng.choice(affordable), 1])
+
+        seeds = private.get("seeds", {}) if isinstance(private, dict) else {}
+        available_seeds = [crop for crop, quantity in seeds.items() if quantity > 0]
+        farmer = ["PLANT", rng.choice(available_seeds)] if available_seeds and rng.random() < 0.3 else [rng.choice(farmer_ops)]
+        hands = [[rng.choice(farmer_ops)] for _ in farm.get("hands", [])]
+        return {"farmer": farmer, "hands": hands, "market": market}
+
+    return random_agent
+
+
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
 
 
 def run_episode(
@@ -34,12 +78,20 @@ def run_episode(
     if steps < 1:
         raise ValueError("steps must be positive")
 
+    try:
+        from kaggle_environments import make
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "kaggle-environments is required to run local games; install the project dependencies first"
+        ) from exc
+
     env = make(
         "kaggriculture",
         configuration={"episodeSteps": steps, "seed": seed},
         debug=debug,
     )
-    env.run([agent, opponent])
+    opponent_agent = _deterministic_random_agent(seed) if opponent == "random" else opponent
+    env.run([agent, opponent_agent])
 
     replay = Path(replay_path)
     replay.parent.mkdir(parents=True, exist_ok=True)
@@ -53,7 +105,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--opponent", choices=OPPONENTS, default="pass")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--steps", type=int, default=720, dest="steps")
+    parser.add_argument("--steps", type=_positive_int, default=720, dest="steps")
     parser.add_argument("--replay", type=Path, default=None, dest="replay_path")
     parser.add_argument("--debug", action="store_true")
     return parser
