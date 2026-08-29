@@ -23,6 +23,12 @@ def test_locked_tiles_are_passable_but_rejected_as_action_targets():
     assert route_to(pos(0, 0), pos(2, 0), 3) == ["EAST", "EAST"]
     assert route_action(pos(0, 0), pos(2, 0), board_size=3, tile="LOCKED", action="WATER") == "EAST"
     assert route_action(pos(2, 0), pos(2, 0), board_size=3, tile="LOCKED", action="WATER") == "PASS"
+    assert route_action(pos(2, 0), pos(2, 0), board_size=3, tile={"kind": "LOCKED"}, action="WATER") == "PASS"
+
+
+def test_route_action_rejects_invalid_current_and_target_positions():
+    assert route_action(pos(-1, 0), pos(0, 0), board_size=3, action="HARVEST") == "PASS"
+    assert route_action(pos(0, 0), pos(3, 0), board_size=3, action="HARVEST") == "PASS"
 
 
 def test_manhattan_routing_and_ties_are_deterministic():
@@ -79,13 +85,60 @@ def test_daily_plan_prioritizes_urgent_water_feed_and_care():
 def test_daily_plan_schedules_positive_harvest_before_decay():
     state = _state(
         day=2,
-        tiles={pos(1, 1): {"crop": "WHEAT", "planted_day": 0, "watered": True}},
+        tiles={pos(1, 1): {"crop": "WHEAT", "planted_day": 0, "yield_units": 2, "watering_days": [0, 1, 2]}},
     )
     harvests = [task for task in build_daily_plan(state, EpisodeMemory()) if task.kind == "HARVEST"]
     assert harvests
     assert harvests[0].target == pos(1, 1)
     assert harvests[0].deadline <= 4
     assert harvests[0].value > 0
+
+
+def test_daily_plan_harvests_at_first_decay_boundary_before_decay():
+    state = _state(
+        day=5,
+        tiles={pos(1, 1): {"crop": "WHEAT", "planted_day": 0, "yield_units": 2, "watering_days": [0, 1, 2, 3, 4]}},
+    )
+    harvests = [task for task in build_daily_plan(state, EpisodeMemory()) if task.kind == "HARVEST"]
+    assert harvests and harvests[0].deadline == 5 and harvests[0].value > 0
+
+
+def test_daily_plan_keeps_ongoing_production_harvestable_past_max_yield_day():
+    state = _state(
+        day=10,
+        tiles={pos(1, 1): {"crop": "TOMATO", "planted_day": 0, "yield_units": 1, "watering_days": list(range(11))}},
+    )
+    harvests = [task for task in build_daily_plan(state, EpisodeMemory()) if task.kind == "HARVEST"]
+    assert harvests and harvests[0].target == pos(1, 1)
+
+
+def test_daily_plan_does_not_invent_harvest_after_missed_watering():
+    state = _state(
+        day=2,
+        tiles={pos(1, 1): {"crop": "WHEAT", "planted_day": 0, "watering_days": []}},
+    )
+    assert not [task for task in build_daily_plan(state, EpisodeMemory()) if task.kind == "HARVEST"]
+
+
+def test_daily_plan_uses_same_locked_predicate_for_mapping_tiles():
+    state = _state(
+        tiles={pos(1, 1): {"kind": "LOCKED", "crop": "WHEAT", "needs_water": True}},
+    )
+    assert not [task for task in build_daily_plan(state, EpisodeMemory()) if task.target == pos(1, 1)]
+
+
+def test_daily_plan_uses_observed_quotes_not_player_inventory_or_curve_overrides():
+    state = _state(
+        day=2,
+        tiles={pos(1, 1): {"crop": "WHEAT", "planted_day": 0, "yield_units": 2}},
+        inventory={"WHEAT": 4},
+        market={"prices": {"WHEAT": 7}, "inventory": {"WHEAT": 99_999}},
+    )
+    plan = build_daily_plan(state, EpisodeMemory())
+    harvest = next(task for task in plan if task.kind == "HARVEST")
+    sell = next(task for task in plan if task.kind == "SELL")
+    assert harvest.value == 14
+    assert sell.value == 28
 
 
 def test_daily_plan_includes_structure_animal_weed_plant_shed_and_sell_work():

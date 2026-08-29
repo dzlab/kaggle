@@ -6,10 +6,10 @@ from collections.abc import Iterable, Mapping, Sequence
 from math import inf
 from typing import Any
 
-from .constants import ANIMALS, CROPS
+from .constants import ANIMALS, CROPS, MARKET_I0
 from .economics import forecast_crop, market_price, sell_batch_value
-from .observation import is_tile_actionable, shed_access_tiles
-from .routing import distance, route_to
+from .observation import shed_access_tiles
+from .routing import distance, is_locked_tile, route_to
 from .types import EpisodeMemory, Position, Task, WorkerAssignment
 
 _BASIC_NEEDS = frozenset({"WATER", "FEED", "CARE"})
@@ -106,21 +106,135 @@ def _needs(tile: Any, field: str, inverse_field: str | None = None) -> bool:
     return False
 
 
-def _tile_value(crop: str, state: Any) -> float:
-    prices = _get(state, "prices", _get(state, "market", {}))
-    try:
-        return float(market_price(crop, _get(_get(state, "inventory", {}), crop, 0), prices if isinstance(prices, Mapping) else None))
-    except (KeyError, TypeError, ValueError):
-        return float(CROPS[crop].get("max_yield", 1))
+def _market_section(state: Any) -> Mapping[str, Any]:
+    market = _get(state, "market", {})
+    return market if isinstance(market, Mapping) else {}
 
 
-def _harvest_value(crop: str, age: int, state: Any) -> float:
+def _observed_prices(state: Any) -> Mapping[str, Any]:
+    market = _market_section(state)
+    for key in ("observed_prices", "market_prices"):
+        values = _get(state, key)
+        if isinstance(values, Mapping):
+            return values
+    values = market.get("prices")
+    if isinstance(values, Mapping):
+        return values
+    values = _get(state, "prices")
+    if isinstance(values, Mapping):
+        return values
+    # A flat market mapping is also an observed quote table, never curve
+    # parameters.  Metadata keys are ignored by the quote lookup.
+    return market
+
+
+def _observed_inventory(item: str, state: Any) -> float:
+    market = _market_section(state)
+    values = None
+    for key in ("observed_market_inventory", "market_inventory"):
+        values = _get(state, key)
+        if values is not None:
+            break
+    if values is None:
+        values = market.get("inventory")
+    if isinstance(values, Mapping):
+        values = values.get(item, MARKET_I0)
     try:
-        forecast = forecast_crop(crop, horizon=age + 1, watering_days=set(range(age + 1)), harvest_day=age)
-        units = forecast.get("harvested_units", 0)
+        return float(values)
+    except (TypeError, ValueError, OverflowError):
+        return float(MARKET_I0)
+
+
+def _observed_quote(item: str, state: Any) -> float:
+    prices = _observed_prices(state)
+    if item in prices:
+        try:
+            return max(0.0, float(prices[item]))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    try:
+        return float(market_price(item, _observed_inventory(item, state)))
     except (KeyError, TypeError, ValueError):
-        units = 0
-    return max(0.0, float(units) * _tile_value(crop, state))
+        return 0.0
+
+
+def _observed_sale_value(item: str, quantity: int, state: Any) -> float:
+    prices = _observed_prices(state)
+    try:
+        quantity = max(0, int(quantity))
+    except (TypeError, ValueError, OverflowError):
+        quantity = 0
+    if quantity == 0:
+        return 0.0
+    if item in prices:
+        return quantity * _observed_quote(item, state)
+    try:
+        return float(sell_batch_value(item, quantity, _observed_inventory(item, state)))
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+
+
+def _state_days(tile: Any, keys: tuple[str, ...], current_day: int) -> set[int]:
+    for key in keys:
+        value = _get(tile, key)
+        if value is None:
+            continue
+        if isinstance(value, (set, frozenset, list, tuple, range)):
+            result = set()
+            for day in value:
+                try:
+                    result.add(int(day))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+            return result
+        if isinstance(value, bool):
+            return {current_day} if value else set()
+    return set()
+
+
+def _crop_age(tile: Any, day: int) -> int:
+    explicit_age = _get(tile, "planted_age", _get(tile, "age"))
+    if explicit_age is not None:
+        try:
+            return max(0, int(explicit_age))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+    planted_day = _get(tile, "planted_day", day)
+    try:
+        return max(0, day - int(planted_day))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _harvest_units(crop: str, tile: Any, age: int, day: int) -> float:
+    recorded = _get(tile, "yield_units")
+    if recorded is not None:
+        try:
+            return max(0.0, float(recorded))
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+    watering_days = _state_days(tile, ("watering_days", "watered_days", "water_history"), day)
+    if not watering_days and _get(tile, "watered") is not None:
+        watering_days = _state_days(tile, ("watered",), day)
+    fertilizer_days = _state_days(tile, ("fertilizer_days", "fertilized_days", "fertilizer_history"), day)
+    if not fertilizer_days and _get(tile, "fertilized") is not None:
+        fertilizer_days = _state_days(tile, ("fertilized",), day)
+    try:
+        forecast = forecast_crop(
+            crop,
+            start_day=day - age,
+            horizon=age + 1,
+            watering_days=watering_days,
+            fertilizer_days=fertilizer_days,
+            harvest_day=day,
+        )
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    return max(0.0, float(forecast.get("harvested_units", 0)))
+
+
+def _harvest_value(crop: str, tile: Any, age: int, day: int, state: Any) -> float:
+    return _harvest_units(crop, tile, age, day) * _observed_quote(crop, state)
 
 
 def _target_position(value: Any) -> Position | None:
@@ -156,7 +270,7 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
     plan: list[Task] = []
 
     for position, tile in _tiles(state):
-        if not is_tile_actionable(tile):
+        if is_locked_tile(tile):
             continue
         kind = _tile_kind(tile)
         crop = _crop(tile)
@@ -165,14 +279,15 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
         if crop:
             if _needs(tile, "needs_water", "watered"):
                 _add(plan, "WATER", position, 100, day, 1)
-            planted_day = _get(tile, "planted_day", day)
-            try:
-                age = day - int(planted_day)
-            except (TypeError, ValueError, OverflowError):
-                age = 0
+            age = _crop_age(tile, day)
             crop_rules = CROPS[crop]
-            if crop_rules["first_yield_day"] <= age <= crop_rules["max_yield_day"]:
-                value = _harvest_value(crop, age, state)
+            # Non-ongoing crops have their first decay step on the day after
+            # max_yield_day, but actions are accepted before that decay.  An
+            # ongoing crop remains harvestable as long as actual state says it
+            # still has product, including after max_yield_day.
+            lifecycle_ready = age >= crop_rules["first_yield_day"]
+            if lifecycle_ready:
+                value = _harvest_value(crop, tile, age, day, state)
                 if value > 0:
                     _add(plan, "HARVEST", position, 90, day, value)
         elif _is_empty(tile):
@@ -181,8 +296,8 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
                 seeds = {}
             available = [crop_name for crop_name in CROPS if seeds.get(crop_name, 0) and crop_name in CROPS]
             if available:
-                crop_name = max(available, key=lambda item: (_tile_value(item, state), item))
-                _add(plan, "PLANT", position, 20, None, _tile_value(crop_name, state))
+                crop_name = max(available, key=lambda item: (_observed_quote(item, state), item))
+                _add(plan, "PLANT", position, 20, None, _observed_quote(crop_name, state))
 
     for animal in _get(state, "animals", ()) or ():
         position = _position(animal)
@@ -211,7 +326,7 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
             if item == "FERTILIZER" or not isinstance(quantity, (int, float)) or quantity <= 0:
                 continue
             try:
-                value = sell_batch_value(item, int(quantity), 0)
+                value = _observed_sale_value(item, int(quantity), state)
             except (KeyError, TypeError, ValueError):
                 value = 0
             if value > 0:

@@ -111,13 +111,14 @@ def nearest_target(current: Any, targets: Iterable[Any]) -> Any | None:
     return best
 
 
-def _locked(tile: Any) -> bool:
-    if tile == "LOCKED":
+def is_locked_tile(tile: Any) -> bool:
+    """Return whether a literal or mapping-shaped tile is locked."""
+    if isinstance(tile, str) and tile.upper() == "LOCKED":
         return True
     if isinstance(tile, Mapping):
         if tile.get("locked") is True:
             return True
-        return str(tile.get("kind", tile.get("type", ""))).upper() == "LOCKED"
+        return str(tile.get("kind", tile.get("type", tile.get("state", "")))).upper() == "LOCKED"
     return False
 
 
@@ -137,11 +138,18 @@ def route_action(
     current_position, target_position = _position(current), _position(target)
     if current_position is None or target_position is None:
         return PASS
+    if board_size is not None and (
+        not _in_bounds(current_position, board_size)
+        or not _in_bounds(target_position, board_size)
+    ):
+        return PASS
     if current_position != target_position:
         movement = next_move(current_position, target_position)
+        if movement == PASS:
+            return PASS
         if board_size is not None and not _in_bounds(_step(current_position, movement), board_size):
             return PASS
         return movement
-    if _locked(tile) or not is_tile_actionable(tile) or not action:
+    if is_locked_tile(tile) or not is_tile_actionable(tile) or not action:
         return PASS
     return action
