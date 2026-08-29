@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 from kagriculture_agent.planner import assign_tasks, build_daily_plan
 from kagriculture_agent.observation import parse_observation
 from kagriculture_agent.routing import (
@@ -213,13 +215,31 @@ def test_assign_tasks_preserves_farmer_for_shed_after_helper_takes_water():
         {"index": 1, "role": "WORKER", "position": pos(0, 0)},
     ]
     plan = [
-        Task("WATER", pos(0, 1), 100, 2, 1),
+        Task("WATER", pos(0, 1), 101, 2, 1),
         Task("PLANT", pos(1, 1), 100, None, 10_000),
         Task("SHED", pos(2, 2), 85, None, 10),
     ]
     assignments = assign_tasks(plan, workers, _state(day=2, workers=workers))
     by_worker = {assignment.worker_index: assignment.task.kind for assignment in assignments}
     assert by_worker == {0: "SHED", 1: "WATER"}
+
+
+def test_assign_tasks_uses_farmer_for_second_basic_task_after_helper_is_taken():
+    workers = [
+        {"index": 0, "role": "FARMER", "position": pos(2, 2)},
+        {"index": 1, "role": "WORKER", "position": pos(0, 0)},
+    ]
+    plan = [
+        Task("WATER", pos(0, 1), 101, 2, 1),
+        Task("FEED", pos(1, 0), 100, 2, 1),
+        Task("SHED", pos(2, 2), 85, None, 10),
+    ]
+    assignments = assign_tasks(plan, workers, _state(day=2, workers=workers))
+    assert {assignment.task.kind for assignment in assignments} == {"WATER", "FEED"}
+    assert {assignment.worker_index: assignment.task.kind for assignment in assignments} == {
+        0: "FEED",
+        1: "WATER",
+    }
 
 
 def test_assign_tasks_keeps_farmer_for_shed_logistics():
@@ -246,3 +266,17 @@ def test_assign_tasks_uses_stable_worker_and_coordinate_tie_breaking():
     assignments = assign_tasks([task], workers, _state(day=2, workers=workers))
     assert len(assignments) == 1
     assert assignments[0].worker_index == 1
+
+
+def test_planner_does_not_mutate_canonical_parse_observation_input():
+    raw = {
+        "day": 0,
+        "farms": [{"tiles": [[None, "LOCKED"], ["LOCKED", "LOCKED"]], "hands": []}],
+        "private": {"seeds": {"WHEAT": 1}, "shed": {}},
+        "market": {"prices": {"WHEAT": 7}},
+    }
+    parsed = parse_observation(raw)
+    snapshot = deepcopy(parsed)
+    build_daily_plan(parsed, EpisodeMemory())
+    assign_tasks([], [], parsed)
+    assert parsed == snapshot

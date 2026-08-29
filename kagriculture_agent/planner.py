@@ -524,7 +524,15 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any], state: Any) -> li
 
     def choose(task: Task) -> tuple[int, str, Position | None] | None:
         candidates = [info for info in infos if info[0] in available]
-        if logistics_pending and farmer is not None and helper_exists and task.kind not in _SHED_WORK:
+        non_farmer_available = any(info[0] in available and info[1] != "FARMER" for info in infos)
+        reserve_farmer = (
+            logistics_pending
+            and farmer is not None
+            and helper_exists
+            and task.kind not in _SHED_WORK
+            and (task.kind not in _BASIC_NEEDS or non_farmer_available)
+        )
+        if reserve_farmer:
             candidates = [info for info in candidates if info[0] != farmer[0]]
         if task.kind in _BASIC_NEEDS and reserved_basic[0] in available:
             candidates = [info for info in candidates if info[0] == reserved_basic[0]] or candidates
