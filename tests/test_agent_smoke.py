@@ -1,6 +1,7 @@
 import builtins
 import importlib.util
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -69,7 +70,8 @@ def _assert_replay_is_legal_and_complete(replay_path: Path) -> dict:
     assert isinstance(replay["info"], dict)
     assert not replay["info"].get("error")
 
-    for turn in replay["steps"]:
+    final_turn = len(replay["steps"]) - 1
+    for turn_number, turn in enumerate(replay["steps"]):
         assert isinstance(turn, list)
         for player_state in turn:
             action = player_state["action"]
@@ -88,7 +90,8 @@ def _assert_replay_is_legal_and_complete(replay_path: Path) -> dict:
                 _assert_market_order(order)
 
             assert isinstance(player_state["status"], str)
-            assert player_state["status"] in {"ACTIVE", "DONE", "INACTIVE", "ERROR", "INVALID", "TIMEOUT"}
+            expected_status = "DONE" if turn_number == final_turn else "ACTIVE"
+            assert player_state["status"] == expected_status
             assert not player_state.get("error")
             assert isinstance(player_state["info"], dict)
             assert not player_state["info"].get("error")
@@ -96,7 +99,9 @@ def _assert_replay_is_legal_and_complete(replay_path: Path) -> dict:
     for player_state in replay["steps"][-1]:
         observation = player_state["observation"]
         player_farm = observation["farms"][observation["player"]]
-        assert "money" in player_farm
+        money = player_farm.get("money")
+        assert isinstance(money, (int, float)) and not isinstance(money, bool)
+        assert math.isfinite(money)
 
     return replay
 
@@ -136,7 +141,8 @@ def test_short_local_game_finishes_with_legal_replay(opponent: str, tmp_path: Pa
     env = run_episode(opponent=opponent, seed=17, steps=96, replay_path=replay_path)
 
     assert env.toJSON()["statuses"] == ["DONE", "DONE"]
-    _assert_replay_is_legal_and_complete(replay_path)
+    replay = _assert_replay_is_legal_and_complete(replay_path)
+    assert len(replay["steps"]) == 96
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
@@ -214,3 +220,61 @@ def test_parser_rejects_non_positive_steps():
         main(["--steps", "0"])
 
     assert exc_info.value.code == 2
+
+
+def _write_replay(path: Path, replay: dict) -> None:
+    path.write_text(json.dumps(replay))
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+@pytest.mark.parametrize("bad_status", ["ERROR", "INVALID", "TIMEOUT"])
+def test_replay_validator_rejects_bad_status_on_intermediate_turn(tmp_path: Path, bad_status: str):
+    replay_path = tmp_path / "valid.json"
+    run_episode(opponent="pass", seed=17, steps=4, replay_path=replay_path)
+    replay = json.loads(replay_path.read_text())
+    replay["steps"][1][0]["status"] = bad_status
+    _write_replay(replay_path, replay)
+
+    with pytest.raises(AssertionError):
+        _assert_replay_is_legal_and_complete(replay_path)
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_replay_validator_requires_done_status_only_on_final_turn(tmp_path: Path):
+    replay_path = tmp_path / "valid.json"
+    run_episode(opponent="pass", seed=17, steps=4, replay_path=replay_path)
+    replay = json.loads(replay_path.read_text())
+    replay["steps"][-1][0]["status"] = "ACTIVE"
+    _write_replay(replay_path, replay)
+
+    with pytest.raises(AssertionError):
+        _assert_replay_is_legal_and_complete(replay_path)
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_replay_validator_requires_numeric_final_money(tmp_path: Path):
+    replay_path = tmp_path / "valid.json"
+    run_episode(opponent="pass", seed=17, steps=4, replay_path=replay_path)
+    replay = json.loads(replay_path.read_text())
+    replay["steps"][-1][0]["observation"]["farms"][0]["money"] = "unknown"
+    _write_replay(replay_path, replay)
+
+    with pytest.raises(AssertionError):
+        _assert_replay_is_legal_and_complete(replay_path)
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_production_agent_changes_state_and_reports_matching_reward(tmp_path: Path):
+    replay_path = tmp_path / "production-agent.json"
+    run_episode(opponent="pass", seed=17, steps=96, replay_path=replay_path)
+    replay = _assert_replay_is_legal_and_complete(replay_path)
+    custom_states = [_player_state(replay, step) for step in range(96)]
+
+    buy_state = next(state for state in custom_states if state["action"]["market"])
+    assert buy_state["action"]["market"][0][0] == "BUY_SEED"
+    assert any(state["action"]["farmer"][0] == "PLANT" for state in custom_states)
+
+    initial_money = custom_states[0]["observation"]["farms"][0]["money"]
+    final_money = custom_states[-1]["observation"]["farms"][0]["money"]
+    assert final_money < initial_money
+    assert replay["rewards"][0] == final_money
