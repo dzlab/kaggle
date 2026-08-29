@@ -151,7 +151,9 @@ def market_regime(prices: Mapping[str, Any], inventory: Mapping[str, Any]) -> di
     inventory = inventory if isinstance(inventory, Mapping) else {}
     result = {}
     for item in sorted(set(prices) | set(inventory)):
-        if _number(prices.get(item)) <= PRICE_FLOOR:
+        observed_price = prices.get(item)
+        price_number = _number(observed_price, math.nan)
+        if math.isfinite(price_number) and price_number <= PRICE_FLOOR:
             result[item] = "floor"
         elif _number(inventory.get(item), MARKET_I0) < MARKET_I0:
             result[item] = "scarce"

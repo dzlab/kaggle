@@ -145,6 +145,10 @@ def test_market_regime_is_compact_and_policy_facing():
     }
 
 
+def test_market_regime_missing_price_uses_inventory_not_floor():
+    assert market_regime({}, {"WHEAT": 9_000})["WHEAT"] == "scarce"
+
+
 def test_forecast_crop_counts_planting_day_watering_miss_and_bonus_window():
     miss = forecast_crop("WHEAT", horizon=5, watering_days={1, 2, 3, 4})
     watered_on_planting_day = forecast_crop(
