@@ -159,22 +159,22 @@ def test_daily_plan_includes_structure_animal_weed_plant_shed_and_sell_work():
 def test_daily_plan_accepts_parse_observation_canonical_nested_state():
     tiles = [["LOCKED" for _ in range(5)] for _ in range(5)]
     tiles[0][0] = None
-    tiles[1][1] = {"crop": "WHEAT", "planted_day": 0, "yield_units": 1, "needs_water": True}
-    tiles[1][2] = "WEED"
+    tiles[1][1] = {"kind": "CROP", "crop": "WHEAT", "planted_day": 0, "yield_units": 1, "watered_today": False}
+    tiles[1][2] = {"kind": "WEED"}
+    tiles[0][1] = {"kind": "ANIMAL", "animal": {"species": "GOOSE", "fed_today": False, "cared_today": False, "needs_placement": True}}
+    tiles[0][2] = {"kind": "STRUCTURE", "structure": {"kind": "COOP", "built": False}}
     parsed = parse_observation({
         "day": 2,
         "farms": [{
             "tiles": tiles,
             "hands": ["WHEAT"],
             "farmer": [0, 0],
-            "animals": [{"position": [0, 1], "species": "GOOSE", "fed": False}],
-            "structures": [{"position": [0, 2], "kind": "COOP", "built": False}],
         }],
         "private": {"seeds": {"WHEAT": 2}, "shed": {"WHEAT": 4}},
         "market": {"prices": {"WHEAT": 7}},
     })
     kinds = {task.kind for task in build_daily_plan(parsed, EpisodeMemory())}
-    assert {"WATER", "FEED", "STRUCTURE", "WEED", "PLANT", "SHED", "SELL"} <= kinds
+    assert {"WATER", "FEED", "CARE", "STRUCTURE", "ANIMAL", "WEED", "PLANT", "SHED", "SELL"} <= kinds
 
 
 def test_assign_tasks_deduplicates_exclusive_tiles_and_reserves_basic_needs():
@@ -205,6 +205,21 @@ def test_assign_tasks_lets_farmer_fallback_to_urgent_needs_without_helpers():
     assert len(assignments) == 1
     assert assignments[0].worker_index == 0
     assert assignments[0].task.kind == "WATER"
+
+
+def test_assign_tasks_preserves_farmer_for_shed_after_helper_takes_water():
+    workers = [
+        {"index": 0, "role": "FARMER", "position": pos(2, 2)},
+        {"index": 1, "role": "WORKER", "position": pos(0, 0)},
+    ]
+    plan = [
+        Task("WATER", pos(0, 1), 100, 2, 1),
+        Task("PLANT", pos(1, 1), 100, None, 10_000),
+        Task("SHED", pos(2, 2), 85, None, 10),
+    ]
+    assignments = assign_tasks(plan, workers, _state(day=2, workers=workers))
+    by_worker = {assignment.worker_index: assignment.task.kind for assignment in assignments}
+    assert by_worker == {0: "SHED", 1: "WATER"}
 
 
 def test_assign_tasks_keeps_farmer_for_shed_logistics():

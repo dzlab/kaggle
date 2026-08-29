@@ -154,6 +154,8 @@ def _tile_kind(tile: Any) -> str:
 
 def _crop(tile: Any) -> str | None:
     crop = _get(tile, "crop")
+    if isinstance(crop, Mapping):
+        crop = crop.get("crop", crop.get("kind", crop.get("type", crop.get("name"))))
     if crop is None and _tile_kind(tile) in CROPS:
         crop = _tile_kind(tile)
     crop = _upper(crop)
@@ -177,6 +179,31 @@ def _needs(tile: Any, field: str, inverse_field: str | None = None) -> bool:
         if explicit is not None:
             return not bool(explicit)
     return False
+
+
+def _needs_today(tile: Any, need_field: str, today_field: str, legacy_field: str | None = None) -> bool:
+    explicit = _get(tile, need_field)
+    if explicit is not None:
+        return bool(explicit)
+    today = _get(tile, today_field)
+    if today is not None:
+        return not bool(today)
+    return _needs(tile, need_field, legacy_field)
+
+
+def _entity_state(tile: Any, entity_name: str) -> dict[str, Any] | None:
+    """Merge an entity nested in a tile with tile-level lifecycle fields."""
+    nested = _get(tile, entity_name)
+    kind = _tile_kind(tile)
+    if nested is None and kind != entity_name.upper():
+        return None
+    result = dict(tile) if isinstance(tile, Mapping) else {}
+    if isinstance(nested, Mapping):
+        result.update(nested)
+    elif isinstance(nested, str):
+        result.setdefault("species", nested)
+        result.setdefault("kind", nested)
+    return result
 
 
 def _market_section(state: Any) -> Mapping[str, Any]:
@@ -286,10 +313,10 @@ def _harvest_units(crop: str, tile: Any, age: int, day: int) -> float:
             return max(0.0, float(recorded))
         except (TypeError, ValueError, OverflowError):
             return 0.0
-    watering_days = _state_days(tile, ("watering_days", "watered_days", "water_history"), day)
+    watering_days = _state_days(tile, ("watering_days", "watered_days", "water_history", "watered_today"), day)
     if not watering_days and _get(tile, "watered") is not None:
         watering_days = _state_days(tile, ("watered",), day)
-    fertilizer_days = _state_days(tile, ("fertilizer_days", "fertilized_days", "fertilizer_history"), day)
+    fertilizer_days = _state_days(tile, ("fertilizer_days", "fertilized_days", "fertilizer_history", "fertilized_today"), day)
     if not fertilizer_days and _get(tile, "fertilized") is not None:
         fertilizer_days = _state_days(tile, ("fertilized",), day)
     try:
@@ -351,7 +378,7 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
         if kind == "WEED":
             _add(plan, "WEED", position, 80, day, 10)
         if crop:
-            if _needs(tile, "needs_water", "watered"):
+            if _needs_today(tile, "needs_water", "watered_today", "watered"):
                 _add(plan, "WATER", position, 100, day, 1)
             age = _crop_age(tile, day)
             crop_rules = CROPS[crop]
@@ -373,15 +400,36 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
                 crop_name = max(available, key=lambda item: (_observed_quote(item, state), item))
                 _add(plan, "PLANT", position, 20, None, _observed_quote(crop_name, state))
 
-    for animal in _get(state, "animals", ()) or ():
+        animal_entity = _entity_state(tile, "animal")
+        if animal_entity is not None:
+            animal_position = _position(animal_entity) or position
+            species = _upper(_get(animal_entity, "species", _get(animal_entity, "animal", _get(animal_entity, "kind", ""))))
+            animal_value = float(ANIMALS.get(species, {}).get("cost", 1))
+            if _needs_today(animal_entity, "needs_feed", "fed_today", "fed"):
+                _add(plan, "FEED", animal_position, 100, day, 1)
+            if _needs_today(animal_entity, "needs_care", "cared_today", "cared"):
+                _add(plan, "CARE", animal_position, 95, day, animal_value)
+            if _get(animal_entity, "needs_placement", False) or _get(animal_entity, "placed") is False or _get(animal_entity, "owned") is False:
+                _add(plan, "ANIMAL", animal_position, 40, None, _get(animal_entity, "value", 1))
+
+        structure_entity = _entity_state(tile, "structure")
+        if structure_entity is not None and (
+            _get(structure_entity, "needs_placement", False)
+            or _get(structure_entity, "built") is False
+            or _get(structure_entity, "placed") is False
+        ):
+            _add(plan, "STRUCTURE", position, 45, None, _get(structure_entity, "value", 1))
+
+    animals = _get(state, "animals", ()) or ()
+    for animal in animals:
         position = _position(animal)
         if position is None:
             continue
         species = _upper(_get(animal, "species", _get(animal, "kind", "")))
         value = float(ANIMALS.get(species, {}).get("cost", 1))
-        if _needs(animal, "needs_feed", "fed"):
+        if _needs_today(animal, "needs_feed", "fed_today", "fed"):
             _add(plan, "FEED", position, 100, day, 1)
-        if _needs(animal, "needs_care", "cared"):
+        if _needs_today(animal, "needs_care", "cared_today", "cared"):
             _add(plan, "CARE", position, 95, day, value)
 
     for structure in _get(state, "structures", ()) or ():
@@ -468,6 +516,7 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any], state: Any) -> li
 
     farmer = next((info for info in infos if info[1] == "FARMER"), None)
     logistics_pending = any(task.kind in _SHED_WORK for task in tasks)
+    helper_exists = any(info[1] != "FARMER" for info in infos)
     reserved_basic = next((info for info in infos if info[1] != "FARMER"), infos[0])
     available = {info[0] for info in infos}
     assignments: list[WorkerAssignment] = []
@@ -475,8 +524,7 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any], state: Any) -> li
 
     def choose(task: Task) -> tuple[int, str, Position | None] | None:
         candidates = [info for info in infos if info[0] in available]
-        non_farmer_available = any(info[0] in available and info[1] != "FARMER" for info in infos)
-        if logistics_pending and farmer is not None and non_farmer_available and task.kind not in _SHED_WORK:
+        if logistics_pending and farmer is not None and helper_exists and task.kind not in _SHED_WORK:
             candidates = [info for info in candidates if info[0] != farmer[0]]
         if task.kind in _BASIC_NEEDS and reserved_basic[0] in available:
             candidates = [info for info in candidates if info[0] == reserved_basic[0]] or candidates
