@@ -1,0 +1,17 @@
+[project]
+name = "kaggriculture-agent"
+version = "0.1.0"
+description = "Kaggriculture Kaggle agent scaffold"
+requires-python = ">=3.10"
+dependencies = [
+    "kaggle-environments==1.32.7; python_version >= '3.11'",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
