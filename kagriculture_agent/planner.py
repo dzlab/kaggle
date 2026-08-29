@@ -58,7 +58,13 @@ def _day(state: Any, memory: EpisodeMemory | Any) -> int:
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
-    return value if isinstance(value, Mapping) else {}
+    if isinstance(value, Mapping):
+        return value
+    try:
+        attributes = vars(value)
+    except TypeError:
+        return {}
+    return attributes if isinstance(attributes, Mapping) else {}
 
 
 def _hand_counts(value: Any) -> dict[str, int]:
@@ -87,7 +93,7 @@ def _grid_size(tiles: Any) -> int | None:
 
 def normalize_planner_state(state: Any) -> dict[str, Any]:
     """Adapt flat and ``parse_observation`` states to the planner contract."""
-    source = dict(state) if isinstance(state, Mapping) else {}
+    source = dict(_mapping(state))
     farm = _mapping(source.get("farm"))
     private = _mapping(source.get("private"))
     market = _mapping(source.get("market"))
@@ -108,6 +114,23 @@ def normalize_planner_state(state: Any) -> dict[str, Any]:
         board_size = _grid_size(tiles)
     if not board_size or board_size < 1:
         board_size = 1
+    workers = source.get("workers") or farm.get("workers")
+    if not workers:
+        workers = []
+        farmer_position = _position(farm.get("farmer", source.get("farmer")))
+        if farmer_position is not None:
+            workers.append({"index": 0, "role": "FARMER", "position": farmer_position})
+        raw_hands = farm.get("hands", source.get("hands", ()))
+        if isinstance(raw_hands, Sequence) and not isinstance(raw_hands, (str, bytes)):
+            for hand in raw_hands:
+                hand_position = _position(hand)
+                if hand_position is None:
+                    continue
+                workers.append({
+                    "index": len(workers),
+                    "role": _get(hand, "role", "WORKER"),
+                    "position": hand_position,
+                })
     source.update({
         "board_size": board_size,
         "tiles": tiles,
@@ -115,7 +138,7 @@ def normalize_planner_state(state: Any) -> dict[str, Any]:
         "structures": source.get("structures", farm.get("structures", private.get("structures", []))),
         "seeds": dict(seeds) if isinstance(seeds, Mapping) else {},
         "inventory": dict(inventory) if isinstance(inventory, Mapping) else {},
-        "workers": source.get("workers", farm.get("workers", [])),
+        "workers": workers,
         "market": market,
     })
     return source

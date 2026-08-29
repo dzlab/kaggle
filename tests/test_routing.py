@@ -1,6 +1,7 @@
 from copy import deepcopy
+from types import SimpleNamespace
 
-from kagriculture_agent.planner import assign_tasks, build_daily_plan
+from kagriculture_agent.planner import assign_tasks, build_daily_plan, normalize_planner_state
 from kagriculture_agent.observation import parse_observation
 from kagriculture_agent.routing import (
     distance,
@@ -177,6 +178,52 @@ def test_daily_plan_accepts_parse_observation_canonical_nested_state():
     })
     kinds = {task.kind for task in build_daily_plan(parsed, EpisodeMemory())}
     assert {"WATER", "FEED", "CARE", "STRUCTURE", "ANIMAL", "WEED", "PLANT", "SHED", "SELL"} <= kinds
+
+
+def test_normalize_planner_state_supports_attribute_based_state():
+    state = SimpleNamespace(
+        day=2,
+        board_size=3,
+        tiles={pos(0, 0): {"empty": True}},
+        seeds={"WHEAT": 1},
+        inventory={},
+        animals=[],
+        structures=[],
+    )
+    assert any(task.kind == "PLANT" for task in build_daily_plan(state, EpisodeMemory()))
+
+
+def test_normalize_planner_state_builds_stable_workers_from_canonical_farm():
+    parsed = parse_observation({
+        "farms": [{
+            "tiles": [[None, None], ["LOCKED", "LOCKED"]],
+            "farmer": [0, 0],
+            "hands": [{"position": [1, 0]}, {"position": [0, 1]}],
+        }],
+    })
+    normalized = normalize_planner_state(parsed)
+    assert normalized["workers"] == [
+        {"index": 0, "role": "FARMER", "position": pos(0, 0)},
+        {"index": 1, "role": "WORKER", "position": pos(1, 0)},
+        {"index": 2, "role": "WORKER", "position": pos(0, 1)},
+    ]
+
+
+def test_generated_plant_task_is_selected_after_urgent_water_task():
+    workers = [
+        {"index": 0, "role": "WORKER", "position": pos(0, 0)},
+        {"index": 1, "role": "WORKER", "position": pos(2, 2)},
+    ]
+    state = _state(
+        workers=workers,
+        tiles={
+            pos(0, 0): {"empty": True},
+            pos(1, 0): {"crop": "WHEAT", "watered_today": False, "yield_units": 0},
+        },
+    )
+    plan = build_daily_plan(state, EpisodeMemory())
+    assignments = assign_tasks(plan, workers, state)
+    assert [assignment.task.kind for assignment in assignments] == ["WATER", "PLANT"]
 
 
 def test_assign_tasks_deduplicates_exclusive_tiles_and_reserves_basic_needs():
