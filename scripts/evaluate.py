@@ -22,12 +22,14 @@ from kagriculture_agent.constants import (  # noqa: E402
     ANIMALS,
     CROPS,
     ENGINE_VERSION,
+    LAND_ORDER,
     LAND_PRICES,
     PRICE_FLOOR,
     PRODUCTS,
     max_market_orders,
     shed_capacity,
 )
+from kagriculture_agent.economics import market_price  # noqa: E402
 from kagriculture_agent.policy import Policy  # noqa: E402
 from scripts.run_local import OPPONENTS, _deterministic_random_agent  # noqa: E402
 
@@ -153,6 +155,17 @@ def _number(value: Any) -> float | None:
     return number if number == number and abs(number) != float("inf") else None
 
 
+def _config_value(configuration: Mapping[str, Any] | None, key: str, default: Any) -> Any:
+    return _mapping(configuration).get(key, default)
+
+
+def _fib(index: int) -> int:
+    first, second = 1, 1
+    for _ in range(max(0, index)):
+        first, second = second, first + second
+    return first
+
+
 def _player_states(replay: Mapping[str, Any], player: int) -> list[Mapping[str, Any]]:
     states = []
     for turn in replay.get("steps", ()):
@@ -165,8 +178,56 @@ def _player_states(replay: Mapping[str, Any], player: int) -> list[Mapping[str, 
     return states
 
 
+def _valid_market_order_schema(order: Any, observation: Mapping[str, Any]) -> bool:
+    if not isinstance(order, Sequence) or isinstance(order, (str, bytes)) or not order or not isinstance(order[0], str):
+        return False
+    operation = order[0]
+    if operation in {"HIRE", "BUY_LAND"}:
+        return len(order) == 1
+    if operation not in {"BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL", "SELL"}:
+        return False
+    if len(order) != 3 or not isinstance(order[1], str) or not isinstance(order[2], int) or isinstance(order[2], bool) or order[2] < 1:
+        return False
+    item = order[1]
+    if operation == "BUY_SEED":
+        return item in CROPS
+    if operation == "BUY_ANIMAL":
+        return item in ANIMALS
+    if operation == "BUY_PRODUCT":
+        return item in _BUYABLE_PRODUCTS
+    if item not in PRODUCTS:
+        return False
+    market = _mapping(observation.get("market"))
+    prices = _mapping(market.get("prices"))
+    inventory = _number(_mapping(market.get("inventory")).get(item))
+    price = _number(prices.get(item))
+    if operation == "BUY_PRODUCT" and item not in _BUYABLE_PRODUCTS:
+        return False
+    return inventory is not None and inventory >= 0 and price is not None and price >= PRICE_FLOOR
+
+
+def _valid_action_schema(action: Any, observation: Mapping[str, Any], configuration: Mapping[str, Any] | None = None) -> bool:
+    if not isinstance(action, Mapping) or set(action) != {"farmer", "hands", "market"}:
+        return False
+    farmer = action.get("farmer")
+    hands = action.get("hands")
+    orders = action.get("market")
+    farm = _farm_observation(observation)
+    if not _legal_unit_command(farmer) or not isinstance(hands, Sequence) or isinstance(hands, (str, bytes)):
+        return False
+    expected_hands = farm.get("hands", ())
+    if not isinstance(expected_hands, Sequence) or isinstance(expected_hands, (str, bytes)) or len(hands) != len(expected_hands):
+        return False
+    if not all(_legal_unit_command(command) for command in hands):
+        return False
+    if not isinstance(orders, Sequence) or isinstance(orders, (str, bytes)):
+        return False
+    order_limit = int(_config_value(configuration, "maxMarketOrdersPerTurn", max_market_orders))
+    return len(orders) <= max(1, order_limit) and all(_valid_market_order_schema(order, observation) for order in orders)
+
+
 def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, Any]],
-                  other_states: Sequence[Mapping[str, Any]]) -> bool:
+                  other_states: Sequence[Mapping[str, Any]], configuration: Mapping[str, Any] | None = None) -> bool:
     statuses = replay.get("statuses")
     if not isinstance(statuses, Sequence) or isinstance(statuses, (str, bytes)) or list(statuses) != ["DONE", "DONE"]:
         return False
@@ -190,6 +251,8 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
             if not isinstance(state.get("action"), Mapping) or state.get("status") not in ("ACTIVE", "DONE"):
                 return False
             if state.get("error") or _mapping(state.get("info")).get("error"):
+                return False
+            if not _valid_action_schema(state["action"], observation, configuration):
                 return False
         if players != {0, 1}:
             return False
@@ -223,6 +286,10 @@ def _shed_total(observation: Mapping[str, Any]) -> float:
 
 
 def _tiles(observation: Mapping[str, Any]) -> Sequence[Any]:
+    return tuple(tile for _position, tile in _tile_entries(observation))
+
+
+def _tile_entries(observation: Mapping[str, Any]) -> Sequence[tuple[tuple[int, int], Any]]:
     farms = observation.get("farms")
     player = observation.get("player")
     if not isinstance(farms, Sequence) or isinstance(farms, (str, bytes)) or not isinstance(player, int):
@@ -232,7 +299,12 @@ def _tiles(observation: Mapping[str, Any]) -> Sequence[Any]:
     tiles = _mapping(farms[player]).get("tiles", ())
     if not isinstance(tiles, Sequence) or isinstance(tiles, (str, bytes)):
         return ()
-    return tuple(tile for row in tiles if isinstance(row, Sequence) and not isinstance(row, (str, bytes)) for tile in row)
+    return tuple(
+        ((x, y), tile)
+        for y, row in enumerate(tiles)
+        if isinstance(row, Sequence) and not isinstance(row, (str, bytes))
+        for x, tile in enumerate(row)
+    )
 
 
 def _tile_kind(tile: Any) -> str:
@@ -253,9 +325,28 @@ def _commands_for_state(state: Mapping[str, Any]) -> list[list[Any]]:
     return commands
 
 
-def _post_tile(observation: Mapping[str, Any], index: int) -> Mapping[str, Any]:
-    tiles = list(_tiles(observation))
-    return _mapping(tiles[index]) if 0 <= index < len(tiles) else {}
+def _command_targets(observation: Mapping[str, Any], state: Mapping[str, Any]) -> dict[str, set[tuple[int, int]]]:
+    farm = _farm_observation(observation)
+    positions = [farm.get("farmer"), *list(farm.get("hands", ()) or ())]
+    commands = _commands_for_state(state)
+    targets: dict[str, set[tuple[int, int]]] = {}
+    for position, command in zip(positions, commands):
+        if not isinstance(position, Sequence) or isinstance(position, (str, bytes)) or len(position) != 2:
+            continue
+        if not command or not isinstance(command[0], str):
+            continue
+        try:
+            coordinate = (int(position[0]), int(position[1]))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        targets.setdefault(command[0], set()).add(coordinate)
+    return targets
+
+
+def _post_tile(observation: Mapping[str, Any] | None, coordinate: tuple[int, int]) -> Mapping[str, Any]:
+    if not observation:
+        return {}
+    return next((_mapping(tile) for position, tile in _tile_entries(observation) if position == coordinate), {})
 
 
 def _missed_needs_at_boundary(observation: Mapping[str, Any], is_boundary: bool,
@@ -264,20 +355,19 @@ def _missed_needs_at_boundary(observation: Mapping[str, Any], is_boundary: bool,
     if not is_boundary:
         return 0
     missed = 0
-    current_tiles = list(_tiles(observation))
     post_hour = _number(_mapping(post_observation).get("hour")) if post_observation else None
     reset_after_boundary = post_hour == 0 and _number(observation.get("hour")) == 23
-    commands = _commands_for_state(action_state or {})
-    operations = {command[0] for command in commands if command and isinstance(command[0], str)}
-    for index, tile in enumerate(current_tiles):
+    targets = _command_targets(observation, action_state or {})
+    for index, (coordinate, tile) in enumerate(_tile_entries(observation)):
         if not isinstance(tile, Mapping):
             continue
         kind = _tile_kind(tile)
-        post_tile = _post_tile(post_observation, index) if post_observation else {}
+        post_tile = _post_tile(post_observation, coordinate)
         if kind == "PLANT":
             needs_water = tile.get("needs_water") is True or tile.get("watered_today") is False
             post_says_watered = post_tile.get("watered_today") is True
-            if needs_water and not post_says_watered and not (reset_after_boundary and "WATER" in operations):
+            target_satisfied = coordinate in targets.get("WATER", set())
+            if needs_water and not post_says_watered and not (reset_after_boundary and target_satisfied) and not (post_observation is None and target_satisfied):
                 missed += 1
         animal = tile.get("animal")
         animal_mapping = _mapping(animal)
@@ -286,11 +376,13 @@ def _missed_needs_at_boundary(observation: Mapping[str, Any], is_boundary: bool,
             animal_state.update(animal_mapping)
             needs_feed = animal_state.get("needs_feed") is True or animal_state.get("fed_today") is False
             post_fed = post_tile.get("fed_today") is True
-            if needs_feed and not post_fed and not (reset_after_boundary and "FEED" in operations):
+            target_fed = coordinate in targets.get("FEED", set())
+            if needs_feed and not post_fed and not (reset_after_boundary and target_fed) and not (post_observation is None and target_fed):
                 missed += 1
             needs_care = animal_state.get("needs_care") is True or animal_state.get("cared_today") is False
             post_cared = post_tile.get("cared_today") is True
-            if needs_care and not post_cared and not (reset_after_boundary and "CARE" in operations):
+            target_cared = coordinate in targets.get("CARE", set())
+            if needs_care and not post_cared and not (reset_after_boundary and target_cared) and not (post_observation is None and target_cared):
                 missed += 1
     return missed
 
@@ -316,7 +408,8 @@ def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, see
     """Extract one game record from the engine replay JSON."""
     own_states = _player_states(replay, 0)
     other_states = _player_states(replay, 1)
-    framework_error = not _valid_replay(replay, own_states, other_states)
+    replay_configuration = _mapping(replay.get("configuration"))
+    framework_error = not _valid_replay(replay, own_states, other_states, replay_configuration)
     own_bank = _final_bank(own_states[-1] if own_states else None)
     other_bank = _final_bank(other_states[-1] if other_states else None)
     if framework_error or own_bank is None or other_bank is None:
@@ -380,61 +473,100 @@ def _market_orders(action: Mapping[str, Any]) -> list[list[Any]]:
     return [list(order) for order in orders if isinstance(order, Sequence) and not isinstance(order, (str, bytes))]
 
 
-def _market_order_cost(order: Sequence[Any], observation: Mapping[str, Any]) -> float:
-    if not order:
-        return 0.0
-    operation = order[0]
-    quantity = int(_number(order[2]) or 0) if len(order) >= 3 else 1
-    if operation == "BUY_SEED" and len(order) == 3 and order[1] in CROPS:
-        return float(CROPS[order[1]]["seed"] * quantity)
-    if operation == "BUY_ANIMAL" and len(order) == 3 and order[1] in ANIMALS:
-        return float(ANIMALS[order[1]]["cost"] * quantity)
-    if operation == "BUY_PRODUCT" and len(order) == 3 and order[1] in _BUYABLE_PRODUCTS:
-        prices = _mapping(_mapping(observation.get("market")).get("prices"))
-        return float((_number(prices.get(order[1])) or 0.0) * quantity)
-    if operation == "BUY_LAND" and len(order) == 1:
-        return float(LAND_PRICES[0])
-    return 0.0
+def _observed_unit_price(item: str, observation: Mapping[str, Any], inventory: float, *, buying: bool,
+                         configuration: Mapping[str, Any] | None = None) -> float:
+    market = _mapping(observation.get("market"))
+    params = _mapping(_config_value(configuration, "marketParams", {}))
+    quote_inventory = inventory - 1 if buying else inventory
+    try:
+        return float(market_price(item, quote_inventory, params))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return _number(_mapping(market.get("prices")).get(item)) or 0.0
 
 
-def _sanitize_market_orders(orders: Sequence[Sequence[Any]], observation: Mapping[str, Any]) -> list[list[Any]]:
-    """Keep at most the engine limit and discard invalid or unaffordable orders."""
+def _sanitize_market_orders(orders: Sequence[Sequence[Any]], observation: Mapping[str, Any],
+                            configuration: Mapping[str, Any] | None = None) -> list[list[Any]]:
+    """Apply the engine's per-unit market rules to a postprocessed action."""
     money = _cash(observation)
     shed = dict(_mapping(_mapping(observation.get("private")).get("shed")))
+    market = _mapping(observation.get("market"))
+    market_inventory = {item: _number(quantity) or 0.0 for item, quantity in _mapping(market.get("inventory")).items()}
+    capacity = max(1, int(_config_value(configuration, "shedCapacity", shed_capacity)))
+    order_limit = max(1, int(_config_value(configuration, "maxMarketOrdersPerTurn", max_market_orders)))
+    farm = _farm_observation(observation)
+    hires_today = int(_number(farm.get("hires_today")) or 0)
+    hire_mult = max(0, int(_config_value(configuration, "farmHandCostMult", 1)))
+    unlocked = list(farm.get("unlocked_quadrants", ()))
     sanitized: list[list[Any]] = []
     for raw_order in orders:
-        if len(sanitized) >= max_market_orders:
+        if len(sanitized) >= order_limit:
             break
         order = list(raw_order)
-        if not order or not isinstance(order[0], str):
+        if not _valid_market_order_schema(order, observation):
             continue
         operation = order[0]
-        if operation in {"HIRE", "BUY_LAND"}:
-            if len(order) != 1:
+        if operation == "HIRE":
+            cost = float(_fib(hires_today) * hire_mult)
+            if cost > money:
                 continue
-        elif operation in {"BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL", "SELL"}:
-            if len(order) != 3 or not isinstance(order[1], str) or not isinstance(order[2], int) or isinstance(order[2], bool) or order[2] < 1:
-                continue
-            if operation == "BUY_SEED" and order[1] not in CROPS:
-                continue
-            if operation == "BUY_PRODUCT" and order[1] not in _BUYABLE_PRODUCTS:
-                continue
-            if operation == "BUY_ANIMAL" and order[1] not in ANIMALS:
-                continue
-            if operation == "SELL":
-                available = int(_number(shed.get(order[1])) or 0)
-                if order[1] not in PRODUCTS or order[2] > available:
-                    continue
-                shed[order[1]] = available - order[2]
-                sanitized.append(order)
-                continue
-        else:
+            money -= cost
+            hires_today += 1
+            sanitized.append(order)
             continue
-        cost = _market_order_cost(order, observation)
-        if cost > money:
+        if operation == "BUY_LAND":
+            next_index = len(unlocked) - 1
+            if next_index < 0 or next_index >= len(LAND_ORDER):
+                continue
+            expected_land = LAND_ORDER[next_index]
+            if expected_land in unlocked or money < LAND_PRICES[next_index]:
+                continue
+            money -= LAND_PRICES[next_index]
+            unlocked.append(expected_land)
+            sanitized.append(order)
             continue
-        money -= cost
-        sanitized.append(order)
+
+        item = order[1]
+        requested = order[2]
+        if operation == "BUY_SEED":
+            unit_cost = float(CROPS[item]["seed"])
+            allowed = min(requested, int(money // unit_cost))
+            if allowed:
+                money -= unit_cost * allowed
+                sanitized.append([operation, item, allowed])
+            continue
+        if operation == "BUY_ANIMAL":
+            unit_cost = float(ANIMALS[item]["cost"])
+            room = max(0, capacity - int(sum(max(0.0, _number(value) or 0.0) for value in shed.values())))
+            allowed = min(requested, room, int(money // unit_cost))
+            if allowed:
+                money -= unit_cost * allowed
+                shed[item] = (_number(shed.get(item)) or 0.0) + allowed
+                sanitized.append([operation, item, allowed])
+            continue
+        if operation == "BUY_PRODUCT":
+            allowed = 0
+            for _ in range(requested):
+                room = capacity - int(sum(max(0.0, _number(value) or 0.0) for value in shed.values()))
+                price = _observed_unit_price(item, observation, market_inventory.get(item, 0.0), buying=True, configuration=configuration)
+                if room <= 0 or price <= 0 or money < price:
+                    break
+                money -= price
+                market_inventory[item] = market_inventory.get(item, 0.0) - 1
+                shed[item] = (_number(shed.get(item)) or 0.0) + 1
+                allowed += 1
+            if allowed:
+                sanitized.append([operation, item, allowed])
+            continue
+        if operation == "SELL":
+            available = int(_number(shed.get(item)) or 0)
+            allowed = min(requested, available)
+            for _ in range(allowed):
+                price = _observed_unit_price(item, observation, market_inventory.get(item, 0.0), buying=False, configuration=configuration)
+                money += price
+                market_inventory[item] = market_inventory.get(item, 0.0) + (1 if price > PRICE_FLOOR else 0)
+            if allowed:
+                shed[item] = available - allowed
+                sanitized.append([operation, item, allowed])
     return sanitized
 
 
@@ -451,11 +583,12 @@ def _legal_unit_command(command: Any) -> bool:
     return False
 
 
-def _sanitize_action(action: Mapping[str, Any], observation: Mapping[str, Any], fallback: Mapping[str, Any]) -> dict[str, Any]:
+def _sanitize_action(action: Mapping[str, Any], observation: Mapping[str, Any], fallback: Mapping[str, Any],
+                     configuration: Mapping[str, Any] | None = None) -> dict[str, Any]:
     result = {
         "farmer": list(action.get("farmer", ())) if isinstance(action.get("farmer", ()), Sequence) else [],
         "hands": [list(command) for command in action.get("hands", ())] if isinstance(action.get("hands", ()), Sequence) else [],
-        "market": _sanitize_market_orders(_market_orders(action), observation),
+        "market": _sanitize_market_orders(_market_orders(action), observation, configuration),
     }
     fallback_farmer = list(fallback.get("farmer", ["PASS"]))
     if not _legal_unit_command(result["farmer"]):
@@ -518,7 +651,8 @@ def _apply_ablations(action: Mapping[str, Any], observation: Mapping[str, Any], 
 
 
 def apply_variant(action: Mapping[str, Any], observation: Mapping[str, Any], variant: str,
-                  ablations: Mapping[str, bool] | None = None) -> dict[str, Any]:
+                  ablations: Mapping[str, bool] | None = None,
+                  configuration: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Apply a named, legality-preserving strategy adjustment at the agent boundary."""
     result = {"farmer": list(action.get("farmer", ["PASS"])), "hands": [list(command) for command in action.get("hands", ())],
               "market": _market_orders(action)}
@@ -555,21 +689,24 @@ def apply_variant(action: Mapping[str, Any], observation: Mapping[str, Any], var
     elif variant != "mixed":
         raise ValueError(f"unsupported variant: {variant}")
     adjusted = _apply_ablations(result, observation, ablations or _DEFAULT_ABLATIONS)
-    return _sanitize_action(adjusted, observation, action)
+    return _sanitize_action(adjusted, observation, action, configuration)
 
 
 class VariantPolicy:
     """Fresh stateful policy instance with evaluator-only variant adjustments."""
 
-    def __init__(self, variant: str, ablations: Mapping[str, bool] | None = None) -> None:
+    def __init__(self, variant: str, ablations: Mapping[str, bool] | None = None,
+                 configuration: Mapping[str, Any] | None = None) -> None:
         if variant not in VARIANTS:
             raise ValueError(f"unsupported variant: {variant}")
         self.variant = variant
         self.ablations = dict(ablations or _DEFAULT_ABLATIONS)
+        self.configuration = dict(configuration or {})
         self.policy = Policy()
 
     def __call__(self, obs: Mapping[str, Any], _configuration: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        return apply_variant(self.policy.act(obs), obs, self.variant, self.ablations)
+        configuration = _configuration if _configuration is not None else self.configuration
+        return apply_variant(self.policy.act(obs), obs, self.variant, self.ablations, configuration)
 
 
 def run_game(*, variant: str, opponent: str, seed: int, steps: int, ablations: Mapping[str, bool] | None = None) -> dict[str, Any]:
@@ -582,7 +719,7 @@ def run_game(*, variant: str, opponent: str, seed: int, steps: int, ablations: M
         raise RuntimeError("kaggle-environments is required for evaluation") from exc
     env = make("kaggriculture", configuration={"episodeSteps": steps, "seed": seed}, debug=False)
     opponent_agent = _deterministic_random_agent(seed) if opponent == "random" else opponent
-    env.run([VariantPolicy(variant, ablations), opponent_agent])
+    env.run([VariantPolicy(variant, ablations, env.configuration), opponent_agent])
     return replay_record(env.toJSON(), variant=variant, opponent=opponent, seed=seed)
 
 

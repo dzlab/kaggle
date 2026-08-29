@@ -226,12 +226,12 @@ def test_replay_record_extracts_outcome_and_replay_metrics():
         "hour": 23,
         "farms": [{"money": 120, "tiles": [[{"kind": "PLANT", "watered_today": False}]]}],
         "private": {"shed": {"WHEAT": 102}},
-        "market": {"prices": {"WHEAT": 1}},
+        "market": {"prices": {"WHEAT": 1}, "inventory": {"WHEAT": 10000}},
     }
     replay = {
         "steps": [[
-            {"observation": observation, "action": {"market": [["SELL", "WHEAT", 3]]}, "status": "DONE", "info": {}},
-            {"observation": {"player": 1, "farms": [{"money": 120}, {"money": 80}]}, "action": {}, "status": "DONE", "info": {}},
+                {"observation": observation, "action": {"farmer": ["PASS"], "hands": [], "market": [["SELL", "WHEAT", 3]]}, "status": "DONE", "info": {}},
+                {"observation": {"player": 1, "farms": [{"money": 120}, {"money": 80}], "market": {"prices": {"WHEAT": 25}, "inventory": {"WHEAT": 10000}}}, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "DONE", "info": {}},
         ]],
         "rewards": [120, 80],
         "statuses": ["DONE", "DONE"],
@@ -277,6 +277,30 @@ def test_top_level_failure_status_is_counted_even_with_complete_states():
     ]
     record = replay_record({"steps": [states], "statuses": ["ERROR", "DONE"], "info": {}},
                            variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+
+
+def test_replay_rejects_invalid_command_and_bad_worker_count():
+    from scripts.evaluate import replay_record
+
+    observation = {
+        "player": 0, "farms": [{"money": 100, "hands": [], "tiles": [[None]]}, {"money": 90, "hands": [], "tiles": [[None]]}],
+        "market": {"prices": {"WHEAT": 25}, "inventory": {"WHEAT": 10000}},
+        "private": {"shed": {}, "seeds": {}},
+    }
+    bad_action = {"farmer": ["NOT_REAL"], "hands": [], "market": []}
+    good_other = {"player": 1, "farms": [{"money": 100}, {"money": 90}], "market": observation["market"]}
+    replay = {
+        "steps": [[
+            {"observation": observation, "action": bad_action, "status": "DONE", "info": {}},
+            {"observation": good_other, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "DONE", "info": {}},
+        ]],
+        "statuses": ["DONE", "DONE"], "info": {},
+    }
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
 
     assert record["framework_error"] is True
     assert record["outcome"] == "framework_error"
@@ -347,6 +371,37 @@ def test_variant_postprocessing_caps_market_orders_and_preserves_affordability()
 
     assert len(result["market"]) <= 10
     assert sum({"WHEAT": 10, "MELON": 80}[order[1]] * order[2] for order in result["market"]) <= 80
+
+
+def test_market_sanitization_obeys_hire_land_and_shed_rules():
+    from scripts.evaluate import apply_variant
+
+    base = {
+        "player": 0,
+        "farms": [{"money": 2003, "farmer": [0, 0], "hands": [], "hires_today": 3, "unlocked_quadrants": ["NW"], "tiles": [[None]]}],
+        "private": {"seeds": {}, "shed": {"WHEAT": 99}},
+        "market": {"prices": {"WHEAT": 25}, "inventory": {"WHEAT": 10000}},
+    }
+    action = {"farmer": ["PASS"], "hands": [], "market": [["HIRE"], ["BUY_LAND"], ["BUY_PRODUCT", "WHEAT", 3]]}
+
+    result = apply_variant(action, base, "mixed", configuration={"shedCapacity": 100, "maxMarketOrdersPerTurn": 10})
+
+    assert result["market"] == [["HIRE"], ["BUY_LAND"], ["BUY_PRODUCT", "WHEAT", 1]]
+
+
+def test_buy_land_uses_next_unlockable_land_and_cost():
+    from scripts.evaluate import apply_variant
+
+    observation = {
+        "player": 0,
+        "farms": [{"money": 1999, "farmer": [0, 0], "hands": [], "hires_today": 0, "unlocked_quadrants": ["NW", "NE"], "tiles": [[None]]}],
+        "private": {"seeds": {}, "shed": {}},
+        "market": {"prices": {}, "inventory": {}},
+    }
+
+    result = apply_variant({"farmer": ["PASS"], "hands": [], "market": [["BUY_LAND"]]}, observation, "mixed")
+
+    assert result["market"] == []
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
