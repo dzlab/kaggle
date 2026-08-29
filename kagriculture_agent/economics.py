@@ -252,7 +252,8 @@ def forecast_crop(
     watering = _days(watering_days, set(range(start_day, start_day + horizon)))
     fertilizer = _days(fertilizer_days, set())
     forecast_days = set(range(start_day, start_day + horizon))
-    active_fertilizer = {day for applied in fertilizer for day in range(applied, applied + 3)}
+    active_fertilizer = set()
+    successful_fertilizer = set()
     units = 0 if cd["ongoing"] else 1
     harvested = decayed = units_before_decay = 0
     units_before_decay = units
@@ -263,6 +264,9 @@ def forecast_crop(
     for day in range(start_day, start_day + horizon):
         if not alive:
             break
+        if day in fertilizer and day in forecast_days:
+            successful_fertilizer.add(day)
+            active_fertilizer.update(range(day, day + 3))
         watered = day in watering
         age = day - start_day
         if not cd["ongoing"]:
@@ -310,8 +314,11 @@ def forecast_crop(
     base_inventory = _number(market_inventory, MARKET_I0)
     crop_quotes = _forecast_sale_quotes(crop, saleable_units, base_inventory, prices, params, fixed_price_mode)
     revenue = sum(crop_quotes)
-    fertilizer_used = len(fertilizer & forecast_days)
-    fertilizer_price = (_quote("FERTILIZER", base_inventory, prices) if fixed_price_mode else market_price("FERTILIZER", base_inventory, params))
+    fertilizer_used = len(successful_fertilizer)
+    if fixed_price_mode and isinstance(prices, Mapping) and "FERTILIZER" in prices:
+        fertilizer_price = _quote("FERTILIZER", base_inventory, prices)
+    else:
+        fertilizer_price = market_price("FERTILIZER", base_inventory, params)
     fertilizer_cost = max(0, fertilizer_used - _whole(fertilizer_owned)) * fertilizer_price
     cap = _whole(shed_capacity if shed_capacity is not None else shed_cap, DEFAULT_SHED_CAPACITY)
     overflow_units = max(0, _whole(held_inventory) + output_units - cap)

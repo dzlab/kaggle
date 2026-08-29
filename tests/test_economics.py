@@ -213,6 +213,29 @@ def test_crop_fertilizer_cost_ignores_applications_after_horizon():
     assert wheat["fertilizer_cost"] == 100
 
 
+def test_crop_fertilizer_after_harvest_is_not_charged():
+    wheat = forecast_crop(
+        "WHEAT", horizon=6, watering_days={0, 1, 2, 3, 4, 5},
+        harvest_day=2, fertilizer_days={4},
+    )
+    assert wheat["fertilizer_cost"] == 0
+
+
+def test_fixed_price_sparse_observations_use_custom_fertilizer_params():
+    params = {
+        "FERTILIZER": {
+            "base": 500, "I0": 10_000, "T": 200,
+            "below_func": "linear", "below_target": 0.4,
+            "above_func": "linear", "above_target": 0.4,
+        }
+    }
+    wheat = forecast_crop(
+        "WHEAT", horizon=1, watering_days={0}, fertilizer_days={0},
+        prices={"WHEAT": 25}, params=params, fixed_price_mode=True,
+    )
+    assert wheat["fertilizer_cost"] == 500
+
+
 def test_forecast_crop_accounts_for_floor_risk_across_sequential_sales():
     params = {
         "WHEAT": {
