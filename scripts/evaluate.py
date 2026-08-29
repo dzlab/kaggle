@@ -22,7 +22,10 @@ from kagriculture_agent.constants import (  # noqa: E402
     ANIMALS,
     CROPS,
     ENGINE_VERSION,
+    LAND_PRICES,
     PRICE_FLOOR,
+    PRODUCTS,
+    max_market_orders,
     shed_capacity,
 )
 from kagriculture_agent.policy import Policy  # noqa: E402
@@ -38,6 +41,7 @@ ABLATION_COMPONENTS = (
     "animals",
 )
 _DEFAULT_ABLATIONS = {component: True for component in ABLATION_COMPONENTS}
+_BUYABLE_PRODUCTS = frozenset({"WHEAT", "FERTILIZER"})
 
 
 def _positive_int(value: str) -> int:
@@ -76,14 +80,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--start-seed", type=int, default=0)
     parser.add_argument("--opponents", nargs="+", choices=OPPONENTS, default=["pass", "random", "starter"])
     parser.add_argument("--steps", type=_positive_int, default=720)
-    parser.add_argument("--output", type=Path, default=Path("evaluation.json"))
+    parser.add_argument("--output", type=Path, default=Path("reports/evaluation.json"))
     parser.add_argument("--variant", action="append", dest="single_variants", choices=VARIANTS)
     parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=None)
     parser.add_argument("--ablation", action="append", type=parse_ablation, default=[], metavar="COMPONENT=on|off")
     parser.add_argument("--quick", action="store_true", help="use a small default batch suitable for local tests")
     args = parser.parse_args(argv)
     args.variants = _variant_list((args.variants or []) + (args.single_variants or []))
-    args.ablation = dict(_DEFAULT_ABLATIONS) | dict(args.ablation)
     if args.quick:
         if args.seeds == 30:
             args.seeds = 2
@@ -115,19 +118,22 @@ def aggregate_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Aggregate game records into the stable per-variant/opponent schema."""
     records = list(records)
     count = len(records)
-    final_banks = [float(record["final_bank"]) for record in records if record.get("final_bank") is not None]
-    outcomes = {outcome: sum(record.get("outcome") == outcome for record in records)
+    valid_records = [record for record in records if not record.get("framework_error")]
+    final_banks = [float(record["final_bank"]) for record in valid_records if record.get("final_bank") is not None]
+    outcomes = {outcome: sum(record.get("outcome") == outcome for record in valid_records)
                 for outcome in ("win", "loss", "tie")}
     return {
         "count": count,
+        "valid_count": len(valid_records),
+        "framework_failures": sum(bool(record.get("framework_error")) for record in records),
         "wins": outcomes["win"],
         "losses": outcomes["loss"],
         "ties": outcomes["tie"],
-        "win_rate": outcomes["win"] / count if count else 0.0,
+        "win_rate": outcomes["win"] / len(valid_records) if valid_records else 0.0,
         "mean_final_bank": float(mean(final_banks)) if final_banks else 0.0,
         "median_final_bank": float(median(final_banks)) if final_banks else 0.0,
         "fifth_percentile_final_bank": float(percentile(final_banks, 5)) if final_banks else 0.0,
-        "mean_bank_differential": _average(records, "bank_differential"),
+        "mean_bank_differential": _average(valid_records, "bank_differential"),
         "framework_error_rate": sum(bool(record.get("framework_error")) for record in records) / count if count else 0.0,
         "average_shed_overflow": _average(records, "shed_overflow"),
         "average_price_floor_sales": _average(records, "price_floor_sales"),
@@ -157,6 +163,42 @@ def _player_states(replay: Mapping[str, Any], player: int) -> list[Mapping[str, 
                 states.append(state)
                 break
     return states
+
+
+def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, Any]],
+                  other_states: Sequence[Mapping[str, Any]]) -> bool:
+    statuses = replay.get("statuses")
+    if not isinstance(statuses, Sequence) or isinstance(statuses, (str, bytes)) or list(statuses) != ["DONE", "DONE"]:
+        return False
+    steps = replay.get("steps")
+    if not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)) or not steps:
+        return False
+    if len(own_states) != len(steps) or len(other_states) != len(steps):
+        return False
+    for index, turn in enumerate(steps):
+        if not isinstance(turn, Sequence) or isinstance(turn, (str, bytes)):
+            return False
+        players = set()
+        for state in turn:
+            if not isinstance(state, Mapping):
+                return False
+            observation = state.get("observation")
+            player = _mapping(observation).get("player")
+            if not isinstance(player, int) or player not in {0, 1} or player in players or not isinstance(observation, Mapping):
+                return False
+            players.add(player)
+            if not isinstance(state.get("action"), Mapping) or state.get("status") not in ("ACTIVE", "DONE"):
+                return False
+            if state.get("error") or _mapping(state.get("info")).get("error"):
+                return False
+        if players != {0, 1}:
+            return False
+        expected_status = "DONE" if index == len(steps) - 1 else "ACTIVE"
+        if any(state.get("status") != expected_status for state in turn if isinstance(state, Mapping)):
+            return False
+    if _final_bank(own_states[-1]) is None or _final_bank(other_states[-1]) is None:
+        return False
+    return not bool(_mapping(replay.get("info")).get("error"))
 
 
 def _final_bank(state: Mapping[str, Any] | None) -> float | None:
@@ -199,25 +241,56 @@ def _tile_kind(tile: Any) -> str:
     return str(_mapping(tile).get("kind", "")).upper()
 
 
-def _missed_needs_at_boundary(observation: Mapping[str, Any], is_boundary: bool) -> int:
+def _commands_for_state(state: Mapping[str, Any]) -> list[list[Any]]:
+    action = _mapping(state.get("action"))
+    commands = []
+    farmer = action.get("farmer")
+    if isinstance(farmer, Sequence) and not isinstance(farmer, (str, bytes)):
+        commands.append(list(farmer))
+    hands = action.get("hands", ())
+    if isinstance(hands, Sequence) and not isinstance(hands, (str, bytes)):
+        commands.extend(list(command) for command in hands if isinstance(command, Sequence) and not isinstance(command, (str, bytes)))
+    return commands
+
+
+def _post_tile(observation: Mapping[str, Any], index: int) -> Mapping[str, Any]:
+    tiles = list(_tiles(observation))
+    return _mapping(tiles[index]) if 0 <= index < len(tiles) else {}
+
+
+def _missed_needs_at_boundary(observation: Mapping[str, Any], is_boundary: bool,
+                              post_observation: Mapping[str, Any] | None = None,
+                              action_state: Mapping[str, Any] | None = None) -> int:
     if not is_boundary:
         return 0
     missed = 0
-    for tile in _tiles(observation):
+    current_tiles = list(_tiles(observation))
+    post_hour = _number(_mapping(post_observation).get("hour")) if post_observation else None
+    reset_after_boundary = post_hour == 0 and _number(observation.get("hour")) == 23
+    commands = _commands_for_state(action_state or {})
+    operations = {command[0] for command in commands if command and isinstance(command[0], str)}
+    for index, tile in enumerate(current_tiles):
         if not isinstance(tile, Mapping):
             continue
         kind = _tile_kind(tile)
+        post_tile = _post_tile(post_observation, index) if post_observation else {}
         if kind == "PLANT":
-            if tile.get("needs_water") is True or tile.get("watered_today") is False:
+            needs_water = tile.get("needs_water") is True or tile.get("watered_today") is False
+            post_says_watered = post_tile.get("watered_today") is True
+            if needs_water and not post_says_watered and not (reset_after_boundary and "WATER" in operations):
                 missed += 1
         animal = tile.get("animal")
         animal_mapping = _mapping(animal)
         if animal_mapping or kind == "ANIMAL":
             animal_state = dict(tile)
             animal_state.update(animal_mapping)
-            if animal_state.get("needs_feed") is True or animal_state.get("fed_today") is False:
+            needs_feed = animal_state.get("needs_feed") is True or animal_state.get("fed_today") is False
+            post_fed = post_tile.get("fed_today") is True
+            if needs_feed and not post_fed and not (reset_after_boundary and "FEED" in operations):
                 missed += 1
-            if animal_state.get("needs_care") is True or animal_state.get("cared_today") is False:
+            needs_care = animal_state.get("needs_care") is True or animal_state.get("cared_today") is False
+            post_cared = post_tile.get("cared_today") is True
+            if needs_care and not post_cared and not (reset_after_boundary and "CARE" in operations):
                 missed += 1
     return missed
 
@@ -243,14 +316,11 @@ def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, see
     """Extract one game record from the engine replay JSON."""
     own_states = _player_states(replay, 0)
     other_states = _player_states(replay, 1)
+    framework_error = not _valid_replay(replay, own_states, other_states)
     own_bank = _final_bank(own_states[-1] if own_states else None)
     other_bank = _final_bank(other_states[-1] if other_states else None)
-    if own_bank is None or other_bank is None:
-        rewards = replay.get("rewards", ())
-        own_bank = _number(rewards[0]) if isinstance(rewards, Sequence) and len(rewards) > 0 else own_bank
-        other_bank = _number(rewards[1]) if isinstance(rewards, Sequence) and len(rewards) > 1 else other_bank
-    if own_bank is None or other_bank is None:
-        outcome = "loss"
+    if framework_error or own_bank is None or other_bank is None:
+        outcome = "framework_error"
         differential = 0.0
     elif own_bank > other_bank:
         outcome, differential = "win", own_bank - other_bank
@@ -259,23 +329,19 @@ def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, see
     else:
         outcome, differential = "tie", 0.0
 
-    framework_error = bool(_mapping(replay.get("info")).get("error"))
-    framework_error = framework_error or any(
-        state.get("error") or _mapping(state.get("info")).get("error") or state.get("status") not in {"ACTIVE", "DONE"}
-        for state in own_states
-    )
     shed_overflow = 0.0
     floor_sales = 0
     missed_needs = 0
     steps = replay.get("steps", ())
     last_step = len(steps) - 1 if isinstance(steps, Sequence) else -1
-    for state in own_states:
+    for index, state in enumerate(own_states):
         observation = _mapping(state.get("observation"))
         shed_overflow = max(shed_overflow, max(0.0, _shed_total(observation) - shed_capacity))
         floor_sales += _price_floor_sales(state)
         hour = _number(observation.get("hour"))
         is_boundary = hour == 23 or observation.get("step") == last_step
-        missed_needs += _missed_needs_at_boundary(observation, is_boundary)
+        post = _mapping(own_states[index + 1].get("observation")) if index + 1 < len(own_states) else None
+        missed_needs += _missed_needs_at_boundary(observation, is_boundary, post, state)
     return {
         "variant": variant,
         "opponent": opponent,
@@ -312,6 +378,91 @@ def _market_orders(action: Mapping[str, Any]) -> list[list[Any]]:
     if not isinstance(orders, Sequence) or isinstance(orders, (str, bytes)):
         return []
     return [list(order) for order in orders if isinstance(order, Sequence) and not isinstance(order, (str, bytes))]
+
+
+def _market_order_cost(order: Sequence[Any], observation: Mapping[str, Any]) -> float:
+    if not order:
+        return 0.0
+    operation = order[0]
+    quantity = int(_number(order[2]) or 0) if len(order) >= 3 else 1
+    if operation == "BUY_SEED" and len(order) == 3 and order[1] in CROPS:
+        return float(CROPS[order[1]]["seed"] * quantity)
+    if operation == "BUY_ANIMAL" and len(order) == 3 and order[1] in ANIMALS:
+        return float(ANIMALS[order[1]]["cost"] * quantity)
+    if operation == "BUY_PRODUCT" and len(order) == 3 and order[1] in _BUYABLE_PRODUCTS:
+        prices = _mapping(_mapping(observation.get("market")).get("prices"))
+        return float((_number(prices.get(order[1])) or 0.0) * quantity)
+    if operation == "BUY_LAND" and len(order) == 1:
+        return float(LAND_PRICES[0])
+    return 0.0
+
+
+def _sanitize_market_orders(orders: Sequence[Sequence[Any]], observation: Mapping[str, Any]) -> list[list[Any]]:
+    """Keep at most the engine limit and discard invalid or unaffordable orders."""
+    money = _cash(observation)
+    shed = dict(_mapping(_mapping(observation.get("private")).get("shed")))
+    sanitized: list[list[Any]] = []
+    for raw_order in orders:
+        if len(sanitized) >= max_market_orders:
+            break
+        order = list(raw_order)
+        if not order or not isinstance(order[0], str):
+            continue
+        operation = order[0]
+        if operation in {"HIRE", "BUY_LAND"}:
+            if len(order) != 1:
+                continue
+        elif operation in {"BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL", "SELL"}:
+            if len(order) != 3 or not isinstance(order[1], str) or not isinstance(order[2], int) or isinstance(order[2], bool) or order[2] < 1:
+                continue
+            if operation == "BUY_SEED" and order[1] not in CROPS:
+                continue
+            if operation == "BUY_PRODUCT" and order[1] not in _BUYABLE_PRODUCTS:
+                continue
+            if operation == "BUY_ANIMAL" and order[1] not in ANIMALS:
+                continue
+            if operation == "SELL":
+                available = int(_number(shed.get(order[1])) or 0)
+                if order[1] not in PRODUCTS or order[2] > available:
+                    continue
+                shed[order[1]] = available - order[2]
+                sanitized.append(order)
+                continue
+        else:
+            continue
+        cost = _market_order_cost(order, observation)
+        if cost > money:
+            continue
+        money -= cost
+        sanitized.append(order)
+    return sanitized
+
+
+def _legal_unit_command(command: Any) -> bool:
+    if not isinstance(command, Sequence) or isinstance(command, (str, bytes)) or not command or not isinstance(command[0], str):
+        return False
+    operation = command[0]
+    if operation in {"NORTH", "SOUTH", "EAST", "WEST", "PASS", "DROP", "WATER", "HARVEST", "FERTILIZE", "FEED", "COLLECT_FERTILIZER", "CARE", "DIG", "BUILD_COOP", "BUILD_PASTURE"}:
+        return len(command) == 1
+    if operation == "PLANT":
+        return len(command) == 2 and command[1] in CROPS
+    if operation in {"PICKUP", "PLACE"}:
+        return len(command) in {2, 3} and command[1] in PRODUCTS | ANIMALS and (len(command) == 2 or (isinstance(command[2], int) and not isinstance(command[2], bool) and command[2] > 0))
+    return False
+
+
+def _sanitize_action(action: Mapping[str, Any], observation: Mapping[str, Any], fallback: Mapping[str, Any]) -> dict[str, Any]:
+    result = {
+        "farmer": list(action.get("farmer", ())) if isinstance(action.get("farmer", ()), Sequence) else [],
+        "hands": [list(command) for command in action.get("hands", ())] if isinstance(action.get("hands", ()), Sequence) else [],
+        "market": _sanitize_market_orders(_market_orders(action), observation),
+    }
+    fallback_farmer = list(fallback.get("farmer", ["PASS"]))
+    if not _legal_unit_command(result["farmer"]):
+        result["farmer"] = fallback_farmer if _legal_unit_command(fallback_farmer) else ["PASS"]
+    fallback_hands = [list(command) for command in fallback.get("hands", ())]
+    result["hands"] = [command if _legal_unit_command(command) else (fallback_hands[index] if index < len(fallback_hands) and _legal_unit_command(fallback_hands[index]) else ["PASS"]) for index, command in enumerate(result["hands"])]
+    return result
 
 
 def _best_seed(observation: Mapping[str, Any], *, prefer: str | None = None) -> str | None:
@@ -403,7 +554,8 @@ def apply_variant(action: Mapping[str, Any], observation: Mapping[str, Any], var
                 result["market"].append(["BUY_ANIMAL", target, 1])
     elif variant != "mixed":
         raise ValueError(f"unsupported variant: {variant}")
-    return _apply_ablations(result, observation, ablations or _DEFAULT_ABLATIONS)
+    adjusted = _apply_ablations(result, observation, ablations or _DEFAULT_ABLATIONS)
+    return _sanitize_action(adjusted, observation, action)
 
 
 class VariantPolicy:
@@ -453,6 +605,44 @@ def run_matrix(*, variants: Sequence[str], opponents: Sequence[str], seeds: Sequ
     return {"records": records}
 
 
+def run_evaluation(*, variants: Sequence[str], opponents: Sequence[str], seeds: Sequence[int], steps: int,
+                   ablations: Sequence[tuple[str, bool]] = ()) -> dict[str, Any]:
+    """Run a baseline and isolated one-component ablations.
+
+    Every ablation starts from the same all-enabled baseline. Repeating a
+    component is rejected instead of being silently merged into a combined
+    configuration.
+    """
+    requested = list(ablations)
+    components = [component for component, _enabled in requested]
+    if len(components) != len(set(components)):
+        raise ValueError("each ablation component may be requested only once")
+    baseline_config = dict(_DEFAULT_ABLATIONS)
+    baseline = run_matrix(variants=variants, opponents=opponents, seeds=seeds, steps=steps, ablations=baseline_config)["records"]
+    ablation_records: dict[str, list[dict[str, Any]]] = {}
+    ablation_configs: dict[str, dict[str, bool]] = {}
+    for component, enabled in requested:
+        config = dict(baseline_config)
+        config[component] = enabled
+        ablation_configs[component] = config
+        ablation_records[component] = run_matrix(
+            variants=variants, opponents=opponents, seeds=seeds, steps=steps, ablations=config
+        )["records"]
+    return {"records": baseline, "ablation_records": ablation_records, "ablation_configs": ablation_configs}
+
+
+def _group_results(records: Sequence[Mapping[str, Any]], variants: Sequence[str], opponents: Sequence[str]) -> dict[str, Any]:
+    return {
+        variant: {
+            opponent: aggregate_records([
+                record for record in records if record.get("variant") == variant and record.get("opponent") == opponent
+            ])
+            for opponent in opponents
+        }
+        for variant in variants
+    }
+
+
 def _select_default(records: Sequence[Mapping[str, Any]], variants: Sequence[str]) -> str:
     scored = []
     for variant in variants:
@@ -468,18 +658,31 @@ def _select_default(records: Sequence[Mapping[str, Any]], variants: Sequence[str
     ))[0]
 
 
-def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mapping[str, Any]], command: Sequence[str] | None = None) -> dict[str, Any]:
+def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mapping[str, Any]], command: Sequence[str] | None = None,
+                          ablation_records: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
+                          ablation_configs: Mapping[str, Mapping[str, bool]] | None = None) -> dict[str, Any]:
     variants = list(config.get("variants", ()))
     opponents = list(config.get("opponents", ()))
-    results = {
-        variant: {
-            opponent: aggregate_records([
-                record for record in records if record.get("variant") == variant and record.get("opponent") == opponent
-            ])
-            for opponent in opponents
+    results = _group_results(records, variants, opponents)
+    ablations = {}
+    for component, component_records in (ablation_records or {}).items():
+        component_results = _group_results(component_records, variants, opponents)
+        contribution = {}
+        for variant in variants:
+            contribution[variant] = {}
+            for opponent in opponents:
+                baseline = results[variant][opponent]
+                ablated = component_results[variant][opponent]
+                contribution[variant][opponent] = {
+                    "win_rate_delta": ablated["win_rate"] - baseline["win_rate"],
+                    "median_final_bank_delta": ablated["median_final_bank"] - baseline["median_final_bank"],
+                    "framework_error_rate_delta": ablated["framework_error_rate"] - baseline["framework_error_rate"],
+                }
+        ablations[component] = {
+            "config": dict((ablation_configs or {}).get(component, {})),
+            "results": component_results,
+            "contribution": contribution,
         }
-        for variant in variants
-    }
     return {
         "schema_version": 1,
         "metadata": {
@@ -487,15 +690,37 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
             "config": dict(config),
             "engine": "kaggle-environments",
             "engine_version": ENGINE_VERSION,
+            "replay_summary": config.get("replay_summary"),
         },
         "selected_default": _select_default(records, variants),
         "results": results,
+        "ablations": ablations,
     }
+
+
+def write_result_document(path: str | Path, document: Mapping[str, Any], *, records: Sequence[Mapping[str, Any]],
+                          ablation_records: Mapping[str, Sequence[Mapping[str, Any]]] | None = None) -> Path:
+    """Write the report and deterministic compact replay-record sidecar."""
+    report_path = Path(path)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    sidecar = report_path.with_name(f"{report_path.stem}.replays.json")
+    sidecar_records = [{"ablation": "baseline", **dict(record)} for record in records]
+    for component, component_records in (ablation_records or {}).items():
+        sidecar_records.extend({"ablation": component, **dict(record)} for record in component_records)
+    sidecar_records.sort(key=lambda record: (
+        str(record.get("ablation", "")), str(record.get("variant", "")),
+        str(record.get("opponent", "")), int(record.get("seed", 0)),
+    ))
+    sidecar.write_text(json.dumps({"schema_version": 1, "records": sidecar_records}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    return sidecar
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     seeds = list(range(args.start_seed, args.start_seed + args.seeds))
+    output = args.output if args.output.is_absolute() else PROJECT_ROOT / args.output
+    sidecar = output.with_name(f"{output.stem}.replays.json")
     config = {
         "seeds": args.seeds,
         "start_seed": args.start_seed,
@@ -503,15 +728,19 @@ def main(argv: list[str] | None = None) -> int:
         "steps": args.steps,
         "opponents": list(args.opponents),
         "variants": list(args.variants),
-        "ablations": dict(args.ablation),
+        "ablations": [f"{component}={'on' if enabled else 'off'}" for component, enabled in args.ablation],
+        "replay_summary": str(sidecar.relative_to(PROJECT_ROOT)) if sidecar.is_relative_to(PROJECT_ROOT) else str(sidecar),
         "quick": args.quick,
     }
-    matrix = run_matrix(variants=args.variants, opponents=args.opponents, seeds=seeds, steps=args.steps, ablations=args.ablation)
-    document = build_result_document(config=config, records=matrix["records"], command=["scripts/evaluate.py", *([*sys.argv[1:]] if argv is None else argv)])
-    output = args.output if args.output.is_absolute() else PROJECT_ROOT / args.output
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
-    print(json.dumps({"output": str(output), "selected_default": document["selected_default"], "games": len(matrix["records"])}, sort_keys=True))
+    evaluation = run_evaluation(variants=args.variants, opponents=args.opponents, seeds=seeds, steps=args.steps, ablations=args.ablation)
+    document = build_result_document(
+        config=config, records=evaluation["records"],
+        command=["scripts/evaluate.py", *([*sys.argv[1:]] if argv is None else argv)],
+        ablation_records=evaluation["ablation_records"], ablation_configs=evaluation["ablation_configs"],
+    )
+    write_result_document(output, document, records=evaluation["records"], ablation_records=evaluation["ablation_records"])
+    games = len(evaluation["records"]) + sum(len(records) for records in evaluation["ablation_records"].values())
+    print(json.dumps({"output": str(output), "selected_default": document["selected_default"], "games": games}, sort_keys=True))
     return 0
 
 
