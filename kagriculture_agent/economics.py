@@ -211,6 +211,7 @@ def forecast_crop(
     start_day, horizon = _whole(start_day), _whole(horizon)
     watering = _days(watering_days, set(range(start_day, start_day + horizon)))
     fertilizer = _days(fertilizer_days, set())
+    forecast_days = set(range(start_day, start_day + horizon))
     active_fertilizer = {day for applied in fertilizer for day in range(applied, applied + 3)}
     units = 0 if cd["ongoing"] else 1
     harvested = decayed = units_before_decay = 0
@@ -222,7 +223,21 @@ def forecast_crop(
     for day in range(start_day, start_day + horizon):
         if not alive:
             break
-        # The interpreter decays at each turn before accepting the day's action.
+        watered = day in watering
+        age = day - start_day
+        if not cd["ongoing"]:
+            window_start = (cd["max_yield_day"] + 1) // 2
+            if watered and window_start <= age <= cd["max_yield_day"]:
+                units = min(cd["max_yield"], units + (2 if day in active_fertilizer else 1))
+        # The interpreter accepts actions first and decays the plant afterward.
+        # This matters on the first lifespan step: a harvest on that turn gets
+        # the pre-decay buffer rather than a prematurely decayed one.
+        if harvest_day is not None and day == _whole(harvest_day) and units:
+            harvested += units
+            units = 0
+            if not cd["ongoing"]:
+                alive = False
+                break
         if lifespan_step >= 0:
             first = max(day * turns_per_day, lifespan_step)
             if day * turns_per_day <= lifespan_step < (day + 1) * turns_per_day:
@@ -235,18 +250,7 @@ def forecast_crop(
                             break
         if not alive:
             break
-        watered = day in watering
-        age = day - start_day
-        if not cd["ongoing"]:
-            window_start = (cd["max_yield_day"] + 1) // 2
-            if watered and window_start <= age <= cd["max_yield_day"]:
-                units = min(cd["max_yield"], units + (2 if day in active_fertilizer else 1))
-        if harvest_day is not None and day == _whole(harvest_day) and units:
-            harvested += units
-            units = 0
-            if not cd["ongoing"]:
-                alive = False
-                break
+        units_before_decay = max(units_before_decay, units)
         consecutive_unwatered = 0 if watered else consecutive_unwatered + 1
         if consecutive_unwatered >= 2:
             alive = False
@@ -260,14 +264,12 @@ def forecast_crop(
                     units = min(cd["max_yield"], units + (2 if watered and day in active_fertilizer else 1))
                     if count == cd["max_yield"]:
                         lifespan_step = (day + 2) * turns_per_day
-        units_before_decay = max(units_before_decay, units)
-
     output_units = harvested + units
     base_inventory = _number(market_inventory, MARKET_I0)
     quote = _quote(crop, base_inventory, prices) if isinstance(prices, Mapping) and crop in prices else market_price(crop, base_inventory, params)
     crop_quotes = [quote] * output_units if isinstance(prices, Mapping) and crop in prices else _sale_quotes(crop, output_units, base_inventory, params)
     revenue = sum(crop_quotes)
-    fertilizer_used = len(fertilizer)
+    fertilizer_used = len(fertilizer & forecast_days)
     fertilizer_price = _quote("FERTILIZER", base_inventory, prices) if isinstance(prices, Mapping) and "FERTILIZER" in prices else market_price("FERTILIZER", base_inventory, params)
     fertilizer_cost = max(0, fertilizer_used - _whole(fertilizer_owned)) * fertilizer_price
     cap = _whole(shed_capacity if shed_capacity is not None else shed_cap, DEFAULT_SHED_CAPACITY)
@@ -294,6 +296,7 @@ def forecast_crop(
 def forecast_animal(
     animal: str, start_day: int = 0, horizon: int = season_days, *,
     feed_days: Any = None, care_days: Any = None, collect_fertilizer_days: Any = None,
+    harvest_days: Any = None,
     market_inventory: float = MARKET_I0, prices: Mapping[str, Any] | None = None,
     animal_owned: bool = False, worker_cost: float = 0, land_cost: float = 0,
     movement_turns: int = 0, action_turns: int = 0, held_inventory: int = 0,
@@ -309,6 +312,11 @@ def forecast_animal(
     care = _days(care_days, set())
     collect = _days(collect_fertilizer_days, set(range(start_day, start_day + horizon)))
     units = fertilizer_units = consecutive_unfed = pending_care = feed_units = 0
+    harvested_units = held_units = production_events = 0
+    # ``None`` means an ideal collection schedule: sell each production as it
+    # is made, so max_held remains a cap on inventory rather than lifetime yield.
+    scheduled_harvest = _days(harvest_days, set())
+    auto_collect = harvest_days is None
     fertilizer_available = False
     escaped = False
     for day in range(start_day, start_day + horizon):
@@ -317,11 +325,19 @@ def forecast_animal(
             feed_units += 1
         consecutive_unfed = 0 if fed else consecutive_unfed + 1
         if consecutive_unfed >= 2:
-            escaped, units = True, 0
+            escaped, units, held_units = True, 0, 0
             break
+        if not auto_collect and day in scheduled_harvest and held_units:
+            harvested_units += held_units
+            held_units = 0
         days_since_first = day + 1 - start_day - ad["first_yield_day"]
         if days_since_first >= 0 and days_since_first % ad["interval"] == 0:
-            units = min(ad["max_held"], units + 1 + (pending_care if fed else 0))
+            production_events += 1
+            production = 1 + (pending_care if fed else 0)
+            held_units = min(ad["max_held"], held_units + production)
+            if auto_collect:
+                harvested_units += held_units
+                held_units = 0
             pending_care = 0
         if fed and day in care:
             pending_care += 1
@@ -332,20 +348,23 @@ def forecast_animal(
         fertilizer_available = True
     product = ad["product"]
     base_inventory = _number(market_inventory, MARKET_I0)
+    output_units = harvested_units + held_units
     product_quote = _quote(product, base_inventory, prices) if isinstance(prices, Mapping) and product in prices else market_price(product, base_inventory, params)
     fertilizer_quote = _quote("FERTILIZER", base_inventory, prices) if isinstance(prices, Mapping) and "FERTILIZER" in prices else market_price("FERTILIZER", base_inventory, params)
-    product_quotes = [product_quote] * units if isinstance(prices, Mapping) and product in prices else _sale_quotes(product, units, base_inventory, params)
+    product_quotes = [product_quote] * output_units if isinstance(prices, Mapping) and product in prices else _sale_quotes(product, output_units, base_inventory, params)
     fertilizer_quotes = [fertilizer_quote] * fertilizer_units if isinstance(prices, Mapping) and "FERTILIZER" in prices else _sale_quotes("FERTILIZER", fertilizer_units, base_inventory, params)
     revenue = sum(product_quotes) + sum(fertilizer_quotes)
-    feed_cost = feed_units * _quote("WHEAT", base_inventory, prices)
-    output_units = units + fertilizer_units
+    feed_quote = _quote("WHEAT", base_inventory, prices) if isinstance(prices, Mapping) and "WHEAT" in prices else market_price("WHEAT", base_inventory, params)
+    feed_cost = feed_units * feed_quote
     cap = _whole(shed_capacity if shed_capacity is not None else shed_cap, DEFAULT_SHED_CAPACITY)
-    overflow_units = max(0, _whole(held_inventory) + output_units - cap)
+    overflow_units = max(0, _whole(held_inventory) + held_units + fertilizer_units - cap)
     floor_units = sum(price <= PRICE_FLOOR for price in product_quotes + fertilizer_quotes)
     result = {
         "kind": "animal", "animal": animal, "product": product,
         "start_day": start_day, "horizon": horizon, "first_yield_day": ad["first_yield_day"],
-        "units": units, "feed_units": feed_units, "feed_cost": feed_cost,
+        "units": output_units, "held_units": held_units, "harvested_units": harvested_units,
+        "production_events": production_events,
+        "feed_units": feed_units, "feed_cost": feed_cost,
         "fertilizer_units": fertilizer_units, "escaped": escaped,
         "animal_cost": 0 if animal_owned else ad["cost"],
         "care_days": care & set(range(start_day, start_day + horizon)),

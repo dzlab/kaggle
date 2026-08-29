@@ -2,7 +2,13 @@ import math
 
 import pytest
 
-from kagriculture_agent.constants import PRODUCTS
+from kagriculture_agent.constants import (
+    HINGE_GAIN,
+    MARKET_I0 as CONSTANT_MARKET_I0,
+    MARKET_PARAMS,
+    PRICE_FLOOR,
+    PRODUCTS,
+)
 from kagriculture_agent.economics import (
     expected_portfolio_cash,
     feed_reserve,
@@ -29,6 +35,14 @@ MARKET_T = {
     "WOOL": 105,
     "FERTILIZER": 200,
 }
+
+
+def test_economics_uses_published_market_reference_constants():
+    assert CONSTANT_MARKET_I0 == 10_000
+    assert PRICE_FLOOR == 1
+    assert HINGE_GAIN == 8.0
+    assert MARKET_PARAMS["WHEAT"]["base"] == 25
+    assert MARKET_PARAMS["FERTILIZER"]["T"] == 200
 
 
 def test_shape_value_matches_published_shapes_and_safe_domain():
@@ -158,6 +172,22 @@ def test_forecast_crop_models_three_day_fertilizer_and_ongoing_schedule_decay():
     assert tomato["decayed_units"] == 4
 
 
+def test_crop_harvest_happens_before_first_decay_turn():
+    wheat = forecast_crop(
+        "WHEAT", horizon=6, watering_days={0, 1, 2, 3, 4}, harvest_day=5,
+    )
+    assert wheat["harvested_units"] == 4
+    assert wheat["decayed_units"] == 0
+
+
+def test_crop_fertilizer_cost_ignores_applications_after_horizon():
+    wheat = forecast_crop(
+        "WHEAT", horizon=5, watering_days={0, 1, 2, 3, 4},
+        fertilizer_days={2, 10},
+    )
+    assert wheat["fertilizer_cost"] == 100
+
+
 def test_forecast_crop_accounts_for_floor_risk_across_sequential_sales():
     params = {
         "WHEAT": {
@@ -193,7 +223,8 @@ def test_forecast_animal_models_first_yield_feed_care_held_cap_and_fertilizer():
         collect_fertilizer_days=set(range(12)),
     )
     assert goose["first_yield_day"] == 4
-    assert goose["units"] == 4
+    assert goose["units"] == 16
+    assert goose["harvested_units"] == 16
     assert goose["feed_units"] == 12
     assert goose["fertilizer_units"] == 11  # manure is available after each day-end refresh
     assert goose["animal_cost"] == 300
@@ -201,6 +232,63 @@ def test_forecast_animal_models_first_yield_feed_care_held_cap_and_fertilizer():
     starved = forecast_animal("GOOSE", horizon=6, feed_days={0, 1})
     assert starved["escaped"] is True
     assert starved["units"] == 0
+
+
+def test_animal_production_continues_past_held_cap_when_collected():
+    goose = forecast_animal("GOOSE", horizon=20, feed_days=set(range(20)))
+    assert goose["units"] > 4
+    assert goose["production_events"] == 17
+
+
+def test_animal_held_cap_applies_to_uncollected_buffer_only():
+    goose = forecast_animal(
+        "GOOSE", horizon=20, feed_days=set(range(20)), harvest_days={10},
+    )
+    assert goose["held_units"] == 4
+    assert goose["harvested_units"] == 4
+    assert goose["production_events"] == 17
+
+
+def test_animal_escape_discards_uncollected_held_product():
+    goose = forecast_animal(
+        "GOOSE", horizon=6, feed_days={0, 1, 2, 3}, harvest_days=set(),
+    )
+    assert goose["escaped"] is True
+    assert goose["held_units"] == 0
+    assert goose["units"] == 0
+
+
+def test_animal_care_bonus_is_banked_once_then_reset_on_production():
+    one_bonus = forecast_animal(
+        "GOOSE", horizon=6, feed_days=set(range(6)), care_days={3},
+    )
+    two_bonuses = forecast_animal(
+        "GOOSE", horizon=6, feed_days=set(range(6)), care_days={3, 4},
+    )
+    assert one_bonus["units"] == 4
+    assert two_bonuses["units"] == 5
+
+
+def test_animal_fertilizer_availability_is_one_unit_and_resets_after_collection():
+    goose = forecast_animal(
+        "GOOSE", horizon=5, feed_days=set(range(5)),
+        collect_fertilizer_days={1, 3},
+    )
+    assert goose["fertilizer_units"] == 2
+
+
+def test_animal_feed_cost_uses_supplied_market_params():
+    params = {
+        "WHEAT": {
+            "base": 100, "I0": 0, "T": 10,
+            "below_func": "linear", "below_target": 1,
+            "above_func": "linear", "above_target": 1,
+        }
+    }
+    goose = forecast_animal(
+        "GOOSE", horizon=1, feed_days={0}, market_inventory=0, params=params,
+    )
+    assert goose["feed_cost"] == 100
 
 
 def test_feed_reserve_covers_one_wheat_per_live_animal_day():
