@@ -270,11 +270,26 @@ def test_production_agent_changes_state_and_reports_matching_reward(tmp_path: Pa
     replay = _assert_replay_is_legal_and_complete(replay_path)
     custom_states = [_player_state(replay, step) for step in range(96)]
 
-    buy_state = next(state for state in custom_states if state["action"]["market"])
-    assert buy_state["action"]["market"][0][0] == "BUY_SEED"
-    assert any(state["action"]["farmer"][0] == "PLANT" for state in custom_states)
+    buy_step = next(step for step, state in enumerate(custom_states[1:], start=1) if state["action"]["market"])
+    buy_before = custom_states[buy_step - 1]["observation"]
+    buy_after = custom_states[buy_step]["observation"]
+    buy_order = custom_states[buy_step]["action"]["market"][0]
+    assert buy_order[0] == "BUY_SEED"
+    assert buy_after["private"]["seeds"][buy_order[1]] == buy_before["private"]["seeds"][buy_order[1]] + buy_order[2]
+    assert buy_after["farms"][0]["money"] == buy_before["farms"][0]["money"] - 10 * buy_order[2]
 
-    initial_money = custom_states[0]["observation"]["farms"][0]["money"]
+    plant_step = next(step for step, state in enumerate(custom_states[1:], start=1) if state["action"]["farmer"][0] == "PLANT")
+    plant_before = custom_states[plant_step - 1]["observation"]
+    plant_after = custom_states[plant_step]["observation"]
+    x, y = plant_before["farms"][0]["farmer"]
+    assert plant_before["farms"][0]["tiles"][y][x] is None
+    planted_tile = plant_after["farms"][0]["tiles"][y][x]
+    assert planted_tile["kind"] == "PLANT"
+    assert planted_tile["crop"] == custom_states[plant_step]["action"]["farmer"][1]
+
     final_money = custom_states[-1]["observation"]["farms"][0]["money"]
-    assert final_money < initial_money
-    assert replay["rewards"][0] == final_money
+    reward = replay["rewards"][0]
+    assert all(not state.get("error") and not state["info"].get("error") for state in custom_states)
+    assert isinstance(reward, (int, float)) and not isinstance(reward, bool)
+    assert math.isfinite(reward)
+    assert reward == final_money
