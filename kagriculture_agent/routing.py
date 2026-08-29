@@ -10,6 +10,13 @@ from .types import Position
 
 PASS = "PASS"
 _DIRECTIONS = ("EAST", "WEST", "SOUTH", "NORTH")
+# ``route_action`` only accepts the no-argument tile actions understood by the
+# planner/engine contract.  Movement directions are returned by the routing
+# helpers and are intentionally not accepted as target actions.
+_SUPPORTED_ACTIONS = frozenset({
+    "WATER", "FEED", "CARE", "HARVEST", "WEED", "PLANT",
+    "STRUCTURE", "ANIMAL", "SHED", "SELL", "FERTILIZE", "COLLECT",
+})
 
 
 def normalize_position(value: Any) -> Position | None:
@@ -165,6 +172,9 @@ def route_action(
         if board_size is not None and not _in_bounds(_step(current_position, movement), board_size):
             return PASS
         return movement
-    if is_locked_tile(tile) or not is_tile_actionable(tile) or not action:
+    if is_locked_tile(tile) or not is_tile_actionable(tile) or not isinstance(action, str):
         return PASS
-    return action
+    normalized_action = action.upper()
+    if normalized_action not in _SUPPORTED_ACTIONS:
+        return PASS
+    return normalized_action

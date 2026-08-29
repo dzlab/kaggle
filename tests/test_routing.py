@@ -54,6 +54,7 @@ def test_route_action_returns_requested_action_only_when_at_legal_target():
     assert route_action(pos(0, 0), pos(1, 0), board_size=4, action="HARVEST") == "EAST"
     assert route_action(pos(1, 0), pos(1, 0), board_size=4, action="HARVEST") == "HARVEST"
     assert route_action(pos(1, 0), pos(1, 0), board_size=4, action=None) == "PASS"
+    assert route_action(pos(1, 0), pos(1, 0), board_size=4, action="NOT_AN_ENGINE_ACTION") == "PASS"
 
 
 def _state(**overrides):
@@ -167,6 +168,16 @@ def test_daily_plan_includes_structure_animal_weed_plant_shed_and_sell_work():
     assert {"STRUCTURE", "ANIMAL", "WEED", "PLANT", "SHED", "SELL"} <= kinds
 
 
+def test_daily_plan_uses_valid_shed_target_on_one_by_one_board():
+    worker = {"index": 0, "role": "FARMER", "position": pos(0, 0)}
+    state = _state(board_size=1, workers=[worker], inventory={"WHEAT": 1})
+    plan = build_daily_plan(state, EpisodeMemory())
+    shed = next(task for task in plan if task.kind == "SHED")
+    assert shed.target == pos(0, 0)
+    assignment = assign_tasks([shed], [worker], state)
+    assert assignment and assignment[0].task.target == pos(0, 0)
+
+
 def test_daily_plan_accepts_parse_observation_canonical_nested_state():
     tiles = [["LOCKED" for _ in range(5)] for _ in range(5)]
     tiles[0][0] = None
@@ -248,6 +259,24 @@ def test_assign_tasks_uses_derived_workers_for_empty_and_none_worker_inputs():
     assert assign_tasks(plan, None, parsed)[0].worker_index == 1
 
 
+def test_generated_plant_task_is_selected_after_urgent_water_task():
+    workers = [
+        {"index": 0, "role": "FARMER", "position": pos(2, 2)},
+        {"index": 1, "role": "WORKER", "position": pos(0, 0)},
+    ]
+    state = _state(
+        workers=workers,
+        tiles={
+            pos(0, 0): {"empty": True},
+            pos(1, 0): {"crop": "WHEAT", "watered_today": False, "yield_units": 0},
+        },
+    )
+    plan = build_daily_plan(state, EpisodeMemory())
+    assert any(task.kind == "PLANT" for task in plan)
+    assignments = assign_tasks(plan, workers, state)
+    assert [assignment.task.kind for assignment in assignments] == ["WATER", "PLANT"]
+
+
 def test_normalize_planner_state_preserves_hand_indices_across_malformed_entries():
     parsed = parse_observation({
         "farms": [{
@@ -258,23 +287,6 @@ def test_normalize_planner_state_preserves_hand_indices_across_malformed_entries
     })
     normalized = normalize_planner_state(parsed)
     assert [worker["index"] for worker in normalized["workers"]] == [2, 4]
-
-
-def test_generated_plant_task_is_selected_after_urgent_water_task():
-    workers = [
-        {"index": 0, "role": "WORKER", "position": pos(0, 0)},
-        {"index": 1, "role": "WORKER", "position": pos(2, 2)},
-    ]
-    state = _state(
-        workers=workers,
-        tiles={
-            pos(0, 0): {"empty": True},
-            pos(1, 0): {"crop": "WHEAT", "watered_today": False, "yield_units": 0},
-        },
-    )
-    plan = build_daily_plan(state, EpisodeMemory())
-    assignments = assign_tasks(plan, workers, state)
-    assert [assignment.task.kind for assignment in assignments] == ["WATER", "PLANT"]
 
 
 def test_assign_tasks_deduplicates_exclusive_tiles_and_reserves_basic_needs():

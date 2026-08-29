@@ -365,9 +365,13 @@ def _inventory(state: Any) -> Mapping[str, Any]:
 
 def _shed_target(state: Any, board_size: int) -> Position:
     explicit = _position(_get(state, "shed_position"))
-    if explicit is not None:
+    if explicit is not None and 0 <= explicit.x < board_size and 0 <= explicit.y < board_size:
         return explicit
-    return shed_access_tiles(board_size)[0]
+    valid_access_tiles = tuple(
+        tile for tile in shed_access_tiles(board_size)
+        if 0 <= tile.x < board_size and 0 <= tile.y < board_size
+    )
+    return valid_access_tiles[0] if valid_access_tiles else Position(0, 0)
 
 
 def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Task]:
