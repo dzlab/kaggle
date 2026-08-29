@@ -224,14 +224,14 @@ def test_replay_record_extracts_outcome_and_replay_metrics():
         "player": 0,
         "step": 23,
         "hour": 23,
-        "farms": [{"money": 120, "tiles": [[{"kind": "PLANT", "watered_today": False}]]}],
-        "private": {"shed": {"WHEAT": 102}},
+        "farms": [{"money": 120, "farmer": [0, 0], "hands": [], "tiles": [[{"kind": "PLANT", "watered_today": False}] + [None for _ in range(9)]] + [[None for _ in range(10)] for _ in range(9)]}],
+        "private": {"shed": {"WHEAT": 102}, "inventories": [{}]},
         "market": {"prices": {"WHEAT": 1}, "inventory": {"WHEAT": 10000}},
     }
     replay = {
         "steps": [[
                 {"observation": observation, "action": {"farmer": ["PASS"], "hands": [], "market": [["SELL", "WHEAT", 3]]}, "status": "DONE", "info": {}},
-                {"observation": {"player": 1, "farms": [{"money": 120}, {"money": 80}], "market": {"prices": {"WHEAT": 25}, "inventory": {"WHEAT": 10000}}}, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "DONE", "info": {}},
+                {"observation": {"player": 1, "farms": [{"money": 120}, {"money": 80, "farmer": [0, 0], "hands": [], "tiles": [[None for _ in range(10)] for _ in range(10)]}], "private": {"inventories": [{}]}, "market": {"prices": {"WHEAT": 25}, "inventory": {"WHEAT": 10000}}}, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "DONE", "info": {}},
         ]],
         "rewards": [120, 80],
         "statuses": ["DONE", "DONE"],
@@ -402,6 +402,75 @@ def test_buy_land_uses_next_unlockable_land_and_cost():
     result = apply_variant({"farmer": ["PASS"], "hands": [], "market": [["BUY_LAND"]]}, observation, "mixed")
 
     assert result["market"] == []
+
+
+def test_pickup_and_place_commands_are_set_compatible_and_state_aware():
+    from scripts.evaluate import apply_variant
+
+    empty_board = [[None for _ in range(10)] for _ in range(10)]
+    observation = {
+        "player": 0,
+        "farms": [{"money": 100, "farmer": [4, 4], "hands": [], "tiles": empty_board}],
+        "private": {"seeds": {}, "shed": {"WHEAT": 1}, "inventories": [{"WHEAT": 1}]},
+        "market": {"prices": {}, "inventory": {}},
+    }
+
+    pickup = apply_variant({"farmer": ["PICKUP", "WHEAT", 1], "hands": [], "market": []}, observation, "mixed")
+    place = apply_variant({"farmer": ["PLACE", "WHEAT", 1], "hands": [], "market": []}, observation, "mixed")
+    observation["farms"][0]["farmer"] = [0, 0]
+    invalid_pickup = apply_variant({"farmer": ["PICKUP", "WHEAT", 1], "hands": [], "market": []}, observation, "mixed")
+    observation["private"]["inventories"] = [{}]
+    invalid_place = apply_variant({"farmer": ["PLACE", "WHEAT", 1], "hands": [], "market": []}, observation, "mixed")
+
+    assert pickup["farmer"] == ["PICKUP", "WHEAT", 1]
+    assert place["farmer"] == ["PLACE", "WHEAT", 1]
+    assert invalid_pickup["farmer"] == ["PASS"]
+    assert invalid_place["farmer"] == ["PASS"]
+
+
+def test_state_aware_unit_sanitization_rejects_locked_occupied_and_failed_preconditions():
+    from scripts.evaluate import apply_variant
+
+    def observation(tile, *, seeds=None, inventory=None, farmer=(0, 0)):
+        board = [[None for _ in range(3)] for _ in range(3)]
+        board[farmer[1]][farmer[0]] = tile
+        return {
+            "player": 0,
+            "farms": [{"money": 100, "farmer": list(farmer), "hands": [], "tiles": board}],
+            "private": {"seeds": seeds or {}, "shed": {}, "inventories": [inventory or {}]},
+            "market": {"prices": {}, "inventory": {}},
+        }
+
+    assert apply_variant({"farmer": ["PLANT", "WHEAT"], "hands": [], "market": []}, observation("LOCKED", seeds={"WHEAT": 1}), "mixed")["farmer"] == ["PASS"]
+    assert apply_variant({"farmer": ["PLANT", "WHEAT"], "hands": [], "market": []}, observation({"kind": "PLANT", "crop": "WHEAT"}, seeds={"WHEAT": 1}), "mixed")["farmer"] == ["PASS"]
+    assert apply_variant({"farmer": ["BUILD_COOP"], "hands": [], "market": []}, observation({"kind": "COOP"}), "mixed")["farmer"] == ["PASS"]
+    assert apply_variant({"farmer": ["WATER"], "hands": [], "market": []}, observation(None), "mixed")["farmer"] == ["PASS"]
+    animal = {"kind": "PASTURE", "animal": "COW", "fed_today": False, "cared_today": False}
+    assert apply_variant({"farmer": ["FEED"], "hands": [], "market": []}, observation(animal), "mixed")["farmer"] == ["PASS"]
+    assert apply_variant({"farmer": ["CARE"], "hands": [], "market": []}, observation(animal), "mixed")["farmer"] == ["CARE"]
+
+
+def test_final_boundary_targeted_feed_without_wheat_is_still_missed():
+    from scripts.evaluate import replay_record
+
+    tiles = [[None for _ in range(3)] for _ in range(3)]
+    tiles[0][0] = {"kind": "PASTURE", "animal": "COW", "fed_today": False, "cared_today": True}
+    before = {"player": 0, "step": 23, "hour": 23, "farms": [{"money": 100, "farmer": [0, 0], "hands": [], "tiles": tiles}],
+              "private": {"shed": {}, "seeds": {}, "inventories": [{}]}, "market": {"prices": {}, "inventory": {}}}
+    after = {"player": 0, "step": 24, "hour": 0, "farms": [{"money": 100, "farmer": [0, 0], "hands": [], "tiles": tiles}],
+             "private": {"shed": {}, "seeds": {}, "inventories": [{}]}, "market": {"prices": {}, "inventory": {}}}
+    other = {"player": 1, "farms": [{"money": 100}, {"money": 90, "farmer": [0, 0], "hands": [], "tiles": [[None for _ in range(3)] for _ in range(3)]}], "private": {"inventories": [{}]}, "market": {"prices": {}, "inventory": {}}}
+    replay = {"steps": [
+        [{"observation": before, "action": {"farmer": ["FEED"], "hands": [], "market": []}, "status": "ACTIVE", "info": {}},
+         {"observation": other, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "ACTIVE", "info": {}}],
+        [{"observation": after, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "DONE", "info": {}},
+         {"observation": other, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "DONE", "info": {}}],
+    ], "statuses": ["DONE", "DONE"], "info": {}}
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+    assert record["missed_basic_needs"] == 1
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")

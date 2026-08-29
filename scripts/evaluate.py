@@ -30,6 +30,7 @@ from kagriculture_agent.constants import (  # noqa: E402
     shed_capacity,
 )
 from kagriculture_agent.economics import market_price  # noqa: E402
+from kagriculture_agent.observation import is_shed_adjacent  # noqa: E402
 from kagriculture_agent.policy import Policy  # noqa: E402
 from scripts.run_local import OPPONENTS, _deterministic_random_agent  # noqa: E402
 
@@ -44,6 +45,9 @@ ABLATION_COMPONENTS = (
 )
 _DEFAULT_ABLATIONS = {component: True for component in ABLATION_COMPONENTS}
 _BUYABLE_PRODUCTS = frozenset({"WHEAT", "FERTILIZER"})
+_PRODUCT_NAMES = frozenset(PRODUCTS)
+_ANIMAL_NAMES = frozenset(ANIMALS)
+_ITEM_NAMES = _PRODUCT_NAMES | _ANIMAL_NAMES
 
 
 def _positive_int(value: str) -> int:
@@ -213,12 +217,12 @@ def _valid_action_schema(action: Any, observation: Mapping[str, Any], configurat
     hands = action.get("hands")
     orders = action.get("market")
     farm = _farm_observation(observation)
-    if not _legal_unit_command(farmer) or not isinstance(hands, Sequence) or isinstance(hands, (str, bytes)):
+    if not _unit_command_valid_for_state(farmer, observation, 0, configuration) or not isinstance(hands, Sequence) or isinstance(hands, (str, bytes)):
         return False
     expected_hands = farm.get("hands", ())
     if not isinstance(expected_hands, Sequence) or isinstance(expected_hands, (str, bytes)) or len(hands) != len(expected_hands):
         return False
-    if not all(_legal_unit_command(command) for command in hands):
+    if not all(_unit_command_valid_for_state(command, observation, index + 1, configuration) for index, command in enumerate(hands)):
         return False
     if not isinstance(orders, Sequence) or isinstance(orders, (str, bytes)):
         return False
@@ -313,6 +317,20 @@ def _tile_kind(tile: Any) -> str:
     return str(_mapping(tile).get("kind", "")).upper()
 
 
+def _animal_state(tile: Any) -> Mapping[str, Any]:
+    """Return the animal fields in either engine or policy-test tile shape."""
+    if not isinstance(tile, Mapping):
+        return {}
+    animal = tile.get("animal")
+    if isinstance(animal, Mapping):
+        state = dict(tile)
+        state.update(animal)
+        return state
+    if animal is not None or _tile_kind(tile) == "ANIMAL":
+        return tile
+    return {}
+
+
 def _commands_for_state(state: Mapping[str, Any]) -> list[list[Any]]:
     action = _mapping(state.get("action"))
     commands = []
@@ -325,12 +343,13 @@ def _commands_for_state(state: Mapping[str, Any]) -> list[list[Any]]:
     return commands
 
 
-def _command_targets(observation: Mapping[str, Any], state: Mapping[str, Any]) -> dict[str, set[tuple[int, int]]]:
+def _command_targets(observation: Mapping[str, Any], state: Mapping[str, Any],
+                     configuration: Mapping[str, Any] | None = None) -> dict[str, set[tuple[int, int]]]:
     farm = _farm_observation(observation)
     positions = [farm.get("farmer"), *list(farm.get("hands", ()) or ())]
     commands = _commands_for_state(state)
     targets: dict[str, set[tuple[int, int]]] = {}
-    for position, command in zip(positions, commands):
+    for worker_index, (position, command) in enumerate(zip(positions, commands)):
         if not isinstance(position, Sequence) or isinstance(position, (str, bytes)) or len(position) != 2:
             continue
         if not command or not isinstance(command[0], str):
@@ -339,7 +358,8 @@ def _command_targets(observation: Mapping[str, Any], state: Mapping[str, Any]) -
             coordinate = (int(position[0]), int(position[1]))
         except (TypeError, ValueError, OverflowError):
             continue
-        targets.setdefault(command[0], set()).add(coordinate)
+        if _unit_command_valid_for_state(command, observation, worker_index, configuration):
+            targets.setdefault(command[0], set()).add(coordinate)
     return targets
 
 
@@ -351,13 +371,14 @@ def _post_tile(observation: Mapping[str, Any] | None, coordinate: tuple[int, int
 
 def _missed_needs_at_boundary(observation: Mapping[str, Any], is_boundary: bool,
                               post_observation: Mapping[str, Any] | None = None,
-                              action_state: Mapping[str, Any] | None = None) -> int:
+                              action_state: Mapping[str, Any] | None = None,
+                              configuration: Mapping[str, Any] | None = None) -> int:
     if not is_boundary:
         return 0
     missed = 0
     post_hour = _number(_mapping(post_observation).get("hour")) if post_observation else None
     reset_after_boundary = post_hour == 0 and _number(observation.get("hour")) == 23
-    targets = _command_targets(observation, action_state or {})
+    targets = _command_targets(observation, action_state or {}, configuration)
     for index, (coordinate, tile) in enumerate(_tile_entries(observation)):
         if not isinstance(tile, Mapping):
             continue
@@ -369,11 +390,8 @@ def _missed_needs_at_boundary(observation: Mapping[str, Any], is_boundary: bool,
             target_satisfied = coordinate in targets.get("WATER", set())
             if needs_water and not post_says_watered and not (reset_after_boundary and target_satisfied) and not (post_observation is None and target_satisfied):
                 missed += 1
-        animal = tile.get("animal")
-        animal_mapping = _mapping(animal)
-        if animal_mapping or kind == "ANIMAL":
-            animal_state = dict(tile)
-            animal_state.update(animal_mapping)
+        animal_state = _animal_state(tile)
+        if animal_state:
             needs_feed = animal_state.get("needs_feed") is True or animal_state.get("fed_today") is False
             post_fed = post_tile.get("fed_today") is True
             target_fed = coordinate in targets.get("FEED", set())
@@ -434,7 +452,7 @@ def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, see
         hour = _number(observation.get("hour"))
         is_boundary = hour == 23 or observation.get("step") == last_step
         post = _mapping(own_states[index + 1].get("observation")) if index + 1 < len(own_states) else None
-        missed_needs += _missed_needs_at_boundary(observation, is_boundary, post, state)
+        missed_needs += _missed_needs_at_boundary(observation, is_boundary, post, state, replay_configuration)
     return {
         "variant": variant,
         "opponent": opponent,
@@ -579,7 +597,113 @@ def _legal_unit_command(command: Any) -> bool:
     if operation == "PLANT":
         return len(command) == 2 and command[1] in CROPS
     if operation in {"PICKUP", "PLACE"}:
-        return len(command) in {2, 3} and command[1] in PRODUCTS | ANIMALS and (len(command) == 2 or (isinstance(command[2], int) and not isinstance(command[2], bool) and command[2] > 0))
+        return len(command) in {2, 3} and command[1] in _ITEM_NAMES and (len(command) == 2 or (isinstance(command[2], int) and not isinstance(command[2], bool) and command[2] > 0))
+    return False
+
+
+def _worker_position(observation: Mapping[str, Any], worker_index: int) -> tuple[int, int] | None:
+    farm = _farm_observation(observation)
+    positions = [farm.get("farmer"), *list(farm.get("hands", ()) or ())]
+    if not 0 <= worker_index < len(positions):
+        return None
+    position = positions[worker_index]
+    if not isinstance(position, Sequence) or isinstance(position, (str, bytes)) or len(position) != 2:
+        return None
+    try:
+        return int(position[0]), int(position[1])
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _board_size(observation: Mapping[str, Any], configuration: Mapping[str, Any] | None = None) -> int:
+    configured = _config_value(configuration, "boardSize", None)
+    if configured is not None:
+        try:
+            return max(1, int(configured))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    tiles = _mapping(_farm_observation(observation)).get("tiles", ())
+    return max(1, len(tiles) if isinstance(tiles, Sequence) and not isinstance(tiles, (str, bytes)) else 1)
+
+
+def _tile_at_worker(observation: Mapping[str, Any], worker_index: int) -> Any:
+    position = _worker_position(observation, worker_index)
+    tiles = _mapping(_farm_observation(observation)).get("tiles", ())
+    if position is None or not isinstance(tiles, Sequence) or isinstance(tiles, (str, bytes)):
+        return None
+    x, y = position
+    if not 0 <= y < len(tiles) or not isinstance(tiles[y], Sequence) or isinstance(tiles[y], (str, bytes)) or not 0 <= x < len(tiles[y]):
+        return None
+    return tiles[y][x]
+
+
+def _worker_inventory(observation: Mapping[str, Any], worker_index: int) -> Mapping[str, Any]:
+    inventories = _mapping(observation.get("private")).get("inventories", ())
+    if isinstance(inventories, Sequence) and not isinstance(inventories, (str, bytes)) and 0 <= worker_index < len(inventories):
+        return _mapping(inventories[worker_index])
+    return {}
+
+
+def _unit_command_valid_for_state(command: Any, observation: Mapping[str, Any], worker_index: int = 0,
+                                  configuration: Mapping[str, Any] | None = None) -> bool:
+    if not _legal_unit_command(command):
+        return False
+    operation = command[0]
+    position = _worker_position(observation, worker_index)
+    if position is None:
+        return False
+    if operation in {"PASS", "DROP", "PICKUP", "PLACE", "PLANT", "WATER", "HARVEST", "FERTILIZE", "FEED", "COLLECT_FERTILIZER", "CARE", "DIG", "BUILD_COOP", "BUILD_PASTURE"}:
+        tile = _tile_at_worker(observation, worker_index)
+    else:
+        tile = None
+    if operation in {"NORTH", "SOUTH", "EAST", "WEST"}:
+        deltas = {"NORTH": (0, -1), "SOUTH": (0, 1), "EAST": (1, 0), "WEST": (-1, 0)}
+        dx, dy = deltas[operation]
+        size = _board_size(observation, configuration)
+        return 0 <= position[0] + dx < size and 0 <= position[1] + dy < size
+    if operation == "PASS":
+        return True
+    if operation == "PLANT":
+        seeds = _private_seeds(observation)
+        return tile is None and _number(seeds.get(command[1])) is not None and (_number(seeds.get(command[1])) or 0) >= 1
+    if operation in {"BUILD_COOP", "BUILD_PASTURE"}:
+        return tile is None
+    if operation == "WATER":
+        return _tile_kind(tile) == "PLANT" and tile.get("watered_today") is False if isinstance(tile, Mapping) else False
+    if operation == "HARVEST":
+        return isinstance(tile, Mapping) and _tile_kind(tile) != "LOCKED" and (_number(tile.get("yield_units")) or 0) > 0
+    if operation == "DIG":
+        return tile is not None and _tile_kind(tile) != "LOCKED" and not (isinstance(tile, Mapping) and "animal" in tile)
+    if operation == "FERTILIZE":
+        return _tile_kind(tile) == "PLANT" and (_number(_worker_inventory(observation, worker_index).get("FERTILIZER")) or 0) >= 1
+    if operation in {"FEED", "CARE", "COLLECT_FERTILIZER"}:
+        animal_state = _animal_state(tile)
+        if not animal_state:
+            return False
+        if operation == "FEED":
+            return (animal_state.get("fed_today") is False or animal_state.get("needs_feed") is True) and (_number(_worker_inventory(observation, worker_index).get("WHEAT")) or 0) >= 1
+        if operation == "CARE":
+            return animal_state.get("cared_today") is False or animal_state.get("needs_care") is True
+        return animal_state.get("fertilizer_available") is True
+    if operation in {"PICKUP", "PLACE", "DROP"}:
+        size = _board_size(observation, configuration)
+        if not is_shed_adjacent(position, size):
+            if operation == "PLACE" and command[1] in _ANIMAL_NAMES:
+                pass
+            else:
+                return False
+        inventory = _worker_inventory(observation, worker_index)
+        shed = _mapping(_mapping(observation.get("private")).get("shed"))
+        if operation == "DROP":
+            return any((_number(value) or 0) > 0 for value in inventory.values())
+        item = command[1]
+        quantity = command[2] if len(command) == 3 else 1
+        if operation == "PICKUP":
+            return (_number(shed.get(item)) or 0) >= quantity
+        if item in _ANIMAL_NAMES:
+            return isinstance(tile, Mapping) and tile.get("kind") == ANIMALS[item]["structure"] and tile.get("animal") is None and (_number(inventory.get(item)) or 0) >= 1
+        room = max(0, int(_config_value(configuration, "shedCapacity", shed_capacity)) - int(sum((_number(value) or 0) for value in shed.values())))
+        return is_shed_adjacent(position, size) and (_number(inventory.get(item)) or 0) >= quantity and room >= quantity
     return False
 
 
@@ -591,10 +715,14 @@ def _sanitize_action(action: Mapping[str, Any], observation: Mapping[str, Any], 
         "market": _sanitize_market_orders(_market_orders(action), observation, configuration),
     }
     fallback_farmer = list(fallback.get("farmer", ["PASS"]))
-    if not _legal_unit_command(result["farmer"]):
-        result["farmer"] = fallback_farmer if _legal_unit_command(fallback_farmer) else ["PASS"]
+    if not _unit_command_valid_for_state(result["farmer"], observation, 0, configuration):
+        result["farmer"] = fallback_farmer if _unit_command_valid_for_state(fallback_farmer, observation, 0, configuration) else ["PASS"]
+    expected_hands = _mapping(_farm_observation(observation)).get("hands", ())
+    expected_count = len(expected_hands) if isinstance(expected_hands, Sequence) and not isinstance(expected_hands, (str, bytes)) else 0
     fallback_hands = [list(command) for command in fallback.get("hands", ())]
-    result["hands"] = [command if _legal_unit_command(command) else (fallback_hands[index] if index < len(fallback_hands) and _legal_unit_command(fallback_hands[index]) else ["PASS"]) for index, command in enumerate(result["hands"])]
+    if len(result["hands"]) != expected_count:
+        result["hands"] = fallback_hands if len(fallback_hands) == expected_count else [["PASS"] for _ in range(expected_count)]
+    result["hands"] = [command if _unit_command_valid_for_state(command, observation, index + 1, configuration) else (fallback_hands[index] if index < len(fallback_hands) and _unit_command_valid_for_state(fallback_hands[index], observation, index + 1, configuration) else ["PASS"]) for index, command in enumerate(result["hands"])]
     return result
 
 
