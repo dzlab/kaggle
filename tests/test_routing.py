@@ -35,6 +35,14 @@ def test_route_action_rejects_invalid_current_and_target_positions():
     assert route_action(pos(0, 0), pos(3, 0), board_size=3, action="HARVEST") == "PASS"
 
 
+def test_routing_accepts_typed_coordinates_and_rejects_typed_locked_tiles():
+    current = SimpleNamespace(x=0, y=0)
+    target = SimpleNamespace(x=1, y=0)
+    locked = SimpleNamespace(kind="LOCKED")
+    assert route_action(current, target, board_size=3, action="WATER") == "EAST"
+    assert route_action(target, target, board_size=3, tile=locked, action="WATER") == "PASS"
+
+
 def test_manhattan_routing_and_ties_are_deterministic():
     assert distance(pos(1, 2), pos(4, 0)) == 5
     assert next_move(pos(1, 2), pos(4, 0)) == "EAST"
@@ -207,6 +215,49 @@ def test_normalize_planner_state_builds_stable_workers_from_canonical_farm():
         {"index": 1, "role": "WORKER", "position": pos(1, 0)},
         {"index": 2, "role": "WORKER", "position": pos(0, 1)},
     ]
+
+
+def test_daily_plan_accepts_typed_tiles_and_nested_entities():
+    state = SimpleNamespace(
+        day=2,
+        board_size=3,
+        tiles=[[
+            SimpleNamespace(kind="CROP", crop="WHEAT", planted_day=0, yield_units=0, watered_today=False),
+            SimpleNamespace(kind="ANIMAL", animal=SimpleNamespace(
+                species="GOOSE", fed_today=False, cared_today=False,
+            )),
+            SimpleNamespace(kind="STRUCTURE", structure=SimpleNamespace(kind="COOP", built=False)),
+        ]],
+        seeds={"WHEAT": 1},
+        inventory={},
+    )
+    kinds = {task.kind for task in build_daily_plan(state, EpisodeMemory())}
+    assert {"WATER", "FEED", "CARE", "STRUCTURE"} <= kinds
+
+
+def test_assign_tasks_uses_derived_workers_for_empty_and_none_worker_inputs():
+    parsed = parse_observation({
+        "farms": [{
+            "tiles": [[None, None], ["LOCKED", "LOCKED"]],
+            "farmer": [0, 0],
+            "hands": [{"position": [1, 0]}],
+        }],
+    })
+    plan = [Task("WEED", pos(1, 0), 10, 1, 1)]
+    assert assign_tasks(plan, [], parsed)[0].worker_index == 1
+    assert assign_tasks(plan, None, parsed)[0].worker_index == 1
+
+
+def test_normalize_planner_state_preserves_hand_indices_across_malformed_entries():
+    parsed = parse_observation({
+        "farms": [{
+            "tiles": [[None, None, None]],
+            "farmer": "malformed",
+            "hands": ["malformed", {"position": [1, 0]}, None, {"position": [2, 0]}],
+        }],
+    })
+    normalized = normalize_planner_state(parsed)
+    assert [worker["index"] for worker in normalized["workers"]] == [2, 4]
 
 
 def test_generated_plant_task_is_selected_after_urgent_water_task():

@@ -12,17 +12,30 @@ PASS = "PASS"
 _DIRECTIONS = ("EAST", "WEST", "SOUTH", "NORTH")
 
 
-def _position(value: Any) -> Position | None:
+def normalize_position(value: Any) -> Position | None:
+    """Normalize typed, mapping-shaped, or sequence coordinates."""
     if isinstance(value, Position):
         return value
     if isinstance(value, Mapping):
+        if "position" in value:
+            return normalize_position(value["position"])
         value = (value.get("x"), value.get("y"))
+    else:
+        nested = getattr(value, "position", None)
+        if nested is not None:
+            return normalize_position(nested)
+        x, y = getattr(value, "x", None), getattr(value, "y", None)
+        if x is not None or y is not None:
+            value = (x, y)
     if isinstance(value, (tuple, list)) and len(value) >= 2:
         try:
             return Position(int(value[0]), int(value[1]))
         except (TypeError, ValueError, OverflowError):
             return None
     return None
+
+
+_position = normalize_position
 
 
 def _board_size(value: Any) -> int | None:
@@ -119,7 +132,9 @@ def is_locked_tile(tile: Any) -> bool:
         if tile.get("locked") is True:
             return True
         return str(tile.get("kind", tile.get("type", tile.get("state", "")))).upper() == "LOCKED"
-    return False
+    if getattr(tile, "locked", False) is True:
+        return True
+    return str(getattr(tile, "kind", getattr(tile, "type", getattr(tile, "state", "")))).upper() == "LOCKED"
 
 
 def route_action(

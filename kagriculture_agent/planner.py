@@ -18,7 +18,7 @@ from typing import Any
 from .constants import ANIMALS, CROPS, MARKET_I0
 from .economics import forecast_crop, market_price, sell_batch_value
 from .observation import shed_access_tiles
-from .routing import distance, is_locked_tile, route_to
+from .routing import distance, is_locked_tile, normalize_position, route_to
 from .types import EpisodeMemory, Position, Task, WorkerAssignment
 
 _BASIC_NEEDS = frozenset({"WATER", "FEED", "CARE"})
@@ -34,19 +34,7 @@ def _get(value: Any, key: str, default: Any = None) -> Any:
     return getattr(value, key, default)
 
 
-def _position(value: Any) -> Position | None:
-    if isinstance(value, Position):
-        return value
-    if isinstance(value, Mapping):
-        if "position" in value:
-            return _position(value["position"])
-        value = (value.get("x"), value.get("y"))
-    if isinstance(value, (tuple, list)) and len(value) >= 2:
-        try:
-            return Position(int(value[0]), int(value[1]))
-        except (TypeError, ValueError, OverflowError):
-            return None
-    return None
+_position = normalize_position
 
 
 def _day(state: Any, memory: EpisodeMemory | Any) -> int:
@@ -122,12 +110,12 @@ def normalize_planner_state(state: Any) -> dict[str, Any]:
             workers.append({"index": 0, "role": "FARMER", "position": farmer_position})
         raw_hands = farm.get("hands", source.get("hands", ()))
         if isinstance(raw_hands, Sequence) and not isinstance(raw_hands, (str, bytes)):
-            for hand in raw_hands:
+            for hand_index, hand in enumerate(raw_hands):
                 hand_position = _position(hand)
                 if hand_position is None:
                     continue
                 workers.append({
-                    "index": len(workers),
+                    "index": hand_index + 1,
                     "role": _get(hand, "role", "WORKER"),
                     "position": hand_position,
                 })
@@ -177,8 +165,8 @@ def _tile_kind(tile: Any) -> str:
 
 def _crop(tile: Any) -> str | None:
     crop = _get(tile, "crop")
-    if isinstance(crop, Mapping):
-        crop = crop.get("crop", crop.get("kind", crop.get("type", crop.get("name"))))
+    if crop is not None and not isinstance(crop, str):
+        crop = _get(crop, "crop", _get(crop, "kind", _get(crop, "type", _get(crop, "name"))))
     if crop is None and _tile_kind(tile) in CROPS:
         crop = _tile_kind(tile)
     crop = _upper(crop)
@@ -220,9 +208,9 @@ def _entity_state(tile: Any, entity_name: str) -> dict[str, Any] | None:
     kind = _tile_kind(tile)
     if nested is None and kind != entity_name.upper():
         return None
-    result = dict(tile) if isinstance(tile, Mapping) else {}
-    if isinstance(nested, Mapping):
-        result.update(nested)
+    result = dict(_mapping(tile))
+    if nested is not None and not isinstance(nested, str):
+        result.update(_mapping(nested))
     elif isinstance(nested, str):
         result.setdefault("species", nested)
         result.setdefault("kind", nested)
@@ -516,9 +504,12 @@ def _route_positions(start: Position | None, target: Position | None, board_size
     return route
 
 
-def assign_tasks(plan: Iterable[Task], workers: Iterable[Any], state: Any) -> list[WorkerAssignment]:
+def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any) -> list[WorkerAssignment]:
     """Assign at most one exclusive task per worker with deterministic priorities."""
     state = normalize_planner_state(state)
+    explicit_workers = list(workers) if workers is not None else []
+    if not explicit_workers:
+        explicit_workers = list(_get(state, "workers", ()) or ())
     day = _day(state, EpisodeMemory())
     try:
         board_size = max(1, int(_get(state, "board_size", 1)))
@@ -533,7 +524,7 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any], state: Any) -> li
         if current is None or _task_sort_key(task, day) < _task_sort_key(current, day):
             unique[key] = task
     tasks = sorted(unique.values(), key=lambda task: _task_sort_key(task, day))
-    infos = sorted((_worker_info(worker, index) for index, worker in enumerate(workers)), key=lambda item: (item[0], item[2].y if item[2] else inf, item[2].x if item[2] else inf))
+    infos = sorted((_worker_info(worker, index) for index, worker in enumerate(explicit_workers)), key=lambda item: (item[0], item[2].y if item[2] else inf, item[2].x if item[2] else inf))
     if not infos:
         return []
 
