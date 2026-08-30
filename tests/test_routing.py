@@ -154,6 +154,17 @@ def test_daily_plan_uses_observed_quotes_not_player_inventory_or_curve_overrides
     assert sell.value == 28
 
 
+def test_planner_sanitizes_nonfinite_and_negative_shed_quantities():
+    from math import inf, isnan
+
+    state = _state(inventory={"WHEAT": float("nan"), "MELON": inf, "CARROT": -3})
+
+    plan = build_daily_plan(state, EpisodeMemory())
+
+    assert all(task.kind not in {"SHED", "SELL"} for task in plan)
+    assert all(not isnan(task.value) and task.value != inf for task in plan)
+
+
 def test_daily_plan_includes_structure_animal_weed_plant_shed_and_sell_work():
     state = _state(
         tiles={

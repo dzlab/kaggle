@@ -343,6 +343,39 @@ def test_replay_rejects_invalid_command_and_bad_worker_count():
     assert record["outcome"] == "framework_error"
 
 
+def test_replay_rejects_market_orders_that_cannot_execute_from_prior_state():
+    from scripts.evaluate import _valid_action_schema
+
+    observation = {
+        "player": 0,
+        "farms": [{"money": 0, "farmer": [0, 0], "hands": [], "hires_today": 0,
+                   "unlocked_quadrants": ["NW"], "tiles": [[None]]}],
+        "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+        "market": {"prices": {"WHEAT": 25}, "inventory": {"WHEAT": 10000}},
+    }
+    prefix = {"farmer": ["PASS"], "hands": []}
+
+    assert not _valid_action_schema({**prefix, "market": [["SELL", "WHEAT", 1]]}, observation)
+    assert not _valid_action_schema({**prefix, "market": [["BUY_SEED", "WHEAT", 1]]}, observation)
+
+
+def test_malformed_market_order_limit_is_a_framework_failure_not_an_exception():
+    from scripts.evaluate import _valid_action_schema
+
+    observation = {
+        "player": 0,
+        "farms": [{"money": 100, "farmer": [0, 0], "hands": [], "tiles": [[None]]}],
+        "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+        "market": {"prices": {}, "inventory": {}},
+    }
+
+    assert not _valid_action_schema(
+        {"farmer": ["PASS"], "hands": [], "market": []},
+        observation,
+        {"maxMarketOrdersPerTurn": "not-a-number"},
+    )
+
+
 def test_boundary_needs_use_post_action_state_when_available():
     from scripts.evaluate import replay_record
 

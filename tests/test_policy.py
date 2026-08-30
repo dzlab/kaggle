@@ -64,6 +64,17 @@ def test_policy_emits_one_legal_command_per_visible_worker_and_bounded_market():
     assert len(action["market"]) <= 10
 
 
+def test_policy_falls_back_to_safe_action_for_nonfinite_or_negative_shed_values():
+    action = policy_module.Policy().act(
+        observation(shed={"WHEAT": float("nan"), "MELON": float("inf"), "CARROT": -3})
+    )
+
+    assert set(action) == {"farmer", "hands", "market"}
+    assert command_is_legal(action["farmer"])
+    assert len(action["hands"]) == 2
+    assert all(command_is_legal(command) for command in action["hands"])
+
+
 def test_policy_preserves_a_command_slot_for_every_malformed_visible_hand():
     action = policy_module.Policy().act(observation(hands=[[1, 0], None, ["bad", 1]]))
 

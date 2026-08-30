@@ -163,6 +163,19 @@ def _config_value(configuration: Mapping[str, Any] | None, key: str, default: An
     return _mapping(configuration).get(key, default)
 
 
+def _market_order_limit(configuration: Mapping[str, Any] | None) -> tuple[int, bool]:
+    raw = _config_value(configuration, "maxMarketOrdersPerTurn", max_market_orders)
+    if isinstance(raw, bool):
+        return max_market_orders, False
+    try:
+        value = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return max_market_orders, False
+    if value < 1 or (isinstance(raw, float) and not raw.is_integer()):
+        return max_market_orders, False
+    return value, True
+
+
 def _fib(index: int) -> int:
     first, second = 1, 1
     for _ in range(max(0, index)):
@@ -235,8 +248,14 @@ def _valid_action_schema(action: Any, observation: Mapping[str, Any], configurat
         return False
     if not isinstance(orders, Sequence) or isinstance(orders, (str, bytes)):
         return False
-    order_limit = int(_config_value(configuration, "maxMarketOrdersPerTurn", max_market_orders))
-    return len(orders) <= max(1, order_limit) and all(_valid_market_order_schema(order, observation) for order in orders)
+    order_limit, config_valid = _market_order_limit(configuration)
+    if not config_valid:
+        return False
+    if len(orders) > order_limit:
+        return False
+    if state_aware:
+        return _valid_market_orders(orders, observation, configuration)
+    return all(_valid_market_order_schema(order, observation) for order in orders)
 
 
 def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, Any]],
@@ -536,8 +555,11 @@ def _sanitize_market_orders(orders: Sequence[Sequence[Any]], observation: Mappin
     shed = dict(_mapping(_mapping(observation.get("private")).get("shed")))
     market = _mapping(observation.get("market"))
     market_inventory = {item: _number(quantity) or 0.0 for item, quantity in _mapping(market.get("inventory")).items()}
-    capacity = max(1, int(_config_value(configuration, "shedCapacity", shed_capacity)))
-    order_limit = max(1, int(_config_value(configuration, "maxMarketOrdersPerTurn", max_market_orders)))
+    try:
+        capacity = max(1, int(_config_value(configuration, "shedCapacity", shed_capacity)))
+    except (TypeError, ValueError, OverflowError):
+        capacity = shed_capacity
+    order_limit, _config_valid = _market_order_limit(configuration)
     farm = _farm_observation(observation)
     hires_today = int(_number(farm.get("hires_today")) or 0)
     hire_mult = max(0, int(_config_value(configuration, "farmHandCostMult", 1)))
@@ -613,6 +635,93 @@ def _sanitize_market_orders(orders: Sequence[Sequence[Any]], observation: Mappin
                 shed[item] = available - allowed
                 sanitized.append([operation, item, allowed])
     return sanitized
+
+
+def _valid_market_orders(orders: Sequence[Any], observation: Mapping[str, Any],
+                         configuration: Mapping[str, Any] | None = None) -> bool:
+    """Validate sequential market orders against the pre-action farm state."""
+    order_limit, config_valid = _market_order_limit(configuration)
+    if not config_valid or len(orders) > order_limit:
+        return False
+    money = _cash(observation)
+    shed = {item: max(0.0, _number(quantity) or 0.0)
+            for item, quantity in _mapping(_mapping(observation.get("private")).get("shed")).items()}
+    market = _mapping(observation.get("market"))
+    market_inventory = {item: max(0.0, _number(quantity) or 0.0)
+                        for item, quantity in _mapping(market.get("inventory")).items()}
+    try:
+        capacity = max(1, int(_config_value(configuration, "shedCapacity", shed_capacity)))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    farm = _farm_observation(observation)
+    hires_today = int(_number(farm.get("hires_today")) or 0)
+    try:
+        hire_mult = int(_config_value(configuration, "farmHandCostMult", 1))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    unlocked = list(farm.get("unlocked_quadrants", ()))
+
+    for raw_order in orders:
+        order = list(raw_order) if isinstance(raw_order, Sequence) and not isinstance(raw_order, (str, bytes)) else raw_order
+        if not _valid_market_order_schema(order, observation):
+            return False
+        operation = order[0]
+        if operation == "HIRE":
+            cost = float(_fib(hires_today) * hire_mult)
+            if cost > money:
+                return False
+            money -= cost
+            hires_today += 1
+            continue
+        if operation == "BUY_LAND":
+            next_index = len(unlocked) - 1
+            if next_index < 0 or next_index >= len(LAND_ORDER):
+                return False
+            expected_land = LAND_ORDER[next_index]
+            if expected_land in unlocked or money < LAND_PRICES[next_index]:
+                return False
+            money -= LAND_PRICES[next_index]
+            unlocked.append(expected_land)
+            continue
+
+        item, quantity = order[1], order[2]
+        if operation == "BUY_SEED":
+            cost = float(CROPS[item]["seed"]) * quantity
+            if cost > money:
+                return False
+            money -= cost
+            continue
+        if operation == "BUY_ANIMAL":
+            cost = float(ANIMALS[item]["cost"]) * quantity
+            room = capacity - int(sum(shed.values()))
+            if cost > money or quantity > room:
+                return False
+            money -= cost
+            shed[item] = shed.get(item, 0.0) + quantity
+            continue
+        if operation == "BUY_PRODUCT":
+            if market_inventory.get(item, 0.0) < quantity:
+                return False
+            for _ in range(quantity):
+                room = capacity - int(sum(shed.values()))
+                price = _observed_unit_price(item, observation, market_inventory.get(item, 0.0), buying=True, configuration=configuration)
+                if room < 1 or price <= 0 or money < price:
+                    return False
+                money -= price
+                market_inventory[item] -= 1
+                shed[item] = shed.get(item, 0.0) + 1
+            continue
+        if operation == "SELL":
+            if shed.get(item, 0.0) < quantity:
+                return False
+            for _ in range(quantity):
+                price = _observed_unit_price(item, observation, market_inventory.get(item, 0.0), buying=False, configuration=configuration)
+                if price <= 0:
+                    return False
+                shed[item] -= 1
+                if price > PRICE_FLOOR:
+                    market_inventory[item] = market_inventory.get(item, 0.0) + 1
+    return True
 
 
 def _legal_unit_command(command: Any) -> bool:

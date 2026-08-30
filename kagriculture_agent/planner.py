@@ -12,7 +12,7 @@ board size is derived from the square tile grid when it is not explicit.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from math import inf
+from math import inf, isfinite
 from typing import Any
 
 from .constants import ANIMALS, CROPS, MARKET_I0
@@ -55,13 +55,23 @@ def _mapping(value: Any) -> Mapping[str, Any]:
     return attributes if isinstance(attributes, Mapping) else {}
 
 
+def _safe_quantity(value: Any) -> int | float:
+    if isinstance(value, bool):
+        return 0
+    try:
+        quantity = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if not isfinite(quantity) or quantity <= 0:
+        return 0
+    return int(quantity) if quantity.is_integer() else quantity
+
+
 def _hand_counts(value: Any) -> dict[str, int]:
     if isinstance(value, Mapping):
-        return {
-            str(item): int(quantity)
-            for item, quantity in value.items()
-            if isinstance(quantity, (int, float)) and not isinstance(quantity, bool) and quantity > 0
-        }
+        return {str(item): int(quantity) for item, quantity in (
+            (item, _safe_quantity(quantity)) for item, quantity in value.items()
+        ) if quantity > 0}
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         counts: dict[str, int] = {}
         for item in value:
@@ -125,7 +135,10 @@ def normalize_planner_state(state: Any) -> dict[str, Any]:
         "animals": source.get("animals", farm.get("animals", private.get("animals", []))),
         "structures": source.get("structures", farm.get("structures", private.get("structures", []))),
         "seeds": dict(seeds) if isinstance(seeds, Mapping) else {},
-        "inventory": dict(inventory) if isinstance(inventory, Mapping) else {},
+        "inventory": {
+            str(item): _safe_quantity(quantity)
+            for item, quantity in inventory.items()
+        } if isinstance(inventory, Mapping) else {},
         "workers": workers,
         "market": market,
     })
@@ -464,7 +477,7 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
                 continue
             try:
                 value = _observed_sale_value(item, int(quantity), state)
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError, OverflowError):
                 value = 0
             if value > 0:
                 plan.append(Task("SELL", shed_target, 75, day, value, sell_all=True))

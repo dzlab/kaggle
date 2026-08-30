@@ -1,8 +1,10 @@
 # Kaggriculture agent
 
-This repository contains the Kaggriculture Kaggle agent. The policy is currently
-a minimal import-compatible placeholder; later tasks will add the competition
-logic.
+This repository contains the Kaggriculture Kaggle agent. The policy is an
+importable, deterministic, legality-first policy. It parses each observation,
+plans daily crop, animal, structure, weed, harvest, shed, and market work,
+assigns tasks to the farmer and hands, routes workers within board bounds, and
+falls back to `PASS` when a task or prerequisite is not currently valid.
 
 ## Local setup
 
@@ -26,9 +28,10 @@ Run the test suite with:
 uv run pytest
 ```
 
-Replay files belong in `replays/`; generated logs belong in `logs/`. These
-directories are kept in the repository with `.gitkeep` files. A future replay
-runner should write its output there for local inspection.
+The local runner in `scripts/run_local.py` runs the packaged `main.agent`
+against `pass`, deterministic `random`, or `starter` opponents and writes a
+JSON replay to `replays/` by default. Generated logs belong in `logs/`; both
+directories are kept in the repository with `.gitkeep` files.
 
 ## Seeded evaluation
 
@@ -61,9 +64,16 @@ never combined silently. These switches only disable corresponding existing
 action categories or batching at the evaluator boundary; the production policy
 and its legality checks are unchanged.
 
+Replay validation pairs each recorded action with the preceding observation
+that was available when the action was chosen. It checks the evaluated policy's
+unit and market preconditions, reports malformed or unverified replays as
+framework failures, and uses the following observation only to confirm effects.
+
 ## Kaggle submission packaging
 
 Package the entrypoint and the `kagriculture_agent/` package together when
 submitting to Kaggle. The submission entrypoint is `main.py`; keep imports
 self-contained and include any runtime dependencies required by the selected
-Kaggle environment.
+Kaggle environment. The project metadata and lockfile support the local `uv`
+workflow; for example, run `uv sync`, `uv run pytest -q`, or
+`uv run python scripts/run_local.py --opponent pass --seed 0`.
