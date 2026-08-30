@@ -2094,16 +2094,28 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
             if not isinstance(post_tile, Mapping) or post_tile.get("fertilizer_available") is not False:
                 return False
         elif operation == "HARVEST":
-            if isinstance(post_tile, Mapping) and (_number(post_tile.get("yield_units")) or 0) != 0:
-                crop = pre_tile.get("crop") if isinstance(pre_tile, Mapping) else None
-                pre_yield = _number(pre_tile.get("yield_units")) if isinstance(pre_tile, Mapping) else None
-                ongoing_boundary_harvest = (
-                    boundary and crop in CROPS and CROPS[crop]["ongoing"]
-                    and pre_yield is not None
-                    and post_tile.get("crop") == crop
-                    and (_number(post_tile.get("yield_units")) or 0) == max(0, pre_yield - 1)
+            ongoing_boundary_harvest = (
+                boundary
+                and isinstance(pre_tile, Mapping)
+                and _tile_kind(pre_tile) == "PLANT"
+                and CROPS.get(pre_tile.get("crop"), {}).get("ongoing", False)
+            )
+            if ongoing_boundary_harvest:
+                same_tile_commands = [
+                    candidate
+                    for candidate_index, candidate in enumerate(commands)
+                    if _worker_position(pre, candidate_index) == position
+                ]
+                valid, expected_tile = _action_target_tile_sequence_expected(
+                    pre_tile, same_tile_commands, pre, post, configuration,
                 )
-                if not ongoing_boundary_harvest:
+                if not valid or not _tile_state_matches_expected(
+                    post_tile, expected_tile, allow_compact=allow_compact,
+                ):
+                    return False
+            elif isinstance(post_tile, Mapping) and (_number(post_tile.get("yield_units")) or 0) != 0:
+                pre_yield = _number(pre_tile.get("yield_units")) if isinstance(pre_tile, Mapping) else None
+                if pre_yield is None:
                     return False
             if post_tile is not None and not isinstance(post_tile, Mapping):
                 return False

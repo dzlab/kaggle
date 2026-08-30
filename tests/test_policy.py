@@ -193,6 +193,89 @@ def test_policy_keeps_required_carried_animal_for_assigned_placement():
     assert action["hands"][0] != ["DROP"]
 
 
+def test_carried_animal_assignment_stays_valid_when_feed_is_staged_in_shed():
+    board = [[None for _ in range(5)] for _ in range(5)]
+    board[1][1] = {"kind": "PASTURE"}
+    state = policy_module.parse_observation(observation(
+        day=4,
+        hands=[[2, 2]],
+        tiles=board,
+        shed={"WHEAT": 1, "SHEEP": 0},
+        seeds={},
+        inventories=[[], ["SHEEP"]],
+    ))
+    assignment = WorkerAssignment(
+        1, Task("ANIMAL", Position(1, 1), 105, 4, 500, item="SHEEP")
+    )
+
+    assert policy_module._assignment_valid(state, assignment)
+    assert policy_module.worker_action(1, state, assignment) == ["PICKUP", "WHEAT", 1]
+
+
+def test_late_season_planners_do_not_start_new_crops():
+    from kagriculture_agent.constants import season_days
+    from kagriculture_agent.planner import build_autonomous_macro_plan, build_daily_plan
+
+    state = observation(
+        day=season_days - 2,
+        hands=[],
+        seeds={"WHEAT": 1},
+        money=3_000,
+    )
+
+    assert all(task.kind != "PLANT" for task in build_daily_plan(state))
+    assert all(task.kind != "PLANT" for task in build_autonomous_macro_plan(state)["tasks"])
+
+
+def test_daily_plan_uses_fertilizer_staged_in_shed():
+    from kagriculture_agent.planner import build_daily_plan
+
+    state = {
+        "day": 4,
+        "tiles": [[{
+            "kind": "PLANT",
+            "crop": "WHEAT",
+            "watered_today": True,
+            "yield_units": 1,
+            "planted_day": 0,
+            "fertilized_until_day": -1,
+        }]],
+        "private": {"shed": {"FERTILIZER": 1}, "inventories": [{}], "seeds": {}},
+        "market": {"prices": {"WHEAT": 25, "FERTILIZER": 100}},
+    }
+
+    assert any(task.kind == "FERTILIZE" for task in build_daily_plan(state))
+
+
+def test_fertilize_can_use_farmer_slot_while_helper_preserves_basic_need():
+    from kagriculture_agent.planner import assign_tasks
+
+    state = {
+        "day": 4,
+        "hour": 10,
+        "board_size": 5,
+        "tiles": [[None for _ in range(5)] for _ in range(5)],
+        "private": {"shed": {"FERTILIZER": 1}, "inventories": [{"FERTILIZER": 1}, {}]},
+        "workers": [
+            {"index": 0, "role": "FARMER", "position": [2, 2]},
+            {"index": 1, "role": "WORKER", "position": [1, 1]},
+        ],
+    }
+    plan = [
+        Task("WATER", Position(0, 0), 100, 4, 1),
+        Task("FERTILIZE", Position(0, 0), 97, 4, 1),
+        Task("CARE", Position(0, 0), 95, 4, 1),
+        Task("SHED", Position(2, 2), 85, 4, 1),
+    ]
+
+    assignments = assign_tasks(plan, state["workers"], state)
+
+    assert {assignment.task.kind: assignment.worker_index for assignment in assignments} == {
+        "WATER": 1,
+        "FERTILIZE": 0,
+    }
+
+
 def test_terminal_cleanup_does_not_mix_carried_pickup_or_drop_with_sales():
     obs = observation(day=29, hour=22, hands=[[2, 2]],
                       inventories=[[], ["FERTILIZER"]],

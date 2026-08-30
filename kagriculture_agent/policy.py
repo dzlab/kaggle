@@ -794,6 +794,18 @@ def _assignment_valid(state: Any, assignment: WorkerAssignment) -> bool:
         if animal is None or bool(_get(animal, completed_field, False)):
             return False
     required = _required_worker_item(assignment.task, state)
+    if (
+        kind == "ANIMAL"
+        and required in ANIMALS
+        and _inventory_for_worker(state, worker_index).get(required, 0) > 0
+        and _whole(_shed(state).get("WHEAT")) > 0
+    ):
+        tile = _tile_at(state, target)
+        return (
+            _structure_kind(tile) == ANIMALS[required]["structure"]
+            and _animal(tile) is None
+            and not (isinstance(tile, Mapping) and "animal" in tile)
+        )
     if required is not None and _inventory_for_worker(state, worker_index).get(required, 0) <= 0:
         # Required inputs can be staged in the shed. Keep the assignment
         # stable while worker_action routes to PICKUP, otherwise logistics

@@ -653,7 +653,7 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None) 
     intents: list[list[Any]] = []
     tasks: list[Task] = []
     _compatible_target, structure_target = _compatible_structure(normalized, animal)
-    if day < season_days - 1:
+    if day < season_days - 2:
         seed_cost = float(CROPS[selected["crop"]]["seed"])
         seed_purchase_planned = _safe_quantity(seeds.get(selected["crop"], 0)) <= 0 and cash >= seed_cost
         if seed_purchase_planned:
@@ -771,7 +771,7 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
             if _needs_today(tile, "needs_water", "watered_today", "watered"):
                 _add(plan, "WATER", position, 100, day, 1)
             if _number(_get(tile, "fertilized_until_day", -1)) < day and has_fertilizer:
-                _add(plan, "FERTILIZE", position, 92, day, 1)
+                _add(plan, "FERTILIZE", position, 97, day, 1)
             age = _crop_age(tile, day)
             crop_rules = CROPS[crop]
             # Non-ongoing crops have their first decay step on the day after
@@ -783,7 +783,7 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
                 value = _harvest_value(crop, tile, age, day, state)
                 if value > 0:
                     _add(plan, "HARVEST", position, 98, day, value)
-        elif _is_empty(tile):
+        elif _is_empty(tile) and day < season_days - 2:
             seeds = _get(state, "seeds", {})
             if not isinstance(seeds, Mapping):
                 seeds = {}
@@ -1076,6 +1076,7 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
             and farmer is not None
             and helper_exists
             and task.kind not in _SHED_WORK
+            and task.kind != "FERTILIZE"
             and (task.kind not in _BASIC_NEEDS or non_farmer_available)
         )
         if reserve_farmer:
