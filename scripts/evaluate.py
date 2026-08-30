@@ -270,6 +270,7 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
         return False
     if not _valid_engine_provenance(replay):
         return False
+    legacy_compact = _legacy_compact_fixture(replay)
     for optional_mapping in ("metadata",):
         if optional_mapping in replay and not isinstance(replay[optional_mapping], Mapping):
             return False
@@ -284,6 +285,10 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
         if not isinstance(rewards, Sequence) or isinstance(rewards, (str, bytes)) or len(rewards) != 2:
             return False
         if any(_number(reward) is None for reward in rewards):
+            return False
+    if not legacy_compact:
+        episode_steps = _number(_config_value(configuration, "episodeSteps", None))
+        if episode_steps is None or int(episode_steps) != episode_steps or len(steps) != int(episode_steps):
             return False
     if len(own_states) != len(steps) or len(other_states) != len(steps):
         return False
@@ -320,17 +325,36 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
             return False
         actions = [states_by_player[player]["action"] for player in (0, 1)]
         observations = [previous_observations[player] for player in (0, 1)]
+        current_observations = [
+            _mapping(states_by_player[player].get("observation")) for player in (0, 1)
+        ]
+        if index > 0 and any(
+            not _time_progression_valid(
+                observations[player], current_observations[player], configuration,
+                allow_missing=legacy_compact, allow_missing_step=player == 1,
+            )
+            for player in (0, 1)
+        ):
+            return False
+        if not legacy_compact and any(
+            not _board_dimensions_valid(observation, configuration)
+            for observation in (*observations, *current_observations)
+        ):
+            return False
         market_result = _simulate_market_orders_lockstep(
             [actions[0].get("market", ()), actions[1].get("market", ())], observations, configuration,
             force_model=bool(actions[1].get("market", ())),
         )
         if market_result is None:
             return False
-        if index > 0 and not _transition_effects_valid(
-            previous_observations[0], _mapping(states_by_player[0].get("observation")), actions[0], configuration,
-            market_result=market_result,
-        ):
-            return False
+        if index > 0:
+            for player in (0, 1):
+                if not _transition_effects_valid(
+                    observations[player], current_observations[player], actions[player], configuration,
+                    market_result=market_result, player_index=player, allow_compact=legacy_compact,
+                    market_observation=observations[0], allow_invalid_unit_noop=player == 1,
+                ):
+                    return False
         expected_status = "DONE" if index == len(steps) - 1 else "ACTIVE"
         if any(state.get("status") != expected_status for state in turn if isinstance(state, Mapping)):
             return False
@@ -340,12 +364,74 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
             for state in turn
             if isinstance(state, Mapping) and _mapping(state.get("observation")).get("player") == player
         }
-    if _final_bank(own_states[-1]) is None or _final_bank(other_states[-1]) is None:
+    final_banks = [_final_bank(own_states[-1]), _final_bank(other_states[-1])]
+    if any(bank is None for bank in final_banks):
         return False
-    final_inventories = _private_inventories(_mapping(own_states[-1].get("observation")))
-    if final_inventories is None or any(inventory for inventory in final_inventories):
-        return False
+    if not legacy_compact:
+        if rewards is None or any(final_banks[player] != _number(rewards[player]) for player in (0, 1)):
+            return False
+        final_inventories = [
+            _private_inventories(_mapping(states[-1].get("observation")))
+            for states in (own_states, other_states)
+        ]
+        if any(inventories is None or any(inventory for inventory in inventories) for inventories in final_inventories):
+            return False
+    else:
+        final_inventories = _private_inventories(_mapping(own_states[-1].get("observation")))
+        if final_inventories is None or any(inventory for inventory in final_inventories):
+            return False
     return not bool(_mapping(replay.get("info")).get("error"))
+
+
+def _legacy_compact_fixture(replay: Mapping[str, Any]) -> bool:
+    metadata = replay.get("metadata")
+    return isinstance(metadata, Mapping) and metadata.get("legacy_compact_fixture") is True
+
+
+def _time_progression_valid(pre: Mapping[str, Any], post: Mapping[str, Any],
+                            configuration: Mapping[str, Any] | None, *, allow_missing: bool = False,
+                            allow_missing_step: bool = False) -> bool:
+    """Validate one player's deterministic step/hour/day progression."""
+    pre_step, post_step = _number(pre.get("step")), _number(post.get("step"))
+    pre_hour, post_hour = _number(pre.get("hour")), _number(post.get("hour"))
+    pre_day, post_day = _number(pre.get("day")), _number(post.get("day"))
+    if pre_step is None or post_step is None:
+        if not allow_missing_step or pre_step is not None or post_step is not None:
+            return allow_missing
+    if pre_hour is None or post_hour is None:
+        return allow_missing
+    turns_per_day = _number(_config_value(configuration, "turnsPerDay", None))
+    if turns_per_day is None or int(turns_per_day) != turns_per_day or int(turns_per_day) < 1:
+        return False
+    if any(int(value) != value for value in (pre_hour, post_hour)):
+        return False
+    if pre_step is not None and post_step is not None and any(
+        int(value) != value for value in (pre_step, post_step)
+    ):
+        return False
+    if pre_step is not None and post_step is not None and int(post_step) != int(pre_step) + 1:
+        return False
+    expected_hour = (int(pre_hour) + 1) % int(turns_per_day)
+    if int(post_hour) != expected_hour:
+        return False
+    if pre_day is None or post_day is None:
+        return allow_missing and pre_day is None and post_day is None
+    if any(int(value) != value for value in (pre_day, post_day)):
+        return False
+    expected_day = int(pre_day) + (1 if expected_hour == 0 else 0)
+    return int(post_day) == expected_day
+
+
+def _observation_step(observation: Mapping[str, Any], configuration: Mapping[str, Any] | None) -> int:
+    step = _number(observation.get("step"))
+    if step is not None and int(step) == step:
+        return int(step)
+    day = _number(observation.get("day"))
+    hour = _number(observation.get("hour"))
+    turns_per_day = _number(_config_value(configuration, "turnsPerDay", 24))
+    if day is not None and hour is not None and turns_per_day is not None and int(turns_per_day) >= 1:
+        return int(day) * int(turns_per_day) + int(hour)
+    return 0
 
 
 def _valid_engine_provenance(replay: Mapping[str, Any]) -> bool:
@@ -531,12 +617,9 @@ def _missed_needs_at_boundary(observation: Mapping[str, Any], is_boundary: bool,
                               post_observation: Mapping[str, Any] | None = None,
                               action_state: Mapping[str, Any] | None = None,
                               configuration: Mapping[str, Any] | None = None) -> int:
-    if (
-        not is_boundary
-        or post_observation is None
-        or _number(observation.get("hour")) != 23
-        or _number(post_observation.get("hour")) != 0
-    ):
+    turns_per_day = _number(_config_value(configuration, "turnsPerDay", 24))
+    last_hour = int(turns_per_day) - 1 if turns_per_day is not None and int(turns_per_day) >= 1 else 23
+    if not is_boundary or post_observation is None or _number(observation.get("hour")) != last_hour or _number(post_observation.get("hour")) != 0:
         return 0
     missed = 0
     reset_after_boundary = True
@@ -615,6 +698,8 @@ def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, see
     shed_overflow = 0.0
     floor_sales = 0
     missed_needs = 0
+    turns_per_day = _number(_config_value(replay_configuration, "turnsPerDay", 24))
+    last_hour = int(turns_per_day) - 1 if turns_per_day is not None and int(turns_per_day) >= 1 else 23
     steps = replay.get("steps", ())
     for index, state in enumerate(own_states):
         post = _mapping(state.get("observation"))
@@ -634,7 +719,7 @@ def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, see
             )
         pre_hour = _number(pre.get("hour"))
         post_hour = _number(post.get("hour"))
-        is_boundary = pre_hour == 23 and post_hour == 0
+        is_boundary = pre_hour == last_hour and post_hour == 0
         if is_boundary:
             shed_overflow = max(
                 shed_overflow,
@@ -1266,15 +1351,21 @@ def _is_end_of_day_transition(pre: Mapping[str, Any], post: Mapping[str, Any],
         return False
     if pre_step is None or post_step is None:
         # Keep small direct unit fixtures useful; real replay observations always
-        # carry step and day, so replay validation takes the strict branch below.
-        return pre_day is None and post_day is None
+        # carry step for player 0. Player 1's engine observation omits step, so
+        # its day increment is the strict boundary signal instead.
+        if pre_step is None and post_step is None:
+            return pre_day is None and post_day is None or (
+                pre_day is not None and post_day == pre_day + 1
+            )
+        return False
     if post_step != pre_step + 1 or int(pre_step) % int(turns_per_day) != int(turns_per_day) - 1:
         return False
     return pre_day is None or (post_day is not None and post_day == pre_day + 1)
 
 
 def _action_target_tile_expected(before: Any, command: Sequence[Any], pre: Mapping[str, Any],
-                                post: Mapping[str, Any], configuration: Mapping[str, Any] | None) -> tuple[bool, Any]:
+                                post: Mapping[str, Any], configuration: Mapping[str, Any] | None,
+                                *, apply_boundary_refresh: bool | None = None) -> tuple[bool, Any]:
     """Return the exact board tile an action may produce at its target.
 
     Targeted tiles cannot be treated as an unrestricted mutation escape hatch:
@@ -1286,8 +1377,9 @@ def _action_target_tile_expected(before: Any, command: Sequence[Any], pre: Mappi
         return False, None
     operation = command[0]
     boundary = _is_end_of_day_transition(pre, post, configuration)
+    refresh = boundary if apply_boundary_refresh is None else apply_boundary_refresh
     day = int(_number(pre.get("day")) or 0)
-    step = int(_number(pre.get("step")) or 0)
+    step = _observation_step(pre, configuration)
     turns_per_day = int(_number(_config_value(configuration, "turnsPerDay", 24)) or 24)
 
     if operation == "PLANT":
@@ -1302,7 +1394,7 @@ def _action_target_tile_expected(before: Any, command: Sequence[Any], pre: Mappi
             "max_lifespan_step": -1 if crop_data["ongoing"] else (day + crop_data["max_yield_day"] + 1) * turns_per_day,
             "fertilized_until_day": -1,
         }
-        return True, _daily_refresh_tile(expected, day, step, turns_per_day) if boundary else expected
+        return True, _daily_refresh_tile(expected, day, step, turns_per_day) if refresh else expected
 
     if operation in {"BUILD_COOP", "BUILD_PASTURE"}:
         expected = {"kind": operation.removeprefix("BUILD_")}
@@ -1325,7 +1417,7 @@ def _action_target_tile_expected(before: Any, command: Sequence[Any], pre: Mappi
             "fed_today": False, "cared_today": False,
             "fertilizer_available": False, "pending_care_bonus": 0,
         }
-        return True, _daily_refresh_tile(expected, day, step, turns_per_day) if boundary else expected
+        return True, _daily_refresh_tile(expected, day, step, turns_per_day) if refresh else expected
 
     if operation in {"WATER", "FEED", "CARE", "FERTILIZE", "COLLECT_FERTILIZER"}:
         if not isinstance(before, Mapping):
@@ -1367,7 +1459,7 @@ def _action_target_tile_expected(before: Any, command: Sequence[Any], pre: Mappi
             if not animal or before.get("fertilizer_available") is not True:
                 return False, None
             expected["fertilizer_available"] = False
-        return True, _daily_refresh_tile(expected, day, step, turns_per_day) if boundary else expected
+        return True, _daily_refresh_tile(expected, day, step, turns_per_day) if refresh else expected
 
     if operation == "HARVEST":
         if not isinstance(before, Mapping) or (_number(before.get("yield_units")) or 0) <= 0:
@@ -1381,46 +1473,47 @@ def _action_target_tile_expected(before: Any, command: Sequence[Any], pre: Mappi
             expected = {**before, "yield_units": 0}
         else:
             return False, None
-        if boundary and expected is not None:
+        if refresh and expected is not None:
             expected = _daily_refresh_tile(expected, day, step, turns_per_day)
         return True, expected
 
     return False, None
 
 
-def _action_target_tile_lifespan_decay_matches(before: Any, after: Any, command: Sequence[Any],
-                                               pre: Mapping[str, Any], post: Mapping[str, Any],
-                                               configuration: Mapping[str, Any] | None) -> bool:
-    """Accept the engine's post-action lifespan decay on a targeted plant.
-
-    ``_decay_plants`` runs after unit actions, including during the day when a
-    plant reaches its exact lifespan step.  This is an action-plus-refresh
-    transition, not permission for any other targeted-tile mutation.
-    """
-    if not command or command[0] != "WATER" or not isinstance(before, Mapping):
-        return False
+def _action_target_tile_sequence_expected(before: Any, commands: Sequence[Sequence[Any]],
+                                          pre: Mapping[str, Any], post: Mapping[str, Any],
+                                          configuration: Mapping[str, Any] | None) -> tuple[bool, Any]:
+    """Apply same-tile commands in farmer-then-hand engine order, then refresh once."""
+    current = before
+    applied = False
+    for command in commands:
+        valid, expected = _action_target_tile_expected(
+            current, command, pre, post, configuration, apply_boundary_refresh=False,
+        )
+        if valid:
+            current = expected
+            applied = True
+        # The engine silently no-ops a later command whose precondition was
+        # consumed by an earlier command on the same tile (for example a
+        # second WATER after the first WATER, or WATER after HARVEST).
+    if not applied:
+        return False, None
+    day = int(_number(pre.get("day")) or 0)
+    step = _observation_step(pre, configuration)
+    turns_per_day = int(_number(_config_value(configuration, "turnsPerDay", 24)) or 24)
     if _is_end_of_day_transition(pre, post, configuration):
-        return False
-    if _tile_kind(before) != "PLANT":
-        return False
-    lifespan = _number(before.get("max_lifespan_step"))
-    step = _number(pre.get("step"))
-    if lifespan is None or step is None or step < lifespan or int(step - lifespan) % 2 != 0:
-        return False
-    valid, expected = _action_target_tile_expected(before, command, pre, post, configuration)
-    if not valid or not isinstance(expected, Mapping) or _tile_kind(expected) != "PLANT":
-        return False
-    yield_units = _number(expected.get("yield_units"))
-    if yield_units is None:
-        return False
-    expected = dict(expected)
-    expected["yield_units"] = int(yield_units) - 1
-    if expected["yield_units"] <= 0:
-        expected = {"kind": "WEED"}
-    return after == expected
+        current = _daily_refresh_tile(current, day, step, turns_per_day)
+    elif isinstance(current, Mapping) and _tile_kind(current) == "PLANT":
+        lifespan = _number(current.get("max_lifespan_step"))
+        if lifespan is not None and lifespan >= 0 and step >= lifespan and int(step - lifespan) % 2 == 0:
+            current = dict(current)
+            current["yield_units"] = (_number(current.get("yield_units")) or 0) - 1
+            if current["yield_units"] <= 0:
+                current = {"kind": "WEED"}
+    return True, current
 
 
-def _tile_state_matches_expected(actual: Any, expected: Any) -> bool:
+def _tile_state_matches_expected(actual: Any, expected: Any, *, allow_compact: bool = False) -> bool:
     """Compare a replay tile without allowing unmodeled fields.
 
     A few unit fixtures intentionally use a compact tile representation.  A
@@ -1430,6 +1523,8 @@ def _tile_state_matches_expected(actual: Any, expected: Any) -> bool:
     """
     if actual == expected:
         return True
+    if not allow_compact:
+        return False
     if not isinstance(actual, Mapping) or not isinstance(expected, Mapping):
         return False
     return set(actual).issubset(expected) and all(actual[key] == expected[key] for key in actual)
@@ -1453,8 +1548,19 @@ def _compact_plant_action_matches(actual: Any, command: Sequence[Any], pre: Mapp
 
 
 def _midday_board_changes_valid(pre: Mapping[str, Any], post: Mapping[str, Any], action: Mapping[str, Any],
-                                configuration: Mapping[str, Any] | None, market_result: Mapping[str, Any]) -> bool:
+                                configuration: Mapping[str, Any] | None, market_result: Mapping[str, Any],
+                                *, allow_compact: bool | None = None) -> bool:
     """Reject board changes not attributable to this turn's unit/land actions."""
+    if allow_compact is None:
+        allow_compact = (
+            "boardSize" not in _mapping(configuration)
+            or ("day" not in pre and "day" not in post)
+        )
+    if not allow_compact and (
+        not _board_dimensions_valid(pre, configuration)
+        or not _board_dimensions_valid(post, configuration)
+    ):
+        return False
     pre_farm = _farm_observation(pre)
     post_farm = _farm_observation(post)
     pre_tiles = pre_farm.get("tiles")
@@ -1491,18 +1597,21 @@ def _midday_board_changes_valid(pre: Mapping[str, Any], post: Mapping[str, Any],
             if before == after:
                 continue
             if (x, y) in target_commands:
-                if any(
-                    valid and (
-                        _tile_state_matches_expected(after, expected)
-                        or _compact_plant_action_matches(after, command, pre)
-                        or _action_target_tile_lifespan_decay_matches(
-                            before, after, command, pre, post, configuration
-                        )
-                    )
-                    for command in target_commands[(x, y)]
-                    for valid, expected in (_action_target_tile_expected(
-                        before, command, pre, post, configuration
-                    ),)
+                valid, expected = _action_target_tile_sequence_expected(
+                    before, target_commands[(x, y)], pre, post, configuration,
+                )
+                if valid and (
+                    _tile_state_matches_expected(after, expected, allow_compact=allow_compact)
+                    or (allow_compact and any(
+                        _compact_plant_action_matches(after, command, pre)
+                        for command in target_commands[(x, y)]
+                    ))
+                ):
+                    continue
+                if not valid and _is_end_of_day_transition(pre, post, configuration) and _end_of_day_tile_compatible(
+                    before, after, day=int(_number(pre.get("day")) or 0),
+                    step=_observation_step(pre, configuration),
+                    turns_per_day=int(_number(_config_value(configuration, "turnsPerDay", 24)) or 24),
                 ):
                     continue
                 return False
@@ -1515,7 +1624,7 @@ def _midday_board_changes_valid(pre: Mapping[str, Any], post: Mapping[str, Any],
                 continue
             if _is_end_of_day_transition(pre, post, configuration) and _end_of_day_tile_compatible(
                     before, after, day=int(_number(pre.get("day")) or 0),
-                    step=int(_number(pre.get("step")) or 0),
+                    step=_observation_step(pre, configuration),
                     turns_per_day=int(_number(_config_value(configuration, "turnsPerDay", 24)) or 24)):
                 continue
             # The engine can decay a plant at its exact lifespan boundary after
@@ -1523,8 +1632,8 @@ def _midday_board_changes_valid(pre: Mapping[str, Any], post: Mapping[str, Any],
             # the resulting weed, so unrelated arbitrary mutations remain errors.
             if isinstance(before, Mapping) and _tile_kind(before) == "PLANT":
                 lifespan = _number(before.get("max_lifespan_step"))
-                step = _number(pre.get("step"))
-                if lifespan is not None and step is not None and step >= lifespan and int(step - lifespan) % 2 == 0:
+                step = _observation_step(pre, configuration)
+                if lifespan is not None and lifespan >= 0 and step is not None and step >= lifespan and int(step - lifespan) % 2 == 0:
                     expected = dict(before)
                     expected["yield_units"] = (_number(before.get("yield_units")) or 0) - 1
                     if expected["yield_units"] <= 0:
@@ -1599,6 +1708,23 @@ def _board_size(observation: Mapping[str, Any], configuration: Mapping[str, Any]
     return max(1, len(tiles) if isinstance(tiles, Sequence) and not isinstance(tiles, (str, bytes)) else 1)
 
 
+def _board_dimensions_valid(observation: Mapping[str, Any], configuration: Mapping[str, Any] | None) -> bool:
+    farm = _farm_observation(observation)
+    tiles = farm.get("tiles")
+    configured_size = _config_value(configuration, "boardSize", None)
+    size = _number(configured_size) if configured_size is not None else (
+        float(len(tiles)) if isinstance(tiles, Sequence) and not isinstance(tiles, (str, bytes)) else None
+    )
+    if size is None or int(size) != size or int(size) < 1:
+        return False
+    if not isinstance(tiles, Sequence) or isinstance(tiles, (str, bytes)) or len(tiles) != int(size):
+        return False
+    return all(
+        isinstance(row, Sequence) and not isinstance(row, (str, bytes)) and len(row) == int(size)
+        for row in tiles
+    )
+
+
 def _tile_at_worker(observation: Mapping[str, Any], worker_index: int) -> Any:
     position = _worker_position(observation, worker_index)
     tiles = _mapping(_farm_observation(observation)).get("tiles", ())
@@ -1644,7 +1770,19 @@ def _unit_command_valid_for_state(command: Any, observation: Mapping[str, Any], 
     if operation == "WATER":
         return _tile_kind(tile) == "PLANT" and tile.get("watered_today") is False if isinstance(tile, Mapping) else False
     if operation == "HARVEST":
-        return isinstance(tile, Mapping) and _tile_kind(tile) != "LOCKED" and (_number(tile.get("yield_units")) or 0) > 0
+        if not isinstance(tile, Mapping) or _tile_kind(tile) == "LOCKED" or (_number(tile.get("yield_units")) or 0) <= 0:
+            return False
+        day = _number(observation.get("day"))
+        if day is None:
+            return True
+        if _tile_kind(tile) == "PLANT":
+            crop = CROPS.get(tile.get("crop"))
+            planted_day = _number(tile.get("planted_day"))
+            return crop is not None and planted_day is not None and day - planted_day >= crop["first_yield_day"]
+        animal = _animal_state(tile)
+        animal_data = ANIMALS.get(animal.get("animal"))
+        placed_day = _number(animal.get("placed_day"))
+        return animal_data is not None and placed_day is not None and day - placed_day >= animal_data["first_yield_day"]
     if operation == "DIG":
         return tile is not None and _tile_kind(tile) != "LOCKED" and not (isinstance(tile, Mapping) and "animal" in tile)
     if operation == "FERTILIZE":
@@ -1711,10 +1849,20 @@ def _private_inventories(observation: Mapping[str, Any]) -> list[dict[str, float
 
 def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], action: Mapping[str, Any],
                              configuration: Mapping[str, Any] | None = None,
-                             market_result: Mapping[str, Any] | None = None) -> bool:
+                             market_result: Mapping[str, Any] | None = None,
+                             *, player_index: int = 0, allow_compact: bool | None = None,
+                             market_observation: Mapping[str, Any] | None = None,
+                             allow_invalid_unit_noop: bool = False) -> bool:
     """Check deterministic effects of one recorded player action."""
     if not isinstance(pre, Mapping) or not isinstance(post, Mapping) or market_result is None:
         return False
+    if player_index not in (0, 1):
+        return False
+    if allow_compact is None:
+        allow_compact = (
+            "boardSize" not in _mapping(configuration)
+            or ("day" not in pre and "day" not in post)
+        )
     pre_farm = _farm_observation(pre)
     post_farm = _farm_observation(post)
     pre_hands = pre_farm.get("hands", ())
@@ -1725,14 +1873,32 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
         return False
     boundary = _is_end_of_day_transition(pre, post, configuration)
     simulated_states = market_result.get("states", ())
-    simulated = simulated_states[0] if isinstance(simulated_states, Sequence) and simulated_states else {}
+    simulated = (
+        simulated_states[player_index]
+        if isinstance(simulated_states, Sequence) and len(simulated_states) > player_index
+        else {}
+    )
     if not isinstance(simulated, Mapping):
         return False
-    pre_hires = int(_number(pre_farm.get("hires_today")) or 0)
+    pre_hires_value = _number(pre_farm.get("hires_today"))
+    if pre_hires_value is None:
+        if not allow_compact:
+            return False
+        pre_hires_value = 0
+    if int(pre_hires_value) != pre_hires_value or pre_hires_value < 0:
+        return False
+    pre_hires = int(pre_hires_value)
     total_hires = int(_number(simulated.get("hires")) or 0)
     hire_count = max(0, total_hires - pre_hires)
     expected_hands = 0 if boundary else len(pre_hands) + hire_count
     if len(post_hands) != expected_hands:
+        return False
+    post_hires_value = _number(post_farm.get("hires_today"))
+    expected_hires = 0 if boundary else total_hires
+    if post_hires_value is None:
+        if not allow_compact:
+            return False
+    elif int(post_hires_value) != post_hires_value or int(post_hires_value) != expected_hires:
         return False
     if boundary:
         reset_position = _default_spawn_position(_board_size(pre, configuration))
@@ -1767,6 +1933,7 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
     for worker_index, command in enumerate(commands):
         if not isinstance(command, Sequence) or isinstance(command, (str, bytes)) or not command:
             return False
+        state_valid = _unit_command_valid_for_state(command, pre, worker_index, configuration)
         position = _worker_position(pre, worker_index)
         post_position = _worker_position(post, worker_index)
         if position is None:
@@ -1780,10 +1947,14 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
         if operation in {"NORTH", "SOUTH", "EAST", "WEST"}:
             deltas = {"NORTH": (0, -1), "SOUTH": (0, 1), "EAST": (1, 0), "WEST": (-1, 0)}
             dx, dy = deltas[operation]
-            if not boundary and post_position != (position[0] + dx, position[1] + dy):
+            expected_position = (position[0] + dx, position[1] + dy) if state_valid else position
+            if not boundary and post_position != expected_position:
                 return False
         elif not boundary and post_position != position:
             return False
+
+        if allow_invalid_unit_noop and not state_valid:
+            continue
 
         pre_tile = _tile_at_position(pre, position)
         post_tile = _tile_at_position(post, position)
@@ -1839,7 +2010,7 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
             if boundary:
                 expected_tile = _targeted_boundary_tile_expected(
                     pre_tile, operation, int(_number(pre.get("day")) or 0),
-                    int(_number(pre.get("step")) or 0),
+                    _observation_step(pre, configuration),
                     int(_number(_config_value(configuration, "turnsPerDay", 24)) or 24),
                 )
                 if post_tile != expected_tile:
@@ -1926,9 +2097,11 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
             spawned.append(list(position))
         if post_hands[len(pre_hands):] != spawned:
             return False
-    if not _midday_board_changes_valid(pre, post, action, configuration, market_result):
+    if not _midday_board_changes_valid(
+        pre, post, action, configuration, market_result, allow_compact=allow_compact,
+    ):
         return False
-    if not _post_market_effects_valid(pre, post, market_result, configuration):
+    if not _post_market_effects_valid(market_observation or pre, post, market_result, configuration):
         return False
     return True
 

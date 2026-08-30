@@ -9,7 +9,7 @@ except ModuleNotFoundError:
     make = None
 
 
-def _engine_envelope(replay, seed=1):
+def _engine_envelope(replay, seed=1, *, legacy_compact_fixture=True):
     from kagriculture_agent.constants import ENGINE_VERSION
 
     replay.update({
@@ -20,6 +20,7 @@ def _engine_envelope(replay, seed=1):
         "schema_version": 1,
         "title": "Kaggriculture",
         "description": "test",
+        "metadata": {"legacy_compact_fixture": legacy_compact_fixture},
         "info": {"seed": seed},
         "configuration": {
             "episodeSteps": 720, "seed": None, "actTimeout": 1, "runTimeout": 1200,
@@ -30,6 +31,47 @@ def _engine_envelope(replay, seed=1):
         },
         "specification": {"action": {}, "agents": [2], "configuration": {}},
     })
+    return replay
+
+
+def _strict_two_turn_replay():
+    """Return a complete two-turn envelope for integrity-only regressions."""
+    tiles = [[None for _ in range(4)] for _ in range(4)]
+    p0_farm = {
+        "money": 100, "farmer": [0, 0], "hands": [], "hires_today": 0,
+        "tiles": tiles, "unlocked_quadrants": ["NW"],
+    }
+    p1_farm = {
+        "money": 90, "farmer": [0, 0], "hands": [], "hires_today": 0,
+        "tiles": [[None for _ in range(4)] for _ in range(4)], "unlocked_quadrants": ["NW"],
+    }
+    market = {"prices": {"WHEAT": 25}, "inventory": {"WHEAT": 10000}}
+
+    def observation(player, step, hour):
+        farms = [p0_farm] if player == 0 else [{"money": 100}, p1_farm]
+        return {
+            "player": player, "step": step, "day": 0, "hour": hour,
+            "farms": farms,
+            "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+            "market": market,
+        }
+
+    def state(player, step, hour, status):
+        return {
+            "observation": observation(player, step, hour),
+            "action": {"farmer": ["PASS"], "hands": [], "market": []},
+            "status": status, "info": {},
+        }
+
+    replay = {
+        "steps": [[state(0, 0, 0, "ACTIVE"), state(1, 0, 0, "ACTIVE")],
+                  [state(0, 1, 1, "DONE"), state(1, 1, 1, "DONE")]],
+        "rewards": [100, 90], "statuses": ["DONE", "DONE"], "info": {},
+    }
+    replay = _engine_envelope(replay, legacy_compact_fixture=False)
+    replay["configuration"]["episodeSteps"] = 2
+    replay["configuration"]["boardSize"] = 4
+    replay["specification"]["action"] = {"type": "object"}
     return replay
 
 
@@ -436,6 +478,135 @@ def test_replay_rejects_tampered_plant_without_post_state_effect():
 
     assert record["framework_error"] is True
     assert record["outcome"] == "framework_error"
+
+
+def test_replay_rejects_truncated_done_replay_against_episode_steps():
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    replay["configuration"]["episodeSteps"] = 720
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+
+
+def test_replay_rejects_opponent_final_money_tampering():
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    post = replay["steps"][1][1]["observation"]
+    replay["steps"][1][1]["observation"] = {
+        **post,
+        "farms": [post["farms"][0], {**post["farms"][1], "money": 91}],
+    }
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+
+
+def test_replay_rejects_player_hour_tampering():
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    post = replay["steps"][1][0]["observation"]
+    replay["steps"][1][0]["observation"] = {**post, "hour": 2}
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+
+
+def test_replay_rejects_opponent_hour_tampering():
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    post = replay["steps"][1][1]["observation"]
+    replay["steps"][1][1]["observation"] = {**post, "hour": 2}
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+
+
+def test_real_replay_rejects_extra_board_row():
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    post = replay["steps"][1][0]["observation"]
+    farm = post["farms"][0]
+    replay["steps"][1][0]["observation"] = {
+        **post, "farms": [{**farm, "tiles": [*farm["tiles"], [None, None, None, None]]}],
+    }
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+
+
+def test_real_replay_rejects_deleted_target_tile_field():
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    animal = {
+        "kind": "COOP", "animal": "GOOSE", "placed_day": 0,
+        "yield_units": 0, "consecutive_unfed": 0, "fed_today": False,
+        "cared_today": False, "fertilizer_available": False,
+        "pending_care_bonus": 0,
+    }
+    pre = replay["steps"][0][0]["observation"]
+    post = replay["steps"][1][0]["observation"]
+    replay["steps"][0][0]["action"] = {"farmer": ["PASS"], "hands": [], "market": []}
+    replay["steps"][1][0]["action"] = {"farmer": ["CARE"], "hands": [], "market": []}
+    pre_farm = {**pre["farms"][0], "tiles": [[animal]]}
+    post_animal = {**animal, "cared_today": True}
+    post_animal.pop("pending_care_bonus")
+    post_farm = {**post["farms"][0], "tiles": [[post_animal]]}
+    replay["steps"][0][0]["observation"] = {**pre, "farms": [pre_farm]}
+    replay["steps"][1][0]["observation"] = {**post, "farms": [post_farm]}
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+
+
+def test_midday_accepts_sequential_same_tile_water_then_fertilize():
+    from scripts.evaluate import _midday_board_changes_valid
+
+    before = {
+        "kind": "PLANT", "crop": "WHEAT", "planted_day": 0,
+        "watered_today": False, "consecutive_unwatered": 0,
+        "yield_units": 1, "max_lifespan_step": 120,
+        "fertilized_until_day": -1,
+    }
+    after = {**before, "watered_today": True, "fertilized_until_day": 2}
+    pre_farm = {
+        "money": 100, "farmer": [0, 0], "hands": [[0, 0]], "hires_today": 1,
+        "tiles": [[before]], "unlocked_quadrants": ["NW"],
+    }
+    post_farm = {**pre_farm, "tiles": [[after]]}
+    pre = {
+        "player": 0, "step": 1, "day": 0, "hour": 1, "farms": [pre_farm],
+        "private": {"seeds": {}, "shed": {}, "inventories": [{}, {"FERTILIZER": 1}]},
+        "market": {"inventory": {}, "prices": {}},
+    }
+    post = {**pre, "step": 2, "hour": 2, "farms": [post_farm]}
+    market_result = {
+        "states": [{"money": 100, "shed": {}, "seeds": {}, "hires": 1, "unlocked": ["NW"]}],
+        "market_inventory": {},
+    }
+
+    assert _midday_board_changes_valid(
+        pre, post, {"farmer": ["WATER"], "hands": [["FERTILIZE"]], "market": []},
+        {"boardSize": 1, "turnsPerDay": 24}, market_result,
+    )
 
 
 def test_price_floor_sales_uses_both_players_market_queues():
