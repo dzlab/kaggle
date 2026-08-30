@@ -547,6 +547,53 @@ def test_transition_effects_accept_end_of_day_hire_hand_reset():
     )
 
 
+def _boundary_feed_replay_states():
+    board = [[None for _ in range(10)] for _ in range(10)]
+    board[0][0] = {"kind": "PASTURE", "animal": "COW", "fed_today": False,
+                   "cared_today": False, "consecutive_unfed": 1, "yield_units": 0,
+                   "fertilizer_available": False, "pending_care_bonus": 0, "placed_day": 0}
+    pre_farm = {"money": 100, "farmer": [0, 0], "hands": [], "hires_today": 0,
+                "tiles": board, "unlocked_quadrants": ["NW"]}
+    post_board = [[tile for tile in row] for row in board]
+    post_board[0][0] = {**board[0][0], "consecutive_unfed": 0,
+                        "fertilizer_available": True, "fed_today": False, "cared_today": False}
+    post_farm = {**pre_farm, "farmer": [4, 4], "tiles": post_board}
+    pre = {"player": 0, "step": 23, "day": 0, "hour": 23, "farms": [pre_farm],
+           "private": {"seeds": {}, "shed": {"WHEAT": 99}, "inventories": [{"WHEAT": 2}]},
+           "market": {"inventory": {}, "prices": {}}}
+    post = {"player": 0, "step": 24, "day": 1, "hour": 0, "farms": [post_farm],
+            "private": {"seeds": {}, "shed": {"WHEAT": 100}, "inventories": [{}]},
+            "market": {"inventory": {}, "prices": {}}}
+    market_result = {"states": [{"money": 100, "shed": {"WHEAT": 99}, "seeds": {},
+                                  "hires": 0, "unlocked": ["NW"]}], "market_inventory": {}}
+    return pre, post, market_result
+
+
+def test_transition_effects_accepts_boundary_feed_consumption_and_drop():
+    from scripts.evaluate import _transition_effects_valid
+
+    pre, post, market_result = _boundary_feed_replay_states()
+
+    assert _transition_effects_valid(
+        pre, post, {"farmer": ["FEED"], "hands": [], "market": []}, {}, market_result,
+    )
+
+
+@pytest.mark.parametrize("tamper", ["shed", "farmer"])
+def test_transition_effects_rejects_boundary_inventory_or_farmer_reset_tampering(tamper):
+    from scripts.evaluate import _transition_effects_valid
+
+    pre, post, market_result = _boundary_feed_replay_states()
+    if tamper == "shed":
+        post["private"]["shed"]["WHEAT"] = 99
+    else:
+        post["farms"][0]["farmer"] = [0, 0]
+
+    assert not _transition_effects_valid(
+        pre, post, {"farmer": ["FEED"], "hands": [], "market": []}, {}, market_result,
+    )
+
+
 def test_transition_effects_accepts_midday_hire_spawn_and_new_inventory():
     from scripts.evaluate import _transition_effects_valid
 
@@ -1097,6 +1144,18 @@ def test_final_boundary_targeted_feed_without_wheat_is_still_missed():
 
     assert record["framework_error"] is True
     assert record["missed_basic_needs"] == 1
+
+
+def test_missed_basic_needs_excludes_optional_care_bonus():
+    from scripts.evaluate import _missed_needs_at_boundary
+
+    animal = {"kind": "PASTURE", "animal": "COW", "fed_today": True, "cared_today": False}
+    farm = {"farmer": [0, 0], "hands": [], "tiles": [[animal]]}
+    observation = {"player": 0, "hour": 23, "farms": [farm]}
+    post = {"player": 0, "hour": 0, "farms": [farm]}
+    action = {"farmer": ["PASS"], "hands": [], "market": []}
+
+    assert _missed_needs_at_boundary(observation, True, post, {"action": action}, {}) == 0
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")

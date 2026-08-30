@@ -52,7 +52,9 @@ an explicitly selected output). Use `--quick` for a 2-seed, 96-step smoke
 batch. `--variant NAME` may be repeated as an alternative to `--variants`. The
 report includes outcome counts, win rate, bank statistics, bank differential,
 framework-error rate, shed overflow, price-floor sales, and replay-observable
-missed basic needs. The `selected_default` field chooses the variant by
+missed watering/feeding basic needs. `CARE` is an optional production bonus and
+is intentionally excluded from that required-needs metric. The
+`selected_default` field chooses the variant by
 lowest framework-error rate first, then aggregate win rate, then median final
 bank. This prevents a less reliable variant from outranking a zero-failure
 variant.

@@ -556,11 +556,8 @@ def _missed_needs_at_boundary(observation: Mapping[str, Any], is_boundary: bool,
             target_fed = coordinate in targets.get("FEED", set())
             if needs_feed and not post_fed and not (reset_after_boundary and target_fed) and not (post_observation is None and target_fed):
                 missed += 1
-            needs_care = animal_state.get("needs_care") is True or animal_state.get("cared_today") is False
-            post_cared = post_tile.get("cared_today") is True
-            target_cared = coordinate in targets.get("CARE", set())
-            if needs_care and not post_cared and not (reset_after_boundary and target_cared) and not (post_observation is None and target_cared):
-                missed += 1
+            # CARE is an optional production bonus, not a basic need.  It is
+            # intentionally excluded from this required-needs metric.
     return missed
 
 
@@ -1077,6 +1074,15 @@ def _shed_access_positions(board_size: int) -> tuple[tuple[int, int], ...]:
     return ((half - 1, half - 1), (half, half - 1), (half - 1, half), (half, half))
 
 
+def _default_spawn_position(board_size: int) -> tuple[int, int]:
+    """Mirror the engine's deterministic farmer reset position."""
+    half = board_size // 2
+    for position in _shed_access_positions(board_size):
+        if position[0] >= 0 and position[1] >= 0 and position[0] < half and position[1] < half:
+            return position
+    return (0, 0)
+
+
 def _spawn_hand_position(farm: Mapping[str, Any], board_size: int,
                          existing_hands: Sequence[Sequence[int]] | None = None) -> tuple[int, int]:
     """Mirror the engine's first-free, least-occupied shed-access spawn rule."""
@@ -1528,10 +1534,22 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
     expected_hands = 0 if boundary else len(pre_hands) + hire_count
     if len(post_hands) != expected_hands:
         return False
+    if boundary:
+        reset_position = _default_spawn_position(_board_size(pre, configuration))
+        tiles = pre_farm.get("tiles")
+        if (isinstance(tiles, Sequence) and not isinstance(tiles, (str, bytes))
+                and len(tiles) < reset_position[1] + 1):
+            reset_position = _default_spawn_position(len(tiles))
+        if _worker_position(post, 0) != reset_position:
+            return False
     commands = [action.get("farmer"), *list(action.get("hands", ()))]
     inventories = _private_inventories(pre)
     post_inventories = _private_inventories(post)
+    if boundary and (inventories is None or post_inventories is None):
+        return False
     if inventories is not None and post_inventories is not None:
+        if len(inventories) < len(commands):
+            return False
         expected_inventories = [dict(inventory) for inventory in inventories]
         if not boundary:
             expected_inventories.extend({} for _ in range(hire_count))
@@ -1612,7 +1630,7 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
             if not isinstance(post_tile, Mapping) or post_tile.get("animal") != command[1]:
                 return False
 
-        if expected_inventories is None or boundary or worker_index >= len(expected_inventories):
+        if expected_inventories is None or worker_index >= len(expected_inventories):
             continue
         inventory = expected_inventories[worker_index]
         item = command[1] if len(command) > 1 else None
@@ -1643,7 +1661,16 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
                 room -= taken
             inventory.clear()
 
-    if expected_inventories is not None and not boundary:
+    if expected_inventories is not None and boundary:
+        for inventory in expected_inventories:
+            room = max(0.0, _shed_capacity(configuration) - sum(expected_shed.values()))
+            for item, quantity in list(inventory.items()):
+                taken = min(max(0.0, quantity), room)
+                add_quantity(expected_shed, item, taken)
+                room -= taken
+                inventory.pop(item, None)
+        expected_inventories = [{}]
+    if expected_inventories is not None:
         if post_inventories != expected_inventories:
             return False
         if _positive_quantities(_mapping(_mapping(post).get("private")).get("shed")) != _positive_quantities(expected_shed):

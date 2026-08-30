@@ -6,7 +6,7 @@
 
 **Architecture:** Use a deterministic observation-to-action policy with a small per-episode memory, an explicit daily macro planner, and a shortest-path task scheduler for the farmer and temporary farm hands. The planner will score crop, animal, land, hiring, fertilizer, and selling decisions with the exact published game mechanics, while the policy layer converts the selected tasks into one legal action per unit and up to ten ordered market orders per turn.
 
-**Tech Stack:** Python 3, `kaggle-environments>=1.32.7`, pytest, standard library (`dataclasses`, `heapq`, `collections`, `math`, `json`), optional pandas only for offline replay analysis.
+**Tech Stack:** Python >=3.11, `kaggle-environments==1.32.7`, pytest as a dev dependency, standard library (`dataclasses`, `heapq`, `collections`, `math`, `json`), optional pandas only for offline replay analysis. Use `uv sync` and `uv run` for the local environment.
 
 ---
 
@@ -138,8 +138,11 @@ Use this minimum project configuration:
 [project]
 name = "kaggriculture-agent"
 version = "0.1.0"
-requires-python = ">=3.10"
-dependencies = ["kaggle-environments==1.32.7", "pytest>=8,<10"]
+requires-python = ">=3.11"
+dependencies = ["kaggle-environments==1.32.7; python_version >= '3.11'"]
+
+[dependency-groups]
+dev = ["pytest>=8,<10"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -313,7 +316,7 @@ Expected: short games and the seeded full game complete with status `DONE` for b
 
 - [x] **Step 1: Implement batch evaluation**
 
-Run at least 30 seeds per opponent and report mean/median/fifth-percentile final bank, win rate, error rate, average shed overflow, average price-floor sales, and missed basic-needs events. Store JSON summaries beside replays.
+Run at least 30 seeds per opponent and report mean/median/fifth-percentile final bank, win rate, error rate, average shed overflow, average price-floor sales, and missed watering/feeding basic-needs events. `CARE` is an optional production bonus and is excluded from the required-needs metric. Store JSON summaries beside replays.
 
 - [x] **Step 2: Add controlled variants**
 
@@ -390,6 +393,8 @@ The evaluator review follow-ups are also complete:
 - mid-day hires are checked for engine spawn positions and newly created hand inventories; shared post-market inventory and price effects are checked against both players’ queues and town demand;
 - both players’ market queues are simulated in shared per-unit lockstep for validation and floor-sale metrics;
 - malformed or missing replay provenance, configuration, info, status, steps, and action structures become framework failures rather than evaluator exceptions;
+- end-of-day validation models action inventory consumption, capacity-limited shed drops, and the deterministic farmer reset position;
+- missed-basic-needs reporting covers required watering/feeding only; omitted `CARE` is not treated as a failure;
 - default variant selection prioritizes framework reliability before win rate and median-bank tie-breakers;
 - isolated one-component ablations, pre-transition overflow, real 23→0 need boundaries, final-state need confirmation, and deterministic batch reporting are covered by regression tests.
 
