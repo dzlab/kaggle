@@ -26,6 +26,7 @@ from kagriculture_agent.constants import (  # noqa: E402
     LAND_PRICES,
     PRICE_FLOOR,
     PRODUCTS,
+    SHOPS,
     max_market_orders,
     shed_capacity,
 )
@@ -267,9 +268,9 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
                   other_states: Sequence[Mapping[str, Any]], configuration: Mapping[str, Any] | None = None) -> bool:
     if not isinstance(replay, Mapping):
         return False
-    if not isinstance(replay.get("info"), Mapping):
+    if not _valid_engine_provenance(replay):
         return False
-    for optional_mapping in ("metadata", "configuration"):
+    for optional_mapping in ("metadata",):
         if optional_mapping in replay and not isinstance(replay[optional_mapping], Mapping):
             return False
     statuses = replay.get("statuses")
@@ -342,6 +343,60 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
     if _final_bank(own_states[-1]) is None or _final_bank(other_states[-1]) is None:
         return False
     return not bool(_mapping(replay.get("info")).get("error"))
+
+
+def _valid_engine_provenance(replay: Mapping[str, Any]) -> bool:
+    """Require the replay envelope emitted by the Kaggriculture engine."""
+    required_text = ("id", "name", "version", "module_version", "title", "description")
+    if any(not isinstance(replay.get(key), str) or not replay[key] for key in required_text):
+        return False
+    if replay.get("name") != "kaggriculture" or replay.get("module_version") != ENGINE_VERSION:
+        return False
+    schema_version = replay.get("schema_version")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != 1:
+        return False
+    info = replay.get("info")
+    if not isinstance(info, Mapping) or isinstance(info.get("seed"), bool) or not isinstance(info.get("seed"), int):
+        return False
+    specification = replay.get("specification")
+    if not isinstance(specification, Mapping):
+        return False
+    action_spec = specification.get("action")
+    agents = specification.get("agents")
+    config_spec = specification.get("configuration")
+    if not isinstance(action_spec, Mapping) or not isinstance(agents, Sequence) or isinstance(agents, (str, bytes)):
+        return False
+    if list(agents) != [2] or not isinstance(config_spec, Mapping):
+        return False
+    configuration = replay.get("configuration")
+    if not isinstance(configuration, Mapping):
+        return False
+    integer_config = {
+        "episodeSteps": 1,
+        "boardSize": 4,
+        "startingMoney": 0,
+        "maxMarketOrdersPerTurn": 1,
+        "turnsPerDay": 1,
+        "shedCapacity": 1,
+        "townShopUnlockInterval": 1,
+        "townShopSellInterval": 1,
+        "townCenterSellInterval": 1,
+        "farmHandCostMult": 0,
+    }
+    for key, minimum in integer_config.items():
+        value = configuration.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            return False
+    for key in ("actTimeout", "runTimeout", "weedSpawnChance"):
+        value = _number(configuration.get(key))
+        if value is None or value < 0:
+            return False
+    seed = configuration.get("seed")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        return False
+    if not isinstance(configuration.get("marketParams"), Mapping):
+        return False
+    return True
 
 
 def _final_bank(state: Mapping[str, Any] | None) -> float | None:
@@ -1017,6 +1072,146 @@ def _worker_position(observation: Mapping[str, Any], worker_index: int) -> tuple
         return None
 
 
+def _shed_access_positions(board_size: int) -> tuple[tuple[int, int], ...]:
+    half = board_size // 2
+    return ((half - 1, half - 1), (half, half - 1), (half - 1, half), (half, half))
+
+
+def _spawn_hand_position(farm: Mapping[str, Any], board_size: int,
+                         existing_hands: Sequence[Sequence[int]] | None = None) -> tuple[int, int]:
+    """Mirror the engine's first-free, least-occupied shed-access spawn rule."""
+    access = _shed_access_positions(board_size)
+    occupants = {position: 0 for position in access}
+    farmer = farm.get("farmer")
+    positions = [farmer, *(existing_hands if existing_hands is not None else farm.get("hands", ()))]
+    for raw_position in positions:
+        if isinstance(raw_position, Sequence) and not isinstance(raw_position, (str, bytes)) and len(raw_position) == 2:
+            try:
+                position = (int(raw_position[0]), int(raw_position[1]))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if position in occupants:
+                occupants[position] += 1
+    return min(access, key=lambda position: (occupants[position], access.index(position)))
+
+
+def _board_value(observation: Mapping[str, Any], position: tuple[int, int]) -> Any:
+    return _tile_at_position(observation, position)
+
+
+def _midday_board_changes_valid(pre: Mapping[str, Any], post: Mapping[str, Any], action: Mapping[str, Any],
+                                configuration: Mapping[str, Any] | None, market_result: Mapping[str, Any]) -> bool:
+    """Reject board changes not attributable to this turn's unit/land actions."""
+    pre_farm = _farm_observation(pre)
+    post_farm = _farm_observation(post)
+    pre_tiles = pre_farm.get("tiles")
+    post_tiles = post_farm.get("tiles")
+    if not isinstance(pre_tiles, Sequence) or isinstance(pre_tiles, (str, bytes)):
+        return False
+    if not isinstance(post_tiles, Sequence) or isinstance(post_tiles, (str, bytes)):
+        return False
+    size = _board_size(pre, configuration)
+    commands = [action.get("farmer"), *list(action.get("hands", ()))]
+    tile_operations = {"PLANT", "WATER", "HARVEST", "FERTILIZE", "FEED", "CARE", "COLLECT_FERTILIZER",
+                       "DIG", "BUILD_COOP", "BUILD_PASTURE", "PLACE"}
+    allowed_positions = set()
+    for index, command in enumerate(commands):
+        if isinstance(command, Sequence) and not isinstance(command, (str, bytes)) and command and command[0] in tile_operations:
+            position = _worker_position(pre, index)
+            if position is not None:
+                allowed_positions.add(position)
+
+    pre_unlocked = pre_farm.get("unlocked_quadrants", ())
+    post_unlocked = post_farm.get("unlocked_quadrants", ())
+    if not isinstance(pre_unlocked, Sequence) or isinstance(pre_unlocked, (str, bytes)):
+        return False
+    if not isinstance(post_unlocked, Sequence) or isinstance(post_unlocked, (str, bytes)):
+        return False
+    try:
+        newly_unlocked = set(post_unlocked) - set(pre_unlocked)
+    except TypeError:
+        return False
+    for y in range(max(len(pre_tiles), len(post_tiles))):
+        for x in range(size):
+            before = _board_value(pre, (x, y))
+            after = _board_value(post, (x, y))
+            if before == after:
+                continue
+            if (x, y) in allowed_positions:
+                continue
+            quadrant = ("N" if y < size // 2 else "S") + ("W" if x < size // 2 else "E")
+            if quadrant in newly_unlocked and before == "LOCKED" and after is None:
+                continue
+            # The engine can decay a plant at its exact lifespan boundary after
+            # actions.  This is deterministic and limited to yield decrement or
+            # the resulting weed, so unrelated arbitrary mutations remain errors.
+            if isinstance(before, Mapping) and _tile_kind(before) == "PLANT":
+                lifespan = _number(before.get("max_lifespan_step"))
+                step = _number(pre.get("step"))
+                if lifespan is not None and step is not None and step >= lifespan and int(step - lifespan) % 2 == 0:
+                    expected = dict(before)
+                    expected["yield_units"] = (_number(before.get("yield_units")) or 0) - 1
+                    if expected["yield_units"] <= 0:
+                        expected = {"kind": "WEED"}
+                    if after == expected:
+                        continue
+            return False
+    return True
+
+
+def _post_market_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any],
+                               market_result: Mapping[str, Any], configuration: Mapping[str, Any] | None) -> bool:
+    """Validate the shared market inventory after orders and deterministic town demand."""
+    town = pre.get("town")
+    if town is not None and not isinstance(town, Mapping):
+        return False
+    expected = market_result.get("market_inventory")
+    if not isinstance(expected, Mapping):
+        return False
+    expected = {item: _number(quantity) for item, quantity in expected.items()}
+    if any(quantity is None for quantity in expected.values()):
+        return False
+    shops = town.get("unlocked_shops", ()) if isinstance(town, Mapping) else ()
+    if not isinstance(shops, Sequence) or isinstance(shops, (str, bytes)):
+        return False
+    if isinstance(town, Mapping):
+        step = _number(pre.get("step"))
+        if step is None or int(step) != step:
+            return False
+        try:
+            shop_interval = int(_config_value(configuration, "townShopSellInterval", 4))
+            center_interval = int(_config_value(configuration, "townCenterSellInterval", 24))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if shop_interval < 1 or center_interval < 1:
+            return False
+        if int(step) % shop_interval == 0:
+            for shop in shops:
+                if shop not in SHOPS:
+                    return False
+                multiplier = 2 if len(SHOPS[shop]) == 1 else 1
+                for item in SHOPS[shop]:
+                    expected[item] = expected.get(item, 0) - multiplier
+        if int(step) % center_interval == 0:
+            for item in PRODUCTS:
+                if item != "FERTILIZER":
+                    expected[item] = expected.get(item, 0) - 1
+    post_market = _mapping(post.get("market"))
+    post_inventory = post_market.get("inventory")
+    if not isinstance(post_inventory, Mapping) or set(post_inventory) != set(expected):
+        return False
+    if any(_number(post_inventory[item]) != quantity for item, quantity in expected.items()):
+        return False
+    prices = post_market.get("prices")
+    if isinstance(town, Mapping) and (not isinstance(prices, Mapping) or set(prices) != set(expected)):
+        return False
+    if isinstance(town, Mapping) and isinstance(prices, Mapping):
+        params = _mapping(_config_value(configuration, "marketParams", {}))
+        if any(_number(prices[item]) != market_price(item, quantity, params) for item, quantity in expected.items()):
+            return False
+    return True
+
+
 def _board_size(observation: Mapping[str, Any], configuration: Mapping[str, Any] | None = None) -> int:
     configured = _config_value(configuration, "boardSize", None)
     if configured is not None:
@@ -1157,7 +1352,10 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
     simulated = simulated_states[0] if isinstance(simulated_states, Sequence) and simulated_states else {}
     if not isinstance(simulated, Mapping):
         return False
-    expected_hands = 0 if boundary else len(pre_hands) + int(simulated.get("hires", 0)) - int(_number(pre_farm.get("hires_today")) or 0)
+    pre_hires = int(_number(pre_farm.get("hires_today")) or 0)
+    total_hires = int(_number(simulated.get("hires")) or 0)
+    hire_count = max(0, total_hires - pre_hires)
+    expected_hands = 0 if boundary else len(pre_hands) + hire_count
     if len(post_hands) != expected_hands:
         return False
     commands = [action.get("farmer"), *list(action.get("hands", ()))]
@@ -1165,6 +1363,8 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
     post_inventories = _private_inventories(post)
     if inventories is not None and post_inventories is not None:
         expected_inventories = [dict(inventory) for inventory in inventories]
+        if not boundary:
+            expected_inventories.extend({} for _ in range(hire_count))
         expected_shed = dict(_positive_quantities(simulated.get("shed")))
     else:
         expected_inventories = None
@@ -1273,6 +1473,19 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
     if expected_money is None or _cash(post) != expected_money:
         return False
     if list(_mapping(post_farm).get("unlocked_quadrants", ())) != list(simulated.get("unlocked", ())):
+        return False
+    if not boundary and hire_count:
+        expected_existing_hands = list(post_hands[:len(pre_hands)])
+        spawned = []
+        for _ in range(hire_count):
+            position = _spawn_hand_position(post_farm, _board_size(pre, configuration),
+                                            [*expected_existing_hands, *spawned])
+            spawned.append(list(position))
+        if post_hands[len(pre_hands):] != spawned:
+            return False
+    if not boundary and not _midday_board_changes_valid(pre, post, action, configuration, market_result):
+        return False
+    if not _post_market_effects_valid(pre, post, market_result, configuration):
         return False
     return True
 

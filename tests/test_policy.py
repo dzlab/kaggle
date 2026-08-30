@@ -64,6 +64,33 @@ def test_policy_emits_one_legal_command_per_visible_worker_and_bounded_market():
     assert len(action["market"]) <= 10
 
 
+def test_planner_sanitizes_invalid_seed_quantities_and_nonfinite_task_values():
+    from kagriculture_agent.planner import assign_tasks, build_daily_plan, normalize_planner_state
+
+    state = {
+        "day": 0,
+        "tiles": [[{"kind": "PLANT", "crop": "WHEAT", "yield_units": float("inf")}]],
+        "seeds": {"WHEAT": float("nan"), "MELON": -3, "CARROT": "invalid"},
+        "inventory": {"WHEAT": float("inf"), "CARROT": -2},
+        "market": {"prices": {"WHEAT": 25}},
+    }
+
+    normalized = normalize_planner_state(state)
+    assert normalized["seeds"] == {"WHEAT": 0, "MELON": 0, "CARROT": 0}
+    assert normalized["inventory"] == {"WHEAT": 0, "CARROT": 0}
+    plan = build_daily_plan(state)
+    assert all(task.value >= 0 and task.value != float("inf") and task.value == task.value for task in plan)
+    assert all(task.kind != "HARVEST" for task in plan)
+
+    invalid_task = Task("WATER", (0, 0), 100, 0, float("nan"))
+    assignments = assign_tasks(
+        [invalid_task],
+        [{"index": 0, "role": "FARMER", "position": (0, 0)}],
+        {"day": 0, "board_size": 1, "tiles": [[None]], "workers": []},
+    )
+    assert assignments == []
+
+
 def test_policy_falls_back_to_safe_action_for_nonfinite_or_negative_shed_values():
     action = policy_module.Policy().act(
         observation(shed={"WHEAT": float("nan"), "MELON": float("inf"), "CARROT": -3})

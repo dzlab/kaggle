@@ -9,6 +9,30 @@ except ModuleNotFoundError:
     make = None
 
 
+def _engine_envelope(replay, seed=1):
+    from kagriculture_agent.constants import ENGINE_VERSION
+
+    replay.update({
+        "id": "test-replay",
+        "name": "kaggriculture",
+        "version": "0.1.0",
+        "module_version": ENGINE_VERSION,
+        "schema_version": 1,
+        "title": "Kaggriculture",
+        "description": "test",
+        "info": {"seed": seed},
+        "configuration": {
+            "episodeSteps": 720, "seed": None, "actTimeout": 1, "runTimeout": 1200,
+            "boardSize": 10, "startingMoney": 3000, "maxMarketOrdersPerTurn": 10,
+            "turnsPerDay": 24, "shedCapacity": 100, "weedSpawnChance": 0.005,
+            "townShopUnlockInterval": 3, "townShopSellInterval": 4,
+            "townCenterSellInterval": 24, "farmHandCostMult": 1, "marketParams": {},
+        },
+        "specification": {"action": {}, "agents": [2], "configuration": {}},
+    })
+    return replay
+
+
 def test_cli_parses_seed_opponent_variant_and_quick_options():
     from scripts.evaluate import parse_args
 
@@ -238,7 +262,7 @@ def test_replay_record_extracts_outcome_and_replay_metrics():
         "info": {},
     }
 
-    record = replay_record(replay, variant="mixed", opponent="pass", seed=5)
+    record = replay_record(_engine_envelope(replay, seed=5), variant="mixed", opponent="pass", seed=5)
 
     assert record["outcome"] == "win"
     assert record["bank_differential"] == 40
@@ -291,7 +315,7 @@ def test_shed_overflow_uses_pre_transition_shed_and_worker_inventory():
          {"observation": other, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "DONE", "info": {}}],
     ], "statuses": ["DONE", "DONE"], "info": {}}
 
-    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+    record = replay_record(_engine_envelope(replay), variant="mixed", opponent="pass", seed=1)
 
     assert record["framework_error"] is False
     assert record["shed_overflow"] == 3
@@ -334,7 +358,7 @@ def test_malformed_unlocked_quadrants_is_a_framework_failure(unlocked_quadrants)
         {"observation": other, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "DONE", "info": {}},
     ]], "statuses": ["DONE", "DONE"], "info": {}}
 
-    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+    record = replay_record(_engine_envelope(replay), variant="mixed", opponent="pass", seed=1)
 
     assert record["framework_error"] is True
     assert record["outcome"] == "framework_error"
@@ -371,7 +395,7 @@ def test_replay_actions_are_validated_against_the_preceding_observation():
         "statuses": ["DONE", "DONE"], "info": {},
     }
 
-    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+    record = replay_record(_engine_envelope(replay), variant="mixed", opponent="pass", seed=1)
 
     assert record["framework_error"] is False
     assert record["outcome"] == "win"
@@ -521,6 +545,129 @@ def test_transition_effects_accept_end_of_day_hire_hand_reset():
     assert _transition_effects_valid(
         pre, post, {"farmer": ["PASS"], "hands": [], "market": [["HIRE"]]}, {}, market_result,
     )
+
+
+def test_transition_effects_accepts_midday_hire_spawn_and_new_inventory():
+    from scripts.evaluate import _transition_effects_valid
+
+    farm = {"money": 100, "farmer": [4, 4], "hands": [], "hires_today": 0,
+            "tiles": [[None for _ in range(10)] for _ in range(10)], "unlocked_quadrants": ["NW"]}
+    pre = {"player": 0, "step": 0, "day": 0, "hour": 0, "farms": [farm],
+           "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+           "market": {"inventory": {}, "prices": {}}}
+    post = {"player": 0, "step": 1, "day": 0, "hour": 1,
+            "farms": [{**farm, "money": 99, "hands": [[5, 4]], "hires_today": 1}],
+            "private": {"seeds": {}, "shed": {}, "inventories": [{}, {}]},
+            "market": {"inventory": {}, "prices": {}}}
+    market_result = {
+        "states": [{"money": 99, "shed": {}, "seeds": {}, "hires": 1, "unlocked": ["NW"]}],
+        "market_inventory": {},
+    }
+
+    assert _transition_effects_valid(
+        pre, post, {"farmer": ["PASS"], "hands": [], "market": [["HIRE"]]},
+        {"boardSize": 10}, market_result,
+    )
+
+
+def test_transition_effects_rejects_invalid_midday_hire_spawn():
+    from scripts.evaluate import _transition_effects_valid
+
+    farm = {"money": 100, "farmer": [4, 4], "hands": [], "hires_today": 0,
+            "tiles": [[None for _ in range(10)] for _ in range(10)], "unlocked_quadrants": ["NW"]}
+    pre = {"player": 0, "step": 0, "day": 0, "hour": 0, "farms": [farm],
+           "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+           "market": {"inventory": {}, "prices": {}}}
+    post = {"player": 0, "step": 1, "day": 0, "hour": 1,
+            "farms": [{**farm, "money": 99, "hands": [[0, 0]], "hires_today": 1}],
+            "private": {"seeds": {}, "shed": {}, "inventories": [{}, {}]},
+            "market": {"inventory": {}, "prices": {}}}
+    market_result = {
+        "states": [{"money": 99, "shed": {}, "seeds": {}, "hires": 1, "unlocked": ["NW"]}],
+        "market_inventory": {},
+    }
+
+    assert not _transition_effects_valid(
+        pre, post, {"farmer": ["PASS"], "hands": [], "market": [["HIRE"]]},
+        {"boardSize": 10}, market_result,
+    )
+
+
+def test_transition_effects_rejects_unrelated_board_mutation():
+    from scripts.evaluate import _transition_effects_valid
+
+    pre_farm = {"money": 100, "farmer": [0, 0], "hands": [], "hires_today": 0,
+                "tiles": [[None, None], [None, None]], "unlocked_quadrants": ["NW"]}
+    post_farm = {**pre_farm, "tiles": [[None, {"kind": "COOP"}], [None, None]]}
+    pre = {"player": 0, "step": 0, "hour": 0, "farms": [pre_farm],
+           "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+           "market": {"inventory": {}, "prices": {}}}
+    post = {"player": 0, "step": 1, "hour": 1, "farms": [post_farm],
+            "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+            "market": {"inventory": {}, "prices": {}}}
+    market_result = {"states": [{"money": 100, "shed": {}, "seeds": {}, "hires": 0, "unlocked": ["NW"]}],
+                     "market_inventory": {}}
+
+    assert not _transition_effects_valid(
+        pre, post, {"farmer": ["PASS"], "hands": [], "market": []}, {}, market_result,
+    )
+
+
+def test_transition_effects_treats_unhashable_unlock_metadata_as_invalid():
+    from scripts.evaluate import _midday_board_changes_valid
+
+    farm = {"money": 100, "farmer": [0, 0], "hands": [], "hires_today": 0,
+            "tiles": [[None]], "unlocked_quadrants": [{}]}
+    pre = {"player": 0, "step": 1, "hour": 1, "farms": [farm], "private": {}, "market": {}}
+    post = {"player": 0, "step": 2, "hour": 2, "farms": [farm], "private": {}, "market": {}}
+    market_result = {"market_inventory": {}, "states": [{"unlocked": [{}]}]}
+
+    assert not _midday_board_changes_valid(
+        pre, post, {"farmer": ["PASS"], "hands": [], "market": []}, {}, market_result,
+    )
+
+
+def test_transition_effects_rejects_unexpected_post_market_inventory():
+    from scripts.evaluate import _transition_effects_valid
+
+    farm = {"money": 100, "farmer": [0, 0], "hands": [], "hires_today": 0,
+            "tiles": [[None]], "unlocked_quadrants": ["NW"]}
+    pre = {"player": 0, "step": 1, "hour": 1, "farms": [farm],
+           "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+           "market": {"inventory": {"WHEAT": 10}, "prices": {"WHEAT": 25}}}
+    post = {"player": 0, "step": 2, "hour": 2, "farms": [{**farm, "money": 75}],
+            "private": {"seeds": {}, "shed": {"WHEAT": 1}, "inventories": [{}]},
+            "market": {"inventory": {"WHEAT": 8}, "prices": {"WHEAT": 25}}}
+    market_result = {"states": [{"money": 75, "shed": {"WHEAT": 1}, "seeds": {}, "hires": 0, "unlocked": ["NW"]}],
+                     "market_inventory": {"WHEAT": 9}}
+
+    assert not _transition_effects_valid(
+        pre, post, {"farmer": ["PASS"], "hands": [], "market": [["BUY_PRODUCT", "WHEAT", 1]]},
+        {"townShopSellInterval": 99, "townCenterSellInterval": 99}, market_result,
+    )
+
+
+def test_replay_requires_configuration_and_engine_provenance():
+    from scripts.evaluate import replay_record
+
+    observation = {
+        "player": 0, "step": 0, "day": 0, "hour": 0,
+        "farms": [{"money": 100, "farmer": [0, 0], "hands": [], "hires_today": 0,
+                   "tiles": [[None]], "unlocked_quadrants": ["NW"]}],
+        "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+        "market": {"prices": {}, "inventory": {}},
+    }
+    other = {**observation, "player": 1, "farms": [{"money": 100}, {"money": 90, "farmer": [0, 0], "hands": [],
+                                                        "hires_today": 0, "tiles": [[None]], "unlocked_quadrants": ["NW"]}]}
+    replay = {"steps": [[
+        {"observation": observation, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "DONE", "info": {}},
+        {"observation": other, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "DONE", "info": {}},
+    ]], "statuses": ["DONE", "DONE"], "info": {}}
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
 
 
 def test_transition_effects_accept_drop_capacity_discard():

@@ -387,9 +387,10 @@ Tasks 1–7 are implemented and locally reviewed. The submission entry point, de
 The evaluator review follow-ups are also complete:
 
 - replay actions are checked against the observation before the action and their deterministic post-state effects, including worker movement, board changes, seeds, inventories, cash, land, builds, and market purchases/sales;
+- mid-day hires are checked for engine spawn positions and newly created hand inventories; shared post-market inventory and price effects are checked against both players’ queues and town demand;
 - both players’ market queues are simulated in shared per-unit lockstep for validation and floor-sale metrics;
-- malformed replay metadata, info, configuration, status, steps, and action structures become framework failures rather than evaluator exceptions;
-- default variant selection prioritizes framework reliability before win rate and bank tie-breakers;
+- malformed or missing replay provenance, configuration, info, status, steps, and action structures become framework failures rather than evaluator exceptions;
+- default variant selection prioritizes framework reliability before win rate and median-bank tie-breakers;
 - isolated one-component ablations, pre-transition overflow, real 23→0 need boundaries, final-state need confirmation, and deterministic batch reporting are covered by regression tests.
 
 The maintained verification command is:

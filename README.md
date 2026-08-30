@@ -69,7 +69,11 @@ and its legality checks are unchanged.
 Replay validation pairs each recorded action with the preceding observation
 that was available when the action was chosen. It checks the evaluated policy's
 unit and market preconditions, reports malformed or unverified replays as
-framework failures, and uses the following observation only to confirm effects.
+framework failures, requires the engine configuration/provenance envelope,
+and verifies deterministic worker, board, inventory, cash, land, and shared
+post-market effects where the replay contains enough state. The following
+observation is used only to confirm those effects; unsupported or ambiguous
+transitions are not reported as clean games.
 
 ## Kaggle submission packaging
 

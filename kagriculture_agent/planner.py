@@ -134,7 +134,10 @@ def normalize_planner_state(state: Any) -> dict[str, Any]:
         "tiles": tiles,
         "animals": source.get("animals", farm.get("animals", private.get("animals", []))),
         "structures": source.get("structures", farm.get("structures", private.get("structures", []))),
-        "seeds": dict(seeds) if isinstance(seeds, Mapping) else {},
+        "seeds": {
+            str(item): _safe_quantity(quantity)
+            for item, quantity in seeds.items()
+        } if isinstance(seeds, Mapping) else {},
         "inventory": {
             str(item): _safe_quantity(quantity)
             for item, quantity in inventory.items()
@@ -368,7 +371,13 @@ def _target_position(value: Any) -> Position | None:
 def _add(plan: list[Task], kind: str, target: Any, priority: int, deadline: int | None, value: float) -> None:
     if _target_position(target) is None and kind not in _SHED_WORK:
         return
-    plan.append(Task(kind, target, priority, deadline, max(0.0, float(value))))
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        numeric_value = 0.0
+    if not isfinite(numeric_value) or numeric_value < 0:
+        numeric_value = 0.0
+    plan.append(Task(kind, target, priority, deadline, numeric_value))
 
 
 def _inventory(state: Any) -> Mapping[str, Any]:
@@ -468,7 +477,7 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
             _add(plan, "ANIMAL", _position(animal), 40, None, _get(animal, "value", 1))
 
     inventory = _inventory(state)
-    held = sum(float(quantity) for quantity in inventory.values() if isinstance(quantity, (int, float)) and quantity > 0)
+    held = sum(float(_safe_quantity(quantity)) for quantity in inventory.values())
     if held > 0:
         shed_target = _shed_target(state, board_size)
         _add(plan, "SHED", shed_target, 85, day, held)
@@ -535,6 +544,12 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
     unique: dict[tuple[Any, ...], Task] = {}
     for task in plan:
         if not isinstance(task, Task):
+            continue
+        try:
+            task_value = float(task.value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not isfinite(task_value) or task_value < 0:
             continue
         key = _task_key(task)
         current = unique.get(key)
