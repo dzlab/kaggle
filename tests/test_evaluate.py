@@ -247,6 +247,43 @@ def test_replay_record_extracts_outcome_and_replay_metrics():
     assert record["missed_basic_needs"] == 1
 
 
+def test_replay_actions_are_validated_against_the_preceding_observation():
+    from scripts.evaluate import replay_record
+
+    initial = {
+        "player": 0, "step": 0, "hour": 0,
+        "farms": [{"money": 100, "farmer": [0, 0], "hands": [], "tiles": [[None]]}],
+        "private": {"seeds": {"WHEAT": 1}, "shed": {}, "inventories": [{}]},
+        "market": {"prices": {"WHEAT": 25}, "inventory": {"WHEAT": 10000}},
+    }
+    post_plant = {
+        "player": 0, "step": 1, "hour": 1,
+        "farms": [{"money": 100, "farmer": [0, 0], "hands": [], "tiles": [[{"kind": "PLANT", "crop": "WHEAT", "watered_today": False, "yield_units": 0}]]}],
+        "private": {"seeds": {"WHEAT": 0}, "shed": {}, "inventories": [{}]},
+        "market": initial["market"],
+    }
+    other_initial = {
+        "player": 1, "step": 0, "hour": 0,
+        "farms": [{"money": 100}, {"money": 90, "farmer": [0, 0], "hands": [], "tiles": [[None]]}],
+        "private": {"seeds": {}, "shed": {}, "inventories": [{}]}, "market": initial["market"],
+    }
+    other_post = {**other_initial, "step": 1, "hour": 1}
+    replay = {
+        "steps": [
+            [{"observation": initial, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "ACTIVE", "info": {}},
+             {"observation": other_initial, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "ACTIVE", "info": {}}],
+            [{"observation": post_plant, "action": {"farmer": ["PLANT", "WHEAT"], "hands": [], "market": []}, "status": "DONE", "info": {}},
+             {"observation": other_post, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "DONE", "info": {}}],
+        ],
+        "statuses": ["DONE", "DONE"], "info": {},
+    }
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is False
+    assert record["outcome"] == "win"
+
+
 def test_invalid_or_missing_replay_states_are_framework_failures():
     from scripts.evaluate import aggregate_records, replay_record
 
@@ -311,19 +348,24 @@ def test_boundary_needs_use_post_action_state_when_available():
 
     before = {
         "player": 0, "step": 23, "hour": 23,
-        "farms": [{"money": 100, "tiles": [[{"kind": "PLANT", "watered_today": False}]]}],
+        "farms": [{"money": 100, "farmer": [0, 0], "hands": [], "tiles": [[{"kind": "PLANT", "watered_today": False}]]}],
+        "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+        "market": {"prices": {}, "inventory": {}},
     }
     after = {
         "player": 0, "step": 24, "hour": 23,
-        "farms": [{"money": 100, "tiles": [[{"kind": "PLANT", "watered_today": True}]]}],
+        "farms": [{"money": 100, "farmer": [0, 0], "hands": [], "tiles": [[{"kind": "PLANT", "watered_today": True}]]}],
+        "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+        "market": {"prices": {}, "inventory": {}},
     }
-    other = {"player": 1, "farms": [{"money": 90}, {"money": 90}]}
+    other = {"player": 1, "farms": [{"money": 90}, {"money": 90, "farmer": [0, 0], "hands": [], "tiles": [[None]]}],
+             "private": {"seeds": {}, "shed": {}, "inventories": [{}]}, "market": {"prices": {}, "inventory": {}}}
     replay = {
         "steps": [
-            [{"observation": before, "action": {"farmer": ["WATER"]}, "status": "ACTIVE", "info": {}},
-             {"observation": other, "action": {}, "status": "ACTIVE", "info": {}}],
-            [{"observation": after, "action": {}, "status": "DONE", "info": {}},
-             {"observation": other, "action": {}, "status": "DONE", "info": {}}],
+            [{"observation": before, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "ACTIVE", "info": {}},
+             {"observation": other, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "ACTIVE", "info": {}}],
+            [{"observation": after, "action": {"farmer": ["WATER"], "hands": [], "market": []}, "status": "DONE", "info": {}},
+             {"observation": other, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "DONE", "info": {}}],
         ],
         "statuses": ["DONE", "DONE"], "info": {},
     }
@@ -461,9 +503,9 @@ def test_final_boundary_targeted_feed_without_wheat_is_still_missed():
              "private": {"shed": {}, "seeds": {}, "inventories": [{}]}, "market": {"prices": {}, "inventory": {}}}
     other = {"player": 1, "farms": [{"money": 100}, {"money": 90, "farmer": [0, 0], "hands": [], "tiles": [[None for _ in range(3)] for _ in range(3)]}], "private": {"inventories": [{}]}, "market": {"prices": {}, "inventory": {}}}
     replay = {"steps": [
-        [{"observation": before, "action": {"farmer": ["FEED"], "hands": [], "market": []}, "status": "ACTIVE", "info": {}},
+        [{"observation": before, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "ACTIVE", "info": {}},
          {"observation": other, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "ACTIVE", "info": {}}],
-        [{"observation": after, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "DONE", "info": {}},
+        [{"observation": after, "action": {"farmer": ["FEED"], "hands": [], "market": []}, "status": "DONE", "info": {}},
          {"observation": other, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "DONE", "info": {}}],
     ], "statuses": ["DONE", "DONE"], "info": {}}
 
@@ -491,3 +533,4 @@ def test_same_seed_random_style_evaluator_is_reproducible():
     second = run_game(variant="mixed", opponent="random", seed=17, steps=8)
 
     assert first == second
+    assert first["framework_error"] is False

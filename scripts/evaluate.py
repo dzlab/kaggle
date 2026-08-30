@@ -210,19 +210,28 @@ def _valid_market_order_schema(order: Any, observation: Mapping[str, Any]) -> bo
     return inventory is not None and inventory >= 0 and price is not None and price >= PRICE_FLOOR
 
 
-def _valid_action_schema(action: Any, observation: Mapping[str, Any], configuration: Mapping[str, Any] | None = None) -> bool:
+def _valid_action_schema(action: Any, observation: Mapping[str, Any], configuration: Mapping[str, Any] | None = None,
+                         *, state_aware: bool = True) -> bool:
     if not isinstance(action, Mapping) or set(action) != {"farmer", "hands", "market"}:
         return False
     farmer = action.get("farmer")
     hands = action.get("hands")
     orders = action.get("market")
     farm = _farm_observation(observation)
-    if not _unit_command_valid_for_state(farmer, observation, 0, configuration) or not isinstance(hands, Sequence) or isinstance(hands, (str, bytes)):
+    valid_farmer = (
+        _unit_command_valid_for_state(farmer, observation, 0, configuration)
+        if state_aware else _legal_unit_command(farmer)
+    )
+    if not valid_farmer or not isinstance(hands, Sequence) or isinstance(hands, (str, bytes)):
         return False
     expected_hands = farm.get("hands", ())
     if not isinstance(expected_hands, Sequence) or isinstance(expected_hands, (str, bytes)) or len(hands) != len(expected_hands):
         return False
-    if not all(_unit_command_valid_for_state(command, observation, index + 1, configuration) for index, command in enumerate(hands)):
+    if state_aware:
+        valid_hands = all(_unit_command_valid_for_state(command, observation, index + 1, configuration) for index, command in enumerate(hands))
+    else:
+        valid_hands = all(_legal_unit_command(command) for command in hands)
+    if not valid_hands:
         return False
     if not isinstance(orders, Sequence) or isinstance(orders, (str, bytes)):
         return False
@@ -240,6 +249,10 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
         return False
     if len(own_states) != len(steps) or len(other_states) != len(steps):
         return False
+    previous_observations = {
+        0: _mapping(own_states[0].get("observation")),
+        1: _mapping(other_states[0].get("observation")),
+    }
     for index, turn in enumerate(steps):
         if not isinstance(turn, Sequence) or isinstance(turn, (str, bytes)):
             return False
@@ -256,13 +269,21 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
                 return False
             if state.get("error") or _mapping(state.get("info")).get("error"):
                 return False
-            if not _valid_action_schema(state["action"], observation, configuration):
+            if not _valid_action_schema(
+                state["action"], previous_observations[player], configuration, state_aware=player == 0
+            ):
                 return False
         if players != {0, 1}:
             return False
         expected_status = "DONE" if index == len(steps) - 1 else "ACTIVE"
         if any(state.get("status") != expected_status for state in turn if isinstance(state, Mapping)):
             return False
+        previous_observations = {
+            player: _mapping(state.get("observation"))
+            for player in (0, 1)
+            for state in turn
+            if isinstance(state, Mapping) and _mapping(state.get("observation")).get("player") == player
+        }
     if _final_bank(own_states[-1]) is None or _final_bank(other_states[-1]) is None:
         return False
     return not bool(_mapping(replay.get("info")).get("error"))
@@ -405,8 +426,8 @@ def _missed_needs_at_boundary(observation: Mapping[str, Any], is_boundary: bool,
     return missed
 
 
-def _price_floor_sales(state: Mapping[str, Any]) -> int:
-    observation = _mapping(state.get("observation"))
+def _price_floor_sales(state: Mapping[str, Any], observation: Mapping[str, Any] | None = None) -> int:
+    observation = observation or _mapping(state.get("observation"))
     market = _mapping(observation.get("market"))
     prices = _mapping(market.get("prices"))
     action = _mapping(state.get("action"))
@@ -444,15 +465,21 @@ def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, see
     floor_sales = 0
     missed_needs = 0
     steps = replay.get("steps", ())
-    last_step = len(steps) - 1 if isinstance(steps, Sequence) else -1
     for index, state in enumerate(own_states):
-        observation = _mapping(state.get("observation"))
-        shed_overflow = max(shed_overflow, max(0.0, _shed_total(observation) - shed_capacity))
-        floor_sales += _price_floor_sales(state)
-        hour = _number(observation.get("hour"))
-        is_boundary = hour == 23 or observation.get("step") == last_step
-        post = _mapping(own_states[index + 1].get("observation")) if index + 1 < len(own_states) else None
-        missed_needs += _missed_needs_at_boundary(observation, is_boundary, post, state, replay_configuration)
+        post = _mapping(state.get("observation"))
+        pre = _mapping(own_states[index - 1].get("observation")) if index else post
+        shed_overflow = max(shed_overflow, max(0.0, _shed_total(post) - shed_capacity))
+        # Kaggriculture emits a bootstrap record at index 0. Its placeholder
+        # action is schema-checked, but it was not chosen from a preceding
+        # replay observation and must not contribute action-derived metrics.
+        is_bootstrap = index == 0 and len(own_states) > 1
+        if not is_bootstrap:
+            floor_sales += _price_floor_sales(state, pre)
+        pre_hour = _number(pre.get("hour"))
+        post_hour = _number(post.get("hour"))
+        is_boundary = pre_hour == 23 or (index == len(own_states) - 1 and post_hour == 23)
+        if not is_bootstrap:
+            missed_needs += _missed_needs_at_boundary(pre, is_boundary, post, state, replay_configuration)
     return {
         "variant": variant,
         "opponent": opponent,
