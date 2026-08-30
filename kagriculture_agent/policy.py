@@ -889,6 +889,9 @@ class Policy:
         self.memory.diagnostics["plan_size"] = len(plan)
         self.memory.diagnostics["portfolio"] = dict(macro.get("portfolio", {}))
         self.memory.diagnostics["scenario_count"] = macro.get("scenario_count", 0)
+        self.memory.diagnostics["worker_indices"] = tuple(
+            sorted(_whole(_get(worker, "index")) for worker in normalized.get("workers", ()))
+        )
         return assignments
 
     def act(self, obs: Any) -> dict[str, Any]:
@@ -899,10 +902,12 @@ class Policy:
         macro = build_autonomous_macro_plan(state, self.memory)
         reset = self.memory.observe_time(_get(state, "day"), _get(state, "hour"))
         workers = _worker_records(state)
+        worker_indices = tuple(sorted(worker["index"] for worker in workers))
+        workers_changed = worker_indices != self.memory.diagnostics.get("worker_indices")
         hour_zero = _whole(_get(state, "hour")) == 0
         regime_changed = bool(self.memory.market_regime) and dict(regime) != self.memory.market_regime
         assignments_valid = all(_assignment_valid(state, assignment) for assignment in self.memory.assignments)
-        if reset or hour_zero or regime_changed or not self.memory.assignments or not assignments_valid:
+        if reset or hour_zero or workers_changed or regime_changed or not self.memory.assignments or not assignments_valid:
             protected = self._carried_assignments(state) if not reset and not hour_zero else ()
             assignments = self._replan(state, regime, macro, protected)
         else:

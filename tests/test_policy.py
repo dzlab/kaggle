@@ -253,6 +253,17 @@ def test_final_actionable_day_hires_for_unmet_basic_need_deadlines():
     assert [intent for intent in build_autonomous_macro_plan(state)["market_intents"] if intent == ["HIRE"]] == [["HIRE"]]
 
 
+def test_policy_replans_when_a_newly_hired_hand_appears_before_deadline():
+    board = [[None for _ in range(5)] for _ in range(5)]
+    board[0][0] = {"kind": "PLANT", "crop": "STRAWBERRY", "watered_today": False}
+    policy = policy_module.Policy()
+
+    policy.act(observation(day=27, hour=0, hands=[], tiles=board, seeds={}, money=1_000))
+    action = policy.act(observation(day=27, hour=1, hands=[[4, 4]], tiles=board, seeds={}, money=999))
+
+    assert action["hands"][0] != ["PASS"]
+
+
 @pytest.mark.parametrize("day", [28, 29])
 def test_late_season_seed_fallback_does_not_buy_wheat_when_planting_is_suppressed(day):
     action = policy_module.Policy().act(observation(day=day, hour=0, hands=[], seeds={}))

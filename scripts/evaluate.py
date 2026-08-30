@@ -2281,6 +2281,64 @@ def _animal_units_owned(observation: Mapping[str, Any]) -> int:
     return carried + placed
 
 
+def _variant_market_spend(order: Sequence[Any], observation: Mapping[str, Any]) -> float:
+    """Estimate non-seed spend so a crop bias cannot consume safety cash."""
+    if not order:
+        return 0.0
+    operation = order[0]
+    item = order[1] if len(order) > 1 else None
+    quantity = max(1, int(_number(order[2]) or 1)) if len(order) > 2 else 1
+    if operation == "HIRE":
+        farm = _farm_observation(observation)
+        return float(_fib(int(_number(farm.get("hires_today")) or 0)))
+    if operation == "BUY_LAND":
+        farm = _farm_observation(observation)
+        unlocked = farm.get("unlocked_quadrants", ())
+        index = len(unlocked) - 1 if isinstance(unlocked, Sequence) and not isinstance(unlocked, (str, bytes)) else -1
+        return float(LAND_PRICES[index]) if 0 <= index < len(LAND_PRICES) else 0.0
+    if operation == "BUY_ANIMAL" and item in ANIMALS:
+        return quantity * float(ANIMALS[item]["cost"])
+    if operation == "BUY_PRODUCT" and item in _BUYABLE_PRODUCTS:
+        market = _mapping(observation.get("market"))
+        inventory = _number(_mapping(market.get("inventory")).get(item)) or 0.0
+        return sum(_observed_unit_price(item, observation, inventory - offset, buying=True) for offset in range(quantity))
+    return 0.0
+
+
+def _preserve_variant_market_capacity(orders: Sequence[Sequence[Any]], observation: Mapping[str, Any],
+                                      *, seed_item: str) -> list[list[Any]]:
+    """Keep the variant seed bias above the policy's worker cash reserve."""
+    reserve = max(100.0, float(CROPS[seed_item]["seed"])) + float(CROPS[seed_item]["seed"])
+    non_seed_spend = sum(
+        _variant_market_spend(order, observation)
+        for order in orders
+        if order and order[0] != "BUY_SEED"
+    )
+    seed_budget = max(0.0, _cash(observation) - non_seed_spend - reserve)
+    result: list[list[Any]] = []
+    for raw_order in orders:
+        order = list(raw_order)
+        if order and order[0] == "BUY_SEED":
+            quantity = min(int(_number(order[2]) or 1), int(seed_budget // float(CROPS[seed_item]["seed"])))
+            if quantity <= 0:
+                continue
+            order[1] = seed_item
+            order[2] = quantity
+            seed_budget -= quantity * float(CROPS[seed_item]["seed"])
+        result.append(order)
+    return result
+
+
+def _prioritize_safety_market_orders(orders: Sequence[Sequence[Any]]) -> list[list[Any]]:
+    def is_safety(order: Sequence[Any]) -> bool:
+        return bool(order) and (order[0] == "HIRE" or (
+            order[0] == "BUY_PRODUCT" and len(order) > 1 and order[1] in _BUYABLE_PRODUCTS
+        ))
+    return [list(order) for order in orders if is_safety(order)] + [
+        list(order) for order in orders if not is_safety(order)
+    ]
+
+
 def _apply_ablations(action: Mapping[str, Any], observation: Mapping[str, Any], ablations: Mapping[str, bool]) -> dict[str, Any]:
     result = {"farmer": list(action.get("farmer", ["PASS"])), "hands": [list(command) for command in action.get("hands", ())],
               "market": _market_orders(action)}
@@ -2346,8 +2404,11 @@ def apply_variant(action: Mapping[str, Any], observation: Mapping[str, Any], var
     elif variant == "melon-heavy":
         if result["farmer"][:1] == ["PLANT"] and len(result["farmer"]) > 1 and result["farmer"][1] == "WHEAT" and _number(seeds.get("MELON")):
             result["farmer"][1] = "MELON"
+        result["market"] = _preserve_variant_market_capacity(
+            result["market"], observation, seed_item="MELON",
+        )
         for order in result["market"]:
-            if order[0] == "BUY_SEED" and _cash(observation) >= CROPS["MELON"]["seed"]:
+            if order[0] == "BUY_SEED":
                 order[1] = "MELON"
                 break
         if not any(order[0] == "BUY_SEED" for order in result["market"]) and not _number(seeds.get("MELON")) and _cash(observation) >= CROPS["MELON"]["seed"]:
@@ -2374,6 +2435,7 @@ def apply_variant(action: Mapping[str, Any], observation: Mapping[str, Any], var
                 result["market"].append(["BUY_ANIMAL", target, 1])
     elif variant != "mixed":
         raise ValueError(f"unsupported variant: {variant}")
+    result["market"] = _prioritize_safety_market_orders(result["market"])
     adjusted = _apply_ablations(result, observation, ablations or _DEFAULT_ABLATIONS)
     return _sanitize_action(adjusted, observation, action, configuration)
 

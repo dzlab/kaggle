@@ -616,6 +616,9 @@ def _feed_purchase_needed(state: Mapping[str, Any], day: int, counts: Mapping[st
 
 def _has_basic_need_deadline(state: Any, day: int | None = None) -> bool:
     """Return whether a required watering or feeding task is due today."""
+    raw_state = _mapping(state)
+    if "farm" not in raw_state and "farms" in raw_state:
+        state = parse_observation(state)
     normalized = normalize_planner_state(state)
     current_day = _day(normalized, EpisodeMemory()) if day is None else day
     return any(

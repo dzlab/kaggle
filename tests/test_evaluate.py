@@ -152,6 +152,18 @@ def test_conservative_seed17_random_replay_meets_all_basic_need_deadlines():
     assert record["missed_basic_needs"] == 0
 
 
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+@pytest.mark.parametrize("variant", ["conservative", "melon-heavy"])
+@pytest.mark.parametrize("opponent", ["pass", "random", "starter"])
+def test_seed17_required_needs_regression_matrix(variant, opponent):
+    from scripts.evaluate import run_game
+
+    record = run_game(variant=variant, opponent=opponent, seed=17, steps=720)
+
+    assert record["framework_error"] is False
+    assert record["missed_basic_needs"] == 0
+
+
 def test_percentile_uses_linear_interpolation():
     from scripts.evaluate import percentile
 
@@ -1562,6 +1574,33 @@ def test_conservative_variant_preserves_mandatory_wheat_and_fertilizer_orders():
         ["BUY_PRODUCT", "WHEAT", 1],
         ["BUY_PRODUCT", "FERTILIZER", 1],
     ]
+
+
+def test_conservative_variant_keeps_deadline_hire_from_raw_engine_observation():
+    from scripts.evaluate import apply_variant
+
+    observation = {
+        "player": 0,
+        "day": 27,
+        "hour": 0,
+        "farms": [{
+            "money": 1_000,
+            "farmer": [0, 0],
+            "hands": [],
+            "hires_today": 0,
+            "tiles": [[{"kind": "PLANT", "crop": "STRAWBERRY", "watered_today": False}]],
+        }],
+        "private": {"seeds": {}, "shed": {}},
+        "market": {"prices": {"WHEAT": 25}, "inventory": {"WHEAT": 10_000}},
+    }
+
+    result = apply_variant(
+        {"farmer": ["PASS"], "hands": [], "market": [["BUY_LAND"], ["HIRE"], ["BUY_PRODUCT", "WHEAT", 1]]},
+        observation,
+        "conservative",
+    )
+
+    assert result["market"][:2] == [["HIRE"], ["BUY_PRODUCT", "WHEAT", 1]]
 
 
 def test_route_scheduling_ablation_safely_inspects_nested_hand_commands():
