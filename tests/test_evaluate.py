@@ -103,6 +103,25 @@ def test_cli_default_output_is_under_reports():
     assert parse_args([]).output == Path("reports/evaluation.json")
 
 
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_quick_starter_replay_does_not_require_full_season_liquidation():
+    from scripts.evaluate import run_game
+
+    record = run_game(variant="mixed", opponent="starter", seed=1, steps=96)
+
+    assert record["framework_error"] is False
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_seed4_random_replay_accepts_natural_boundary_decay():
+    from scripts.evaluate import run_game
+
+    record = run_game(variant="mixed", opponent="random", seed=4, steps=720)
+
+    assert record["framework_error"] is False
+    assert record["missed_basic_needs"] == 0
+
+
 def test_percentile_uses_linear_interpolation():
     from scripts.evaluate import percentile
 
@@ -1370,6 +1389,75 @@ def test_variants_and_ablations_change_only_legal_action_shapes():
     assert variant_action["farmer"] == ["PLANT", "MELON"]
     assert variant_action["market"] == [["BUY_SEED", "MELON", 1]]
     assert ablated_action == {"farmer": ["PASS"], "hands": [], "market": []}
+
+
+def test_route_scheduling_ablation_safely_inspects_nested_hand_commands():
+    from scripts.evaluate import apply_variant
+
+    observation = {
+        "player": 0,
+        "farms": [{"money": 100, "farmer": [0, 0], "hands": [[0, 0]], "tiles": [[None]]}],
+        "private": {"seeds": {}, "inventories": [{}, {}]},
+        "market": {"prices": {}, "inventory": {}},
+    }
+    action = {"farmer": ["PASS"], "hands": [["EAST"]], "market": []}
+
+    result = apply_variant(
+        action, observation, "mixed",
+        {"route_scheduling": False, "market_batch_sizing": True, "shop_adaptation": True,
+         "land_purchase": True, "animals": True},
+    )
+
+    assert result["hands"] == [["PASS"]]
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_route_scheduling_ablation_produces_a_valid_replay():
+    from scripts.evaluate import run_game
+
+    record = run_game(
+        variant="mixed", opponent="pass", seed=2, steps=96,
+        ablations={"route_scheduling": False, "market_batch_sizing": True,
+                   "shop_adaptation": True, "land_purchase": True, "animals": True},
+    )
+
+    assert record["framework_error"] is False
+
+
+def test_demand_reactive_preserves_needs_safe_planner_schedule():
+    from scripts.evaluate import apply_variant
+
+    observation = {
+        "player": 0,
+        "farms": [{"money": 100, "farmer": [0, 0], "hands": [], "tiles": [[None]]}],
+        "private": {"seeds": {"WHEAT": 1}},
+        "market": {"prices": {"WHEAT": 25, "MELON": 250}, "inventory": {}},
+    }
+    action = {"farmer": ["PLANT", "WHEAT"], "hands": [], "market": []}
+
+    assert apply_variant(action, observation, "demand-reactive") == apply_variant(action, observation, "mixed")
+
+
+def test_malformed_unit_args_are_a_framework_failure_not_an_exception():
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    replay["steps"][0][0]["action"]["farmer"] = ["PLANT", []]
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+
+
+def test_real_replay_requires_every_intermediate_inventory_snapshot():
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    del replay["steps"][1][1]["observation"]["private"]["inventories"]
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
 
 
 def test_variant_postprocessing_caps_market_orders_and_preserves_affordability():

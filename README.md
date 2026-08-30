@@ -71,6 +71,14 @@ lowest framework-error rate first, then aggregate win rate, then median final
 bank. This prevents a less reliable variant from outranking a zero-failure
 variant.
 
+Replay validation requires empty carried inventories only when the replay
+reaches the configured full-season length (720 turns with the default
+configuration). Short `--quick` replays validate the recorded horizon without
+imposing end-of-season liquidation. `demand-reactive` remains supported as a
+needs-safe evaluator variant: the autonomous production policy performs the
+live quote/shop adaptation, while evaluator postprocessing does not rewrite its
+already scheduled crop choices and risk watering or feeding deadlines.
+
 The evaluator also supports isolated component ablations with repeated
 `--ablation component=off` options: `route_scheduling`, `market_batch_sizing`,
 `shop_adaptation`, `land_purchase`, and `animals`. The output always runs a

@@ -28,6 +28,7 @@ from kagriculture_agent.constants import (  # noqa: E402
     PRODUCTS,
     SHOPS,
     max_market_orders,
+    season_days,
     shed_capacity,
 )
 from kagriculture_agent.economics import market_price  # noqa: E402
@@ -316,6 +317,8 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
                 return False
             if state.get("error") or _mapping(state.get("info")).get("error"):
                 return False
+            if not legacy_compact and not _strict_private_inventories(observation):
+                return False
             if not _valid_action_schema(
                 state["action"], previous_observations[player], configuration,
                 state_aware=player == 0, validate_market=False,
@@ -370,12 +373,13 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
     if not legacy_compact:
         if rewards is None or any(final_banks[player] != _number(rewards[player]) for player in (0, 1)):
             return False
-        final_inventories = [
-            _private_inventories(_mapping(states[-1].get("observation")))
-            for states in (own_states, other_states)
-        ]
-        if any(inventories is None or any(inventory for inventory in inventories) for inventories in final_inventories):
-            return False
+        if _requires_full_liquidation(configuration, len(steps)):
+            final_inventories = [
+                _private_inventories(_mapping(states[-1].get("observation")))
+                for states in (own_states, other_states)
+            ]
+            if any(inventories is None or any(inventory for inventory in inventories) for inventories in final_inventories):
+                return False
     else:
         final_inventories = _private_inventories(_mapping(own_states[-1].get("observation")))
         if final_inventories is None or any(inventory for inventory in final_inventories):
@@ -386,6 +390,16 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
 def _legacy_compact_fixture(replay: Mapping[str, Any]) -> bool:
     metadata = replay.get("metadata")
     return isinstance(metadata, Mapping) and metadata.get("legacy_compact_fixture") is True
+
+
+def _requires_full_liquidation(configuration: Mapping[str, Any] | None, step_count: int) -> bool:
+    """Require terminal cleanup only for a complete configured season."""
+    episode_steps = _number(_config_value(configuration, "episodeSteps", None))
+    turns = _number(_config_value(configuration, "turnsPerDay", None))
+    if (episode_steps is None or turns is None or int(episode_steps) != episode_steps
+            or int(turns) != turns or int(turns) < 1):
+        return False
+    return int(episode_steps) == step_count and int(episode_steps) >= int(turns) * season_days
 
 
 def _time_progression_valid(pre: Mapping[str, Any], post: Mapping[str, Any],
@@ -1137,9 +1151,10 @@ def _legal_unit_command(command: Any) -> bool:
     if operation in {"NORTH", "SOUTH", "EAST", "WEST", "PASS", "DROP", "WATER", "HARVEST", "FERTILIZE", "FEED", "COLLECT_FERTILIZER", "CARE", "DIG", "BUILD_COOP", "BUILD_PASTURE"}:
         return len(command) == 1
     if operation == "PLANT":
-        return len(command) == 2 and command[1] in CROPS
+        return len(command) == 2 and isinstance(command[1], str) and command[1] in CROPS
     if operation in {"PICKUP", "PLACE"}:
-        return len(command) in {2, 3} and command[1] in _ITEM_NAMES and (len(command) == 2 or (isinstance(command[2], int) and not isinstance(command[2], bool) and command[2] > 0))
+        return (len(command) in {2, 3} and isinstance(command[1], str) and command[1] in _ITEM_NAMES
+                and (len(command) == 2 or (isinstance(command[2], int) and not isinstance(command[2], bool) and command[2] > 0)))
     return False
 
 
@@ -1383,7 +1398,8 @@ def _action_target_tile_expected(before: Any, command: Sequence[Any], pre: Mappi
     turns_per_day = int(_number(_config_value(configuration, "turnsPerDay", 24)) or 24)
 
     if operation == "PLANT":
-        if before is not None or len(command) != 2 or command[1] not in CROPS:
+        if (before is not None or len(command) != 2 or not isinstance(command[1], str)
+                or command[1] not in CROPS):
             return False, None
         crop = command[1]
         crop_data = CROPS[crop]
@@ -1607,6 +1623,15 @@ def _midday_board_changes_valid(pre: Mapping[str, Any], post: Mapping[str, Any],
                         for command in target_commands[(x, y)]
                     ))
                 ):
+                    continue
+                # A mature finite crop is removed by HARVEST before the
+                # seeded end-of-day weed spawn.  The action expectation is
+                # therefore None, while the real engine may record WEED.
+                if valid and _is_end_of_day_transition(pre, post, configuration) and expected is None and any(
+                    isinstance(command, Sequence) and not isinstance(command, (str, bytes))
+                    and command and command[0] == "HARVEST"
+                    for command in target_commands[(x, y)]
+                ) and _tile_kind(after) == "WEED":
                     continue
                 if not valid and _is_end_of_day_transition(pre, post, configuration) and _end_of_day_tile_compatible(
                     before, after, day=int(_number(pre.get("day")) or 0),
@@ -1845,6 +1870,32 @@ def _private_inventories(observation: Mapping[str, Any]) -> list[dict[str, float
     if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
         return None
     return [_positive_quantities(inventory) for inventory in raw]
+
+
+def _strict_quantity_mapping(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    for item, raw_quantity in value.items():
+        if not isinstance(item, str) or _number(raw_quantity) is None or _number(raw_quantity) < 0:
+            return False
+    return True
+
+
+def _strict_private_inventories(observation: Mapping[str, Any]) -> bool:
+    """Require the engine's complete, finite worker-inventory snapshot."""
+    private = observation.get("private")
+    if not isinstance(private, Mapping) or not _strict_quantity_mapping(private.get("shed", {})):
+        return False
+    if not _strict_quantity_mapping(private.get("seeds", {})):
+        return False
+    raw = private.get("inventories")
+    farm = _farm_observation(observation)
+    hands = farm.get("hands", ())
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return False
+    if not isinstance(hands, Sequence) or isinstance(hands, (str, bytes)) or len(raw) != len(hands) + 1:
+        return False
+    return all(_strict_quantity_mapping(inventory) for inventory in raw)
 
 
 def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], action: Mapping[str, Any],
@@ -2153,12 +2204,18 @@ def _apply_ablations(action: Mapping[str, Any], observation: Mapping[str, Any], 
     result = {"farmer": list(action.get("farmer", ["PASS"])), "hands": [list(command) for command in action.get("hands", ())],
               "market": _market_orders(action)}
     if not ablations.get("route_scheduling", True):
-        for key in ("farmer", "hands"):
-            commands = result[key] if key == "farmer" else result[key]
-            if commands and commands[0] in {"NORTH", "SOUTH", "EAST", "WEST"}:
-                result[key] = ["PASS"]
-            if key == "hands":
-                result[key] = [["PASS"] if command and command[0] in {"NORTH", "SOUTH", "EAST", "WEST"} else command for command in commands]
+        directions = {"NORTH", "SOUTH", "EAST", "WEST"}
+        farmer = result["farmer"]
+        if farmer and isinstance(farmer[0], str) and farmer[0] in directions:
+            result["farmer"] = ["PASS"]
+        # Hand commands are nested one level below the farmer command.  Keep
+        # malformed/nested values inert here; the final sanitizer is the
+        # authority that turns them into a legal fallback.
+        result["hands"] = [
+            ["PASS"] if isinstance(command, Sequence) and not isinstance(command, (str, bytes))
+            and command and isinstance(command[0], str) and command[0] in directions else command
+            for command in result["hands"]
+        ]
     if not ablations.get("market_batch_sizing", True):
         result["market"] = result["market"][:1]
     if not ablations.get("shop_adaptation", True):
@@ -2170,10 +2227,16 @@ def _apply_ablations(action: Mapping[str, Any], observation: Mapping[str, Any], 
         for key in ("farmer", "hands"):
             commands = result[key] if key == "farmer" else result[key]
             if key == "farmer":
-                if len(commands) > 1 and commands[0] == "PLACE" and commands[1] in ANIMALS:
+                if (len(commands) > 1 and commands[0] == "PLACE" and isinstance(commands[1], str)
+                        and commands[1] in ANIMALS):
                     result[key] = ["PASS"]
             else:
-                result[key] = [["PASS"] if len(command) > 1 and command[0] == "PLACE" and command[1] in ANIMALS else command for command in commands]
+                result[key] = [
+                    ["PASS"] if (isinstance(command, Sequence) and not isinstance(command, (str, bytes))
+                                 and len(command) > 1 and command[0] == "PLACE"
+                                 and isinstance(command[1], str) and command[1] in ANIMALS) else command
+                    for command in commands
+                ]
     return result
 
 
@@ -2196,14 +2259,11 @@ def apply_variant(action: Mapping[str, Any], observation: Mapping[str, Any], var
         if not any(order[0] == "BUY_SEED" for order in result["market"]) and not _number(seeds.get("MELON")) and _cash(observation) >= CROPS["MELON"]["seed"]:
             result["market"].append(["BUY_SEED", "MELON", 1])
     elif variant == "demand-reactive":
-        best = _best_seed(observation)
-        if best:
-            for order in result["market"]:
-                if order[0] == "BUY_SEED" and order[1] in CROPS:
-                    order[1] = best
-                    break
-            if result["farmer"][:1] == ["PLANT"] and len(result["farmer"]) > 1 and _number(seeds.get(best)):
-                result["farmer"][1] = best
+        # The production policy already reacts to live market/shop demand.
+        # Rewriting its scheduled crop after planning can consume the wheat
+        # reserved for FEED or invalidate a WATER deadline, so this supported
+        # evaluator variant deliberately preserves that needs-safe schedule.
+        pass
     elif variant == "animal-heavy":
         target = _empty_animal_target(observation)
         if target:
