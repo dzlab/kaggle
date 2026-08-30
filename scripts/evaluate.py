@@ -329,6 +329,30 @@ def _shed_total(observation: Mapping[str, Any]) -> float:
     return sum(max(0.0, _number(quantity) or 0.0) for quantity in shed.values())
 
 
+def _inventory_total(observation: Mapping[str, Any]) -> float:
+    """Return worker inventories that have not yet been dropped into the shed."""
+    inventories = _mapping(_mapping(observation.get("private")).get("inventories"))
+    if inventories:
+        return sum(max(0.0, _number(quantity) or 0.0) for quantity in inventories.values())
+    raw_inventories = _mapping(observation.get("private")).get("inventories")
+    if not isinstance(raw_inventories, Sequence) or isinstance(raw_inventories, (str, bytes)):
+        return 0.0
+    return sum(
+        max(0.0, _number(quantity) or 0.0)
+        for inventory in raw_inventories
+        if isinstance(inventory, Mapping)
+        for quantity in inventory.values()
+    )
+
+
+def _shed_capacity(configuration: Mapping[str, Any] | None = None) -> int:
+    raw = _config_value(configuration, "shedCapacity", shed_capacity)
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError, OverflowError):
+        return shed_capacity
+
+
 def _tiles(observation: Mapping[str, Any]) -> Sequence[Any]:
     return tuple(tile for _position, tile in _tile_entries(observation))
 
@@ -413,11 +437,15 @@ def _missed_needs_at_boundary(observation: Mapping[str, Any], is_boundary: bool,
                               post_observation: Mapping[str, Any] | None = None,
                               action_state: Mapping[str, Any] | None = None,
                               configuration: Mapping[str, Any] | None = None) -> int:
-    if not is_boundary:
+    if (
+        not is_boundary
+        or post_observation is None
+        or _number(observation.get("hour")) != 23
+        or _number(post_observation.get("hour")) != 0
+    ):
         return 0
     missed = 0
-    post_hour = _number(_mapping(post_observation).get("hour")) if post_observation else None
-    reset_after_boundary = post_hour == 0 and _number(observation.get("hour")) == 23
+    reset_after_boundary = True
     targets = _command_targets(observation, action_state or {}, configuration)
     for index, (coordinate, tile) in enumerate(_tile_entries(observation)):
         if not isinstance(tile, Mapping):
@@ -445,10 +473,18 @@ def _missed_needs_at_boundary(observation: Mapping[str, Any], is_boundary: bool,
     return missed
 
 
-def _price_floor_sales(state: Mapping[str, Any], observation: Mapping[str, Any] | None = None) -> int:
+def _price_floor_sales(state: Mapping[str, Any], observation: Mapping[str, Any] | None = None,
+                       configuration: Mapping[str, Any] | None = None) -> int:
     observation = observation or _mapping(state.get("observation"))
     market = _mapping(observation.get("market"))
-    prices = _mapping(market.get("prices"))
+    market_inventory = {
+        item: max(0.0, _number(quantity) or 0.0)
+        for item, quantity in _mapping(market.get("inventory")).items()
+    }
+    shed = {
+        item: max(0.0, _number(quantity) or 0.0)
+        for item, quantity in _mapping(_mapping(observation.get("private")).get("shed")).items()
+    }
     action = _mapping(state.get("action"))
     orders = action.get("market", ())
     if not isinstance(orders, Sequence) or isinstance(orders, (str, bytes)):
@@ -457,8 +493,18 @@ def _price_floor_sales(state: Mapping[str, Any], observation: Mapping[str, Any] 
     for order in orders:
         if not isinstance(order, Sequence) or len(order) < 3 or order[0] != "SELL":
             continue
-        if _number(prices.get(str(order[1]).upper())) == PRICE_FLOOR:
-            sales += max(0, int(_number(order[2]) or 0))
+        item = str(order[1]).upper()
+        quantity = max(0, int(_number(order[2]) or 0))
+        for _ in range(min(quantity, int(shed.get(item, 0.0)))):
+            price = _observed_unit_price(
+                item, observation, market_inventory.get(item, 0.0), buying=False,
+                configuration=configuration,
+            )
+            if price == PRICE_FLOOR:
+                sales += 1
+            shed[item] = shed.get(item, 0.0) - 1
+            if price > PRICE_FLOOR:
+                market_inventory[item] = market_inventory.get(item, 0.0) + 1
     return sales
 
 
@@ -487,16 +533,22 @@ def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, see
     for index, state in enumerate(own_states):
         post = _mapping(state.get("observation"))
         pre = _mapping(own_states[index - 1].get("observation")) if index else post
-        shed_overflow = max(shed_overflow, max(0.0, _shed_total(post) - shed_capacity))
+        capacity = _shed_capacity(replay_configuration)
+        shed_overflow = max(shed_overflow, max(0.0, _shed_total(post) - capacity))
         # Kaggriculture emits a bootstrap record at index 0. Its placeholder
         # action is schema-checked, but it was not chosen from a preceding
         # replay observation and must not contribute action-derived metrics.
         is_bootstrap = index == 0 and len(own_states) > 1
         if not is_bootstrap:
-            floor_sales += _price_floor_sales(state, pre)
+            floor_sales += _price_floor_sales(state, pre, replay_configuration)
         pre_hour = _number(pre.get("hour"))
         post_hour = _number(post.get("hour"))
-        is_boundary = pre_hour == 23 or (index == len(own_states) - 1 and post_hour == 23)
+        is_boundary = pre_hour == 23 and post_hour == 0
+        if is_boundary:
+            shed_overflow = max(
+                shed_overflow,
+                max(0.0, _shed_total(pre) + _inventory_total(pre) - capacity),
+            )
         if not is_bootstrap:
             missed_needs += _missed_needs_at_boundary(pre, is_boundary, post, state, replay_configuration)
     return {
@@ -541,11 +593,18 @@ def _observed_unit_price(item: str, observation: Mapping[str, Any], inventory: f
                          configuration: Mapping[str, Any] | None = None) -> float:
     market = _mapping(observation.get("market"))
     params = _mapping(_config_value(configuration, "marketParams", {}))
+    observed = _number(_mapping(market.get("prices")).get(item))
     quote_inventory = inventory - 1 if buying else inventory
     try:
-        return float(market_price(item, quote_inventory, params))
+        quote = float(market_price(item, quote_inventory, params))
+        # A replay without configuration may contain a deliberately fixed
+        # floor quote. Preserve that valid observation while still recomputing
+        # later units from the market curve as inventory changes.
+        if not params and observed == PRICE_FLOOR:
+            return PRICE_FLOOR
+        return quote
     except (KeyError, TypeError, ValueError, OverflowError):
-        return _number(_mapping(market.get("prices")).get(item)) or 0.0
+        return observed or 0.0
 
 
 def _sanitize_market_orders(orders: Sequence[Sequence[Any]], observation: Mapping[str, Any],
@@ -563,7 +622,8 @@ def _sanitize_market_orders(orders: Sequence[Sequence[Any]], observation: Mappin
     farm = _farm_observation(observation)
     hires_today = int(_number(farm.get("hires_today")) or 0)
     hire_mult = max(0, int(_config_value(configuration, "farmHandCostMult", 1)))
-    unlocked = list(farm.get("unlocked_quadrants", ()))
+    raw_unlocked = farm.get("unlocked_quadrants", ())
+    unlocked = list(raw_unlocked) if isinstance(raw_unlocked, Sequence) and not isinstance(raw_unlocked, (str, bytes)) else []
     sanitized: list[list[Any]] = []
     for raw_order in orders:
         if len(sanitized) >= order_limit:
@@ -659,7 +719,10 @@ def _valid_market_orders(orders: Sequence[Any], observation: Mapping[str, Any],
         hire_mult = int(_config_value(configuration, "farmHandCostMult", 1))
     except (TypeError, ValueError, OverflowError):
         return False
-    unlocked = list(farm.get("unlocked_quadrants", ()))
+    raw_unlocked = farm.get("unlocked_quadrants", ())
+    if not isinstance(raw_unlocked, Sequence) or isinstance(raw_unlocked, (str, bytes)):
+        return False
+    unlocked = list(raw_unlocked)
 
     for raw_order in orders:
         order = list(raw_order) if isinstance(raw_order, Sequence) and not isinstance(raw_order, (str, bytes)) else raw_order
