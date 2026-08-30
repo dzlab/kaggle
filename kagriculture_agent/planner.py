@@ -597,7 +597,7 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None) 
             if cash >= float(ANIMALS[animal]["cost"]) + reserve:
                 intents.append(["BUY_ANIMAL", animal, 1])
         if compatible is not None and animal_in_storage:
-            tasks.append(Task("ANIMAL", compatible, 40, None, float(ANIMALS[animal]["cost"])))
+            tasks.append(Task("ANIMAL", compatible, 40, None, float(ANIMALS[animal]["cost"]), item=animal))
         elif empty is not None and not _placed_animal_count(normalized):
             kind = "BUILD_PASTURE" if ANIMALS[animal]["structure"] == "PASTURE" else "BUILD_COOP"
             tasks.append(Task(kind, empty, 35, None, 1.0))
@@ -619,6 +619,12 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
     except (TypeError, ValueError, OverflowError):
         board_size = 1
     plan: list[Task] = []
+    held_inventory = _mapping(state.get("inventory"))
+    shed_inventory = _mapping(_mapping(state.get("private")).get("shed"))
+    has_fertilizer = (
+        _safe_quantity(held_inventory.get("FERTILIZER", 0)) > 0
+        or _safe_quantity(shed_inventory.get("FERTILIZER", 0)) > 0
+    )
 
     for position, tile in _tiles(state):
         if is_locked_tile(tile):
@@ -630,8 +636,7 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
         if crop:
             if _needs_today(tile, "needs_water", "watered_today", "watered"):
                 _add(plan, "WATER", position, 100, day, 1)
-            if _number(_get(tile, "fertilized_until_day", -1)) < day and _safe_quantity(
-                    _mapping(state.get("inventory")).get("FERTILIZER", 0)) > 0:
+            if _number(_get(tile, "fertilized_until_day", -1)) < day and has_fertilizer:
                 _add(plan, "FERTILIZE", position, 92, day, 1)
             age = _crop_age(tile, day)
             crop_rules = CROPS[crop]

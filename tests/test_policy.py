@@ -161,6 +161,18 @@ def test_market_orders_do_not_spend_cash_reserved_for_feed_or_exceed_ten_orders(
     assert sum(order[2] for order in orders if order[:2] == ["BUY_SEED", "WHEAT"]) <= 1
 
 
+def test_market_orders_liquidate_saleable_shed_inventory_on_penultimate_turn():
+    state = {
+        "day": 29, "hour": 22, "cash": 0,
+        "private": {"shed": {"MELON": 2}, "seeds": {}},
+        "market": {"prices": {"MELON": 250}, "inventory": {"MELON": 10_000}},
+    }
+
+    orders = policy_module.build_market_orders(state, [])
+
+    assert ["SELL", "MELON", 2] in orders
+
+
 def test_zero_filled_real_engine_shed_does_not_keep_cached_shed_or_sell_valid():
     state = {
         "board_size": 5,
@@ -386,6 +398,34 @@ def test_policy_uses_autonomous_macro_orders_without_external_intents():
     assert any(order[0] == "HIRE" for order in action["market"])
     assert any(order[0] == "BUY_ANIMAL" for order in action["market"])
     assert len(action["market"]) <= 10
+
+
+def test_autonomous_animal_task_carries_item_through_pickup_place_feed_care():
+    from kagriculture_agent.planner import build_autonomous_macro_plan
+
+    board = [[None for _ in range(5)] for _ in range(5)]
+    board[0][0] = {"kind": "COOP"}
+    obs = observation(day=4, hour=1, hands=[[4, 4]], tiles=board, money=2_000,
+                      shed={"GOOSE": 1, "WHEAT": 1}, seeds={}, inventories=[[], []])
+    obs["town"] = {"unlocked_shops": ["BAKERY"]}
+    macro = build_autonomous_macro_plan(obs)
+    animal_task = next(task for task in macro["tasks"] if task.kind == "ANIMAL")
+
+    assert animal_task.item == "GOOSE"
+    state = policy_module.parse_observation(obs)
+    assignment = WorkerAssignment(1, animal_task)
+    state["farm"]["hands"][0] = [2, 2]
+    assert policy_module.worker_action(1, state, assignment) == ["PICKUP", "GOOSE", 1]
+    state["farm"]["hands"][0] = [0, 0]
+    state["private"]["inventories"] = [{}, {"GOOSE": 1, "WHEAT": 1}]
+    assert policy_module.worker_action(1, state, assignment) == ["PLACE", "GOOSE", 1]
+
+    state["farm"]["tiles"][0][0] = {"kind": "COOP", "animal": "GOOSE", "fed_today": False, "cared_today": False}
+    feed = WorkerAssignment(1, Task("FEED", Position(0, 0), 100, 4, 1))
+    care = WorkerAssignment(1, Task("CARE", Position(0, 0), 95, 4, 1))
+    assert policy_module.worker_action(1, state, feed) == ["FEED"]
+    state["farm"]["tiles"][0][0]["fed_today"] = True
+    assert policy_module.worker_action(1, state, care) == ["CARE"]
 
 
 def test_buy_product_is_restricted_to_feed_and_fertilizer():

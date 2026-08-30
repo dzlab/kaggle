@@ -1569,7 +1569,12 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
             return False
         position = _worker_position(pre, worker_index)
         post_position = _worker_position(post, worker_index)
-        if position is None or post_position is None:
+        if position is None:
+            return False
+        # Farm hands are one-day assets: the engine can remove them while
+        # resetting the day, so their post-boundary position is intentionally
+        # absent. Their pre-action effects are still validated below.
+        if post_position is None and not boundary:
             return False
         operation = command[0]
         if operation in {"NORTH", "SOUTH", "EAST", "WEST"}:

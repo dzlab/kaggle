@@ -426,7 +426,10 @@ def build_market_orders(state: Any, plan: Any) -> list[list[Any]]:
     animal_buys = 0
     shed_room = max(0, DEFAULT_SHED_CAPACITY - sum(shed.values()))
     intents = _approved_intents(plan)
-    final_turn = day >= season_days - 1 and hour >= 23
+    # The engine records the action selected from the preceding observation;
+    # hour 22 is therefore the last reliably executable liquidation window
+    # for a 30-day episode, with hour 23 retained for direct callers.
+    final_turn = day >= season_days - 1 and hour >= 22
 
     # Protect the remaining wheat needed by living animals before selling.
     carried_wheat = sum(_counts(inventory).get("WHEAT", 0) for inventory in _inventories(state))

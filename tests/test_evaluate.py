@@ -547,6 +547,28 @@ def test_transition_effects_accept_end_of_day_hire_hand_reset():
     )
 
 
+def test_transition_effects_accepts_hired_hand_disappearance_at_day_boundary():
+    from scripts.evaluate import _transition_effects_valid
+
+    farm = {"money": 100, "farmer": [4, 4], "hands": [[2, 2]], "hires_today": 1,
+            "tiles": [[None for _ in range(10)] for _ in range(10)], "unlocked_quadrants": ["NW"]}
+    pre = {"player": 0, "step": 23, "day": 0, "hour": 23, "farms": [farm],
+           "private": {"seeds": {}, "shed": {}, "inventories": [{}, {}]},
+           "market": {"inventory": {}, "prices": {}}}
+    post = {"player": 0, "step": 24, "day": 1, "hour": 0,
+            "farms": [{**farm, "farmer": [4, 4], "hands": [], "hires_today": 0}],
+            "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+            "market": {"inventory": {}, "prices": {}}}
+    market_result = {
+        "states": [{"money": 100, "shed": {}, "seeds": {}, "hires": 1, "unlocked": ["NW"]}],
+        "market_inventory": {},
+    }
+
+    assert _transition_effects_valid(
+        pre, post, {"farmer": ["PASS"], "hands": [["PASS"]], "market": []}, {}, market_result,
+    )
+
+
 def _boundary_feed_replay_states():
     board = [[None for _ in range(10)] for _ in range(10)]
     board[0][0] = {"kind": "PASTURE", "animal": "COW", "fed_today": False,

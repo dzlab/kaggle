@@ -20,6 +20,14 @@ uv venv
 uv sync
 ```
 
+The equivalent standard-library virtual-environment setup is:
+
+```bash
+python -m venv .venv
+.venv/bin/python -m pip install -e .
+.venv/bin/python -m pip install 'pytest>=8,<10'
+```
+
 Run the import smoke test locally:
 
 ```bash
@@ -86,8 +94,18 @@ transitions are not reported as clean games.
 Package the entrypoint and the `kagriculture_agent/` package together when
 submitting to Kaggle. The submission entrypoint is `main.py`; keep imports
 self-contained and include any runtime dependencies required by the selected
-Kaggle environment. A clean submission archive can be created and inspected
-without including development files:
+Kaggle environment.
+
+For the single-file form, use the root `main.py` as the visible Kaggle
+entrypoint during an early import smoke test:
+
+```bash
+uv run python -c "from main import agent; print(callable(agent))"
+```
+
+Because this repository's `main.py` imports `kagriculture_agent`, the complete
+standalone submission form is the multi-file tarball below. It keeps `main.py`
+at the archive root and includes only runtime package files:
 
 ```bash
 tar --exclude='__pycache__' -czf /tmp/kaggriculture-submission.tar.gz \

@@ -224,6 +224,20 @@ def test_daily_plan_accepts_parse_observation_canonical_nested_state():
     assert {"WATER", "FEED", "CARE", "STRUCTURE", "ANIMAL", "WEED", "PLANT", "SHED", "SELL"} <= kinds
 
 
+def test_daily_plan_keeps_canonical_shed_fertilizer_available_for_fertilizing():
+    tiles = [[{"kind": "PLANT", "crop": "WHEAT", "fertilized_until_day": 0}] + [None for _ in range(4)]] + [[None for _ in range(5)] for _ in range(4)]
+    parsed = parse_observation({
+        "day": 2,
+        "farms": [{"tiles": tiles, "farmer": [0, 0], "hands": []}],
+        "private": {"seeds": {"WHEAT": 1}, "shed": {"FERTILIZER": 1}, "inventories": [{}]},
+        "market": {"prices": {"WHEAT": 7, "FERTILIZER": 100}},
+    })
+
+    plan = build_daily_plan(parsed, EpisodeMemory())
+
+    assert any(task.kind == "FERTILIZE" and task.target == pos(0, 0) for task in plan)
+
+
 def test_normalize_planner_state_supports_attribute_based_state():
     state = SimpleNamespace(
         day=2,
