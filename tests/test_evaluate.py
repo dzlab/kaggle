@@ -613,6 +613,43 @@ def test_transition_effects_rejects_unrelated_board_mutation():
     )
 
 
+def test_transition_effects_rejects_unrelated_end_of_day_board_mutation():
+    from scripts.evaluate import _transition_effects_valid
+
+    pre_farm = {"money": 100, "farmer": [0, 0], "hands": [], "hires_today": 0,
+                "tiles": [[None, None], [None, None]], "unlocked_quadrants": ["NW"]}
+    post_farm = {**pre_farm, "tiles": [[None, {"kind": "COOP"}], [None, None]], "farmer": [0, 0], "hands": []}
+    pre = {"player": 0, "step": 23, "day": 0, "hour": 23, "farms": [pre_farm],
+           "private": {"seeds": {}, "shed": {}, "inventories": [{}]}, "market": {"inventory": {}, "prices": {}}}
+    post = {"player": 0, "step": 24, "day": 1, "hour": 0, "farms": [post_farm],
+            "private": {"seeds": {}, "shed": {}, "inventories": [{}]}, "market": {"inventory": {}, "prices": {}}}
+    market_result = {"states": [{"money": 100, "shed": {}, "seeds": {}, "hires": 0, "unlocked": ["NW"]}],
+                     "market_inventory": {}}
+
+    assert not _transition_effects_valid(
+        pre, post, {"farmer": ["PASS"], "hands": [], "market": []}, {}, market_result,
+    )
+
+
+def test_transition_effects_rejects_boundary_water_without_refresh_effect():
+    from scripts.evaluate import _transition_effects_valid
+
+    plant = {"kind": "PLANT", "crop": "WHEAT", "watered_today": False,
+             "consecutive_unwatered": 1, "yield_units": 1}
+    farm = {"money": 100, "farmer": [0, 0], "hands": [], "hires_today": 0,
+            "tiles": [[plant]], "unlocked_quadrants": ["NW"]}
+    pre = {"player": 0, "step": 23, "day": 0, "hour": 23, "farms": [farm],
+           "private": {"seeds": {}, "shed": {}, "inventories": [{}]}, "market": {"inventory": {}, "prices": {}}}
+    post = {"player": 0, "step": 24, "day": 1, "hour": 0, "farms": [farm],
+            "private": {"seeds": {}, "shed": {}, "inventories": [{}]}, "market": {"inventory": {}, "prices": {}}}
+    market_result = {"states": [{"money": 100, "shed": {}, "seeds": {}, "hires": 0, "unlocked": ["NW"]}],
+                     "market_inventory": {}}
+
+    assert not _transition_effects_valid(
+        pre, post, {"farmer": ["WATER"], "hands": [], "market": []}, {}, market_result,
+    )
+
+
 def test_transition_effects_treats_unhashable_unlock_metadata_as_invalid():
     from scripts.evaluate import _midday_board_changes_valid
 

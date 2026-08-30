@@ -1099,6 +1099,29 @@ def _board_value(observation: Mapping[str, Any], position: tuple[int, int]) -> A
     return _tile_at_position(observation, position)
 
 
+def _end_of_day_tile_compatible(before: Any, after: Any) -> bool:
+    """Accept only board changes produced by the engine's daily refresh."""
+    if before is None:
+        return after is None or _tile_kind(after) == "WEED"
+    if before == "LOCKED":
+        return after == "LOCKED"
+    if _tile_kind(before) == "WEED":
+        return _tile_kind(after) == "WEED"
+    if not isinstance(before, Mapping) or not isinstance(after, Mapping):
+        return before == after
+    before_kind = _tile_kind(before)
+    after_kind = _tile_kind(after)
+    if before_kind == "PLANT":
+        return after_kind == "PLANT" and after.get("crop") == before.get("crop") or after_kind == "WEED"
+    if before_kind in {"COOP", "PASTURE"}:
+        if after_kind != before_kind:
+            return False
+        before_animal = before.get("animal")
+        after_animal = after.get("animal")
+        return before_animal is None and after_animal is None or before_animal == after_animal or after_animal is None
+    return before == after
+
+
 def _midday_board_changes_valid(pre: Mapping[str, Any], post: Mapping[str, Any], action: Mapping[str, Any],
                                 configuration: Mapping[str, Any] | None, market_result: Mapping[str, Any]) -> bool:
     """Reject board changes not attributable to this turn's unit/land actions."""
@@ -1141,6 +1164,8 @@ def _midday_board_changes_valid(pre: Mapping[str, Any], post: Mapping[str, Any],
                 continue
             quadrant = ("N" if y < size // 2 else "S") + ("W" if x < size // 2 else "E")
             if quadrant in newly_unlocked and before == "LOCKED" and after is None:
+                continue
+            if _number(pre.get("hour")) == 23 and _number(post.get("hour")) == 0 and _end_of_day_tile_compatible(before, after):
                 continue
             # The engine can decay a plant at its exact lifespan boundary after
             # actions.  This is deterministic and limited to yield decrement or
@@ -1410,12 +1435,30 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
             return False
         elif operation == "DIG" and post_tile is not None:
             return False
-        elif operation == "WATER" and not boundary and (not isinstance(post_tile, Mapping) or post_tile.get("watered_today") is not True):
-            return False
-        elif operation == "FEED" and not boundary and (not isinstance(post_tile, Mapping) or post_tile.get("fed_today") is not True):
-            return False
-        elif operation == "CARE" and not boundary and (not isinstance(post_tile, Mapping) or post_tile.get("cared_today") is not True):
-            return False
+        elif operation == "WATER":
+            if not isinstance(post_tile, Mapping):
+                return False
+            if boundary:
+                if post_tile.get("watered_today") is not False or post_tile.get("consecutive_unwatered") not in (0,):
+                    return False
+            elif post_tile.get("watered_today") is not True:
+                return False
+        elif operation == "FEED":
+            if not isinstance(post_tile, Mapping):
+                return False
+            if boundary:
+                if post_tile.get("fed_today") is not False or post_tile.get("consecutive_unfed") not in (0,):
+                    return False
+            elif post_tile.get("fed_today") is not True:
+                return False
+        elif operation == "CARE":
+            if not isinstance(post_tile, Mapping):
+                return False
+            if boundary:
+                if post_tile.get("cared_today") is not False:
+                    return False
+            elif post_tile.get("cared_today") is not True:
+                return False
         elif operation == "FERTILIZE":
             if not isinstance(post_tile, Mapping) or (_number(post_tile.get("fertilized_until_day")) or -1) < (_number(pre.get("day")) or 0) + 2:
                 return False
@@ -1483,7 +1526,7 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
             spawned.append(list(position))
         if post_hands[len(pre_hands):] != spawned:
             return False
-    if not boundary and not _midday_board_changes_valid(pre, post, action, configuration, market_result):
+    if not _midday_board_changes_valid(pre, post, action, configuration, market_result):
         return False
     if not _post_market_effects_valid(pre, post, market_result, configuration):
         return False

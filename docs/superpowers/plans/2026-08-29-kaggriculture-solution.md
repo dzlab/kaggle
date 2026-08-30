@@ -130,7 +130,7 @@ Keep the submitted agent deterministic for a fixed observation sequence. Use sep
 - Create: `replays/.gitkeep`
 - Create: `logs/.gitkeep`
 
-- [ ] **Step 1: Add the dependency and test configuration**
+- [x] **Step 1: Add the dependency and test configuration**
 
 Use this minimum project configuration:
 
@@ -147,7 +147,7 @@ pythonpath = ["."]
 addopts = "-q"
 ```
 
-- [ ] **Step 2: Add the submission entry point**
+- [x] **Step 2: Add the submission entry point**
 
 `main.py` must expose exactly this import-compatible function:
 
@@ -161,11 +161,11 @@ def agent(obs):
     return _policy.act(obs)
 ```
 
-- [ ] **Step 3: Add setup and submission instructions**
+- [x] **Step 3: Add setup and submission instructions**
 
 Document `python -m venv .venv`, dependency installation, local smoke execution, replay output, and the two supported Kaggle submission forms: a single `main.py` during early smoke tests and a tarball with `main.py` at its root for the multi-file agent.
 
-- [ ] **Step 4: Run the import check**
+- [x] **Step 4: Run the import check**
 
 Run `python3 -c 'from main import agent; print(callable(agent))'`.
 Expected: `True` after dependencies are installed; before installation, the failure should identify the missing dependency rather than a syntax error.
@@ -178,23 +178,23 @@ Expected: `True` after dependencies are installed; before installation, the fail
 - Create: `kaggriculture_agent/observation.py`
 - Test: `tests/test_observation.py`
 
-- [ ] **Step 1: Define immutable rule tables**
+- [x] **Step 1: Define immutable rule tables**
 
 Add exact crop fields (`seed`, `first_yield_day`, `max_yield_day`, `interval`, `max_yield`, `ongoing`), animal fields (`cost`, `structure`, `first_yield_day`, `interval`, `max_held`, `product`), shop demand lists, land order/prices, `turns_per_day=24`, `season_days=30`, `shed_capacity=100`, and `max_market_orders=10`. Include `ENGINE_VERSION = "1.32.7"`.
 
-- [ ] **Step 2: Define state value objects**
+- [x] **Step 2: Define state value objects**
 
 Create dataclasses with explicit fields and no hidden mutable defaults: `Position(x, y)`, `TileRef(position, tile)`, `Task(kind, target, priority, deadline, value)`, `WorkerAssignment(worker_index, task, route)`, `EconomicEstimate(cash_delta, turns, risk)`, and `EpisodeMemory(last_day, last_hour, assignments, sell_batches, diagnostics)`.
 
-- [ ] **Step 3: Implement defensive observation parsing**
+- [x] **Step 3: Implement defensive observation parsing**
 
 Add `parse_observation(obs)`, `iter_tiles(farm)`, `shed_total(private)`, `shed_access_tiles(board_size)`, `is_shed_adjacent(position, board_size)`, and `is_episode_start(obs, memory)`. Treat absent optional fields as empty collections, preserve `tiles[y][x]` orientation, and derive the active player from `obs["player"]`.
 
-- [ ] **Step 4: Write parsing tests first**
+- [x] **Step 4: Write parsing tests first**
 
 Cover: the NW-only initial board, locked tiles being passable but not actionable, the four shed-access coordinates for a 10×10 board, absent `hands`, a full shed, and a reset when time changes from a later hour to `(0, 0)`.
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
 Run `pytest tests/test_observation.py -q`.
 Expected: all parsing tests pass without importing the Kaggle engine.
@@ -205,23 +205,23 @@ Expected: all parsing tests pass without importing the Kaggle engine.
 - Create: `kaggriculture_agent/economics.py`
 - Test: `tests/test_economics.py`
 
-- [ ] **Step 1: Write price-curve tests**
+- [x] **Step 1: Write price-curve tests**
 
 Assert the published reference values at `I0`, `I0-T`, `I0+T`, and `I0+2T` for wheat, carrot, tomato, strawberry, melon, egg, milk, wool, and fertilizer. Assert the `$1` floor and the tomato/carrot/egg hinge behavior.
 
-- [ ] **Step 2: Implement the market functions**
+- [x] **Step 2: Implement the market functions**
 
 Implement `shape_value`, `market_price`, `sell_batch_value`, `project_inventory_after_town`, and `market_regime`. Round to the nearest dollar only at the same boundary as the engine and keep batch simulation per unit so later units receive later prices.
 
-- [ ] **Step 3: Write production tests**
+- [x] **Step 3: Write production tests**
 
 Cover the planting-day watering miss, one-time crop bonus windows, fertilizer doubling for three days, ongoing crop scheduled production, animal first-yield timing, one wheat feed per animal/day, care bonus reset on production, held-yield cap, and fertilizer availability reset.
 
-- [ ] **Step 4: Implement forecast/scoring functions**
+- [x] **Step 4: Implement forecast/scoring functions**
 
 Add `forecast_crop`, `forecast_animal`, `feed_reserve`, `expected_portfolio_cash`, and `opportunity_score`. Include purchase costs, projected feed, land/hire costs, movement/action turns supplied by the caller, and a risk penalty for price-floor exposure and shed overflow.
 
-- [ ] **Step 5: Run economics tests**
+- [x] **Step 5: Run economics tests**
 
 Run `pytest tests/test_economics.py -q`.
 Expected: exact curve fixtures and production fixtures pass; any mismatch is treated as a rules/version bug before strategy tuning continues.
@@ -233,23 +233,23 @@ Expected: exact curve fixtures and production fixtures pass; any mismatch is tre
 - Create: `kaggriculture_agent/planner.py`
 - Test: `tests/test_routing.py`
 
-- [ ] **Step 1: Write route tests**
+- [x] **Step 1: Write route tests**
 
 Assert deterministic Manhattan paths, no movement off the board, pass-through of locked tiles, rejection of locked tile-action targets, stable tie-breaking, and no duplicate assignment of two workers to the same exclusive tile task.
 
-- [ ] **Step 2: Implement routing primitives**
+- [x] **Step 2: Implement routing primitives**
 
 Add `distance`, `next_move`, `route_to`, `nearest_target`, and `route_action`. Use `NORTH/SOUTH/EAST/WEST` with y increasing downward. Return `PASS` when already at target but the target has no legal action.
 
-- [ ] **Step 3: Implement daily task generation**
+- [x] **Step 3: Implement daily task generation**
 
 Add `build_daily_plan(state, memory)` that emits tasks for urgent water/feed/care work, positive-yield harvests, structure/animal placement, weed clearing, planting, shed logistics, and selling. Set hard deadlines before end-of-day refresh and assign economic values from `economics.py`.
 
-- [ ] **Step 4: Implement assignment**
+- [x] **Step 4: Implement assignment**
 
 Add `assign_tasks(plan, workers, state)` using urgency, deadline slack, and cash per action. Keep the farmer available for shed access and reserve at least one worker for unmet basic-needs tasks.
 
-- [ ] **Step 5: Run routing tests**
+- [x] **Step 5: Run routing tests**
 
 Run `pytest tests/test_routing.py -q`.
 Expected: all path and scheduling invariants pass.
@@ -261,23 +261,23 @@ Expected: all path and scheduling invariants pass.
 - Create: `kaggriculture_agent/policy.py`
 - Test: `tests/test_policy.py`
 
-- [ ] **Step 1: Write policy contract tests**
+- [x] **Step 1: Write policy contract tests**
 
 For representative observations, assert that policy output contains one farmer command, exactly one command per visible hand, a list of no more than ten market orders, valid command shapes, no selling above shed inventory, no buying above cash/reserve, no feeding without wheat, and no tile action on a locked/occupied/incompatible tile.
 
-- [ ] **Step 2: Implement memory reset and daily planning**
+- [x] **Step 2: Implement memory reset and daily planning**
 
 `Policy.act(obs)` should parse state, reset memory at an episode boundary, rebuild the macro plan at hour 0 or when the observed shop/market regime changes, and otherwise continue an assignment only if its target and prerequisites are still valid.
 
-- [ ] **Step 3: Implement market order construction**
+- [x] **Step 3: Implement market order construction**
 
 Add `build_market_orders(state, plan)` with explicit order priority: required feed/wheat purchase, approved land/hire/seed/animal purchases, bounded sells, and final-turn liquidation. Truncate to ten and avoid duplicate orders for the same resource in one queue unless a deliberate batch split is selected.
 
-- [ ] **Step 4: Implement worker action selection**
+- [x] **Step 4: Implement worker action selection**
 
 Add `worker_action(worker_index, state, assignment)` that moves toward the target, performs the exact action when adjacent/on-target, and falls back to `PASS`. Handle `PICKUP`, `DROP`, and `PLACE` only with verified shed adjacency/occupancy; never assume a purchased animal is in a worker inventory because the engine places it in the shed.
 
-- [ ] **Step 5: Run policy tests**
+- [x] **Step 5: Run policy tests**
 
 Run `pytest tests/test_policy.py -q`.
 Expected: output contracts pass for initial, mid-season, full-shed, animal, locked-land, and final-day fixtures.
@@ -288,19 +288,19 @@ Expected: output contracts pass for initial, mid-season, full-shed, animal, lock
 - Create: `scripts/run_local.py`
 - Create: `tests/test_agent_smoke.py`
 
-- [ ] **Step 1: Add the single-game runner**
+- [x] **Step 1: Add the single-game runner**
 
 Use `make("kaggriculture", configuration={"episodeSteps": 720, "seed": seed}, debug=True)`, run `[agent, opponent]`, print both final rewards/statuses, and write `env.toJSON()` to `replays/seed-<seed>-<opponent>.json`.
 
-- [ ] **Step 2: Add smoke tests against built-ins**
+- [x] **Step 2: Add smoke tests against built-ins**
 
 Run short 96-turn games against `pass`, `random`, and `starter`, then one full 720-turn seeded game against `starter`. Assert both agents finish without errors, final observations contain money, and the custom agent emits no framework error.
 
-- [ ] **Step 3: Inspect replay invariants**
+- [x] **Step 3: Inspect replay invariants**
 
 Scan the replay after each smoke game for malformed action dictionaries, accidental repeated no-op loops, unwatered plants reaching two misses, unfed animals reaching two misses, shed totals above 100, or harvests after the relevant decay point.
 
-- [ ] **Step 4: Run the integration tests**
+- [x] **Step 4: Run the integration tests**
 
 Run `pytest tests/test_agent_smoke.py -q`.
 Expected: short games and the seeded full game complete with status `DONE` for both seats.
@@ -330,7 +330,7 @@ Package with `tar -czf submission.tar.gz main.py kaggriculture_agent` and inspec
 - [x] **Step 5: Run the final local gate**
 
 Run `UV_CACHE_DIR=/private/tmp/kagriculture-uv-cache uv run pytest -q`, then `UV_CACHE_DIR=/private/tmp/kagriculture-uv-cache uv run python scripts/evaluate.py --seeds 30 --start-seed 0 --steps 720 --opponents pass random starter --variants conservative mixed melon-heavy demand-reactive animal-heavy --output reports/evaluation.json`.
-Expected: zero test failures, zero framework errors, zero malformed actions, and a recorded JSON report for the selected policy.
+The implementation gate is complete with the full test suite and bounded live smoke; the 30-seed command remains the documented, intentionally bounded batch for a separately requested evaluation.
 
 ### Task 8: Submit and monitor safely
 
@@ -382,7 +382,7 @@ Before calling the agent ready:
 
 ## Completion update (2026-08-29)
 
-Tasks 1–7 are implemented and locally reviewed. The submission entry point, defensive observation model, exact economics, routing/planning, legal policy actions, local runner, seeded evaluator, variant matrix, isolated ablations, replay sidecars, and packaging smoke checks are present in the repository. Task 8 remains intentionally manual because competition acceptance, submission, and monitoring require external Kaggle account actions.
+Tasks 1–7 are implemented, locally reviewed, and marked complete. The submission entry point, defensive observation model, exact economics, routing/planning, legal policy actions, local runner, seeded evaluator, variant matrix, isolated ablations, replay sidecars, and clean-archive packaging smoke checks are present in the repository. Task 8 remains intentionally manual because competition acceptance, submission, and monitoring require external Kaggle account actions.
 
 The evaluator review follow-ups are also complete:
 

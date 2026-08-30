@@ -39,3 +39,20 @@ def test_archived_root_entrypoint_executes(monkeypatch, tmp_path):
 
     assert callable(namespace["agent"])
     assert namespace["agent"]({"step": 0}) == {"farmer": ["PASS"], "hands": [], "market": []}
+
+
+def test_submission_tarball_contains_only_runtime_files(tmp_path):
+    archive = tmp_path / "submission.tar.gz"
+    subprocess.run(
+        ["tar", "--exclude=__pycache__", "-czf", str(archive), "-C", str(PROJECT_ROOT), "main.py", "kagriculture_agent"],
+        check=True,
+        capture_output=True,
+    )
+
+    with tarfile.open(archive, mode="r:gz") as tar:
+        names = set(tar.getnames())
+
+    assert "main.py" in names
+    assert "kagriculture_agent/policy.py" in names
+    assert all("__pycache__" not in name for name in names)
+    assert all(not name.startswith(("reports/", "docs/", "tests/")) for name in names)

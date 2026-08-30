@@ -80,6 +80,15 @@ transitions are not reported as clean games.
 Package the entrypoint and the `kagriculture_agent/` package together when
 submitting to Kaggle. The submission entrypoint is `main.py`; keep imports
 self-contained and include any runtime dependencies required by the selected
-Kaggle environment. The project metadata and lockfile support the local `uv`
+Kaggle environment. A clean submission archive can be created and inspected
+without including development files:
+
+```bash
+tar --exclude='__pycache__' -czf /tmp/kaggriculture-submission.tar.gz \
+  -C . main.py kagriculture_agent
+tar -tzf /tmp/kaggriculture-submission.tar.gz
+```
+
+The project metadata and lockfile support Python 3.11+ and the local `uv`
 workflow; for example, run `uv sync`, `uv run pytest -q`, or
 `uv run python scripts/run_local.py --opponent pass --seed 0`.
