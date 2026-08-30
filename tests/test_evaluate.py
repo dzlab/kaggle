@@ -650,6 +650,43 @@ def test_transition_effects_rejects_boundary_water_without_refresh_effect():
     )
 
 
+@pytest.mark.parametrize("operation", ["WATER", "FEED", "CARE"])
+def test_transition_effects_rejects_tampered_boundary_target_tile(operation):
+    from scripts.evaluate import _transition_effects_valid
+
+    if operation == "WATER":
+        before_tile = {"kind": "PLANT", "crop": "WHEAT", "watered_today": False,
+                       "consecutive_unwatered": 1, "yield_units": 1,
+                       "max_lifespan_step": 120, "fertilized_until_day": -1, "planted_day": -2}
+        # The action waters WHEAT, then the day refresh clears the flag.  The
+        # crop mutation is unrelated and must not be hidden by that reset.
+        after_tile = {**before_tile, "crop": "CARROT", "watered_today": False,
+                      "consecutive_unwatered": 0, "yield_units": 2}
+    else:
+        before_tile = {"kind": "PASTURE", "animal": "COW", "fed_today": False,
+                       "cared_today": False, "consecutive_unfed": 1, "yield_units": 0,
+                       "fertilizer_available": False, "placed_day": 0}
+        after_tile = {**before_tile, "animal": "SHEEP", "consecutive_unfed": 0,
+                      "fertilizer_available": True, "fed_today": False,
+                      "cared_today": False}
+
+    pre_farm = {"money": 100, "farmer": [0, 0], "hands": [], "hires_today": 0,
+                "tiles": [[before_tile]], "unlocked_quadrants": ["NW"]}
+    post_farm = {**pre_farm, "tiles": [[after_tile]]}
+    pre = {"player": 0, "step": 23, "day": 0, "hour": 23, "farms": [pre_farm],
+           "private": {"seeds": {}, "shed": {}, "inventories": [{"WHEAT": 1}]},
+           "market": {"inventory": {}, "prices": {}}}
+    post = {"player": 0, "step": 24, "day": 1, "hour": 0, "farms": [post_farm],
+            "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+            "market": {"inventory": {}, "prices": {}}}
+    market_result = {"states": [{"money": 100, "shed": {}, "seeds": {}, "hires": 0, "unlocked": ["NW"]}],
+                     "market_inventory": {}}
+
+    assert not _transition_effects_valid(
+        pre, post, {"farmer": [operation], "hands": [], "market": []}, {}, market_result,
+    )
+
+
 def test_transition_effects_rejects_boundary_plant_field_tampering():
     from scripts.evaluate import _transition_effects_valid
 

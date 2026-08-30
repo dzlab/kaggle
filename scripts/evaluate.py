@@ -1207,6 +1207,43 @@ def _end_of_day_tile_compatible(before: Any, after: Any, *, day: int = 0, step: 
     return after == expected
 
 
+def _targeted_boundary_tile_expected(before: Any, operation: str, day: int, step: int,
+                                    turns_per_day: int) -> Any:
+    """Return a targeted tile after its action and the following refresh."""
+    if not isinstance(before, Mapping):
+        return object()
+    expected = dict(before)
+    if operation == "WATER":
+        if _tile_kind(before) != "PLANT" or before.get("watered_today") is not False:
+            return object()
+        crop = before.get("crop")
+        crop_data = CROPS.get(crop)
+        planted_day = _number(before.get("planted_day"))
+        yield_units = _number(before.get("yield_units"))
+        fertilized_until = _number(before.get("fertilized_until_day"))
+        if (crop_data is None or planted_day is None or int(planted_day) != planted_day
+                or yield_units is None or fertilized_until is None):
+            return object()
+        expected["watered_today"] = True
+        if not crop_data["ongoing"]:
+            age_days = day - int(planted_day)
+            window_start = (int(crop_data["max_yield_day"]) + 1) // 2
+            if window_start <= age_days <= int(crop_data["max_yield_day"]):
+                bonus = 2 if fertilized_until >= day else 1
+                expected["yield_units"] = min(int(crop_data["max_yield"]), int(yield_units) + bonus)
+    elif operation == "FEED":
+        if not _animal_state(before) or before.get("fed_today") is not False:
+            return object()
+        expected["fed_today"] = True
+    elif operation == "CARE":
+        if not _animal_state(before) or before.get("cared_today") is not False:
+            return object()
+        expected["cared_today"] = True
+    else:
+        return object()
+    return _daily_refresh_tile(expected, day, step, turns_per_day)
+
+
 def _is_end_of_day_transition(pre: Mapping[str, Any], post: Mapping[str, Any],
                               configuration: Mapping[str, Any] | None) -> bool:
     turns_per_day = _number(_config_value(configuration, "turnsPerDay", 24))
@@ -1543,29 +1580,22 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
             return False
         elif operation == "DIG" and post_tile is not None:
             return False
-        elif operation == "WATER":
+        elif operation in {"WATER", "FEED", "CARE"}:
             if not isinstance(post_tile, Mapping):
                 return False
             if boundary:
-                if post_tile.get("watered_today") is not False or post_tile.get("consecutive_unwatered") not in (0,):
+                expected_tile = _targeted_boundary_tile_expected(
+                    pre_tile, operation, int(_number(pre.get("day")) or 0),
+                    int(_number(pre.get("step")) or 0),
+                    int(_number(_config_value(configuration, "turnsPerDay", 24)) or 24),
+                )
+                if post_tile != expected_tile:
                     return False
-            elif post_tile.get("watered_today") is not True:
+            elif operation == "WATER" and post_tile.get("watered_today") is not True:
                 return False
-        elif operation == "FEED":
-            if not isinstance(post_tile, Mapping):
+            elif operation == "FEED" and post_tile.get("fed_today") is not True:
                 return False
-            if boundary:
-                if post_tile.get("fed_today") is not False or post_tile.get("consecutive_unfed") not in (0,):
-                    return False
-            elif post_tile.get("fed_today") is not True:
-                return False
-        elif operation == "CARE":
-            if not isinstance(post_tile, Mapping):
-                return False
-            if boundary:
-                if post_tile.get("cared_today") is not False:
-                    return False
-            elif post_tile.get("cared_today") is not True:
+            elif operation == "CARE" and post_tile.get("cared_today") is not True:
                 return False
         elif operation == "FERTILIZE":
             if not isinstance(post_tile, Mapping) or (_number(post_tile.get("fertilized_until_day")) or -1) < (_number(pre.get("day")) or 0) + 2:
