@@ -377,6 +377,106 @@ def test_replay_actions_are_validated_against_the_preceding_observation():
     assert record["outcome"] == "win"
 
 
+def test_replay_rejects_tampered_plant_without_post_state_effect():
+    from scripts.evaluate import replay_record
+
+    initial = {
+        "player": 0, "step": 0, "hour": 0,
+        "farms": [{"money": 100, "farmer": [0, 0], "hands": [], "tiles": [[None]]}],
+        "private": {"seeds": {"WHEAT": 1}, "shed": {}, "inventories": [{}]},
+        "market": {"prices": {"WHEAT": 25}, "inventory": {"WHEAT": 10000}},
+    }
+    tampered_post = {
+        **initial,
+        "step": 1,
+        "hour": 1,
+        "private": {"seeds": {"WHEAT": 1}, "shed": {}, "inventories": [{}]},
+    }
+    other = {
+        "player": 1,
+        "farms": [{"money": 100}, {"money": 90, "farmer": [0, 0], "hands": [], "tiles": [[None]]}],
+        "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+        "market": initial["market"],
+    }
+    replay = {
+        "steps": [
+            [{"observation": initial, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "ACTIVE", "info": {}},
+             {"observation": other, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "ACTIVE", "info": {}}],
+            [{"observation": tampered_post, "action": {"farmer": ["PLANT", "WHEAT"], "hands": [], "market": []}, "status": "DONE", "info": {}},
+             {"observation": other, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "DONE", "info": {}}],
+        ],
+        "statuses": ["DONE", "DONE"], "info": {},
+    }
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+
+
+def test_price_floor_sales_uses_both_players_market_queues():
+    from scripts.evaluate import _price_floor_sales
+
+    inventory = 1_717_032_651_333
+    own_observation = {
+        "player": 0,
+        "farms": [{"money": 100, "farmer": [0, 0], "hands": [], "tiles": [[None]]}],
+        "private": {"shed": {"WHEAT": 2}, "inventories": [{}]},
+        "market": {"prices": {"WHEAT": 1}, "inventory": {"WHEAT": inventory}},
+    }
+    other_observation = {
+        "player": 1,
+        "farms": [{"money": 100}, {"money": 100, "farmer": [0, 0], "hands": [], "tiles": [[None]]}],
+        "private": {"shed": {}, "inventories": [{}]},
+        "market": own_observation["market"],
+    }
+    own_state = {"action": {"market": [["SELL", "WHEAT", 2]]}}
+    other_state = {"action": {"market": [["BUY_PRODUCT", "WHEAT", 1]]}}
+
+    assert _price_floor_sales(
+        own_state, own_observation, {},
+        other_state=other_state, other_observation=other_observation,
+    ) == 1
+
+
+def test_default_selection_prioritizes_zero_framework_failure_rate():
+    from scripts.evaluate import build_result_document
+
+    records = [
+        {"variant": "mixed", "opponent": "pass", "outcome": "loss", "final_bank": 10,
+         "opponent_final_bank": 20, "framework_error": False, "shed_overflow": 0,
+         "price_floor_sales": 0, "missed_basic_needs": 0},
+        {"variant": "melon-heavy", "opponent": "pass", "outcome": "win", "final_bank": 100,
+         "opponent_final_bank": 20, "framework_error": False, "shed_overflow": 0,
+         "price_floor_sales": 0, "missed_basic_needs": 0},
+        {"variant": "melon-heavy", "opponent": "starter", "outcome": "framework_error", "final_bank": None,
+         "opponent_final_bank": None, "framework_error": True, "shed_overflow": 0,
+         "price_floor_sales": 0, "missed_basic_needs": 0},
+    ]
+
+    document = build_result_document(
+        config={"opponents": ["pass", "starter"], "variants": ["mixed", "melon-heavy"]},
+        records=records,
+    )
+
+    assert document["selected_default"] == "mixed"
+
+
+@pytest.mark.parametrize("replay", [
+    {"steps": None, "statuses": ["DONE", "DONE"], "info": {}},
+    {"steps": [], "statuses": ["DONE", "DONE"], "info": None},
+    {"steps": [], "statuses": ["DONE", "DONE"], "info": {}, "configuration": []},
+    {"steps": [], "statuses": ["DONE", "DONE"], "info": {}, "metadata": []},
+])
+def test_malformed_replay_shapes_become_framework_failures(replay):
+    from scripts.evaluate import replay_record
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+
+
 def test_invalid_or_missing_replay_states_are_framework_failures():
     from scripts.evaluate import aggregate_records, replay_record
 

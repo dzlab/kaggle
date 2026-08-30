@@ -185,7 +185,10 @@ def _fib(index: int) -> int:
 
 def _player_states(replay: Mapping[str, Any], player: int) -> list[Mapping[str, Any]]:
     states = []
-    for turn in replay.get("steps", ()):
+    steps = replay.get("steps", ())
+    if not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)):
+        return states
+    for turn in steps:
         if not isinstance(turn, Sequence):
             continue
         for state in turn:
@@ -224,7 +227,7 @@ def _valid_market_order_schema(order: Any, observation: Mapping[str, Any]) -> bo
 
 
 def _valid_action_schema(action: Any, observation: Mapping[str, Any], configuration: Mapping[str, Any] | None = None,
-                         *, state_aware: bool = True) -> bool:
+                         *, state_aware: bool = True, validate_market: bool = True) -> bool:
     if not isinstance(action, Mapping) or set(action) != {"farmer", "hands", "market"}:
         return False
     farmer = action.get("farmer")
@@ -253,6 +256,8 @@ def _valid_action_schema(action: Any, observation: Mapping[str, Any], configurat
         return False
     if len(orders) > order_limit:
         return False
+    if not validate_market:
+        return all(_valid_market_order_schema(order, observation) for order in orders)
     if state_aware:
         return _valid_market_orders(orders, observation, configuration)
     return all(_valid_market_order_schema(order, observation) for order in orders)
@@ -260,12 +265,25 @@ def _valid_action_schema(action: Any, observation: Mapping[str, Any], configurat
 
 def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, Any]],
                   other_states: Sequence[Mapping[str, Any]], configuration: Mapping[str, Any] | None = None) -> bool:
+    if not isinstance(replay, Mapping):
+        return False
+    if not isinstance(replay.get("info"), Mapping):
+        return False
+    for optional_mapping in ("metadata", "configuration"):
+        if optional_mapping in replay and not isinstance(replay[optional_mapping], Mapping):
+            return False
     statuses = replay.get("statuses")
     if not isinstance(statuses, Sequence) or isinstance(statuses, (str, bytes)) or list(statuses) != ["DONE", "DONE"]:
         return False
     steps = replay.get("steps")
     if not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)) or not steps:
         return False
+    rewards = replay.get("rewards")
+    if rewards is not None:
+        if not isinstance(rewards, Sequence) or isinstance(rewards, (str, bytes)) or len(rewards) != 2:
+            return False
+        if any(_number(reward) is None for reward in rewards):
+            return False
     if len(own_states) != len(steps) or len(other_states) != len(steps):
         return False
     previous_observations = {
@@ -273,9 +291,10 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
         1: _mapping(other_states[0].get("observation")),
     }
     for index, turn in enumerate(steps):
-        if not isinstance(turn, Sequence) or isinstance(turn, (str, bytes)):
+        if not isinstance(turn, Sequence) or isinstance(turn, (str, bytes)) or len(turn) != 2:
             return False
         players = set()
+        states_by_player = {}
         for state in turn:
             if not isinstance(state, Mapping):
                 return False
@@ -284,15 +303,32 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
             if not isinstance(player, int) or player not in {0, 1} or player in players or not isinstance(observation, Mapping):
                 return False
             players.add(player)
+            states_by_player[player] = state
             if not isinstance(state.get("action"), Mapping) or state.get("status") not in ("ACTIVE", "DONE"):
+                return False
+            if "info" in state and not isinstance(state["info"], Mapping):
                 return False
             if state.get("error") or _mapping(state.get("info")).get("error"):
                 return False
             if not _valid_action_schema(
-                state["action"], previous_observations[player], configuration, state_aware=player == 0
+                state["action"], previous_observations[player], configuration,
+                state_aware=player == 0, validate_market=False,
             ):
                 return False
         if players != {0, 1}:
+            return False
+        actions = [states_by_player[player]["action"] for player in (0, 1)]
+        observations = [previous_observations[player] for player in (0, 1)]
+        market_result = _simulate_market_orders_lockstep(
+            [actions[0].get("market", ()), actions[1].get("market", ())], observations, configuration,
+            force_model=bool(actions[1].get("market", ())),
+        )
+        if market_result is None:
+            return False
+        if index > 0 and not _transition_effects_valid(
+            previous_observations[0], _mapping(states_by_player[0].get("observation")), actions[0], configuration,
+            market_result=market_result,
+        ):
             return False
         expected_status = "DONE" if index == len(steps) - 1 else "ACTIVE"
         if any(state.get("status") != expected_status for state in turn if isinstance(state, Mapping)):
@@ -474,42 +510,37 @@ def _missed_needs_at_boundary(observation: Mapping[str, Any], is_boundary: bool,
 
 
 def _price_floor_sales(state: Mapping[str, Any], observation: Mapping[str, Any] | None = None,
-                       configuration: Mapping[str, Any] | None = None) -> int:
+                       configuration: Mapping[str, Any] | None = None,
+                       *, other_state: Mapping[str, Any] | None = None,
+                       other_observation: Mapping[str, Any] | None = None) -> int:
     observation = observation or _mapping(state.get("observation"))
-    market = _mapping(observation.get("market"))
-    market_inventory = {
-        item: max(0.0, _number(quantity) or 0.0)
-        for item, quantity in _mapping(market.get("inventory")).items()
-    }
-    shed = {
-        item: max(0.0, _number(quantity) or 0.0)
-        for item, quantity in _mapping(_mapping(observation.get("private")).get("shed")).items()
-    }
     action = _mapping(state.get("action"))
-    orders = action.get("market", ())
-    if not isinstance(orders, Sequence) or isinstance(orders, (str, bytes)):
-        return 0
-    sales = 0
-    for order in orders:
-        if not isinstance(order, Sequence) or len(order) < 3 or order[0] != "SELL":
-            continue
-        item = str(order[1]).upper()
-        quantity = max(0, int(_number(order[2]) or 0))
-        for _ in range(min(quantity, int(shed.get(item, 0.0)))):
-            price = _observed_unit_price(
-                item, observation, market_inventory.get(item, 0.0), buying=False,
-                configuration=configuration,
-            )
-            if price == PRICE_FLOOR:
-                sales += 1
-            shed[item] = shed.get(item, 0.0) - 1
-            if price > PRICE_FLOOR:
-                market_inventory[item] = market_inventory.get(item, 0.0) + 1
-    return sales
+    other_action = _mapping((other_state or {}).get("action"))
+    result = _simulate_market_orders_lockstep(
+        [action.get("market", ()), other_action.get("market", ())],
+        [observation, other_observation or observation],
+        configuration,
+        force_model=bool(other_action.get("market", ())),
+    )
+    return int(result["floor_sales"][0]) if result is not None else 0
 
 
 def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, seed: int) -> dict[str, Any]:
     """Extract one game record from the engine replay JSON."""
+    if not isinstance(replay, Mapping):
+        return {
+            "variant": variant,
+            "opponent": opponent,
+            "seed": seed,
+            "outcome": "framework_error",
+            "final_bank": None,
+            "opponent_final_bank": None,
+            "bank_differential": 0.0,
+            "framework_error": True,
+            "shed_overflow": 0.0,
+            "price_floor_sales": 0,
+            "missed_basic_needs": 0,
+        }
     own_states = _player_states(replay, 0)
     other_states = _player_states(replay, 1)
     replay_configuration = _mapping(replay.get("configuration"))
@@ -540,7 +571,12 @@ def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, see
         # replay observation and must not contribute action-derived metrics.
         is_bootstrap = index == 0 and len(own_states) > 1
         if not is_bootstrap:
-            floor_sales += _price_floor_sales(state, pre, replay_configuration)
+            other_state = other_states[index] if index < len(other_states) else {}
+            other_pre = _mapping(other_states[index - 1].get("observation")) if index else _mapping(other_state.get("observation"))
+            floor_sales += _price_floor_sales(
+                state, pre, replay_configuration,
+                other_state=other_state, other_observation=other_pre,
+            )
         pre_hour = _number(pre.get("hour"))
         post_hour = _number(post.get("hour"))
         is_boundary = pre_hour == 23 and post_hour == 0
@@ -590,7 +626,8 @@ def _market_orders(action: Mapping[str, Any]) -> list[list[Any]]:
 
 
 def _observed_unit_price(item: str, observation: Mapping[str, Any], inventory: float, *, buying: bool,
-                         configuration: Mapping[str, Any] | None = None) -> float:
+                         configuration: Mapping[str, Any] | None = None,
+                         force_model: bool = False) -> float:
     market = _mapping(observation.get("market"))
     params = _mapping(_config_value(configuration, "marketParams", {}))
     observed = _number(_mapping(market.get("prices")).get(item))
@@ -600,7 +637,7 @@ def _observed_unit_price(item: str, observation: Mapping[str, Any], inventory: f
         # A replay without configuration may contain a deliberately fixed
         # floor quote. Preserve that valid observation while still recomputing
         # later units from the market curve as inventory changes.
-        if not params and observed == PRICE_FLOOR:
+        if not force_model and not params and observed == PRICE_FLOOR:
             return PRICE_FLOOR
         return quote
     except (KeyError, TypeError, ValueError, OverflowError):
@@ -787,6 +824,172 @@ def _valid_market_orders(orders: Sequence[Any], observation: Mapping[str, Any],
     return True
 
 
+def _market_sim_state(observation: Mapping[str, Any]) -> dict[str, Any] | None:
+    farm = _farm_observation(observation)
+    raw_unlocked = farm.get("unlocked_quadrants", ())
+    if not isinstance(raw_unlocked, Sequence) or isinstance(raw_unlocked, (str, bytes)):
+        return None
+    private = _mapping(observation.get("private"))
+    raw_shed = private.get("shed", {})
+    if not isinstance(raw_shed, Mapping):
+        return None
+    return {
+        "money": _cash(observation),
+        "shed": {item: max(0.0, _number(quantity) or 0.0) for item, quantity in raw_shed.items()},
+        "seeds": {item: max(0.0, _number(quantity) or 0.0) for item, quantity in _mapping(private.get("seeds")).items()},
+        "hires": int(_number(farm.get("hires_today")) or 0),
+        "unlocked": list(raw_unlocked),
+    }
+
+
+def _simulate_market_orders_lockstep(orders_by_player: Sequence[Any], observations: Sequence[Mapping[str, Any]],
+                                     configuration: Mapping[str, Any] | None = None,
+                                     *, force_model: bool = False) -> dict[str, Any] | None:
+    """Simulate both market queues against one shared inventory snapshot."""
+    if len(orders_by_player) != 2 or len(observations) != 2:
+        return None
+    order_limit, config_valid = _market_order_limit(configuration)
+    if not config_valid:
+        return None
+    states = [_market_sim_state(observation) for observation in observations]
+    if any(state is None for state in states):
+        return None
+    market = _mapping(observations[0].get("market"))
+    market_inventory = {
+        item: max(0.0, _number(quantity) or 0.0)
+        for item, quantity in _mapping(market.get("inventory")).items()
+    }
+    if _mapping(observations[1].get("market")).get("inventory") != _mapping(market.get("inventory")):
+        return None
+    queues = []
+    for player, raw_orders in enumerate(orders_by_player):
+        if not isinstance(raw_orders, Sequence) or isinstance(raw_orders, (str, bytes)) or len(raw_orders) > order_limit:
+            return None
+        queue = []
+        for raw_order in raw_orders:
+            order = list(raw_order) if isinstance(raw_order, Sequence) and not isinstance(raw_order, (str, bytes)) else raw_order
+            if not _valid_market_order_schema(order, observations[player]):
+                return None
+            queue.append(order)
+        queues.append(queue)
+
+    capacity = _shed_capacity(configuration)
+    try:
+        hire_mult = int(_config_value(configuration, "farmHandCostMult", 1))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    floor_sales = [0, 0]
+    for order_index in range(max((len(queue) for queue in queues), default=0)):
+        active = [queue[order_index] if order_index < len(queue) else None for queue in queues]
+        # HIRE and BUY_LAND are atomic orders, handled before per-unit quotes.
+        for player, order in enumerate(active):
+            if order is None:
+                continue
+            operation = order[0]
+            state = states[player]
+            if operation == "HIRE":
+                cost = _fib(state["hires"]) * hire_mult
+                if cost > state["money"]:
+                    if player == 0:
+                        return None
+                    active[player] = None
+                    continue
+                state["money"] -= cost
+                state["hires"] += 1
+                continue
+            if operation == "BUY_LAND":
+                next_index = len(state["unlocked"]) - 1
+                if next_index < 0 or next_index >= len(LAND_ORDER) or state["money"] < LAND_PRICES[next_index]:
+                    if player == 0:
+                        return None
+                    active[player] = None
+                    continue
+                state["money"] -= LAND_PRICES[next_index]
+                state["unlocked"].append(LAND_ORDER[next_index])
+                continue
+
+        remaining = [order[2] if order is not None and order[0] not in {"HIRE", "BUY_LAND"} else 0 for order in active]
+        while any(remaining):
+            quotes = [None, None]
+            for player, order in enumerate(active):
+                if order is None or remaining[player] <= 0:
+                    continue
+                operation, item = order[0], order[1]
+                if operation == "BUY_SEED":
+                    quotes[player] = float(CROPS[item]["seed"])
+                elif operation == "BUY_ANIMAL":
+                    quotes[player] = float(ANIMALS[item]["cost"])
+                elif operation == "BUY_PRODUCT":
+                    quotes[player] = _observed_unit_price(
+                        item, observations[0], market_inventory.get(item, 0.0), buying=True,
+                        configuration=configuration, force_model=force_model,
+                    )
+                elif operation == "SELL":
+                    quotes[player] = _observed_unit_price(
+                        item, observations[0], market_inventory.get(item, 0.0), buying=False,
+                        configuration=configuration, force_model=force_model,
+                    )
+            if all(quote is None for quote in quotes):
+                break
+            committed = False
+            for player, order in enumerate(active):
+                if order is None or remaining[player] <= 0 or quotes[player] is None:
+                    continue
+                operation, item, price = order[0], order[1], quotes[player]
+                state = states[player]
+                shed_total = sum(state["shed"].values())
+                if operation == "SELL":
+                    if state["shed"].get(item, 0.0) < 1:
+                        if player == 0:
+                            return None
+                        active[player] = None
+                        continue
+                    state["shed"][item] -= 1
+                    state["money"] += price
+                    if price > PRICE_FLOOR:
+                        market_inventory[item] = market_inventory.get(item, 0.0) + 1
+                    else:
+                        floor_sales[player] += 1
+                elif operation == "BUY_PRODUCT":
+                    if market_inventory.get(item, 0.0) < 1 or state["money"] < price or shed_total >= capacity:
+                        if player == 0:
+                            return None
+                        active[player] = None
+                        continue
+                    state["money"] -= price
+                    state["shed"][item] = state["shed"].get(item, 0.0) + 1
+                    market_inventory[item] -= 1
+                elif operation == "BUY_SEED":
+                    if state["money"] < price:
+                        if player == 0:
+                            return None
+                        active[player] = None
+                        continue
+                    state["money"] -= price
+                    state["seeds"][item] = state["seeds"].get(item, 0.0) + 1
+                elif operation == "BUY_ANIMAL":
+                    if state["money"] < price or shed_total >= capacity:
+                        if player == 0:
+                            return None
+                        active[player] = None
+                        continue
+                    state["money"] -= price
+                    state["shed"][item] = state["shed"].get(item, 0.0) + 1
+                remaining[player] -= 1
+                committed = True
+            if not committed:
+                break
+    return {"states": states, "market_inventory": market_inventory, "floor_sales": floor_sales}
+
+
+def _valid_market_orders_lockstep(orders_by_player: Sequence[Any], observations: Sequence[Mapping[str, Any]],
+                                  configuration: Mapping[str, Any] | None = None) -> bool:
+    other_orders = orders_by_player[1] if len(orders_by_player) > 1 else ()
+    return _simulate_market_orders_lockstep(
+        orders_by_player, observations, configuration, force_model=bool(other_orders),
+    ) is not None
+
+
 def _legal_unit_command(command: Any) -> bool:
     if not isinstance(command, Sequence) or isinstance(command, (str, bytes)) or not command or not isinstance(command[0], str):
         return False
@@ -904,6 +1107,163 @@ def _unit_command_valid_for_state(command: Any, observation: Mapping[str, Any], 
         room = max(0, int(_config_value(configuration, "shedCapacity", shed_capacity)) - int(sum((_number(value) or 0) for value in shed.values())))
         return is_shed_adjacent(position, size) and (_number(inventory.get(item)) or 0) >= quantity and room >= quantity
     return False
+
+
+def _tile_at_position(observation: Mapping[str, Any], position: tuple[int, int]) -> Any:
+    farm = _farm_observation(observation)
+    tiles = farm.get("tiles", ())
+    x, y = position
+    if not isinstance(tiles, Sequence) or isinstance(tiles, (str, bytes)) or not 0 <= y < len(tiles):
+        return None
+    row = tiles[y]
+    if not isinstance(row, Sequence) or isinstance(row, (str, bytes)) or not 0 <= x < len(row):
+        return None
+    return row[x]
+
+
+def _positive_quantities(value: Any) -> dict[str, float]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        str(item): quantity
+        for item, raw_quantity in value.items()
+        if (quantity := _number(raw_quantity)) is not None and quantity > 0
+    }
+
+
+def _private_inventories(observation: Mapping[str, Any]) -> list[dict[str, float]] | None:
+    raw = _mapping(observation.get("private")).get("inventories")
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return None
+    return [_positive_quantities(inventory) for inventory in raw]
+
+
+def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], action: Mapping[str, Any],
+                             configuration: Mapping[str, Any] | None = None,
+                             market_result: Mapping[str, Any] | None = None) -> bool:
+    """Check deterministic effects of one recorded player action."""
+    if not isinstance(pre, Mapping) or not isinstance(post, Mapping) or market_result is None:
+        return False
+    pre_farm = _farm_observation(pre)
+    post_farm = _farm_observation(post)
+    pre_hands = pre_farm.get("hands", ())
+    post_hands = post_farm.get("hands", ())
+    if not isinstance(pre_hands, Sequence) or isinstance(pre_hands, (str, bytes)):
+        return False
+    if not isinstance(post_hands, Sequence) or isinstance(post_hands, (str, bytes)):
+        return False
+    simulated_states = market_result.get("states", ())
+    simulated = simulated_states[0] if isinstance(simulated_states, Sequence) and simulated_states else {}
+    if not isinstance(simulated, Mapping):
+        return False
+    expected_hands = len(pre_hands) + int(simulated.get("hires", 0)) - int(_number(pre_farm.get("hires_today")) or 0)
+    if len(post_hands) != expected_hands:
+        return False
+    commands = [action.get("farmer"), *list(action.get("hands", ()))]
+    boundary = _number(pre.get("hour")) == 23 and _number(post.get("hour")) == 0
+    inventories = _private_inventories(pre)
+    post_inventories = _private_inventories(post)
+    if inventories is not None and post_inventories is not None:
+        expected_inventories = [dict(inventory) for inventory in inventories]
+        expected_shed = dict(_positive_quantities(simulated.get("shed")))
+    else:
+        expected_inventories = None
+        expected_shed = None
+    expected_seeds = dict(_positive_quantities(simulated.get("seeds")))
+
+    def add_quantity(values: dict[str, float], item: str, amount: float) -> None:
+        values[item] = values.get(item, 0.0) + amount
+        if values[item] <= 0:
+            values.pop(item, None)
+
+    for worker_index, command in enumerate(commands):
+        if not isinstance(command, Sequence) or isinstance(command, (str, bytes)) or not command:
+            return False
+        position = _worker_position(pre, worker_index)
+        post_position = _worker_position(post, worker_index)
+        if position is None or post_position is None:
+            return False
+        operation = command[0]
+        if operation in {"NORTH", "SOUTH", "EAST", "WEST"}:
+            deltas = {"NORTH": (0, -1), "SOUTH": (0, 1), "EAST": (1, 0), "WEST": (-1, 0)}
+            dx, dy = deltas[operation]
+            if not boundary and post_position != (position[0] + dx, position[1] + dy):
+                return False
+        elif not boundary and post_position != position:
+            return False
+
+        pre_tile = _tile_at_position(pre, position)
+        post_tile = _tile_at_position(post, position)
+        if operation == "PLANT":
+            if not isinstance(post_tile, Mapping) or _tile_kind(post_tile) != "PLANT" or post_tile.get("crop") != command[1]:
+                return False
+            add_quantity(expected_seeds, command[1], -1)
+        elif operation == "BUILD_COOP" and (not isinstance(post_tile, Mapping) or _tile_kind(post_tile) != "COOP"):
+            return False
+        elif operation == "BUILD_PASTURE" and (not isinstance(post_tile, Mapping) or _tile_kind(post_tile) != "PASTURE"):
+            return False
+        elif operation == "DIG" and post_tile is not None:
+            return False
+        elif operation == "WATER" and not boundary and (not isinstance(post_tile, Mapping) or post_tile.get("watered_today") is not True):
+            return False
+        elif operation == "FEED" and not boundary and (not isinstance(post_tile, Mapping) or post_tile.get("fed_today") is not True):
+            return False
+        elif operation == "CARE" and not boundary and (not isinstance(post_tile, Mapping) or post_tile.get("cared_today") is not True):
+            return False
+        elif operation == "FERTILIZE":
+            if not isinstance(post_tile, Mapping) or (_number(post_tile.get("fertilized_until_day")) or -1) < (_number(pre.get("day")) or 0) + 2:
+                return False
+        elif operation == "COLLECT_FERTILIZER" and not boundary:
+            if not isinstance(post_tile, Mapping) or post_tile.get("fertilizer_available") is not False:
+                return False
+        elif operation == "HARVEST":
+            if isinstance(post_tile, Mapping) and (_number(post_tile.get("yield_units")) or 0) != 0:
+                return False
+            if post_tile is not None and not isinstance(post_tile, Mapping):
+                return False
+        elif operation == "PLACE" and command[1] in _ANIMAL_NAMES:
+            if not isinstance(post_tile, Mapping) or post_tile.get("animal") != command[1]:
+                return False
+
+        if expected_inventories is None or boundary or worker_index >= len(expected_inventories):
+            continue
+        inventory = expected_inventories[worker_index]
+        item = command[1] if len(command) > 1 else None
+        quantity = float(command[2] if len(command) > 2 else 1) if item is not None else 0.0
+        if operation == "PICKUP":
+            add_quantity(expected_shed, item, -quantity)
+            add_quantity(inventory, item, quantity)
+        elif operation == "PLACE" and item not in _ANIMAL_NAMES:
+            add_quantity(inventory, item, -quantity)
+            add_quantity(expected_shed, item, quantity)
+        elif operation == "FEED":
+            add_quantity(inventory, "WHEAT", -1)
+        elif operation == "FERTILIZE":
+            add_quantity(inventory, "FERTILIZER", -1)
+        elif operation == "COLLECT_FERTILIZER":
+            add_quantity(inventory, "FERTILIZER", 1)
+        elif operation == "HARVEST" and isinstance(pre_tile, Mapping):
+            item = pre_tile.get("crop") or _animal_state(pre_tile).get("product")
+            if item:
+                add_quantity(inventory, item, _number(pre_tile.get("yield_units")) or 0)
+        elif operation == "DROP":
+            for drop_item, drop_quantity in list(inventory.items()):
+                add_quantity(expected_shed, drop_item, drop_quantity)
+            inventory.clear()
+
+    if expected_inventories is not None and not boundary:
+        if post_inventories != expected_inventories:
+            return False
+        if _positive_quantities(_mapping(_mapping(post).get("private")).get("shed")) != _positive_quantities(expected_shed):
+            return False
+    if _positive_quantities(_mapping(_mapping(post).get("private")).get("seeds")) != expected_seeds:
+        return False
+    expected_money = _number(simulated.get("money"))
+    if expected_money is None or _cash(post) != expected_money:
+        return False
+    if list(_mapping(post_farm).get("unlocked_quadrants", ())) != list(simulated.get("unlocked", ())):
+        return False
+    return True
 
 
 def _sanitize_action(action: Mapping[str, Any], observation: Mapping[str, Any], fallback: Mapping[str, Any],
@@ -1115,9 +1475,9 @@ def _select_default(records: Sequence[Mapping[str, Any]], variants: Sequence[str
     if not scored:
         return "mixed"
     return min(scored, key=lambda item: (
+        item[1]["framework_error_rate"],
         -item[1]["win_rate"],
         -item[1]["median_final_bank"],
-        item[1]["framework_error_rate"],
         item[0],
     ))[0]
 
