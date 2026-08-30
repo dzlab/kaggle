@@ -552,6 +552,31 @@ def test_transition_effects_accepts_same_tile_water_blocked_by_harvest():
     )
 
 
+def test_transition_effects_accepts_water_followed_by_lifespan_decay():
+    from scripts.evaluate import _transition_effects_valid
+
+    plant = {"kind": "PLANT", "crop": "MELON", "watered_today": False,
+             "yield_units": 1, "planted_day": 0, "fertilized_until_day": -1,
+             "max_lifespan_step": 312, "consecutive_unwatered": 0}
+    farm = {"money": 100, "farmer": [3, 0], "hands": [], "hires_today": 0,
+            "tiles": [[None, None, None, plant]], "unlocked_quadrants": ["NW"]}
+    pre = {"player": 0, "step": 322, "day": 13, "hour": 10, "farms": [farm],
+           "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+           "market": {"inventory": {}, "prices": {}}}
+    post = {"player": 0, "step": 323, "day": 13, "hour": 11,
+            "farms": [{**farm, "tiles": [[None, None, None, {"kind": "WEED"}]]}],
+            "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+            "market": {"inventory": {}, "prices": {}}}
+    market_result = {
+        "states": [{"money": 100, "shed": {}, "seeds": {}, "hires": 0, "unlocked": ["NW"]}],
+        "market_inventory": {},
+    }
+
+    assert _transition_effects_valid(
+        pre, post, {"farmer": ["WATER"], "hands": [], "market": []}, {}, market_result,
+    )
+
+
 def test_transition_effects_accept_end_of_day_hire_hand_reset():
     from scripts.evaluate import _transition_effects_valid
 
@@ -904,6 +929,41 @@ def test_replay_requires_configuration_and_engine_provenance():
     ]], "statuses": ["DONE", "DONE"], "info": {}}
 
     record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+
+
+def test_replay_rejects_final_carried_inventory_even_when_transition_is_consistent():
+    from scripts.evaluate import replay_record
+
+    pre = {
+        "player": 0, "step": 0, "day": 0, "hour": 0,
+        "farms": [{"money": 100, "farmer": [0, 0], "hands": [], "hires_today": 0,
+                   "tiles": [[None]], "unlocked_quadrants": ["NW"]}],
+        "private": {"seeds": {}, "shed": {}, "inventories": [{"WHEAT": 1}]},
+        "market": {"prices": {}, "inventory": {}},
+    }
+    post = {**pre, "step": 1, "day": 0, "hour": 1}
+    other_pre = {
+        "player": 1, "step": 0, "day": 0, "hour": 0,
+        "farms": [{"money": 100}, {"money": 90, "farmer": [0, 0], "hands": [], "hires_today": 0,
+                   "tiles": [[None]], "unlocked_quadrants": ["NW"]}],
+        "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+        "market": {"prices": {}, "inventory": {}},
+    }
+    other_post = {**other_pre, "step": 1, "day": 0, "hour": 1}
+    replay = {
+        "steps": [
+            [{"observation": pre, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "ACTIVE", "info": {}},
+             {"observation": other_pre, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "ACTIVE", "info": {}}],
+            [{"observation": post, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "DONE", "info": {}},
+             {"observation": other_post, "action": {"farmer": ["PASS"], "hands": [], "market": []}, "status": "DONE", "info": {}}],
+        ],
+        "statuses": ["DONE", "DONE"], "info": {},
+    }
+
+    record = replay_record(_engine_envelope(replay), variant="mixed", opponent="pass", seed=1)
 
     assert record["framework_error"] is True
     assert record["outcome"] == "framework_error"

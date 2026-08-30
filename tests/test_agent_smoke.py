@@ -168,10 +168,16 @@ def test_full_seeded_local_game_finishes_with_legal_replay(tmp_path: Path):
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
 def test_full_pass_exercises_autonomous_macro_action_and_market_flows(tmp_path: Path):
+    from scripts.evaluate import replay_record
+
     replay_path = tmp_path / "full-pass-macro.json"
 
     run_episode(opponent="pass", seed=17, steps=720, replay_path=replay_path)
     replay = _assert_replay_is_legal_and_complete(replay_path)
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=17)
+    assert record["framework_error"] is False
+    assert record["missed_basic_needs"] == 0
+    assert all(not inventory for inventory in replay["steps"][-1][0]["observation"]["private"]["inventories"])
     unit_operations = set()
     market_operations = set()
     for player_state in replay["steps"]:

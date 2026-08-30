@@ -193,6 +193,17 @@ def test_policy_keeps_required_carried_animal_for_assigned_placement():
     assert action["hands"][0] != ["DROP"]
 
 
+def test_terminal_cleanup_does_not_mix_carried_pickup_or_drop_with_sales():
+    obs = observation(day=29, hour=22, hands=[[2, 2]],
+                      inventories=[[], ["FERTILIZER"]],
+                      shed={"MELON": 2, "FERTILIZER": 0}, seeds={})
+
+    action = policy_module.Policy().act(obs)
+
+    assert action["hands"][0] == ["DROP"]
+    assert action["market"] == []
+
+
 def test_zero_filled_real_engine_shed_does_not_keep_cached_shed_or_sell_valid():
     state = {
         "board_size": 5,

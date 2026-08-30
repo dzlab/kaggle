@@ -431,6 +431,11 @@ def build_market_orders(state: Any, plan: Any) -> list[list[Any]]:
     # for a 30-day episode, with hour 23 retained for direct callers.
     final_turn = day >= season_days - 1 and hour >= 22
 
+    # Do not sell while a worker is still carrying goods.  The terminal
+    # cleanup window gets those goods into the shed first.
+    if final_turn and _has_carried_goods(state):
+        return []
+
     # Protect the remaining wheat needed by living animals before selling.
     carried_wheat = sum(_counts(inventory).get("WHEAT", 0) for inventory in _inventories(state))
     total_feed_wheat = feed_reserve(_animals(state), _days_left(state), 0)
@@ -683,6 +688,10 @@ def _drop_carried_goods(state: Any, worker_index: int, task: Any, current: Posit
     return "DROP" if current == access else next_move(current, access)
 
 
+def _has_carried_goods(state: Any) -> bool:
+    return any(_counts(inventory) for inventory in _inventories(state))
+
+
 def worker_action(worker_index: int, state: Any, assignment: WorkerAssignment | Task | None) -> list[Any]:
     """Emit one safe command for a worker, falling back to ``PASS``."""
     if assignment is None:
@@ -801,17 +810,24 @@ class Policy:
         by_worker = {assignment.worker_index: assignment for assignment in assignments}
         terminal_cleanup = (
             _whole(_get(state, "day")) >= season_days - 1
-            and _whole(_get(state, "hour")) >= 20
+            and _whole(_get(state, "hour")) >= 12
         )
-        commands = {worker["index"]: worker_action(worker["index"], state, by_worker.get(worker["index"])) for worker in workers}
-        for worker in workers:
-            drop = _drop_carried_goods(
-                state, worker["index"],
-                _get(by_worker.get(worker["index"]), "task"), worker["position"],
-                force=terminal_cleanup,
-            )
-            if drop is not None:
-                commands[worker["index"]] = _unit_command(drop)
+        if terminal_cleanup:
+            commands = {}
+            for worker in workers:
+                drop = _drop_carried_goods(
+                    state, worker["index"], None, worker["position"], force=True,
+                )
+                commands[worker["index"]] = _unit_command(drop or PASS)
+        else:
+            commands = {worker["index"]: worker_action(worker["index"], state, by_worker.get(worker["index"])) for worker in workers}
+            for worker in workers:
+                drop = _drop_carried_goods(
+                    state, worker["index"],
+                    _get(by_worker.get(worker["index"]), "task"), worker["position"],
+                )
+                if drop is not None:
+                    commands[worker["index"]] = _unit_command(drop)
         farmer = commands.get(0, [PASS])
         market_plan = build_daily_plan(_state_for_planner(state), self.memory)
         market_plan.extend(macro.get("market_intents", ()))
@@ -824,6 +840,6 @@ class Policy:
         if not isinstance(visible_hands, Sequence) or isinstance(visible_hands, (str, bytes)):
             visible_hands = [worker for worker in workers if worker["index"] != 0]
         hands = [commands.get(index + 1, [PASS]) for index in range(len(visible_hands))]
-        market = build_market_orders(state, market_plan)
+        market = [] if terminal_cleanup else build_market_orders(state, market_plan)
         self.memory.sell_batches = [order for order in market if order[0] == "SELL"]
         return {"farmer": farmer, "hands": hands, "market": market}

@@ -659,7 +659,7 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
             available = [crop_name for crop_name in CROPS if seeds.get(crop_name, 0) and crop_name in CROPS]
             if available:
                 crop_name = max(available, key=lambda item: (_observed_quote(item, state), item))
-                _add(plan, "PLANT", position, 20, None, _observed_quote(crop_name, state))
+                _add(plan, "PLANT", position, 20, day, _observed_quote(crop_name, state))
 
         animal_entity = _entity_state(tile, "animal")
         if animal_entity is not None:
@@ -759,6 +759,71 @@ def _route_positions(start: Position | None, target: Position | None, board_size
     return route
 
 
+def _held_quantity(state: Mapping[str, Any], item: str) -> int | float:
+    private = _mapping(state.get("private"))
+    if "inventories" in private:
+        held = _held_inventory(private.get("inventories"))
+        return _safe_quantity(held.get(item, 0))
+    inventory = state.get("inventory")
+    if isinstance(inventory, Mapping):
+        return _safe_quantity(inventory.get(item, 0))
+    return 0
+
+
+def _shed_quantity(state: Mapping[str, Any], item: str) -> int | float:
+    private = _mapping(state.get("private"))
+    shed = private.get("shed", state.get("shed", {}))
+    return _safe_quantity(shed.get(item, 0)) if isinstance(shed, Mapping) else 0
+
+
+def _shed_route_distance(start: Position, board_size: int) -> int:
+    access = [
+        point for point in shed_access_tiles(board_size)
+        if 0 <= point.x < board_size and 0 <= point.y < board_size
+    ]
+    return min((distance(start, point) for point in access), default=10**9)
+
+
+def _task_turn_budget(task: Task, worker: tuple[int, str, Position | None], state: Mapping[str, Any],
+                      board_size: int) -> int:
+    target = _target_position(task.target)
+    start = worker[2]
+    if start is None or target is None:
+        return 0
+    travel = distance(start, target)
+    kind = str(task.kind).upper()
+    if kind == "PLANT":
+        # A newly planted crop must have one further turn reserved for WATER.
+        return travel + 2
+    if kind in {"FEED", "FERTILIZE", "ANIMAL"}:
+        item = "WHEAT" if kind == "FEED" else (
+            "FERTILIZER" if kind == "FERTILIZE" else str(task.item or "").upper()
+        )
+        if item and _held_quantity(state, item) <= 0:
+            if _shed_quantity(state, item) <= 0:
+                return 10**9
+            pickup = _shed_route_distance(start, board_size) + 1
+            target_from_shed = min(
+                (distance(point, target) for point in shed_access_tiles(board_size)
+                 if 0 <= point.x < board_size and 0 <= point.y < board_size),
+                default=10**9,
+            )
+            return pickup + target_from_shed + 1
+    return travel + 1
+
+
+def _fits_same_day_deadline(task: Task, worker: tuple[int, str, Position | None], state: Mapping[str, Any],
+                            board_size: int, day: int) -> bool:
+    if task.deadline is None or task.deadline > day:
+        return True
+    try:
+        hour = min(23, max(0, int(_get(state, "hour", 0))))
+    except (TypeError, ValueError, OverflowError):
+        hour = 0
+    remaining_turns = 24 - hour
+    return _task_turn_budget(task, worker, state, board_size) <= remaining_turns
+
+
 def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any) -> list[WorkerAssignment]:
     """Assign at most one exclusive task per worker with deterministic priorities."""
     state = normalize_planner_state(state)
@@ -798,7 +863,10 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
     remaining = list(tasks)
 
     def choose(task: Task) -> tuple[int, str, Position | None] | None:
-        candidates = [info for info in infos if info[0] in available]
+        candidates = [
+            info for info in infos
+            if info[0] in available and _fits_same_day_deadline(task, info, state, board_size, day)
+        ]
         non_farmer_available = any(info[0] in available and info[1] != "FARMER" for info in infos)
         reserve_farmer = (
             logistics_pending

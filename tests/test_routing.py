@@ -255,6 +255,35 @@ def test_daily_plan_schedules_collect_fertilizer_and_keeps_harvest_urgent():
     assert harvest.priority > fertilize.priority
 
 
+def test_assign_tasks_rejects_same_day_water_without_route_time():
+    state = _state(
+        hour=22,
+        tiles={pos(4, 4): {"kind": "PLANT", "crop": "WHEAT", "watered": False}},
+        workers=[{"index": 0, "role": "FARMER", "position": pos(0, 0)}],
+    )
+
+    assignments = assign_tasks(
+        [Task("WATER", pos(4, 4), 100, 2, 1)], state["workers"], state,
+    )
+
+    assert assignments == []
+
+
+def test_assign_tasks_reserves_shed_pickup_time_for_same_day_feed():
+    state = _state(
+        hour=14,
+        tiles={pos(4, 4): {"kind": "PASTURE", "animal": "GOOSE", "fed": False}},
+        workers=[{"index": 0, "role": "FARMER", "position": pos(0, 0)}],
+        private={"shed": {"WHEAT": 1}, "inventories": [[]]},
+    )
+    task = Task("FEED", pos(4, 4), 100, 2, 1)
+
+    assert assign_tasks([task], state["workers"], state)
+
+    state["hour"] = 17
+    assert assign_tasks([task], state["workers"], state) == []
+
+
 def test_normalize_planner_state_supports_attribute_based_state():
     state = SimpleNamespace(
         day=2,

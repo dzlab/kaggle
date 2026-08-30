@@ -342,6 +342,9 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
         }
     if _final_bank(own_states[-1]) is None or _final_bank(other_states[-1]) is None:
         return False
+    final_inventories = _private_inventories(_mapping(own_states[-1].get("observation")))
+    if final_inventories is None or any(inventory for inventory in final_inventories):
+        return False
     return not bool(_mapping(replay.get("info")).get("error"))
 
 
@@ -1622,6 +1625,20 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
                 if post_tile is None and blocked_by_harvest and isinstance(pre_tile, Mapping):
                     continue
                 return False
+            if operation == "WATER" and _tile_kind(post_tile) == "WEED" and isinstance(pre_tile, Mapping):
+                lifespan = _number(pre_tile.get("max_lifespan_step"))
+                step = _number(pre.get("step"))
+                yield_units = _number(pre_tile.get("yield_units"))
+                if (
+                    _tile_kind(pre_tile) == "PLANT"
+                    and lifespan is not None and step is not None
+                    and step >= lifespan and int(step - lifespan) % 2 == 0
+                    and yield_units == 1
+                ):
+                    # The engine applies the action to the pre-state, then
+                    # its lifespan decay can replace the last unit with WEED
+                    # in the same transition.
+                    continue
             if boundary:
                 expected_tile = _targeted_boundary_tile_expected(
                     pre_tile, operation, int(_number(pre.get("day")) or 0),
