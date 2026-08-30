@@ -2095,7 +2095,16 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
                 return False
         elif operation == "HARVEST":
             if isinstance(post_tile, Mapping) and (_number(post_tile.get("yield_units")) or 0) != 0:
-                return False
+                crop = pre_tile.get("crop") if isinstance(pre_tile, Mapping) else None
+                pre_yield = _number(pre_tile.get("yield_units")) if isinstance(pre_tile, Mapping) else None
+                ongoing_boundary_harvest = (
+                    boundary and crop in CROPS and CROPS[crop]["ongoing"]
+                    and pre_yield is not None
+                    and post_tile.get("crop") == crop
+                    and (_number(post_tile.get("yield_units")) or 0) == max(0, pre_yield - 1)
+                )
+                if not ongoing_boundary_harvest:
+                    return False
             if post_tile is not None and not isinstance(post_tile, Mapping):
                 return False
         elif operation == "PLACE" and command[1] in _ANIMAL_NAMES:
@@ -2277,7 +2286,15 @@ def apply_variant(action: Mapping[str, Any], observation: Mapping[str, Any], var
               "market": _market_orders(action)}
     seeds = _private_seeds(observation)
     if variant == "conservative":
-        result["market"] = [order for order in result["market"] if order[0] not in {"BUY_ANIMAL", "BUY_LAND", "BUY_PRODUCT"}][:1]
+        mandatory = [
+            order for order in result["market"]
+            if order[0] == "BUY_PRODUCT" and order[1] in {"WHEAT", "FERTILIZER"}
+        ]
+        discretionary = [
+            order for order in result["market"]
+            if order[0] not in {"BUY_ANIMAL", "BUY_LAND", "BUY_PRODUCT"}
+        ][:max(0, 1 - len(mandatory))]
+        result["market"] = mandatory + discretionary
     elif variant == "melon-heavy":
         if result["farmer"][:1] == ["PLANT"] and len(result["farmer"]) > 1 and result["farmer"][1] == "WHEAT" and _number(seeds.get("MELON")):
             result["farmer"][1] = "MELON"
@@ -2416,6 +2433,34 @@ def _select_default(records: Sequence[Mapping[str, Any]], variants: Sequence[str
     ))[0]
 
 
+def _normalized_report_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove output-directory dependence from metadata while retaining names."""
+    normalized = dict(config)
+    for key in ("output", "replay_summary"):
+        value = normalized.get(key)
+        if value is not None:
+            normalized[key] = Path(str(value)).name
+    return normalized
+
+
+def _normalized_command(command: Sequence[str] | None) -> list[str]:
+    """Canonicalize evaluator script and report output arguments."""
+    values = [str(value) for value in (command or ())]
+    normalized: list[str] = []
+    for index, value in enumerate(values):
+        if index == 0 and Path(value).name == "evaluate.py":
+            normalized.append("scripts/evaluate.py")
+        elif value == "--output":
+            normalized.append(value)
+        elif index and values[index - 1] == "--output":
+            normalized.append("<report>")
+        elif value.startswith("--output="):
+            normalized.append("--output=<report>")
+        else:
+            normalized.append(value)
+    return normalized
+
+
 def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mapping[str, Any]], command: Sequence[str] | None = None,
                           ablation_records: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
                           ablation_configs: Mapping[str, Mapping[str, bool]] | None = None) -> dict[str, Any]:
@@ -2444,11 +2489,14 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
     return {
         "schema_version": 1,
         "metadata": {
-            "command": list(command) if command is not None else [],
-            "config": dict(config),
+            "command": _normalized_command(command),
+            "config": _normalized_report_config(config),
             "engine": "kaggle-environments",
             "engine_version": ENGINE_VERSION,
-            "replay_summary": config.get("replay_summary"),
+            "replay_summary": (
+                Path(str(config["replay_summary"])).name
+                if config.get("replay_summary") is not None else None
+            ),
         },
         "selected_default": _select_default(records, variants),
         "results": results,
@@ -2487,7 +2535,7 @@ def main(argv: list[str] | None = None) -> int:
         "opponents": list(args.opponents),
         "variants": list(args.variants),
         "ablations": [f"{component}={'on' if enabled else 'off'}" for component, enabled in args.ablation],
-        "replay_summary": str(sidecar.relative_to(PROJECT_ROOT)) if sidecar.is_relative_to(PROJECT_ROOT) else str(sidecar),
+        "replay_summary": sidecar.name,
         "quick": args.quick,
     }
     evaluation = run_evaluation(variants=args.variants, opponents=args.opponents, seeds=seeds, steps=args.steps, ablations=args.ablation)

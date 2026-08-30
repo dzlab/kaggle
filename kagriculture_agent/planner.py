@@ -15,7 +15,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from math import inf, isfinite
 from typing import Any
 
-from .constants import ANIMALS, CROPS, LAND_ORDER, LAND_PRICES, MARKET_I0, SHOPS, season_days
+from .constants import ANIMALS, CROPS, LAND_ORDER, LAND_PRICES, MARKET_I0, PRODUCTS, SHOPS, season_days, shed_capacity
 from .economics import forecast_crop, market_price, sell_batch_value
 from .observation import parse_observation, shed_access_tiles
 from .routing import distance, is_locked_tile, normalize_position, route_to
@@ -519,6 +519,101 @@ def _compatible_structure(state: Mapping[str, Any], animal: str) -> tuple[Positi
     return None, empty
 
 
+def _feed_animal_counts(state: Mapping[str, Any]) -> dict[str, int]:
+    """Count placed and stored animals without double-counting observations."""
+    counts: dict[str, int] = {}
+    placed: dict[str, int] = {}
+    for _position_value, tile in _tiles(state):
+        animal = _entity_state(tile, "animal")
+        species = _upper(_get(animal, "species", _get(animal, "animal", ""))) if animal else ""
+        if species in ANIMALS:
+            placed[species] = placed.get(species, 0) + 1
+    if placed:
+        counts.update(placed)
+    else:
+        observed = _get(state, "animals", ())
+        if isinstance(observed, Mapping):
+            observed = (observed,)
+        if isinstance(observed, Sequence) and not isinstance(observed, (str, bytes)):
+            for animal in observed:
+                species = _upper(_get(animal, "species", _get(animal, "animal", _get(animal, "kind", ""))))
+                if species in ANIMALS and _get(animal, "owned", True) is not False:
+                    counts[species] = counts.get(species, 0) + 1
+    private = _mapping(state.get("private"))
+    shed = private.get("shed", state.get("shed", {}))
+    if isinstance(shed, Mapping):
+        for species in ANIMALS:
+            counts[species] = counts.get(species, 0) + _safe_quantity(shed.get(species, 0))
+    return counts
+
+
+def _staged_wheat(state: Mapping[str, Any]) -> int | float:
+    """Return wheat in the shed and in every worker inventory."""
+    private = _mapping(state.get("private"))
+    shed = private.get("shed", state.get("shed", {}))
+    total = _safe_quantity(shed.get("WHEAT", 0)) if isinstance(shed, Mapping) else 0
+    inventories = private.get("inventories")
+    if isinstance(inventories, Sequence) and not isinstance(inventories, (str, bytes)):
+        total += _held_inventory(inventories).get("WHEAT", 0)
+    else:
+        inventory = state.get("inventory", {})
+        if isinstance(inventory, Mapping):
+            total += _safe_quantity(inventory.get("WHEAT", 0))
+    return total
+
+
+def _intent_purchase_cost(intents: Sequence[Sequence[Any]], state: Mapping[str, Any]) -> float:
+    """Estimate all already-planned purchase cash at the observed quotes."""
+    farm = _mapping(state.get("farm"))
+    unlocked = farm.get("unlocked_quadrants", state.get("unlocked_quadrants", ["NW"]))
+    if not isinstance(unlocked, Sequence) or isinstance(unlocked, (str, bytes)):
+        unlocked = ["NW"]
+    hires = _safe_quantity(farm.get("hires_today", state.get("hires_today", 0)))
+    first, second = 1, 1
+    for _ in range(int(hires)):
+        first, second = second, first + second
+    total = 0.0
+    for intent in intents:
+        if not isinstance(intent, Sequence) or isinstance(intent, (str, bytes)) or not intent:
+            continue
+        kind = str(intent[0]).upper()
+        item = str(intent[1]).upper() if len(intent) > 1 and intent[1] is not None else ""
+        quantity = int(_safe_quantity(intent[2])) if len(intent) > 2 else 1
+        if kind == "BUY_SEED" and item in CROPS:
+            total += quantity * float(CROPS[item]["seed"])
+        elif kind == "BUY_PRODUCT" and item in PRODUCTS:
+            total += quantity * _observed_quote(item, state)
+        elif kind == "BUY_ANIMAL" and item in ANIMALS:
+            total += quantity * float(ANIMALS[item]["cost"])
+        elif kind == "BUY_LAND":
+            index = len(unlocked) - 1
+            if 0 <= index < len(LAND_PRICES):
+                total += float(LAND_PRICES[index])
+                unlocked = [*unlocked, LAND_ORDER[index]]
+        elif kind == "HIRE":
+            total += float(first)
+            first, second = second, first + second
+    return total
+
+
+def _feed_purchase_needed(state: Mapping[str, Any], day: int, counts: Mapping[str, int],
+                          intents: Sequence[Sequence[Any]], cash: float,
+                          wheat_price: float) -> tuple[int, float]:
+    """Return missing full-season feed and cash after buying that feed."""
+    days = max(0, season_days - day)
+    already_planned = sum(
+        int(_safe_quantity(intent[2]))
+        for intent in intents
+        if isinstance(intent, Sequence) and not isinstance(intent, (str, bytes))
+        and len(intent) >= 3 and str(intent[0]).upper() == "BUY_PRODUCT"
+        and str(intent[1]).upper() == "WHEAT"
+    )
+    required = sum(max(0, int(quantity)) for quantity in counts.values()) * days
+    missing = max(0, required - int(_staged_wheat(state)) - already_planned)
+    cash_after = cash - _intent_purchase_cost(intents, state) - missing * max(0.0, wheat_price)
+    return missing, cash_after
+
+
 def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None) -> dict[str, Any]:
     """Choose a live portfolio and executable macro intents from observations.
 
@@ -550,28 +645,13 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None) 
     stored_animals = [candidate for candidate in ANIMALS if _safe_quantity(shed.get(candidate, 0)) > 0]
     if stored_animals and animal not in stored_animals:
         animal = stored_animals[0]
-    wheat_staged = (
-        _safe_quantity(shed.get("WHEAT", 0))
-        + _safe_quantity(_mapping(normalized.get("inventory")).get("WHEAT", 0))
-    )
+    animal_counts = _feed_animal_counts(normalized)
+    wheat_staged = _staged_wheat(normalized)
     wheat_price = _observed_quote("WHEAT", normalized)
-    feed_required = bool(stored_animals)
-    for _position_value, tile in _tiles(normalized):
-        animal_state = _entity_state(tile, "animal")
-        if animal_state is not None and _needs_today(animal_state, "needs_feed", "fed_today", "fed"):
-            feed_required = True
-    observed_animals = _get(normalized, "animals", ())
-    if isinstance(observed_animals, Mapping):
-        observed_animals = (observed_animals,)
-    elif not isinstance(observed_animals, Sequence) or isinstance(observed_animals, (str, bytes)):
-        observed_animals = ()
-    for animal_state in observed_animals:
-        if _needs_today(animal_state, "needs_feed", "fed_today", "fed"):
-            feed_required = True
+    feed_required = bool(animal_counts)
     cash = _state_cash(normalized)
     intents: list[list[Any]] = []
     tasks: list[Task] = []
-    feed_horizon = min(7, max(1, season_days - day))
     _compatible_target, structure_target = _compatible_structure(normalized, animal)
     if day < season_days - 1:
         seed_cost = float(CROPS[selected["crop"]]["seed"])
@@ -606,9 +686,11 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None) 
             unlocked = ["NW"]
         land_index = len(unlocked) - 1
         reserve = max(100.0, seed_cost)
-        if feed_required and wheat_staged < feed_horizon and wheat_price > 0:
-            quantity = feed_horizon - wheat_staged
-            if cash >= wheat_price * quantity + reserve:
+        if feed_required and wheat_price > 0:
+            quantity, cash_after = _feed_purchase_needed(
+                normalized, day, animal_counts, intents, cash, wheat_price,
+            )
+            if quantity and cash_after >= reserve:
                 intents.append(["BUY_PRODUCT", "WHEAT", quantity])
         if 0 <= land_index < len(LAND_ORDER) and cash >= float(LAND_PRICES[land_index]) + reserve:
             intents.append(["BUY_LAND"])
@@ -622,28 +704,34 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None) 
         compatible, empty = _compatible_structure(normalized, animal)
         animal_in_storage = _safe_quantity(shed.get(animal, 0)) > 0
         if _placed_animal_count(normalized) == 0 and not animal_in_storage and (compatible is not None or empty is not None):
-            wheat_staged = (
-                _safe_quantity(shed.get("WHEAT", 0))
-                + _safe_quantity(_mapping(normalized.get("inventory")).get("WHEAT", 0))
+            candidate_counts = dict(animal_counts)
+            candidate_counts[animal] = candidate_counts.get(animal, 0) + 1
+            quantity, cash_after = _feed_purchase_needed(
+                normalized, day, candidate_counts, intents, cash, wheat_price,
             )
-            wheat_price = _observed_quote("WHEAT", normalized)
-            if (
-                wheat_staged <= 0
-                and wheat_price > 0
-                and cash >= float(ANIMALS[animal]["cost"]) + wheat_price + reserve
-            ):
-                # Stage the first feed before buying the animal.  The market
-                # processor preserves intent order, so both are available to
-                # the placement task on the next observation.
-                intents.append(["BUY_PRODUCT", "WHEAT", 1])
-            if cash >= float(ANIMALS[animal]["cost"]) + reserve:
+            if quantity and wheat_price > 0 and cash_after >= float(ANIMALS[animal]["cost"]) + reserve:
+                staged_for_purchase = int(_staged_wheat(normalized)) + sum(
+                    int(_safe_quantity(intent[2])) for intent in intents
+                    if len(intent) >= 3 and intent[0] == "BUY_PRODUCT" and intent[1] == "WHEAT"
+                )
+                if staged_for_purchase + quantity <= shed_capacity:
+                    intents.append(["BUY_PRODUCT", "WHEAT", quantity])
+            quantity_after_planning, candidate_cash_after = _feed_purchase_needed(
+                normalized, day, candidate_counts, intents, cash, wheat_price,
+            )
+            if quantity_after_planning == 0 and candidate_cash_after >= float(ANIMALS[animal]["cost"]) + reserve:
                 intents.append(["BUY_ANIMAL", animal, 1])
-        animal_feed_ready = (
-            wheat_staged >= feed_horizon
-            or (wheat_price > 0 and cash >= wheat_price * feed_horizon + reserve)
+        unfunded_feed, feed_cash_after = _feed_purchase_needed(
+            normalized, day, animal_counts, intents, cash, wheat_price,
         )
+        # Placement consumes already-staged goods and a worker turn; it does
+        # not need the discretionary cash cushion used for new purchases.
+        animal_feed_ready = unfunded_feed == 0
         if compatible is not None and animal_in_storage and animal_feed_ready:
-            tasks.append(Task("ANIMAL", compatible, 94, day, float(ANIMALS[animal]["cost"]), item=animal))
+            # A stored animal cannot be fed until it is placed. Give this
+            # delivery a higher priority than routine field work so a hand
+            # expiring at the day boundary cannot strand the animal.
+            tasks.append(Task("ANIMAL", compatible, 105, day, float(ANIMALS[animal]["cost"]), item=animal))
         elif empty is not None and not _placed_animal_count(normalized):
             kind = "BUILD_PASTURE" if ANIMALS[animal]["structure"] == "PASTURE" else "BUILD_COOP"
             tasks.append(Task(kind, empty, 96, day, 1.0))
@@ -925,8 +1013,6 @@ def _task_turn_budget(task: Task, worker: tuple[int, str, Position | None], stat
 def _fits_same_day_deadline(task: Task, worker: tuple[int, str, Position | None], state: Mapping[str, Any],
                             board_size: int, day: int) -> bool:
     if task.deadline is None or task.deadline > day:
-        return True
-    if str(task.kind).upper() == "ANIMAL":
         return True
     try:
         hour = min(23, max(0, int(_get(state, "hour", 0))))

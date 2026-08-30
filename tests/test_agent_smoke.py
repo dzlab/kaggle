@@ -167,6 +167,19 @@ def test_full_seeded_local_game_finishes_with_legal_replay(tmp_path: Path):
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_seed_zero_starter_has_no_missed_required_needs(tmp_path: Path):
+    from scripts.evaluate import replay_record
+
+    replay_path = tmp_path / "seed-zero-starter.json"
+    run_episode(opponent="starter", seed=0, steps=720, replay_path=replay_path)
+    replay = _assert_replay_is_legal_and_complete(replay_path)
+    record = replay_record(replay, variant="mixed", opponent="starter", seed=0)
+
+    assert record["framework_error"] is False
+    assert record["missed_basic_needs"] == 0
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
 def test_full_pass_exercises_autonomous_macro_action_and_market_flows(tmp_path: Path):
     from scripts.evaluate import replay_record
 

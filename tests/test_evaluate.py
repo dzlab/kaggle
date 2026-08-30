@@ -297,6 +297,32 @@ def test_write_result_document_is_byte_stable(tmp_path):
     assert first.with_name("first.replays.json").read_bytes() == second.with_name("second.replays.json").read_bytes()
 
 
+def test_result_metadata_normalizes_invocation_and_sidecar_paths():
+    from scripts.evaluate import build_result_document
+
+    record = [{
+        "variant": "mixed", "opponent": "pass", "seed": 7, "outcome": "win",
+        "final_bank": 100, "opponent_final_bank": 50, "framework_error": False,
+        "shed_overflow": 0, "price_floor_sales": 0, "missed_basic_needs": 0,
+    }]
+    first = build_result_document(
+        config={"variants": ["mixed"], "opponents": ["pass"],
+                "replay_summary": "/tmp/one/evaluation.replays.json"},
+        records=record,
+        command=["/tmp/one/scripts/evaluate.py", "--output", "/tmp/one/evaluation.json"],
+    )
+    second = build_result_document(
+        config={"variants": ["mixed"], "opponents": ["pass"],
+                "replay_summary": "/tmp/two/evaluation.replays.json"},
+        records=record,
+        command=["/tmp/two/scripts/evaluate.py", "--output", "/tmp/two/evaluation.json"],
+    )
+
+    assert first == second
+    assert first["metadata"]["command"] == ["scripts/evaluate.py", "--output", "<report>"]
+    assert first["metadata"]["config"]["replay_summary"] == "evaluation.replays.json"
+
+
 def test_no_network_dependency_for_import_and_aggregation(monkeypatch):
     import builtins
 
@@ -1438,6 +1464,36 @@ def test_variants_and_ablations_change_only_legal_action_shapes():
     assert variant_action["farmer"] == ["PLANT", "MELON"]
     assert variant_action["market"] == [["BUY_SEED", "MELON", 1]]
     assert ablated_action == {"farmer": ["PASS"], "hands": [], "market": []}
+
+
+def test_conservative_variant_preserves_mandatory_wheat_and_fertilizer_orders():
+    from scripts.evaluate import apply_variant
+
+    observation = {
+        "player": 0,
+        "farms": [{"money": 200, "farmer": [0, 0], "hands": [], "tiles": [[None]]}],
+        "private": {"seeds": {}, "shed": {}},
+        "market": {
+            "prices": {"WHEAT": 25, "FERTILIZER": 100, "CARROT": 35},
+            "inventory": {"WHEAT": 10_000, "FERTILIZER": 10_000},
+        },
+    }
+    action = {
+        "farmer": ["PASS"], "hands": [],
+        "market": [
+            ["BUY_PRODUCT", "WHEAT", 1],
+            ["BUY_PRODUCT", "FERTILIZER", 1],
+            ["BUY_SEED", "CARROT", 1],
+            ["BUY_ANIMAL", "GOOSE", 1],
+        ],
+    }
+
+    result = apply_variant(action, observation, "conservative")
+
+    assert result["market"] == [
+        ["BUY_PRODUCT", "WHEAT", 1],
+        ["BUY_PRODUCT", "FERTILIZER", 1],
+    ]
 
 
 def test_route_scheduling_ablation_safely_inspects_nested_hand_commands():

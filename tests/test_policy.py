@@ -464,6 +464,41 @@ def test_autonomous_macro_replenishes_wheat_for_placed_animal_feed():
     )
 
 
+def test_autonomous_macro_does_not_buy_or_place_animal_without_full_remaining_feed_reserve():
+    from kagriculture_agent.planner import build_autonomous_macro_plan
+
+    board = [[None for _ in range(5)] for _ in range(5)]
+    board[0][0] = {"kind": "COOP"}
+    state = observation(day=0, hour=0, hands=[], tiles=board, money=600,
+                        shed={}, seeds={}, inventories=[[]])
+    state["town"] = {"unlocked_shops": ["BAKERY"]}
+    state["market"] = {"prices": {"WHEAT": 25, "EGG": 50}, "inventory": {"WHEAT": 10_000}}
+
+    macro = build_autonomous_macro_plan(state)
+
+    assert not any(intent[0] == "BUY_ANIMAL" for intent in macro["market_intents"])
+    assert not any(task.kind == "ANIMAL" for task in macro["tasks"])
+
+
+def test_autonomous_macro_counts_shed_and_worker_wheat_before_animal_reserve_purchase():
+    from kagriculture_agent.planner import build_autonomous_macro_plan
+
+    board = [[None for _ in range(5)] for _ in range(5)]
+    board[0][0] = {"kind": "COOP"}
+    state = observation(day=0, hour=1, hands=[[1, 0]], tiles=board, money=1_000,
+                        shed={"WHEAT": 10}, seeds={}, inventories=[[], {"WHEAT": 5}])
+    state["town"] = {"unlocked_shops": ["BAKERY"]}
+    state["market"] = {"prices": {"WHEAT": 25, "EGG": 50}, "inventory": {"WHEAT": 10_000}}
+
+    macro = build_autonomous_macro_plan(state)
+
+    wheat_orders = [intent for intent in macro["market_intents"]
+                    if intent[0] == "BUY_PRODUCT" and intent[1] == "WHEAT"]
+    animal_orders = [intent for intent in macro["market_intents"] if intent[0] == "BUY_ANIMAL"]
+    assert wheat_orders == [["BUY_PRODUCT", "WHEAT", 15]]
+    assert animal_orders == [["BUY_ANIMAL", "GOOSE", 1]]
+
+
 def test_policy_autonomously_adapts_seed_and_animal_choices_to_shop_and_market_state():
     from kagriculture_agent.planner import build_autonomous_macro_plan
 
