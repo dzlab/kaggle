@@ -650,6 +650,76 @@ def test_transition_effects_rejects_boundary_water_without_refresh_effect():
     )
 
 
+def test_transition_effects_rejects_boundary_plant_field_tampering():
+    from scripts.evaluate import _transition_effects_valid
+
+    plant_before = {"kind": "PLANT", "crop": "WHEAT", "watered_today": True,
+                    "consecutive_unwatered": 1, "yield_units": 1,
+                    "max_lifespan_step": 120, "fertilized_until_day": -1, "planted_day": 0}
+    plant_after = {**plant_before, "yield_units": 99}
+    pre_farm = {"money": 100, "farmer": [0, 0], "hands": [], "hires_today": 0,
+                "tiles": [[plant_before]], "unlocked_quadrants": ["NW"]}
+    post_farm = {**pre_farm, "tiles": [[plant_after]]}
+    pre = {"player": 0, "step": 23, "day": 0, "hour": 23, "farms": [pre_farm],
+           "private": {"seeds": {}, "shed": {}, "inventories": [{}]}, "market": {"inventory": {}, "prices": {}}}
+    post = {"player": 0, "step": 24, "day": 1, "hour": 0, "farms": [post_farm],
+            "private": {"seeds": {}, "shed": {}, "inventories": [{}]}, "market": {"inventory": {}, "prices": {}}}
+    market_result = {"states": [{"money": 100, "shed": {}, "seeds": {}, "hires": 0, "unlocked": ["NW"]}],
+                     "market_inventory": {}}
+
+    assert not _transition_effects_valid(
+        pre, post, {"farmer": ["PASS"], "hands": [], "market": []}, {}, market_result,
+    )
+
+
+def test_transition_effects_rejects_boundary_animal_removal_without_refresh_rule():
+    from scripts.evaluate import _transition_effects_valid
+
+    animal_before = {"kind": "PASTURE", "animal": "COW", "fed_today": True,
+                     "cared_today": False, "consecutive_unfed": 0, "yield_units": 0,
+                     "fertilizer_available": False, "placed_day": 0}
+    animal_after = {"kind": "PASTURE"}
+    pre_farm = {"money": 100, "farmer": [0, 0], "hands": [], "hires_today": 0,
+                "tiles": [[animal_before]], "unlocked_quadrants": ["NW"]}
+    post_farm = {**pre_farm, "tiles": [[animal_after]]}
+    pre = {"player": 0, "step": 23, "day": 0, "hour": 23, "farms": [pre_farm],
+           "private": {"seeds": {}, "shed": {}, "inventories": [{}]}, "market": {"inventory": {}, "prices": {}}}
+    post = {"player": 0, "step": 24, "day": 1, "hour": 0, "farms": [post_farm],
+            "private": {"seeds": {}, "shed": {}, "inventories": [{}]}, "market": {"inventory": {}, "prices": {}}}
+    market_result = {"states": [{"money": 100, "shed": {}, "seeds": {}, "hires": 0, "unlocked": ["NW"]}],
+                     "market_inventory": {}}
+
+    assert not _transition_effects_valid(
+        pre, post, {"farmer": ["PASS"], "hands": [], "market": []}, {}, market_result,
+    )
+
+
+def test_transition_effects_accepts_boundary_refresh_growth_and_escape():
+    from scripts.evaluate import _transition_effects_valid
+
+    plant_before = {"kind": "PLANT", "crop": "TOMATO", "watered_today": True,
+                    "consecutive_unwatered": 1, "yield_units": 0,
+                    "max_lifespan_step": -1, "fertilized_until_day": -1, "planted_day": -7}
+    plant_after = {**plant_before, "watered_today": False, "consecutive_unwatered": 0, "yield_units": 1}
+    animal_before = {"kind": "PASTURE", "animal": "COW", "fed_today": False,
+                     "cared_today": False, "consecutive_unfed": 1, "yield_units": 0,
+                     "fertilizer_available": False, "placed_day": 0}
+    animal_after = {"kind": "PASTURE"}
+    pre_farm = {"money": 100, "farmer": [0, 0], "hands": [], "hires_today": 0,
+                "tiles": [[plant_before, animal_before]], "unlocked_quadrants": ["NW"]}
+    post_farm = {**pre_farm, "tiles": [[plant_after, animal_after]]}
+    pre = {"player": 0, "step": 23, "day": 0, "hour": 23, "farms": [pre_farm],
+           "private": {"seeds": {}, "shed": {}, "inventories": [{}]}, "market": {"inventory": {}, "prices": {}}}
+    post = {"player": 0, "step": 24, "day": 1, "hour": 0, "farms": [post_farm],
+            "private": {"seeds": {}, "shed": {}, "inventories": [{}]}, "market": {"inventory": {}, "prices": {}}}
+    market_result = {"states": [{"money": 100, "shed": {}, "seeds": {}, "hires": 0, "unlocked": ["NW"]}],
+                     "market_inventory": {}}
+
+    assert _transition_effects_valid(
+        pre, post, {"farmer": ["PASS"], "hands": [], "market": []}, {}, market_result,
+    )
+
+
 def test_transition_effects_treats_unhashable_unlock_metadata_as_invalid():
     from scripts.evaluate import _midday_board_changes_valid
 

@@ -1,0 +1,6 @@
+# Generated Python bytecode.
+__pycache__/
+
+# Evaluator reports and replay sidecars.
+reports/
+replays/

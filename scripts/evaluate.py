@@ -1099,27 +1099,132 @@ def _board_value(observation: Mapping[str, Any], position: tuple[int, int]) -> A
     return _tile_at_position(observation, position)
 
 
-def _end_of_day_tile_compatible(before: Any, after: Any) -> bool:
-    """Accept only board changes produced by the engine's daily refresh."""
+def _daily_refresh_tile(before: Any, day: int, step: int, turns_per_day: int) -> Any:
+    """Model the deterministic part of the engine's end-of-day tile refresh.
+
+    Weed spawning is seeded elsewhere and is therefore represented separately as
+    the only allowed ``None -> WEED`` transition.  All mutations to an existing
+    plant or animal are calculated from the pre-action tile, matching the engine's
+    refresh order (decay, then daily refresh).
+    """
     if before is None:
-        return after is None or _tile_kind(after) == "WEED"
-    if before == "LOCKED":
-        return after == "LOCKED"
-    if _tile_kind(before) == "WEED":
-        return _tile_kind(after) == "WEED"
-    if not isinstance(before, Mapping) or not isinstance(after, Mapping):
-        return before == after
-    before_kind = _tile_kind(before)
-    after_kind = _tile_kind(after)
-    if before_kind == "PLANT":
-        return after_kind == "PLANT" and after.get("crop") == before.get("crop") or after_kind == "WEED"
-    if before_kind in {"COOP", "PASTURE"}:
-        if after_kind != before_kind:
-            return False
-        before_animal = before.get("animal")
-        after_animal = after.get("animal")
-        return before_animal is None and after_animal is None or before_animal == after_animal or after_animal is None
-    return before == after
+        return None
+    if before == "LOCKED" or _tile_kind(before) == "WEED":
+        return before
+    if not isinstance(before, Mapping):
+        return before
+
+    expected = dict(before)
+    kind = _tile_kind(before)
+    if kind == "PLANT":
+        crop = before.get("crop")
+        crop_data = CROPS.get(crop)
+        yield_units = _number(before.get("yield_units"))
+        lifespan = _number(before.get("max_lifespan_step"))
+        if crop_data is None or yield_units is None or lifespan is None:
+            return object()
+        # _decay_plants runs immediately before the day boundary refresh.
+        if lifespan >= 0 and step >= lifespan and int(step - lifespan) % 2 == 0:
+            yield_units -= 1
+            if yield_units <= 0:
+                return {"kind": "WEED"}
+            expected["yield_units"] = yield_units
+
+        watered = before.get("watered_today")
+        consecutive = _number(before.get("consecutive_unwatered"))
+        if not isinstance(watered, bool) or consecutive is None or int(consecutive) != consecutive:
+            return object()
+        consecutive = 0 if watered else int(consecutive) + 1
+        expected["consecutive_unwatered"] = consecutive
+        expected["watered_today"] = False
+        if consecutive >= 2:
+            return {"kind": "WEED"}
+        if not crop_data["ongoing"]:
+            return expected
+        planted_day = _number(before.get("planted_day"))
+        if planted_day is None or int(planted_day) != planted_day:
+            return object()
+        next_day = day + 1
+        days_since_first = next_day - int(planted_day) - int(crop_data["first_yield_day"])
+        interval = int(crop_data["interval"])
+        if days_since_first >= 0 and days_since_first % interval == 0:
+            production_count = days_since_first // interval + 1
+            if production_count <= int(crop_data["max_yield"]):
+                fertilized_until = _number(before.get("fertilized_until_day", -1))
+                if fertilized_until is None:
+                    return object()
+                bonus = 2 if watered and fertilized_until >= day else 1
+                expected["yield_units"] = min(int(crop_data["max_yield"]), int(yield_units) + bonus)
+                if production_count == int(crop_data["max_yield"]):
+                    expected["max_lifespan_step"] = (next_day + 1) * turns_per_day
+        return expected
+
+    if kind in {"COOP", "PASTURE"} and "animal" in before:
+        animal = before.get("animal")
+        animal_data = ANIMALS.get(animal)
+        fed = before.get("fed_today")
+        cared = before.get("cared_today")
+        consecutive = _number(before.get("consecutive_unfed"))
+        placed_day = _number(before.get("placed_day"))
+        yield_units = _number(before.get("yield_units"))
+        if (animal_data is None or not isinstance(fed, bool) or not isinstance(cared, bool)
+                or consecutive is None or int(consecutive) != consecutive or placed_day is None
+                or int(placed_day) != placed_day or yield_units is None):
+            return object()
+        consecutive = 0 if fed else int(consecutive) + 1
+        if consecutive >= 2:
+            # The engine removes only the animal and retains its structure after
+            # two consecutive unfed refreshes.
+            return {"kind": animal_data["structure"]}
+        expected["consecutive_unfed"] = consecutive
+        next_day = day + 1
+        days_since_first = next_day - int(placed_day) - int(animal_data["first_yield_day"])
+        if days_since_first >= 0 and days_since_first % int(animal_data["interval"]) == 0:
+            pending = _number(before.get("pending_care_bonus", 0))
+            if pending is None:
+                return object()
+            bonus = int(pending) if fed else 0
+            expected["yield_units"] = min(int(animal_data["max_held"]), int(yield_units) + 1 + bonus)
+            expected["pending_care_bonus"] = 0
+        if cared and fed:
+            pending = _number(expected.get("pending_care_bonus", 0))
+            if pending is None:
+                return object()
+            expected["pending_care_bonus"] = int(pending) + 1
+        expected["fertilizer_available"] = True
+        expected["fed_today"] = False
+        expected["cared_today"] = False
+        return expected
+    return before
+
+
+def _end_of_day_tile_compatible(before: Any, after: Any, *, day: int = 0, step: int = 0,
+                                turns_per_day: int = 24) -> bool:
+    """Accept only board changes produced by the engine's daily refresh."""
+    expected = _daily_refresh_tile(before, day, step, turns_per_day)
+    if before is None and _tile_kind(after) == "WEED":
+        return True  # deterministic engine rule with seed-dependent occurrence
+    return after == expected
+
+
+def _is_end_of_day_transition(pre: Mapping[str, Any], post: Mapping[str, Any],
+                              configuration: Mapping[str, Any] | None) -> bool:
+    turns_per_day = _number(_config_value(configuration, "turnsPerDay", 24))
+    pre_step = _number(pre.get("step"))
+    post_step = _number(post.get("step"))
+    pre_day = _number(pre.get("day"))
+    post_day = _number(post.get("day"))
+    if turns_per_day is None or int(turns_per_day) < 1:
+        return False
+    if _number(pre.get("hour")) != int(turns_per_day) - 1 or _number(post.get("hour")) != 0:
+        return False
+    if pre_step is None or post_step is None:
+        # Keep small direct unit fixtures useful; real replay observations always
+        # carry step and day, so replay validation takes the strict branch below.
+        return pre_day is None and post_day is None
+    if post_step != pre_step + 1 or int(pre_step) % int(turns_per_day) != int(turns_per_day) - 1:
+        return False
+    return pre_day is None or (post_day is not None and post_day == pre_day + 1)
 
 
 def _midday_board_changes_valid(pre: Mapping[str, Any], post: Mapping[str, Any], action: Mapping[str, Any],
@@ -1165,7 +1270,10 @@ def _midday_board_changes_valid(pre: Mapping[str, Any], post: Mapping[str, Any],
             quadrant = ("N" if y < size // 2 else "S") + ("W" if x < size // 2 else "E")
             if quadrant in newly_unlocked and before == "LOCKED" and after is None:
                 continue
-            if _number(pre.get("hour")) == 23 and _number(post.get("hour")) == 0 and _end_of_day_tile_compatible(before, after):
+            if _is_end_of_day_transition(pre, post, configuration) and _end_of_day_tile_compatible(
+                    before, after, day=int(_number(pre.get("day")) or 0),
+                    step=int(_number(pre.get("step")) or 0),
+                    turns_per_day=int(_number(_config_value(configuration, "turnsPerDay", 24)) or 24)):
                 continue
             # The engine can decay a plant at its exact lifespan boundary after
             # actions.  This is deterministic and limited to yield decrement or
@@ -1372,7 +1480,7 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
         return False
     if not isinstance(post_hands, Sequence) or isinstance(post_hands, (str, bytes)):
         return False
-    boundary = _number(pre.get("hour")) == 23 and _number(post.get("hour")) == 0
+    boundary = _is_end_of_day_transition(pre, post, configuration)
     simulated_states = market_result.get("states", ())
     simulated = simulated_states[0] if isinstance(simulated_states, Sequence) and simulated_states else {}
     if not isinstance(simulated, Mapping):
