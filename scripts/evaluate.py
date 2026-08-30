@@ -1314,7 +1314,11 @@ def _midday_board_changes_valid(pre: Mapping[str, Any], post: Mapping[str, Any],
             if (x, y) in allowed_positions:
                 continue
             quadrant = ("N" if y < size // 2 else "S") + ("W" if x < size // 2 else "E")
-            if quadrant in newly_unlocked and before == "LOCKED" and after is None:
+            if (
+                quadrant in newly_unlocked
+                and before == "LOCKED"
+                and (after is None or (_tile_kind(after) == "WEED" and isinstance(after, Mapping)))
+            ):
                 continue
             if _is_end_of_day_transition(pre, post, configuration) and _end_of_day_tile_compatible(
                     before, after, day=int(_number(pre.get("day")) or 0),

@@ -877,6 +877,38 @@ def test_transition_effects_accepts_boundary_refresh_growth_and_escape():
     )
 
 
+def test_end_of_day_refresh_accepts_newly_unlocked_locked_tile_becoming_weed():
+    from scripts.evaluate import _midday_board_changes_valid
+
+    before_tiles = [[None for _ in range(6)] for _ in range(6)]
+    after_tiles = [[None for _ in range(6)] for _ in range(6)]
+    before_tiles[0][4] = "LOCKED"
+    after_tiles[0][4] = {"kind": "WEED"}
+    before_farm = {
+        "money": 100, "farmer": [0, 0], "hands": [], "hires_today": 0,
+        "tiles": before_tiles, "unlocked_quadrants": ["NW"],
+    }
+    after_farm = {
+        **before_farm, "tiles": after_tiles,
+        "unlocked_quadrants": ["NW", "NE"],
+    }
+    pre = {"player": 0, "step": 23, "day": 0, "hour": 23,
+           "farms": [before_farm], "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+           "market": {"inventory": {}, "prices": {}}}
+    post = {"player": 0, "step": 24, "day": 1, "hour": 0,
+            "farms": [after_farm], "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+            "market": {"inventory": {}, "prices": {}}}
+    market_result = {
+        "states": [{"money": 100, "shed": {}, "seeds": {}, "hires": 0,
+                     "unlocked": ["NW", "NE"]}],
+        "market_inventory": {},
+    }
+
+    assert _midday_board_changes_valid(
+        pre, post, {"farmer": ["PASS"], "hands": [], "market": []}, {}, market_result,
+    )
+
+
 def test_transition_effects_treats_unhashable_unlock_metadata_as_invalid():
     from scripts.evaluate import _midday_board_changes_valid
 
