@@ -794,7 +794,7 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
             if _needs_today(tile, "needs_water", "watered_today", "watered"):
                 _add(plan, "WATER", position, 100, day, 1)
             if _number(_get(tile, "fertilized_until_day", -1)) < day and has_fertilizer:
-                _add(plan, "FERTILIZE", position, 97, day, 1)
+                _add(plan, "FERTILIZE", position, 97, None, 1)
             age = _crop_age(tile, day)
             crop_rules = CROPS[crop]
             # Non-ongoing crops have their first decay step on the day after

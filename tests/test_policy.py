@@ -320,6 +320,63 @@ def test_fertilize_can_use_farmer_slot_while_helper_preserves_basic_need():
     }
 
 
+def test_staged_fertilizer_remains_assignable_after_same_day_route_budget():
+    from kagriculture_agent.planner import assign_tasks, build_daily_plan
+
+    board = [[None for _ in range(5)] for _ in range(5)]
+    board[0][0] = {
+        "kind": "PLANT",
+        "crop": "WHEAT",
+        "watered_today": True,
+        "yield_units": 0,
+        "planted_day": 0,
+        "fertilized_until_day": -1,
+    }
+    state = {
+        "day": 4,
+        "hour": 10,
+        "board_size": 5,
+        "tiles": board,
+        "private": {"shed": {"FERTILIZER": 1}, "inventories": [[]], "seeds": {}},
+        "workers": [{"index": 0, "role": "FARMER", "position": [0, 0]}],
+    }
+    assignments = assign_tasks(build_daily_plan(state), None, state)
+
+    assert [assignment.task.kind for assignment in assignments] == ["FERTILIZE"]
+
+
+def test_replanning_does_not_duplicate_a_protected_carried_feed_task():
+    board = [[None for _ in range(10)] for _ in range(10)]
+    board[0][0] = {
+        "kind": "PASTURE", "animal": "COW", "fed_today": False,
+        "cared_today": False,
+    }
+    obs = observation(
+        day=20,
+        hour=1,
+        hands=[[5, 4]],
+        tiles=board,
+        shed={"WHEAT": 1},
+        seeds={},
+        inventories=[["WHEAT"], ["WHEAT"]],
+    )
+    obs["farms"][0]["farmer"] = [4, 4]
+    policy = policy_module.Policy()
+    policy.memory.assignments = [
+        WorkerAssignment(0, Task("FEED", Position(0, 0), 100, 20, 1)),
+    ]
+    policy.memory.last_day = 20
+    policy.memory.last_hour = 0
+
+    policy.act(obs)
+
+    feed_assignments = [assignment for assignment in policy.memory.assignments
+                        if assignment.task.kind == "FEED"]
+    assert [(assignment.worker_index, assignment.task.target) for assignment in feed_assignments] == [
+        (0, Position(0, 0)),
+    ]
+
+
 def test_terminal_cleanup_does_not_mix_carried_pickup_or_drop_with_sales():
     obs = observation(day=29, hour=22, hands=[[2, 2]],
                       inventories=[[], ["FERTILIZER"]],

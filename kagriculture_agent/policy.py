@@ -872,7 +872,7 @@ class Policy:
         protected_tasks = {
             (str(_get(assignment.task, "kind", "")).upper(),
              _position(_task_target(assignment.task)),
-             str(_get(assignment.task, "item", "")).upper())
+             str(_get(assignment.task, "item", "") or "").upper())
             for assignment in protected
         }
         plan = [task for task in plan if (

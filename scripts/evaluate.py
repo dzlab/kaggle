@@ -2281,6 +2281,18 @@ def _animal_units_owned(observation: Mapping[str, Any]) -> int:
     return carried + placed
 
 
+def _has_complete_market_state(observation: Mapping[str, Any]) -> bool:
+    """Return whether state-aware market capacity checks have full inputs."""
+    farm = _farm_observation(observation)
+    private = _mapping(observation.get("private"))
+    market = _mapping(observation.get("market"))
+    return (
+        "unlocked_quadrants" in farm
+        and isinstance(private.get("shed"), Mapping)
+        and isinstance(market.get("inventory"), Mapping)
+    )
+
+
 def _variant_market_spend(order: Sequence[Any], observation: Mapping[str, Any]) -> float:
     """Estimate non-seed spend so a crop bias cannot consume safety cash."""
     if not order:
@@ -2308,6 +2320,8 @@ def _variant_market_spend(order: Sequence[Any], observation: Mapping[str, Any]) 
 def _preserve_variant_market_capacity(orders: Sequence[Sequence[Any]], observation: Mapping[str, Any],
                                       *, seed_item: str) -> list[list[Any]]:
     """Keep the variant seed bias above the policy's worker cash reserve."""
+    if not _has_complete_market_state(observation):
+        return [list(order) for order in orders]
     reserve = max(100.0, float(CROPS[seed_item]["seed"])) + float(CROPS[seed_item]["seed"])
     non_seed_spend = sum(
         _variant_market_spend(order, observation)
@@ -2330,13 +2344,20 @@ def _preserve_variant_market_capacity(orders: Sequence[Sequence[Any]], observati
 
 
 def _prioritize_safety_market_orders(orders: Sequence[Sequence[Any]]) -> list[list[Any]]:
-    def is_safety(order: Sequence[Any]) -> bool:
-        return bool(order) and (order[0] == "HIRE" or (
-            order[0] == "BUY_PRODUCT" and len(order) > 1 and order[1] in _BUYABLE_PRODUCTS
-        ))
-    return [list(order) for order in orders if is_safety(order)] + [
-        list(order) for order in orders if not is_safety(order)
-    ]
+    def order_priority(order: Sequence[Any]) -> int:
+        if not order:
+            return 3
+        if order[0] == "HIRE":
+            return 0
+        if order[0] == "BUY_LAND":
+            return 1
+        if order[0] == "BUY_PRODUCT" and len(order) > 1 and order[1] in _BUYABLE_PRODUCTS:
+            return 2
+        return 3
+
+    return [list(order) for _index, order in sorted(
+        enumerate(orders), key=lambda item: (order_priority(item[1]), item[0])
+    )]
 
 
 def _apply_ablations(action: Mapping[str, Any], observation: Mapping[str, Any], ablations: Mapping[str, bool]) -> dict[str, Any]:
