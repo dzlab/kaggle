@@ -228,6 +228,31 @@ def test_late_season_planners_do_not_start_new_crops():
     assert all(task.kind != "PLANT" for task in build_autonomous_macro_plan(state)["tasks"])
 
 
+def test_final_actionable_day_hires_for_unmet_basic_need_deadlines():
+    from kagriculture_agent.constants import season_days
+    from kagriculture_agent.planner import build_autonomous_macro_plan
+
+    board = [[None for _ in range(5)] for _ in range(5)]
+    for x in (1, 2):
+        board[1][x] = {
+            "kind": "PLANT",
+            "crop": "STRAWBERRY",
+            "watered_today": False,
+            "yield_units": 1,
+            "planted_day": 0,
+        }
+    state = observation(
+        day=season_days - 2,
+        hour=0,
+        hands=[],
+        tiles=board,
+        seeds={},
+        money=3_000,
+    )
+
+    assert [intent for intent in build_autonomous_macro_plan(state)["market_intents"] if intent == ["HIRE"]] == [["HIRE"]]
+
+
 @pytest.mark.parametrize("day", [28, 29])
 def test_late_season_seed_fallback_does_not_buy_wheat_when_planting_is_suppressed(day):
     action = policy_module.Policy().act(observation(day=day, hour=0, hands=[], seeds={}))

@@ -614,6 +614,18 @@ def _feed_purchase_needed(state: Mapping[str, Any], day: int, counts: Mapping[st
     return missing, cash_after
 
 
+def _has_basic_need_deadline(state: Any, day: int | None = None) -> bool:
+    """Return whether a required watering or feeding task is due today."""
+    normalized = normalize_planner_state(state)
+    current_day = _day(normalized, EpisodeMemory()) if day is None else day
+    return any(
+        task.kind in {"WATER", "FEED"}
+        and task.deadline is not None
+        and task.deadline <= current_day
+        for task in build_daily_plan(normalized, EpisodeMemory())
+    )
+
+
 def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None) -> dict[str, Any]:
     """Choose a live portfolio and executable macro intents from observations.
 
@@ -652,6 +664,7 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None) 
     cash = _state_cash(normalized)
     intents: list[list[Any]] = []
     tasks: list[Task] = []
+    deadline_needs = _has_basic_need_deadline(normalized, day)
     _compatible_target, structure_target = _compatible_structure(normalized, animal)
     if day < season_days - 2:
         seed_cost = float(CROPS[selected["crop"]]["seed"])
@@ -735,6 +748,13 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None) 
         elif empty is not None and not _placed_animal_count(normalized):
             kind = "BUILD_PASTURE" if ANIMALS[animal]["structure"] == "PASTURE" else "BUILD_COOP"
             tasks.append(Task(kind, empty, 96, day, 1.0))
+    if day == season_days - 2 and deadline_needs and hour == 0:
+        hands = farm.get("hands", ())
+        hand_count = len(hands) if isinstance(hands, Sequence) and not isinstance(hands, (str, bytes)) else 0
+        hires_today = _safe_quantity(farm.get("hires_today", 0))
+        reserve = max(100.0, float(CROPS[selected["crop"]]["seed"]))
+        if hand_count < 2 and hires_today == 0 and cash >= 100.0 + reserve:
+            intents.append(["HIRE"])
     return {
         "portfolio": {"crop": selected["crop"], "mode": selected["mode"], "animal": animal, "score": selected["score"]},
         "scenario_count": len(scenarios),

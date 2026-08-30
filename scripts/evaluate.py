@@ -33,6 +33,7 @@ from kagriculture_agent.constants import (  # noqa: E402
 )
 from kagriculture_agent.economics import market_price  # noqa: E402
 from kagriculture_agent.observation import is_shed_adjacent  # noqa: E402
+from kagriculture_agent.planner import _has_basic_need_deadline  # noqa: E402
 from kagriculture_agent.policy import Policy  # noqa: E402
 from scripts.run_local import OPPONENTS, _deterministic_random_agent  # noqa: E402
 
@@ -2328,10 +2329,15 @@ def apply_variant(action: Mapping[str, Any], observation: Mapping[str, Any], var
               "market": _market_orders(action)}
     seeds = _private_seeds(observation)
     if variant == "conservative":
+        deadline_hires = [
+            order for order in result["market"]
+            if order == ["HIRE"] and _has_basic_need_deadline(observation)
+        ]
         mandatory = [
             order for order in result["market"]
             if order[0] == "BUY_PRODUCT" and order[1] in {"WHEAT", "FERTILIZER"}
         ]
+        mandatory = deadline_hires + mandatory
         discretionary = [
             order for order in result["market"]
             if order[0] not in {"BUY_ANIMAL", "BUY_LAND", "BUY_PRODUCT"}

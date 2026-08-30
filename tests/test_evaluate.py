@@ -142,6 +142,16 @@ def test_conservative_seed17_random_replay_has_no_framework_error():
     assert record["framework_error"] is False
 
 
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_conservative_seed17_random_replay_meets_all_basic_need_deadlines():
+    from scripts.evaluate import run_game
+
+    record = run_game(variant="conservative", opponent="random", seed=17, steps=720)
+
+    assert record["framework_error"] is False
+    assert record["missed_basic_needs"] == 0
+
+
 def test_percentile_uses_linear_interpolation():
     from scripts.evaluate import percentile
 
