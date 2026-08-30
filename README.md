@@ -2,7 +2,7 @@
 
 This repository contains the Kaggriculture Kaggle agent. The policy is an
 importable, deterministic, legality-first policy. On every episode/day it
-autonomously scores a 16-scenario crop/posture portfolio from live quotes,
+autonomously scores a 20-scenario crop/posture portfolio from live quotes,
 market inventory, and unlocked shop demand, then makes guarded land, hire,
 animal, seed, fertilizer, planting, and worker-scheduling decisions. It parses
 each observation, plans crop, animal, structure, weed, harvest, shed, and

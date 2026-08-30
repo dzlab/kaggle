@@ -266,7 +266,8 @@ def _valid_action_schema(action: Any, observation: Mapping[str, Any], configurat
 
 
 def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, Any]],
-                  other_states: Sequence[Mapping[str, Any]], configuration: Mapping[str, Any] | None = None) -> bool:
+                  other_states: Sequence[Mapping[str, Any]], configuration: Mapping[str, Any] | None = None,
+                  *, expected_seed: int | None = None) -> bool:
     if not isinstance(replay, Mapping):
         return False
     if not _valid_engine_provenance(replay):
@@ -274,6 +275,16 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
     legacy_compact = _legacy_compact_fixture(replay)
     for optional_mapping in ("metadata",):
         if optional_mapping in replay and not isinstance(replay[optional_mapping], Mapping):
+            return False
+    info = replay.get("info")
+    metadata = replay.get("metadata")
+    if expected_seed is not None:
+        if not isinstance(info, Mapping) or info.get("seed") != expected_seed:
+            return False
+        if isinstance(metadata, Mapping) and "seed" in metadata and metadata.get("seed") != expected_seed:
+            return False
+        configured_seed = _mapping(configuration).get("seed")
+        if configured_seed is not None and configured_seed != expected_seed:
             return False
     statuses = replay.get("statuses")
     if not isinstance(statuses, Sequence) or isinstance(statuses, (str, bytes)) or list(statuses) != ["DONE", "DONE"]:
@@ -696,7 +707,9 @@ def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, see
     own_states = _player_states(replay, 0)
     other_states = _player_states(replay, 1)
     replay_configuration = _mapping(replay.get("configuration"))
-    framework_error = not _valid_replay(replay, own_states, other_states, replay_configuration)
+    framework_error = not _valid_replay(
+        replay, own_states, other_states, replay_configuration, expected_seed=seed,
+    )
     own_bank = _final_bank(own_states[-1] if own_states else None)
     other_bank = _final_bank(other_states[-1] if other_states else None)
     if framework_error or own_bank is None or other_bank is None:
@@ -1872,11 +1885,13 @@ def _private_inventories(observation: Mapping[str, Any]) -> list[dict[str, float
     return [_positive_quantities(inventory) for inventory in raw]
 
 
-def _strict_quantity_mapping(value: Any) -> bool:
+def _strict_quantity_mapping(value: Any, allowed_items: set[str] | frozenset[str]) -> bool:
     if not isinstance(value, Mapping):
         return False
     for item, raw_quantity in value.items():
-        if not isinstance(item, str) or _number(raw_quantity) is None or _number(raw_quantity) < 0:
+        quantity = _number(raw_quantity)
+        if (not isinstance(item, str) or item not in allowed_items or quantity is None
+                or quantity < 0 or int(quantity) != quantity):
             return False
     return True
 
@@ -1884,9 +1899,9 @@ def _strict_quantity_mapping(value: Any) -> bool:
 def _strict_private_inventories(observation: Mapping[str, Any]) -> bool:
     """Require the engine's complete, finite worker-inventory snapshot."""
     private = observation.get("private")
-    if not isinstance(private, Mapping) or not _strict_quantity_mapping(private.get("shed", {})):
+    if not isinstance(private, Mapping) or not _strict_quantity_mapping(private.get("shed", {}), _ITEM_NAMES):
         return False
-    if not _strict_quantity_mapping(private.get("seeds", {})):
+    if not _strict_quantity_mapping(private.get("seeds", {}), frozenset(CROPS)):
         return False
     raw = private.get("inventories")
     farm = _farm_observation(observation)
@@ -1895,7 +1910,7 @@ def _strict_private_inventories(observation: Mapping[str, Any]) -> bool:
         return False
     if not isinstance(hands, Sequence) or isinstance(hands, (str, bytes)) or len(raw) != len(hands) + 1:
         return False
-    return all(_strict_quantity_mapping(inventory) for inventory in raw)
+    return all(_strict_quantity_mapping(inventory, _ITEM_NAMES) for inventory in raw)
 
 
 def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], action: Mapping[str, Any],

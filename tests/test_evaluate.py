@@ -510,6 +510,44 @@ def test_replay_rejects_tampered_plant_without_post_state_effect():
     assert record["outcome"] == "framework_error"
 
 
+@pytest.mark.parametrize("bad_quantity", [1.5, -1, float("nan"), float("inf")])
+def test_replay_rejects_invalid_inventory_quantity_for_any_player_snapshot(bad_quantity):
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    replay["steps"][0][1]["observation"]["private"]["shed"] = {"WHEAT": bad_quantity}
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+
+
+def test_replay_rejects_unknown_inventory_product():
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    replay["steps"][1][0]["observation"]["private"]["inventories"] = [{"NOT_A_PRODUCT": 1}]
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+
+
+@pytest.mark.parametrize("field", ["info", "metadata"])
+def test_replay_record_rejects_supplied_seed_mismatch(field):
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    if field == "info":
+        replay["info"]["seed"] = 2
+    else:
+        replay["metadata"]["seed"] = 2
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+
+
 def test_replay_rejects_truncated_done_replay_against_episode_steps():
     from scripts.evaluate import replay_record
 

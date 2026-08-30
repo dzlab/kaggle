@@ -430,7 +430,7 @@ def _shed_target(state: Any, board_size: int) -> Position:
     return valid_access_tiles[0] if valid_access_tiles else Position(0, 0)
 
 
-_MACRO_CROPS = ("WHEAT", "CARROT", "TOMATO", "MELON")
+_MACRO_CROPS = ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")
 _MACRO_MODES = ("cash", "demand", "balanced", "animal")
 
 
@@ -453,7 +453,7 @@ def _town_demand(state: Mapping[str, Any]) -> set[str]:
 
 
 def _portfolio_scenarios(state: Mapping[str, Any], day: int) -> list[dict[str, Any]]:
-    """Evaluate a deterministic 4x4 crop/posture portfolio matrix."""
+    """Evaluate a deterministic 5x4 crop/posture portfolio matrix."""
     horizon = max(1, min(season_days - day, 12))
     demand = _town_demand(state)
     prices = _observed_prices(state)

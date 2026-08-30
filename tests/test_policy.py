@@ -407,10 +407,29 @@ def test_autonomous_macro_plan_covers_portfolio_and_growth_actions():
     macro = build_autonomous_macro_plan(state)
     kinds = [intent[0] for intent in macro["market_intents"]]
 
-    assert macro["scenario_count"] == 16
-    assert macro["portfolio"]["crop"] in {"WHEAT", "CARROT", "TOMATO", "MELON"}
+    assert macro["scenario_count"] == 20
+    assert macro["portfolio"]["crop"] in {"WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON"}
     assert {"BUY_LAND", "HIRE", "BUY_ANIMAL", "BUY_PRODUCT", "BUY_SEED"} <= set(kinds)
     assert any(task.kind == "PLANT" and task.item == macro["portfolio"]["crop"] for task in macro["tasks"])
+
+
+def test_autonomous_macro_portfolio_includes_and_can_select_strawberry():
+    from kagriculture_agent.planner import _portfolio_scenarios, build_autonomous_macro_plan
+
+    state = observation(day=4, hour=0, hands=[], tiles=[[None for _ in range(5)] for _ in range(5)],
+                       money=5_000, seeds={}, inventories=[[]])
+    state["market"] = {
+        "prices": {"WHEAT": 1, "CARROT": 1, "TOMATO": 1, "STRAWBERRY": 1_000, "MELON": 1},
+        "inventory": {crop: 10_000 for crop in ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")},
+    }
+    state["town"] = {"unlocked_shops": ["BRUNCH_SPOT"]}
+
+    scenarios = _portfolio_scenarios(state, 4)
+    macro = build_autonomous_macro_plan(state)
+
+    assert len(scenarios) == 20
+    assert sum(candidate["crop"] == "STRAWBERRY" for candidate in scenarios) == 4
+    assert macro["portfolio"]["crop"] == "STRAWBERRY"
 
 
 def test_policy_autonomously_adapts_seed_and_animal_choices_to_shop_and_market_state():

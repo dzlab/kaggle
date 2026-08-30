@@ -4,7 +4,7 @@
 
 **Goal:** Build, locally validate, and submit a robust model-based Kaggriculture agent that maximizes the probability of beating another agent over 720 turns under randomized shops and a shared dynamic market.
 
-**Architecture:** Use a deterministic observation-to-action policy with a small per-episode memory, an explicit daily macro planner, and a shortest-path task scheduler for the farmer and temporary farm hands. The planner autonomously scores a 16-scenario crop/posture portfolio from live shop and market state, then makes guarded crop, animal, land, hiring, fertilizer, and selling decisions with the exact published game mechanics. The policy layer converts the selected tasks into one legal action per unit and up to ten ordered market orders per turn.
+**Architecture:** Use a deterministic observation-to-action policy with a small per-episode memory, an explicit daily macro planner, and a shortest-path task scheduler for the farmer and temporary farm hands. The planner autonomously scores a 20-scenario crop/posture portfolio, including strawberry, from live shop and market state, then makes guarded crop, animal, land, hiring, fertilizer, and selling decisions with the exact published game mechanics. The policy layer converts the selected tasks into one legal action per unit and up to ten ordered market orders per turn.
 
 **Tech Stack:** Python >=3.11, `kaggle-environments==1.32.7`, pytest as a dev dependency, standard library (`dataclasses`, `heapq`, `collections`, `math`, `json`), optional pandas only for offline replay analysis. Use `uv sync` and `uv run` for the local environment.
 
@@ -83,7 +83,7 @@ The macro planner should compare a small set of portfolio candidates each day ra
 4. egg/cow/sheep infrastructure with wheat feed reserve,
 5. mixed portfolio with one risk-limited premium batch.
 
-Score each candidate against at least 16 deterministic shop/market scenarios sampled from the current observed shop state and plausible future unlocks. Select by expected win proxy: expected bank differential divided by estimated variance, with a conservative penalty for inventory overflow, missed watering/feed, and sales at the price floor.
+Score each candidate against 20 deterministic crop/posture scenarios (wheat, carrot, tomato, strawberry, and melon across four postures) sampled from the current observed shop state and plausible future unlocks. Select by expected win proxy: expected bank differential divided by estimated variance, with a conservative penalty for inventory overflow, missed watering/feed, and sales at the price floor.
 
 ### 3. Worker scheduling and routing
 
