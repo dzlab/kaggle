@@ -204,6 +204,38 @@ def test_terminal_cleanup_does_not_mix_carried_pickup_or_drop_with_sales():
     assert action["market"] == []
 
 
+def test_replan_preserves_carried_feed_when_another_assignment_finishes():
+    board = [[None for _ in range(10)] for _ in range(10)]
+    board[0][5] = {
+        "kind": "COOP", "animal": "GOOSE", "fed_today": False,
+        "cared_today": True,
+    }
+    obs = {
+        "player": 0, "day": 20, "hour": 16,
+        "farms": [{
+            "tiles": board, "farmer": [5, 4], "hands": [[5, 0]],
+            "money": 1000, "unlocked_quadrants": ["NW"],
+        }, {"tiles": board, "farmer": [0, 0], "hands": []}],
+        "private": {
+            "shed": {"WHEAT": 1}, "seeds": {},
+            "inventories": [{"WHEAT": 1}, {}],
+        },
+        "market": {"prices": {"WHEAT": 10}, "inventory": {}},
+        "town": {"unlocked_shops": []},
+    }
+    policy = policy_module.Policy()
+    policy.memory.assignments = [
+        WorkerAssignment(0, Task("FEED", Position(5, 0), 100, 20, 1)),
+        WorkerAssignment(1, Task("CARE", Position(5, 0), 95, 20, 1)),
+    ]
+    policy.memory.last_day = 20
+    policy.memory.last_hour = 15
+
+    action = policy.act(obs)
+
+    assert action["farmer"] != ["DROP"]
+
+
 def test_zero_filled_real_engine_shed_does_not_keep_cached_shed_or_sell_valid():
     state = {
         "board_size": 5,

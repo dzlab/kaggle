@@ -10,7 +10,13 @@ from .constants import ANIMALS, CROPS, LAND_PRICES, PRODUCTS, max_market_orders,
 from .economics import feed_reserve, market_price, market_regime
 from .memory import PolicyMemory
 from .observation import is_shed_adjacent, parse_observation as _parse_observation, shed_access_tiles
-from .planner import assign_tasks, build_autonomous_macro_plan, build_daily_plan, normalize_planner_state
+from .planner import (
+    _fits_same_day_deadline,
+    assign_tasks,
+    build_autonomous_macro_plan,
+    build_daily_plan,
+    normalize_planner_state,
+)
 from .routing import is_locked_tile, normalize_position, next_move
 from .types import Position, Task, WorkerAssignment
 
@@ -711,6 +717,20 @@ def worker_action(worker_index: int, state: Any, assignment: WorkerAssignment | 
     fetched = _fetch_required_item(state, worker_index, task, current)
     if fetched is not None:
         return _unit_command(fetched)
+    if kind == "ANIMAL":
+        animal = _required_worker_item(task, state)
+        inventory = _inventory_for_worker(state, worker_index)
+        if (
+            animal in ANIMALS
+            and inventory.get(animal, 0) > 0
+            and inventory.get("WHEAT", 0) <= 0
+            and _whole(_shed(state).get("WHEAT")) > 0
+        ):
+            access = _shed_access_target(state, current)
+            if access is not None and current != access:
+                return _unit_command(next_move(current, access))
+            if access is not None:
+                return ["PICKUP", "WHEAT", 1]
     if current != target:
         if not all(0 <= point.x < board_size and 0 <= point.y < board_size for point in (current, target)):
             return [PASS]
@@ -722,6 +742,22 @@ def _assignment_valid(state: Any, assignment: WorkerAssignment) -> bool:
     target = _position(_task_target(assignment.task))
     kind = str(_get(assignment.task, "kind", "")).upper()
     worker_index = _whole(_get(assignment, "worker_index", 0))
+    deadline = _get(assignment.task, "deadline")
+    if deadline is not None and _whole(_get(state, "day")) >= _whole(deadline):
+        worker = next((worker for worker in _worker_records(state)
+                       if worker["index"] == worker_index), None)
+        if worker is None or worker["position"] is None:
+            return False
+        normalized = _state_for_planner(state)
+        board_size = _whole(_get(normalized, "board_size", 1), 1)
+        if not _fits_same_day_deadline(
+            assignment.task,
+            (worker["index"], worker["role"], worker["position"]),
+            normalized,
+            board_size,
+            _whole(_get(normalized, "day")),
+        ):
+            return False
     if target is None:
         if kind not in {"PICKUP", "PLACE"}:
             return False
@@ -767,8 +803,26 @@ class Policy:
     def __init__(self) -> None:
         self.memory = PolicyMemory()
 
+    def _carried_assignments(self, state: Mapping[str, Any]) -> list[WorkerAssignment]:
+        """Keep a valid delivery task when another worker forces replanning."""
+        protected = []
+        for assignment in self.memory.assignments:
+            kind = str(_get(assignment.task, "kind", "")).upper()
+            if kind not in {"FEED", "FERTILIZE", "ANIMAL", "PLACE"}:
+                continue
+            required = _required_worker_item(assignment.task, state)
+            if required is None:
+                continue
+            worker_index = _whole(_get(assignment, "worker_index"))
+            if _inventory_for_worker(state, worker_index).get(required, 0) <= 0:
+                continue
+            if _assignment_valid(state, assignment):
+                protected.append(assignment)
+        return protected
+
     def _replan(self, state: Mapping[str, Any], regime: Mapping[str, str],
-                macro: Mapping[str, Any] | None = None) -> list[WorkerAssignment]:
+                macro: Mapping[str, Any] | None = None,
+                protected: Sequence[WorkerAssignment] = ()) -> list[WorkerAssignment]:
         normalized = _state_for_planner(state)
         macro = macro or build_autonomous_macro_plan(normalized, self.memory)
         plan = build_daily_plan(normalized, self.memory)
@@ -784,7 +838,22 @@ class Policy:
                 task.kind == "PLANT" and task.target in reserved_structure_tiles
             )]
         plan.extend(task for task in macro.get("tasks", ()) if isinstance(task, Task))
-        assignments = assign_tasks(plan, normalized.get("workers", ()), normalized)
+        protected_workers = {_whole(_get(assignment, "worker_index")) for assignment in protected}
+        protected_tasks = {
+            (str(_get(assignment.task, "kind", "")).upper(),
+             _position(_task_target(assignment.task)),
+             str(_get(assignment.task, "item", "")).upper())
+            for assignment in protected
+        }
+        plan = [task for task in plan if (
+            str(task.kind).upper(), _position(task.target), str(task.item or "").upper()
+        ) not in protected_tasks]
+        available_workers = [
+            worker for worker in normalized.get("workers", ())
+            if _whole(_get(worker, "index")) not in protected_workers
+        ]
+        assignments = assign_tasks(plan, available_workers, normalized)
+        assignments.extend(protected)
         self.memory.assignments = assignments
         self.memory.market_regime = dict(regime)
         self.memory.diagnostics["plan_size"] = len(plan)
@@ -804,7 +873,8 @@ class Policy:
         regime_changed = bool(self.memory.market_regime) and dict(regime) != self.memory.market_regime
         assignments_valid = all(_assignment_valid(state, assignment) for assignment in self.memory.assignments)
         if reset or hour_zero or regime_changed or not self.memory.assignments or not assignments_valid:
-            assignments = self._replan(state, regime, macro)
+            protected = self._carried_assignments(state) if not reset and not hour_zero else ()
+            assignments = self._replan(state, regime, macro, protected)
         else:
             assignments = self.memory.assignments
         by_worker = {assignment.worker_index: assignment for assignment in assignments}

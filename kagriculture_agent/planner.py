@@ -597,6 +597,20 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None) 
         compatible, empty = _compatible_structure(normalized, animal)
         animal_in_storage = _safe_quantity(shed.get(animal, 0)) > 0
         if _placed_animal_count(normalized) == 0 and not animal_in_storage and (compatible is not None or empty is not None):
+            wheat_staged = (
+                _safe_quantity(shed.get("WHEAT", 0))
+                + _safe_quantity(_mapping(normalized.get("inventory")).get("WHEAT", 0))
+            )
+            wheat_price = _observed_quote("WHEAT", normalized)
+            if (
+                wheat_staged <= 0
+                and wheat_price > 0
+                and cash >= float(ANIMALS[animal]["cost"]) + wheat_price + reserve
+            ):
+                # Stage the first feed before buying the animal.  The market
+                # processor preserves intent order, so both are available to
+                # the placement task on the next observation.
+                intents.append(["BUY_PRODUCT", "WHEAT", 1])
             if cash >= float(ANIMALS[animal]["cost"]) + reserve:
                 intents.append(["BUY_ANIMAL", animal, 1])
         if compatible is not None and animal_in_storage:
@@ -671,7 +685,7 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
             if _needs_today(animal_entity, "needs_care", "cared_today", "cared"):
                 _add(plan, "CARE", animal_position, 95, day, animal_value)
             if _get(animal_entity, "fertilizer_available") is True:
-                _add(plan, "COLLECT_FERTILIZER", animal_position, 70, day, 1)
+                _add(plan, "COLLECT_FERTILIZER", animal_position, 96, day, 1)
             if _get(animal_entity, "needs_placement", False) or _get(animal_entity, "placed") is False or _get(animal_entity, "owned") is False:
                 _add(plan, "ANIMAL", animal_position, 94, day, _get(animal_entity, "value", 1), item=species)
 
@@ -695,7 +709,7 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
         if _needs_today(animal, "needs_care", "cared_today", "cared"):
             _add(plan, "CARE", position, 95, day, value)
         if _get(animal, "fertilizer_available") is True:
-            _add(plan, "COLLECT_FERTILIZER", position, 70, day, 1)
+            _add(plan, "COLLECT_FERTILIZER", position, 96, day, 1)
 
     for structure in _get(state, "structures", ()) or ():
         if not bool(_get(structure, "built", True)):
@@ -770,6 +784,20 @@ def _held_quantity(state: Mapping[str, Any], item: str) -> int | float:
     return 0
 
 
+def _worker_quantity(state: Mapping[str, Any], worker_index: int, item: str) -> int | float:
+    private = _mapping(state.get("private"))
+    inventories = private.get("inventories")
+    if isinstance(inventories, Sequence) and not isinstance(inventories, (str, bytes)):
+        if 0 <= worker_index < len(inventories):
+            inventory = inventories[worker_index]
+            if isinstance(inventory, Mapping):
+                return _safe_quantity(inventory.get(item, 0))
+            if isinstance(inventory, Sequence) and not isinstance(inventory, (str, bytes)):
+                return sum(1 for value in inventory if str(value).upper() == item)
+    inventory = state.get("inventory")
+    return _safe_quantity(inventory.get(item, 0)) if isinstance(inventory, Mapping) else 0
+
+
 def _shed_quantity(state: Mapping[str, Any], item: str) -> int | float:
     private = _mapping(state.get("private"))
     shed = private.get("shed", state.get("shed", {}))
@@ -792,23 +820,73 @@ def _task_turn_budget(task: Task, worker: tuple[int, str, Position | None], stat
         return 0
     travel = distance(start, target)
     kind = str(task.kind).upper()
+    access = [
+        point for point in shed_access_tiles(board_size)
+        if 0 <= point.x < board_size and 0 <= point.y < board_size
+    ]
+
+    worker_index = worker[0]
+    worker_has_wheat = _worker_quantity(state, worker_index, "WHEAT") > 0
+    private = state.get("private")
+    logistics_known = isinstance(private, Mapping) and ("shed" in private or "inventories" in private)
+
+    if kind == "ANIMAL":
+        item = str(task.item or "").upper()
+        worker_has_animal = _worker_quantity(state, worker_index, item) > 0
+        shed_has_animal = _shed_quantity(state, item) > 0
+        shed_has_wheat = _shed_quantity(state, "WHEAT") > 0
+        if not worker_has_animal and not shed_has_animal:
+            return travel + 1 if not logistics_known else 10**9
+        if worker_has_animal:
+            if worker_has_wheat:
+                return travel + 2  # PLACE, then same-tile FEED.
+            if shed_has_wheat:
+                return min(
+                    (distance(start, point) + 1 + distance(point, target) + 1
+                     for point in access),
+                    default=10**9,
+                )
+            return 10**9 if logistics_known else travel + 2
+        if worker_has_wheat:
+            return min(
+                (distance(start, point) + 1 + distance(point, target) + 2
+                 for point in access),
+                default=10**9,
+            )
+        if shed_has_wheat:
+            return min(
+                (distance(start, point) + 2 + distance(point, target) + 2
+                 for point in access),
+                default=10**9,
+            )
+        return 10**9 if logistics_known else travel + 2
+
     if kind == "PLANT":
         # A newly planted crop must have one further turn reserved for WATER.
         return travel + 2
-    if kind in {"FEED", "FERTILIZE", "ANIMAL"}:
+    if kind in {"FEED", "FERTILIZE"}:
         item = "WHEAT" if kind == "FEED" else (
             "FERTILIZER" if kind == "FERTILIZE" else str(task.item or "").upper()
         )
-        if item and _held_quantity(state, item) <= 0:
+        if item and _worker_quantity(state, worker_index, item) <= 0:
             if _shed_quantity(state, item) <= 0:
-                return 10**9
-            pickup = _shed_route_distance(start, board_size) + 1
-            target_from_shed = min(
-                (distance(point, target) for point in shed_access_tiles(board_size)
-                 if 0 <= point.x < board_size and 0 <= point.y < board_size),
+                # Flat planner fixtures often omit logistics state.  Keep
+                # their task-assignment semantics; parsed engine observations
+                # always include private shed/inventory data and are handled
+                # conservatively below.
+                private = state.get("private")
+                if isinstance(private, Mapping) and ("shed" in private or "inventories" in private):
+                    return 10**9
+                return travel + 1
+            # Pickup and delivery must use the same shed access tile. Taking
+            # independent minima can undercount the route and schedule a
+            # feed/fertilize action after the day's deadline.
+            delivery = min(
+                (distance(start, point) + 1 + distance(point, target) + 1
+                 for point in access),
                 default=10**9,
             )
-            return pickup + target_from_shed + 1
+            return delivery
     return travel + 1
 
 
@@ -867,7 +945,12 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
             info for info in infos
             if info[0] in available and _fits_same_day_deadline(task, info, state, board_size, day)
         ]
-        non_farmer_available = any(info[0] in available and info[1] != "FARMER" for info in infos)
+        non_farmer_available = any(
+            info[0] in available
+            and info[1] != "FARMER"
+            and _fits_same_day_deadline(task, info, state, board_size, day)
+            for info in infos
+        )
         reserve_farmer = (
             logistics_pending
             and farmer is not None
