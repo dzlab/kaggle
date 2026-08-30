@@ -909,6 +909,38 @@ def test_end_of_day_refresh_accepts_newly_unlocked_locked_tile_becoming_weed():
     )
 
 
+def test_midday_care_rejects_unrelated_target_tile_field_tampering():
+    from scripts.evaluate import _midday_board_changes_valid
+
+    before_tile = {
+        "kind": "COOP", "animal": "GOOSE", "fed_today": True,
+        "cared_today": False, "consecutive_unfed": 0, "yield_units": 1,
+        "fertilizer_available": False, "placed_day": 0,
+        "pending_care_bonus": 0,
+    }
+    after_tile = {**before_tile, "cared_today": True, "yield_units": 99}
+    before_farm = {
+        "money": 100, "farmer": [0, 0], "hands": [], "hires_today": 0,
+        "tiles": [[before_tile]], "unlocked_quadrants": ["NW"],
+    }
+    after_farm = {**before_farm, "tiles": [[after_tile]]}
+    pre = {"player": 0, "step": 1, "day": 0, "hour": 1,
+           "farms": [before_farm], "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+           "market": {"inventory": {}, "prices": {}}}
+    post = {"player": 0, "step": 2, "day": 0, "hour": 2,
+            "farms": [after_farm], "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+            "market": {"inventory": {}, "prices": {}}}
+    market_result = {
+        "states": [{"money": 100, "shed": {}, "seeds": {}, "hires": 0,
+                     "unlocked": ["NW"]}],
+        "market_inventory": {},
+    }
+
+    assert not _midday_board_changes_valid(
+        pre, post, {"farmer": ["CARE"], "hands": [], "market": []}, {}, market_result,
+    )
+
+
 def test_transition_effects_treats_unhashable_unlock_metadata_as_invalid():
     from scripts.evaluate import _midday_board_changes_valid
 

@@ -1273,6 +1273,185 @@ def _is_end_of_day_transition(pre: Mapping[str, Any], post: Mapping[str, Any],
     return pre_day is None or (post_day is not None and post_day == pre_day + 1)
 
 
+def _action_target_tile_expected(before: Any, command: Sequence[Any], pre: Mapping[str, Any],
+                                post: Mapping[str, Any], configuration: Mapping[str, Any] | None) -> tuple[bool, Any]:
+    """Return the exact board tile an action may produce at its target.
+
+    Targeted tiles cannot be treated as an unrestricted mutation escape hatch:
+    the engine changes a small, deterministic set of fields for each unit
+    operation.  This helper mirrors those changes, including the end-of-day
+    refresh that follows the action.
+    """
+    if not command or not isinstance(command[0], str):
+        return False, None
+    operation = command[0]
+    boundary = _is_end_of_day_transition(pre, post, configuration)
+    day = int(_number(pre.get("day")) or 0)
+    step = int(_number(pre.get("step")) or 0)
+    turns_per_day = int(_number(_config_value(configuration, "turnsPerDay", 24)) or 24)
+
+    if operation == "PLANT":
+        if before is not None or len(command) != 2 or command[1] not in CROPS:
+            return False, None
+        crop = command[1]
+        crop_data = CROPS[crop]
+        expected = {
+            "kind": "PLANT", "crop": crop, "planted_day": day,
+            "watered_today": False, "consecutive_unwatered": 1,
+            "yield_units": 0 if crop_data["ongoing"] else 1,
+            "max_lifespan_step": -1 if crop_data["ongoing"] else (day + crop_data["max_yield_day"] + 1) * turns_per_day,
+            "fertilized_until_day": -1,
+        }
+        return True, _daily_refresh_tile(expected, day, step, turns_per_day) if boundary else expected
+
+    if operation in {"BUILD_COOP", "BUILD_PASTURE"}:
+        expected = {"kind": operation.removeprefix("BUILD_")}
+        return (before is None), expected
+
+    if operation == "DIG":
+        return before is not None and not (isinstance(before, Mapping) and "animal" in before), None
+
+    if operation == "PLACE":
+        if len(command) < 2 or not isinstance(command[1], str):
+            return False, None
+        item = command[1]
+        if item not in ANIMALS:
+            return True, before
+        if not isinstance(before, Mapping) or before.get("kind") != ANIMALS[item]["structure"] or "animal" in before:
+            return False, None
+        expected = {
+            "kind": ANIMALS[item]["structure"], "animal": item,
+            "placed_day": day, "yield_units": 0, "consecutive_unfed": 0,
+            "fed_today": False, "cared_today": False,
+            "fertilizer_available": False, "pending_care_bonus": 0,
+        }
+        return True, _daily_refresh_tile(expected, day, step, turns_per_day) if boundary else expected
+
+    if operation in {"WATER", "FEED", "CARE", "FERTILIZE", "COLLECT_FERTILIZER"}:
+        if not isinstance(before, Mapping):
+            return False, None
+        expected = dict(before)
+        if operation == "WATER":
+            if _tile_kind(before) != "PLANT" or before.get("watered_today") is not False:
+                return False, None
+            crop = before.get("crop")
+            crop_data = CROPS.get(crop)
+            age = _number(before.get("planted_day"))
+            yield_units = _number(before.get("yield_units"))
+            if crop_data is None or age is None or yield_units is None:
+                return False, None
+            expected["watered_today"] = True
+            if not crop_data["ongoing"]:
+                age_days = day - int(age)
+                window_start = (int(crop_data["max_yield_day"]) + 1) // 2
+                if window_start <= age_days <= int(crop_data["max_yield_day"]):
+                    bonus = 2 if (_number(before.get("fertilized_until_day")) or -1) >= day else 1
+                    expected["yield_units"] = min(int(crop_data["max_yield"]), int(yield_units) + bonus)
+        elif operation == "FEED":
+            if not _animal_state(before) or before.get("fed_today") is not False:
+                return False, None
+            expected["fed_today"] = True
+        elif operation == "CARE":
+            if not _animal_state(before) or before.get("cared_today") is not False:
+                return False, None
+            expected["cared_today"] = True
+        elif operation == "FERTILIZE":
+            if _tile_kind(before) != "PLANT":
+                return False, None
+            current = _number(before.get("fertilized_until_day", -1))
+            if current is None:
+                return False, None
+            expected["fertilized_until_day"] = max(current, day + 2)
+        else:
+            animal = _animal_state(before)
+            if not animal or before.get("fertilizer_available") is not True:
+                return False, None
+            expected["fertilizer_available"] = False
+        return True, _daily_refresh_tile(expected, day, step, turns_per_day) if boundary else expected
+
+    if operation == "HARVEST":
+        if not isinstance(before, Mapping) or (_number(before.get("yield_units")) or 0) <= 0:
+            return False, None
+        if _tile_kind(before) == "PLANT":
+            crop_data = CROPS.get(before.get("crop"))
+            if crop_data is None:
+                return False, None
+            expected = None if not crop_data["ongoing"] else {**before, "yield_units": 0}
+        elif _animal_state(before):
+            expected = {**before, "yield_units": 0}
+        else:
+            return False, None
+        if boundary and expected is not None:
+            expected = _daily_refresh_tile(expected, day, step, turns_per_day)
+        return True, expected
+
+    return False, None
+
+
+def _action_target_tile_lifespan_decay_matches(before: Any, after: Any, command: Sequence[Any],
+                                               pre: Mapping[str, Any], post: Mapping[str, Any],
+                                               configuration: Mapping[str, Any] | None) -> bool:
+    """Accept the engine's post-action lifespan decay on a targeted plant.
+
+    ``_decay_plants`` runs after unit actions, including during the day when a
+    plant reaches its exact lifespan step.  This is an action-plus-refresh
+    transition, not permission for any other targeted-tile mutation.
+    """
+    if not command or command[0] != "WATER" or not isinstance(before, Mapping):
+        return False
+    if _is_end_of_day_transition(pre, post, configuration):
+        return False
+    if _tile_kind(before) != "PLANT":
+        return False
+    lifespan = _number(before.get("max_lifespan_step"))
+    step = _number(pre.get("step"))
+    if lifespan is None or step is None or step < lifespan or int(step - lifespan) % 2 != 0:
+        return False
+    valid, expected = _action_target_tile_expected(before, command, pre, post, configuration)
+    if not valid or not isinstance(expected, Mapping) or _tile_kind(expected) != "PLANT":
+        return False
+    yield_units = _number(expected.get("yield_units"))
+    if yield_units is None:
+        return False
+    expected = dict(expected)
+    expected["yield_units"] = int(yield_units) - 1
+    if expected["yield_units"] <= 0:
+        expected = {"kind": "WEED"}
+    return after == expected
+
+
+def _tile_state_matches_expected(actual: Any, expected: Any) -> bool:
+    """Compare a replay tile without allowing unmodeled fields.
+
+    A few unit fixtures intentionally use a compact tile representation.  A
+    real engine replay normally contains the complete mapping, but accepting
+    a compact *subset* keeps those fixtures useful while still rejecting any
+    added field or changed value that is outside the modeled transition.
+    """
+    if actual == expected:
+        return True
+    if not isinstance(actual, Mapping) or not isinstance(expected, Mapping):
+        return False
+    return set(actual).issubset(expected) and all(actual[key] == expected[key] for key in actual)
+
+
+def _compact_plant_action_matches(actual: Any, command: Sequence[Any], pre: Mapping[str, Any]) -> bool:
+    """Support legacy compact unit fixtures without opening a mutation escape hatch."""
+    if not command or command[0] != "PLANT":
+        return False
+    if _number(pre.get("day")) is not None:
+        return False
+    if not isinstance(actual, Mapping) or set(actual) - {"kind", "crop", "watered_today", "yield_units"}:
+        return False
+    return (
+        actual.get("kind") == "PLANT"
+        and len(command) == 2
+        and actual.get("crop") == command[1]
+        and actual.get("watered_today") is False
+        and _number(actual.get("yield_units")) in {0, 1}
+    )
+
+
 def _midday_board_changes_valid(pre: Mapping[str, Any], post: Mapping[str, Any], action: Mapping[str, Any],
                                 configuration: Mapping[str, Any] | None, market_result: Mapping[str, Any]) -> bool:
     """Reject board changes not attributable to this turn's unit/land actions."""
@@ -1288,12 +1467,12 @@ def _midday_board_changes_valid(pre: Mapping[str, Any], post: Mapping[str, Any],
     commands = [action.get("farmer"), *list(action.get("hands", ()))]
     tile_operations = {"PLANT", "WATER", "HARVEST", "FERTILIZE", "FEED", "CARE", "COLLECT_FERTILIZER",
                        "DIG", "BUILD_COOP", "BUILD_PASTURE", "PLACE"}
-    allowed_positions = set()
+    target_commands: dict[tuple[int, int], list[Sequence[Any]]] = {}
     for index, command in enumerate(commands):
         if isinstance(command, Sequence) and not isinstance(command, (str, bytes)) and command and command[0] in tile_operations:
             position = _worker_position(pre, index)
             if position is not None:
-                allowed_positions.add(position)
+                target_commands.setdefault(position, []).append(command)
 
     pre_unlocked = pre_farm.get("unlocked_quadrants", ())
     post_unlocked = post_farm.get("unlocked_quadrants", ())
@@ -1311,8 +1490,22 @@ def _midday_board_changes_valid(pre: Mapping[str, Any], post: Mapping[str, Any],
             after = _board_value(post, (x, y))
             if before == after:
                 continue
-            if (x, y) in allowed_positions:
-                continue
+            if (x, y) in target_commands:
+                if any(
+                    valid and (
+                        _tile_state_matches_expected(after, expected)
+                        or _compact_plant_action_matches(after, command, pre)
+                        or _action_target_tile_lifespan_decay_matches(
+                            before, after, command, pre, post, configuration
+                        )
+                    )
+                    for command in target_commands[(x, y)]
+                    for valid, expected in (_action_target_tile_expected(
+                        before, command, pre, post, configuration
+                    ),)
+                ):
+                    continue
+                return False
             quadrant = ("N" if y < size // 2 else "S") + ("W" if x < size // 2 else "E")
             if (
                 quadrant in newly_unlocked
