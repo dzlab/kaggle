@@ -39,7 +39,7 @@ Run reproducible local games with the evaluator. It uses the same seed set for
 every selected variant/opponent pair and writes a stable JSON report:
 
 ```bash
-uv run python scripts/evaluate.py \
+UV_CACHE_DIR=/private/tmp/kagriculture-uv-cache uv run python scripts/evaluate.py \
   --seeds 30 --start-seed 0 --steps 720 \
   --opponents pass random starter \
   --variants conservative mixed melon-heavy demand-reactive animal-heavy \
@@ -53,7 +53,9 @@ batch. `--variant NAME` may be repeated as an alternative to `--variants`. The
 report includes outcome counts, win rate, bank statistics, bank differential,
 framework-error rate, shed overflow, price-floor sales, and replay-observable
 missed basic needs. The `selected_default` field chooses the variant by
-aggregate win rate, then median final bank, then lower framework-error rate.
+lowest framework-error rate first, then aggregate win rate, then median final
+bank. This prevents a less reliable variant from outranking a zero-failure
+variant.
 
 The evaluator also supports isolated component ablations with repeated
 `--ablation component=off` options: `route_scheduling`, `market_batch_sizing`,

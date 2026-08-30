@@ -1152,15 +1152,15 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
         return False
     if not isinstance(post_hands, Sequence) or isinstance(post_hands, (str, bytes)):
         return False
+    boundary = _number(pre.get("hour")) == 23 and _number(post.get("hour")) == 0
     simulated_states = market_result.get("states", ())
     simulated = simulated_states[0] if isinstance(simulated_states, Sequence) and simulated_states else {}
     if not isinstance(simulated, Mapping):
         return False
-    expected_hands = len(pre_hands) + int(simulated.get("hires", 0)) - int(_number(pre_farm.get("hires_today")) or 0)
+    expected_hands = 0 if boundary else len(pre_hands) + int(simulated.get("hires", 0)) - int(_number(pre_farm.get("hires_today")) or 0)
     if len(post_hands) != expected_hands:
         return False
     commands = [action.get("farmer"), *list(action.get("hands", ()))]
-    boundary = _number(pre.get("hour")) == 23 and _number(post.get("hour")) == 0
     inventories = _private_inventories(pre)
     post_inventories = _private_inventories(post)
     if inventories is not None and post_inventories is not None:
@@ -1195,7 +1195,13 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
         pre_tile = _tile_at_position(pre, position)
         post_tile = _tile_at_position(post, position)
         if operation == "PLANT":
-            if not isinstance(post_tile, Mapping) or _tile_kind(post_tile) != "PLANT" or post_tile.get("crop") != command[1]:
+            plant_persisted = (
+                isinstance(post_tile, Mapping)
+                and _tile_kind(post_tile) == "PLANT"
+                and post_tile.get("crop") == command[1]
+            )
+            end_of_day_decay = boundary and _tile_kind(post_tile) == "WEED"
+            if not plant_persisted and not end_of_day_decay:
                 return False
             add_quantity(expected_seeds, command[1], -1)
         elif operation == "BUILD_COOP" and (not isinstance(post_tile, Mapping) or _tile_kind(post_tile) != "COOP"):
@@ -1236,6 +1242,8 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
         elif operation == "PLACE" and item not in _ANIMAL_NAMES:
             add_quantity(inventory, item, -quantity)
             add_quantity(expected_shed, item, quantity)
+        elif operation == "PLACE" and item in _ANIMAL_NAMES:
+            add_quantity(inventory, item, -1)
         elif operation == "FEED":
             add_quantity(inventory, "WHEAT", -1)
         elif operation == "FERTILIZE":
@@ -1247,8 +1255,11 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
             if item:
                 add_quantity(inventory, item, _number(pre_tile.get("yield_units")) or 0)
         elif operation == "DROP":
+            room = max(0.0, _shed_capacity(configuration) - sum(expected_shed.values()))
             for drop_item, drop_quantity in list(inventory.items()):
-                add_quantity(expected_shed, drop_item, drop_quantity)
+                taken = min(drop_quantity, room)
+                add_quantity(expected_shed, drop_item, taken)
+                room -= taken
             inventory.clear()
 
     if expected_inventories is not None and not boundary:

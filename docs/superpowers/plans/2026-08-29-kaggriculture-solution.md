@@ -311,25 +311,25 @@ Expected: short games and the seeded full game complete with status `DONE` for b
 - Create: `scripts/evaluate.py`
 - Modify: `README.md`
 
-- [ ] **Step 1: Implement batch evaluation**
+- [x] **Step 1: Implement batch evaluation**
 
 Run at least 30 seeds per opponent and report mean/median/fifth-percentile final bank, win rate, error rate, average shed overflow, average price-floor sales, and missed basic-needs events. Store JSON summaries beside replays.
 
-- [ ] **Step 2: Add controlled variants**
+- [x] **Step 2: Add controlled variants**
 
-Evaluate the conservative, melon-heavy, demand-reactive, and animal-heavy portfolio settings against identical seed/opponent sets. Select the default by win rate first, then median bank and failure rate; do not select by one lucky seed.
+Evaluate the conservative, melon-heavy, demand-reactive, and animal-heavy portfolio settings against identical seed/opponent sets. Select the default by failure rate first, then win rate, then median bank; do not select by one lucky seed.
 
-- [ ] **Step 3: Add ablations**
+- [x] **Step 3: Add ablations**
 
 Measure the contribution of route scheduling, market batch sizing, shop adaptation, land purchase, and animals by disabling one component at a time. Keep only changes that improve win rate without increasing invalid actions or basic-needs failures.
 
-- [ ] **Step 4: Add submission checks**
+- [x] **Step 4: Add submission checks**
 
 Package with `tar -czf submission.tar.gz main.py kaggriculture_agent` and inspect the archive so `main.py` is at its root. Run the exact packaged entry point locally before any upload.
 
-- [ ] **Step 5: Run the final local gate**
+- [x] **Step 5: Run the final local gate**
 
-Run `pytest -q`, then `python3 scripts/evaluate.py --seeds 30 --opponents pass random starter`.
+Run `UV_CACHE_DIR=/private/tmp/kagriculture-uv-cache uv run pytest -q`, then `UV_CACHE_DIR=/private/tmp/kagriculture-uv-cache uv run python scripts/evaluate.py --seeds 30 --start-seed 0 --steps 720 --opponents pass random starter --variants conservative mixed melon-heavy demand-reactive animal-heavy --output reports/evaluation.json`.
 Expected: zero test failures, zero framework errors, zero malformed actions, and a recorded JSON report for the selected policy.
 
 ### Task 8: Submit and monitor safely
