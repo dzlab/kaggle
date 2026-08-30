@@ -238,6 +238,23 @@ def test_daily_plan_keeps_canonical_shed_fertilizer_available_for_fertilizing():
     assert any(task.kind == "FERTILIZE" and task.target == pos(0, 0) for task in plan)
 
 
+def test_daily_plan_schedules_collect_fertilizer_and_keeps_harvest_urgent():
+    tiles = [[
+        {"kind": "PLANT", "crop": "WHEAT", "planted_day": 0, "yield_units": 2,
+         "watered_today": True, "fertilized_until_day": 0},
+        {"kind": "COOP", "animal": "GOOSE", "fed_today": True, "cared_today": True,
+         "fertilizer_available": True},
+    ]]
+    state = _state(day=4, board_size=2, tiles=tiles, inventory={"FERTILIZER": 1})
+
+    plan = build_daily_plan(state, EpisodeMemory())
+
+    assert any(task.kind == "COLLECT_FERTILIZER" and task.target == pos(1, 0) for task in plan)
+    harvest = next(task for task in plan if task.kind == "HARVEST")
+    fertilize = next(task for task in plan if task.kind == "FERTILIZE")
+    assert harvest.priority > fertilize.priority
+
+
 def test_normalize_planner_state_supports_attribute_based_state():
     state = SimpleNamespace(
         day=2,

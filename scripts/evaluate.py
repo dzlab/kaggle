@@ -1605,6 +1605,22 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
             return False
         elif operation in {"WATER", "FEED", "CARE"}:
             if not isinstance(post_tile, Mapping):
+                # Unit actions are resolved in one engine turn.  If a farmer
+                # harvests a tile before a hand's WATER/FEED/CARE command is
+                # resolved, the second command is a legal no-op because the
+                # harvested tile is already gone.  Do not demand a post-tile
+                # effect that the engine cannot produce in this conflict.
+                blocked_by_harvest = any(
+                    other_index != worker_index
+                    and isinstance(other_command, Sequence)
+                    and not isinstance(other_command, (str, bytes))
+                    and other_command
+                    and other_command[0] == "HARVEST"
+                    and _worker_position(pre, other_index) == position
+                    for other_index, other_command in enumerate(commands)
+                )
+                if post_tile is None and blocked_by_harvest and isinstance(pre_tile, Mapping):
+                    continue
                 return False
             if boundary:
                 expected_tile = _targeted_boundary_tile_expected(

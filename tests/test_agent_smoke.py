@@ -167,6 +167,28 @@ def test_full_seeded_local_game_finishes_with_legal_replay(tmp_path: Path):
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_full_pass_exercises_autonomous_macro_action_and_market_flows(tmp_path: Path):
+    replay_path = tmp_path / "full-pass-macro.json"
+
+    run_episode(opponent="pass", seed=17, steps=720, replay_path=replay_path)
+    replay = _assert_replay_is_legal_and_complete(replay_path)
+    unit_operations = set()
+    market_operations = set()
+    for player_state in replay["steps"]:
+        state = next(item for item in player_state if item["observation"]["player"] == 0)
+        action = state["action"]
+        unit_operations.add(action["farmer"][0])
+        unit_operations.update(command[0] for command in action["hands"])
+        market_operations.update(order[0] for order in action["market"])
+
+    assert {"PLANT", "WATER", "HARVEST"} <= unit_operations
+    assert unit_operations & {"BUILD_COOP", "BUILD_PASTURE"}
+    assert {"FERTILIZE", "COLLECT_FERTILIZER"} <= unit_operations
+    assert {"PLACE", "FEED", "CARE"} <= unit_operations
+    assert "SELL" in market_operations
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
 def test_seeded_random_style_opponent_replays_are_reproducible(tmp_path: Path):
     first_path = tmp_path / "random-first.json"
     second_path = tmp_path / "random-second.json"

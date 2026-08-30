@@ -173,6 +173,26 @@ def test_market_orders_liquidate_saleable_shed_inventory_on_penultimate_turn():
     assert ["SELL", "MELON", 2] in orders
 
 
+def test_policy_drops_carried_animals_before_terminal_sale_window():
+    obs = observation(day=29, hour=21, hands=[[2, 2]], inventories=[[], ["GOOSE"]],
+                      shed={"GOOSE": 0, "MELON": 0}, seeds={})
+
+    action = policy_module.Policy().act(obs)
+
+    assert action["hands"][0] == ["DROP"]
+
+
+def test_policy_keeps_required_carried_animal_for_assigned_placement():
+    board = [[None for _ in range(5)] for _ in range(5)]
+    board[0][0] = {"kind": "COOP"}
+    obs = observation(day=4, hour=1, hands=[[4, 4]], inventories=[[], ["GOOSE"]],
+                      shed={"GOOSE": 0}, seeds={}, tiles=board)
+
+    action = policy_module.Policy().act(obs)
+
+    assert action["hands"][0] != ["DROP"]
+
+
 def test_zero_filled_real_engine_shed_does_not_keep_cached_shed_or_sell_valid():
     state = {
         "board_size": 5,

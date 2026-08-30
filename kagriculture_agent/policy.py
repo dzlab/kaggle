@@ -586,7 +586,7 @@ def _task_action(state: Any, worker_index: int, task: Task, position: Position) 
     if kind == "STRUCTURE":
         return _structure_action(state, position) or PASS
     if kind == "ANIMAL":
-        item = str(_get(task, "animal", _get(task, "species", ""))).upper()
+        item = str(_get(task, "animal", _get(task, "species", _get(task, "item", "")))).upper()
         if not item:
             for candidate in _get(state, "desired_animals", ()) or ():
                 if _position(candidate) == position:
@@ -669,12 +669,13 @@ def _fetch_required_item(state: Any, worker_index: int, task: Any, current: Posi
     return f"PICKUP {item} 1"
 
 
-def _drop_carried_goods(state: Any, worker_index: int, task: Any, current: Position) -> str | None:
+def _drop_carried_goods(state: Any, worker_index: int, task: Any, current: Position,
+                        *, force: bool = False) -> str | None:
     inventory = _inventory_for_worker(state, worker_index)
-    if not any(inventory.get(item, 0) > 0 for item in PRODUCTS):
+    if not any(inventory.get(item, 0) > 0 for item in set(PRODUCTS) | set(ANIMALS)):
         return None
     required = _required_worker_item(task, state)
-    if required is not None and inventory.get(required, 0) > 0:
+    if not force and required is not None and inventory.get(required, 0) > 0:
         return None
     access = _shed_access_target(state, current)
     if access is None:
@@ -729,6 +730,25 @@ def _assignment_valid(state: Any, assignment: WorkerAssignment) -> bool:
         completed_field = "fed_today" if kind == "FEED" else "cared_today"
         if animal is None or bool(_get(animal, completed_field, False)):
             return False
+    required = _required_worker_item(assignment.task, state)
+    if required is not None and _inventory_for_worker(state, worker_index).get(required, 0) <= 0:
+        # Required inputs can be staged in the shed. Keep the assignment
+        # stable while worker_action routes to PICKUP, otherwise logistics
+        # replanning every turn starves build/placement/harvest work.
+        if _whole(_shed(state).get(required)) <= 0:
+            return False
+        if kind == "FERTILIZE":
+            return _is_engine_plant_tile(_tile_at(state, target))
+        if kind == "FEED":
+            return _animal(_tile_at(state, target)) is not None
+        if kind == "ANIMAL":
+            tile = _tile_at(state, target)
+            return (
+                required in ANIMALS
+                and _structure_kind(tile) == ANIMALS[required]["structure"]
+                and _animal(tile) is None
+                and not (isinstance(tile, Mapping) and "animal" in tile)
+            )
     return _task_action(state, worker_index, assignment.task, target) != PASS
 
 
@@ -741,8 +761,19 @@ class Policy:
     def _replan(self, state: Mapping[str, Any], regime: Mapping[str, str],
                 macro: Mapping[str, Any] | None = None) -> list[WorkerAssignment]:
         normalized = _state_for_planner(state)
-        plan = build_daily_plan(normalized, self.memory)
         macro = macro or build_autonomous_macro_plan(normalized, self.memory)
+        plan = build_daily_plan(normalized, self.memory)
+        # Reserve the macro infrastructure tile before daily planting fills
+        # the first empty square. This keeps BUILD_* and the selected crop
+        # executable as separate tasks rather than competing for one tile.
+        reserved_structure_tiles = {
+            task.target for task in macro.get("tasks", ())
+            if isinstance(task, Task) and task.kind in {"BUILD_COOP", "BUILD_PASTURE"}
+        }
+        if reserved_structure_tiles:
+            plan = [task for task in plan if not (
+                task.kind == "PLANT" and task.target in reserved_structure_tiles
+            )]
         plan.extend(task for task in macro.get("tasks", ()) if isinstance(task, Task))
         assignments = assign_tasks(plan, normalized.get("workers", ()), normalized)
         self.memory.assignments = assignments
@@ -768,9 +799,17 @@ class Policy:
         else:
             assignments = self.memory.assignments
         by_worker = {assignment.worker_index: assignment for assignment in assignments}
+        terminal_cleanup = (
+            _whole(_get(state, "day")) >= season_days - 1
+            and _whole(_get(state, "hour")) >= 20
+        )
         commands = {worker["index"]: worker_action(worker["index"], state, by_worker.get(worker["index"])) for worker in workers}
         for worker in workers:
-            drop = _drop_carried_goods(state, worker["index"], by_worker.get(worker["index"]), worker["position"])
+            drop = _drop_carried_goods(
+                state, worker["index"],
+                _get(by_worker.get(worker["index"]), "task"), worker["position"],
+                force=terminal_cleanup,
+            )
             if drop is not None:
                 commands[worker["index"]] = _unit_command(drop)
         farmer = commands.get(0, [PASS])

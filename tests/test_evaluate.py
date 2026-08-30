@@ -526,6 +526,32 @@ def test_transition_effects_accept_animal_place_inventory_consumption():
     )
 
 
+def test_transition_effects_accepts_same_tile_water_blocked_by_harvest():
+    from scripts.evaluate import _transition_effects_valid
+
+    plant = {"kind": "PLANT", "crop": "MELON", "watered_today": False,
+             "yield_units": 1, "planted_day": 0, "fertilized_until_day": -1}
+    pre_farm = {"money": 100, "farmer": [0, 0], "hands": [[0, 0]],
+                "hires_today": 1, "tiles": [[plant]], "unlocked_quadrants": ["NW"]}
+    post_farm = {**pre_farm, "tiles": [[None]]}
+    pre = {"player": 0, "step": 1, "day": 0, "hour": 1, "farms": [pre_farm],
+           "private": {"seeds": {}, "shed": {}, "inventories": [{}, {}]},
+           "market": {"inventory": {}, "prices": {}}}
+    post = {"player": 0, "step": 2, "day": 0, "hour": 2, "farms": [post_farm],
+            "private": {"seeds": {}, "shed": {}, "inventories": [{"MELON": 1}, {}]},
+            "market": {"inventory": {}, "prices": {}}}
+    market_result = {
+        "states": [{"money": 100, "shed": {}, "seeds": {}, "hires": 1, "unlocked": ["NW"]}],
+        "market_inventory": {},
+    }
+
+    assert _transition_effects_valid(
+        pre, post,
+        {"farmer": ["HARVEST"], "hands": [["WATER"]], "market": []},
+        {}, market_result,
+    )
+
+
 def test_transition_effects_accept_end_of_day_hire_hand_reset():
     from scripts.evaluate import _transition_effects_valid
 
