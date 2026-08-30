@@ -161,6 +161,13 @@ def _number(value: Any) -> float | None:
     return number if number == number and abs(number) != float("inf") else None
 
 
+def _crop_data(crop: Any) -> Mapping[str, Any] | None:
+    """Return crop rules without allowing malformed replay keys to escape."""
+    if not isinstance(crop, str):
+        return None
+    return CROPS.get(crop)
+
+
 def _config_value(configuration: Mapping[str, Any] | None, key: str, default: Any) -> Any:
     return _mapping(configuration).get(key, default)
 
@@ -688,22 +695,26 @@ def _price_floor_sales(state: Mapping[str, Any], observation: Mapping[str, Any] 
     return int(result["floor_sales"][0]) if result is not None else 0
 
 
-def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, seed: int) -> dict[str, Any]:
+def _framework_error_record(*, variant: str, opponent: str, seed: int) -> dict[str, Any]:
+    return {
+        "variant": variant,
+        "opponent": opponent,
+        "seed": seed,
+        "outcome": "framework_error",
+        "final_bank": None,
+        "opponent_final_bank": None,
+        "bank_differential": 0.0,
+        "framework_error": True,
+        "shed_overflow": 0.0,
+        "price_floor_sales": 0,
+        "missed_basic_needs": 0,
+    }
+
+
+def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, seed: int) -> dict[str, Any]:
     """Extract one game record from the engine replay JSON."""
     if not isinstance(replay, Mapping):
-        return {
-            "variant": variant,
-            "opponent": opponent,
-            "seed": seed,
-            "outcome": "framework_error",
-            "final_bank": None,
-            "opponent_final_bank": None,
-            "bank_differential": 0.0,
-            "framework_error": True,
-            "shed_overflow": 0.0,
-            "price_floor_sales": 0,
-            "missed_basic_needs": 0,
-        }
+        return _framework_error_record(variant=variant, opponent=opponent, seed=seed)
     own_states = _player_states(replay, 0)
     other_states = _player_states(replay, 1)
     replay_configuration = _mapping(replay.get("configuration"))
@@ -767,6 +778,14 @@ def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, see
         "price_floor_sales": floor_sales,
         "missed_basic_needs": missed_needs,
     }
+
+
+def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, seed: int) -> dict[str, Any]:
+    """Extract one replay record, classifying malformed replay data safely."""
+    try:
+        return _replay_record(replay, variant=variant, opponent=opponent, seed=seed)
+    except TypeError:
+        return _framework_error_record(variant=variant, opponent=opponent, seed=seed)
 
 
 def _farm_observation(observation: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -1240,7 +1259,7 @@ def _daily_refresh_tile(before: Any, day: int, step: int, turns_per_day: int) ->
     kind = _tile_kind(before)
     if kind == "PLANT":
         crop = before.get("crop")
-        crop_data = CROPS.get(crop)
+        crop_data = _crop_data(crop)
         yield_units = _number(before.get("yield_units"))
         lifespan = _number(before.get("max_lifespan_step"))
         if crop_data is None or yield_units is None or lifespan is None:
@@ -1339,7 +1358,7 @@ def _targeted_boundary_tile_expected(before: Any, operation: str, day: int, step
         if _tile_kind(before) != "PLANT" or before.get("watered_today") is not False:
             return object()
         crop = before.get("crop")
-        crop_data = CROPS.get(crop)
+        crop_data = _crop_data(crop)
         planted_day = _number(before.get("planted_day"))
         yield_units = _number(before.get("yield_units"))
         fertilized_until = _number(before.get("fertilized_until_day"))
@@ -1456,7 +1475,7 @@ def _action_target_tile_expected(before: Any, command: Sequence[Any], pre: Mappi
             if _tile_kind(before) != "PLANT" or before.get("watered_today") is not False:
                 return False, None
             crop = before.get("crop")
-            crop_data = CROPS.get(crop)
+            crop_data = _crop_data(crop)
             age = _number(before.get("planted_day"))
             yield_units = _number(before.get("yield_units"))
             if crop_data is None or age is None or yield_units is None:
@@ -1494,7 +1513,7 @@ def _action_target_tile_expected(before: Any, command: Sequence[Any], pre: Mappi
         if not isinstance(before, Mapping) or (_number(before.get("yield_units")) or 0) <= 0:
             return False, None
         if _tile_kind(before) == "PLANT":
-            crop_data = CROPS.get(before.get("crop"))
+            crop_data = _crop_data(before.get("crop"))
             if crop_data is None:
                 return False, None
             expected = None if not crop_data["ongoing"] else {**before, "yield_units": 0}
@@ -1814,7 +1833,7 @@ def _unit_command_valid_for_state(command: Any, observation: Mapping[str, Any], 
         if day is None:
             return True
         if _tile_kind(tile) == "PLANT":
-            crop = CROPS.get(tile.get("crop"))
+            crop = _crop_data(tile.get("crop"))
             planted_day = _number(tile.get("planted_day"))
             return crop is not None and planted_day is not None and day - planted_day >= crop["first_yield_day"]
         animal = _animal_state(tile)
@@ -2088,7 +2107,18 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
             elif operation == "CARE" and post_tile.get("cared_today") is not True:
                 return False
         elif operation == "FERTILIZE":
-            if not isinstance(post_tile, Mapping) or (_number(post_tile.get("fertilized_until_day")) or -1) < (_number(pre.get("day")) or 0) + 2:
+            harvest_follows = any(
+                other_index > worker_index
+                and isinstance(other_command, Sequence)
+                and not isinstance(other_command, (str, bytes))
+                and other_command
+                and other_command[0] == "HARVEST"
+                and _worker_position(pre, other_index) == position
+                for other_index, other_command in enumerate(commands)
+            )
+            if post_tile is None and harvest_follows:
+                pass
+            elif not isinstance(post_tile, Mapping) or (_number(post_tile.get("fertilized_until_day")) or -1) < (_number(pre.get("day")) or 0) + 2:
                 return False
         elif operation == "COLLECT_FERTILIZER" and not boundary:
             if not isinstance(post_tile, Mapping) or post_tile.get("fertilizer_available") is not False:
@@ -2098,7 +2128,7 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
                 boundary
                 and isinstance(pre_tile, Mapping)
                 and _tile_kind(pre_tile) == "PLANT"
-                and CROPS.get(pre_tile.get("crop"), {}).get("ongoing", False)
+                and bool((_crop_data(pre_tile.get("crop")) or {}).get("ongoing", False))
             )
             if ongoing_boundary_harvest:
                 same_tile_commands = [

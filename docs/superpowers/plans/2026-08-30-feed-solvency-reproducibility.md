@@ -1,5 +1,11 @@
 # Feed Solvency and Reproducibility Fix Implementation Plan
 
+**Status (2026-08-30): Superseded.** The implementation and regressions for this
+plan’s feed-solvency work are present in the current codebase. Its remaining
+unchecked work is no longer an active execution queue; the focused replay and
+late-season follow-up is tracked in
+`docs/superpowers/plans/2026-08-30-replay-policy-regressions.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make animal acquisition and placement reserve all remaining wheat feeds through the season, handle expiring farm hands safely, and make evaluator reports byte-stable across equivalent invocations.
@@ -53,4 +59,3 @@
 - [ ] Run `UV_CACHE_DIR=/private/tmp/kaggriculture-uv-cache uv run pytest -q`.
 - [ ] Run bounded all-variant 720 smokes against `pass`, `random`, and `starter`, checking framework errors and missed required needs.
 - [ ] Inspect `git diff`, confirm no generated reports/replays are staged, and commit the implementation.
-

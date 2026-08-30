@@ -133,6 +133,15 @@ def test_animal_heavy_seed17_preserves_required_needs(opponent):
     assert record["missed_basic_needs"] == 0
 
 
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_conservative_seed17_random_replay_has_no_framework_error():
+    from scripts.evaluate import run_game
+
+    record = run_game(variant="conservative", opponent="random", seed=17, steps=720)
+
+    assert record["framework_error"] is False
+
+
 def test_percentile_uses_linear_interpolation():
     from scripts.evaluate import percentile
 
@@ -701,6 +710,55 @@ def test_midday_accepts_sequential_same_tile_water_then_fertilize():
         pre, post, {"farmer": ["WATER"], "hands": [["FERTILIZE"]], "market": []},
         {"boardSize": 1, "turnsPerDay": 24}, market_result,
     )
+
+
+def test_transition_effects_accepts_same_tile_fertilize_then_consuming_harvest():
+    from scripts.evaluate import _transition_effects_valid
+
+    plant = {
+        "kind": "PLANT", "crop": "WHEAT", "planted_day": 0,
+        "watered_today": True, "consecutive_unwatered": 0,
+        "yield_units": 1, "max_lifespan_step": 120,
+        "fertilized_until_day": -1,
+    }
+    pre_farm = {
+        "money": 100, "farmer": [0, 0], "hands": [[0, 0]], "hires_today": 1,
+        "tiles": [[plant]], "unlocked_quadrants": ["NW"],
+    }
+    post_farm = {**pre_farm, "tiles": [[None]]}
+    pre = {
+        "player": 0, "step": 1, "day": 0, "hour": 1, "farms": [pre_farm],
+        "private": {"seeds": {}, "shed": {}, "inventories": [{"FERTILIZER": 1}, {}]},
+        "market": {"inventory": {}, "prices": {}},
+    }
+    post = {
+        "player": 0, "step": 2, "day": 0, "hour": 2, "farms": [post_farm],
+        "private": {"seeds": {}, "shed": {}, "inventories": [{}, {"WHEAT": 1}]},
+        "market": {"inventory": {}, "prices": {}},
+    }
+    market_result = {
+        "states": [{"money": 100, "shed": {}, "seeds": {}, "hires": 1, "unlocked": ["NW"]}],
+        "market_inventory": {},
+    }
+
+    assert _transition_effects_valid(
+        pre, post, {"farmer": ["FERTILIZE"], "hands": [["HARVEST"]], "market": []},
+        {"boardSize": 1, "turnsPerDay": 24}, market_result,
+    )
+
+
+def test_malformed_unhashable_replay_crop_is_a_framework_failure_not_an_exception():
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    malformed_tile = {"kind": "PLANT", "crop": [], "yield_units": 1, "planted_day": 0}
+    replay["steps"][0][0]["observation"]["farms"][0]["tiles"][0][0] = malformed_tile
+    replay["steps"][1][0]["action"] = {"farmer": ["HARVEST"], "hands": [], "market": []}
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
 
 
 def test_price_floor_sales_uses_both_players_market_queues():

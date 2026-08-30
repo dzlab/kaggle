@@ -934,7 +934,7 @@ class Policy:
         market_plan.extend(_explicit_market_intents(obs, state))
         seeds = _mapping(_get(state, "private", {})).get("seeds", {})
         has_seed = isinstance(seeds, Mapping) and any(_whole(quantity) > 0 for quantity in seeds.values())
-        if not has_seed:
+        if not has_seed and _whole(_get(state, "day")) < season_days - 2:
             market_plan.append({"kind": "BUY_SEED", "item": "WHEAT", "quantity": 1})
         visible_hands = _get(_mapping(_get(state, "farm", {})), "hands", ())
         if not isinstance(visible_hands, Sequence) or isinstance(visible_hands, (str, bytes)):

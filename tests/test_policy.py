@@ -1,6 +1,7 @@
 from copy import deepcopy
 
 import kagriculture_agent.policy as policy_module
+import pytest
 from kagriculture_agent.types import Position, Task, WorkerAssignment
 
 
@@ -225,6 +226,13 @@ def test_late_season_planners_do_not_start_new_crops():
 
     assert all(task.kind != "PLANT" for task in build_daily_plan(state))
     assert all(task.kind != "PLANT" for task in build_autonomous_macro_plan(state)["tasks"])
+
+
+@pytest.mark.parametrize("day", [28, 29])
+def test_late_season_seed_fallback_does_not_buy_wheat_when_planting_is_suppressed(day):
+    action = policy_module.Policy().act(observation(day=day, hour=0, hands=[], seeds={}))
+
+    assert [order for order in action["market"] if order[:2] == ["BUY_SEED", "WHEAT"]] == []
 
 
 def test_daily_plan_uses_fertilizer_staged_in_shed():
