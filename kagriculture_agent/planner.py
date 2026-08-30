@@ -547,9 +547,31 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None) 
     shed = private.get("shed", normalized.get("inventory", {}))
     seeds = seeds if isinstance(seeds, Mapping) else {}
     shed = shed if isinstance(shed, Mapping) else {}
+    stored_animals = [candidate for candidate in ANIMALS if _safe_quantity(shed.get(candidate, 0)) > 0]
+    if stored_animals and animal not in stored_animals:
+        animal = stored_animals[0]
+    wheat_staged = (
+        _safe_quantity(shed.get("WHEAT", 0))
+        + _safe_quantity(_mapping(normalized.get("inventory")).get("WHEAT", 0))
+    )
+    wheat_price = _observed_quote("WHEAT", normalized)
+    feed_required = bool(stored_animals)
+    for _position_value, tile in _tiles(normalized):
+        animal_state = _entity_state(tile, "animal")
+        if animal_state is not None and _needs_today(animal_state, "needs_feed", "fed_today", "fed"):
+            feed_required = True
+    observed_animals = _get(normalized, "animals", ())
+    if isinstance(observed_animals, Mapping):
+        observed_animals = (observed_animals,)
+    elif not isinstance(observed_animals, Sequence) or isinstance(observed_animals, (str, bytes)):
+        observed_animals = ()
+    for animal_state in observed_animals:
+        if _needs_today(animal_state, "needs_feed", "fed_today", "fed"):
+            feed_required = True
     cash = _state_cash(normalized)
     intents: list[list[Any]] = []
     tasks: list[Task] = []
+    feed_horizon = min(7, max(1, season_days - day))
     _compatible_target, structure_target = _compatible_structure(normalized, animal)
     if day < season_days - 1:
         seed_cost = float(CROPS[selected["crop"]]["seed"])
@@ -579,12 +601,15 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None) 
         )
         if has_unfertilized_crop and _safe_quantity(shed.get("FERTILIZER", 0)) <= 0 and cash >= _observed_quote("FERTILIZER", normalized):
             intents.append(["BUY_PRODUCT", "FERTILIZER", 1])
-
         unlocked = farm.get("unlocked_quadrants", normalized.get("unlocked_quadrants", ["NW"]))
         if not isinstance(unlocked, Sequence) or isinstance(unlocked, (str, bytes)):
             unlocked = ["NW"]
         land_index = len(unlocked) - 1
         reserve = max(100.0, seed_cost)
+        if feed_required and wheat_staged < feed_horizon and wheat_price > 0:
+            quantity = feed_horizon - wheat_staged
+            if cash >= wheat_price * quantity + reserve:
+                intents.append(["BUY_PRODUCT", "WHEAT", quantity])
         if 0 <= land_index < len(LAND_ORDER) and cash >= float(LAND_PRICES[land_index]) + reserve:
             intents.append(["BUY_LAND"])
 
@@ -613,7 +638,11 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None) 
                 intents.append(["BUY_PRODUCT", "WHEAT", 1])
             if cash >= float(ANIMALS[animal]["cost"]) + reserve:
                 intents.append(["BUY_ANIMAL", animal, 1])
-        if compatible is not None and animal_in_storage:
+        animal_feed_ready = (
+            wheat_staged >= feed_horizon
+            or (wheat_price > 0 and cash >= wheat_price * feed_horizon + reserve)
+        )
+        if compatible is not None and animal_in_storage and animal_feed_ready:
             tasks.append(Task("ANIMAL", compatible, 94, day, float(ANIMALS[animal]["cost"]), item=animal))
         elif empty is not None and not _placed_animal_count(normalized):
             kind = "BUILD_PASTURE" if ANIMALS[animal]["structure"] == "PASTURE" else "BUILD_COOP"
@@ -754,7 +783,10 @@ def _task_key(task: Task) -> tuple[Any, ...]:
 
 
 def _task_sort_key(task: Task, day: int) -> tuple[Any, ...]:
-    urgent = task.deadline is not None and task.deadline <= day
+    urgent = (
+        (task.deadline is not None and task.deadline <= day)
+        or str(task.kind).upper() == "ANIMAL"
+    )
     slack = task.deadline - day if task.deadline is not None else inf
     target = _target_position(task.target)
     coordinate = (target.y, target.x) if target is not None else (inf, inf)
@@ -893,6 +925,8 @@ def _task_turn_budget(task: Task, worker: tuple[int, str, Position | None], stat
 def _fits_same_day_deadline(task: Task, worker: tuple[int, str, Position | None], state: Mapping[str, Any],
                             board_size: int, day: int) -> bool:
     if task.deadline is None or task.deadline > day:
+        return True
+    if str(task.kind).upper() == "ANIMAL":
         return True
     try:
         hour = min(23, max(0, int(_get(state, "hour", 0))))

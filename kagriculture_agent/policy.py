@@ -610,6 +610,8 @@ def _task_action(state: Any, worker_index: int, task: Task, position: Position) 
             item = next((candidate for candidate in ANIMALS
                          if ANIMALS[candidate]["structure"] == structure_kind
                          and inventory.get(candidate, 0) > 0), "")
+        if item in ANIMALS and inventory.get("WHEAT", 0) <= 0:
+            return PASS
         if item in ANIMALS and ANIMALS[item]["structure"] == _structure_kind(tile) and _animal(tile) is None and not (isinstance(tile, Mapping) and "animal" in tile):
             return f"PLACE {item} 1" if inventory.get(item, 0) else PASS
         return PASS
@@ -698,6 +700,20 @@ def _drop_carried_goods(state: Any, worker_index: int, task: Any, current: Posit
 
 def _has_carried_goods(state: Any) -> bool:
     return any(_counts(inventory) for inventory in _inventories(state))
+
+
+def _remove_pickup_sale_conflicts(market: Sequence[Sequence[Any]], commands: Mapping[int, Sequence[Any]]) -> list[list[Any]]:
+    """Keep a same-turn pickup from racing a sale of the picked item."""
+    picked = {
+        str(command[1]).upper()
+        for command in commands.values()
+        if isinstance(command, Sequence) and not isinstance(command, (str, bytes))
+        and len(command) >= 2 and command[0] == "PICKUP"
+    }
+    return [list(order) for order in market if not (
+        isinstance(order, Sequence) and len(order) >= 2
+        and order[0] == "SELL" and str(order[1]).upper() in picked
+    )]
 
 
 def worker_action(worker_index: int, state: Any, assignment: WorkerAssignment | Task | None) -> list[Any]:
@@ -918,5 +934,6 @@ class Policy:
             if not terminal_cleanup or (final_liquidation_window and not _has_carried_goods(state))
             else []
         )
+        market = _remove_pickup_sale_conflicts(market, commands)
         self.memory.sell_batches = [order for order in market if order[0] == "SELL"]
         return {"farmer": farmer, "hands": hands, "market": market}

@@ -432,6 +432,38 @@ def test_autonomous_macro_portfolio_includes_and_can_select_strawberry():
     assert macro["portfolio"]["crop"] == "STRAWBERRY"
 
 
+def test_autonomous_macro_stages_wheat_for_stored_animal():
+    from kagriculture_agent.planner import build_autonomous_macro_plan
+
+    board = [[None for _ in range(5)] for _ in range(5)]
+    board[0][0] = {"kind": "PASTURE"}
+    state = observation(day=4, hour=1, hands=[[4, 4]], tiles=board, money=2_000,
+                        shed={"SHEEP": 1}, seeds={}, inventories=[[], []])
+
+    macro = build_autonomous_macro_plan(state)
+
+    assert any(
+        intent[0] == "BUY_PRODUCT" and intent[1] == "WHEAT" and intent[2] > 0
+        for intent in macro["market_intents"]
+    )
+
+
+def test_autonomous_macro_replenishes_wheat_for_placed_animal_feed():
+    from kagriculture_agent.planner import build_autonomous_macro_plan
+
+    board = [[None for _ in range(5)] for _ in range(5)]
+    board[0][0] = {"kind": "PASTURE", "animal": "SHEEP", "fed_today": False}
+    state = observation(day=4, hour=1, hands=[], tiles=board, money=2_000,
+                        shed={}, seeds={}, inventories=[[]])
+
+    macro = build_autonomous_macro_plan(state)
+
+    assert any(
+        intent[0] == "BUY_PRODUCT" and intent[1] == "WHEAT" and intent[2] > 0
+        for intent in macro["market_intents"]
+    )
+
+
 def test_policy_autonomously_adapts_seed_and_animal_choices_to_shop_and_market_state():
     from kagriculture_agent.planner import build_autonomous_macro_plan
 
@@ -502,6 +534,12 @@ def test_autonomous_animal_task_carries_item_through_pickup_place_feed_care():
     state["private"]["inventories"] = [{}, {"GOOSE": 1, "WHEAT": 1}]
     assert policy_module.worker_action(1, state, assignment) == ["PLACE", "GOOSE", 1]
 
+    state["private"]["inventories"] = [{}, {"GOOSE": 1}]
+    state["private"]["shed"] = {}
+    state["farm"]["hands"][0] = [0, 0]
+    assert policy_module.worker_action(1, state, assignment) == ["PASS"]
+
+    state["private"]["inventories"] = [{}, {"WHEAT": 1}]
     state["farm"]["tiles"][0][0] = {"kind": "COOP", "animal": "GOOSE", "fed_today": False, "cared_today": False}
     feed = WorkerAssignment(1, Task("FEED", Position(0, 0), 100, 4, 1))
     care = WorkerAssignment(1, Task("CARE", Position(0, 0), 95, 4, 1))
@@ -522,6 +560,13 @@ def test_buy_product_is_restricted_to_feed_and_fertilizer():
 
     assert ["BUY_PRODUCT", "CARROT", 3] not in orders
     assert ["BUY_PRODUCT", "FERTILIZER", 2] in orders
+
+
+def test_policy_drops_sale_that_conflicts_with_same_turn_pickup():
+    assert policy_module._remove_pickup_sale_conflicts(
+        [["SELL", "WHEAT", 7], ["SELL", "MELON", 1]],
+        {1: ["PICKUP", "WHEAT", 1]},
+    ) == [["SELL", "MELON", 1]]
 
 
 def test_hire_uses_fibonacci_cost_and_land_uses_next_fixed_quadrant_cost():
