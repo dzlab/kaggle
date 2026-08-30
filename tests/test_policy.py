@@ -92,6 +92,15 @@ def test_planner_sanitizes_invalid_seed_quantities_and_nonfinite_task_values():
     assert assignments == []
 
 
+@pytest.mark.parametrize("malformed_shop", [{}, []])
+def test_town_demand_ignores_unhashable_shop_entries(malformed_shop):
+    from kagriculture_agent.planner import _town_demand
+
+    state = {"town": {"unlocked_shops": [malformed_shop]}}
+
+    assert _town_demand(state) == set()
+
+
 def test_policy_falls_back_to_safe_action_for_nonfinite_or_negative_shed_values():
     action = policy_module.Policy().act(
         observation(shed={"WHEAT": float("nan"), "MELON": float("inf"), "CARROT": -3})

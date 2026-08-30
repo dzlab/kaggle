@@ -449,7 +449,8 @@ def _town_demand(state: Mapping[str, Any]) -> set[str]:
     shops = town.get("unlocked_shops", ())
     if not isinstance(shops, Sequence) or isinstance(shops, (str, bytes)):
         return set()
-    return {item for shop in shops for item in SHOPS.get(shop, ())}
+    safe_shops = (shop for shop in shops if isinstance(shop, str) and shop in SHOPS)
+    return {item for shop in safe_shops for item in SHOPS.get(shop, ())}
 
 
 def _portfolio_scenarios(state: Mapping[str, Any], day: int) -> list[dict[str, Any]]:
