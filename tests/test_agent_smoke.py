@@ -195,6 +195,26 @@ def test_full_pass_exercises_autonomous_macro_action_and_market_flows(tmp_path: 
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+@pytest.mark.parametrize("opponent", ["pass", "random", "starter"])
+def test_seed17_terminal_liquidation_leaves_no_saleable_inventory(opponent: str, tmp_path: Path):
+    from scripts.evaluate import replay_record
+
+    replay_path = tmp_path / f"terminal-{opponent}.json"
+    run_episode(opponent=opponent, seed=17, steps=720, replay_path=replay_path)
+    replay = _assert_replay_is_legal_and_complete(replay_path)
+    record = replay_record(replay, variant="mixed", opponent=opponent, seed=17)
+    final = replay["steps"][-1][0]["observation"]
+    private = final["private"]
+    saleable = {item: quantity for item, quantity in private["shed"].items()
+                if item in PRODUCTS and item != "FERTILIZER" and quantity}
+
+    assert record["framework_error"] is False
+    assert record["missed_basic_needs"] == 0
+    assert all(not inventory for inventory in private["inventories"])
+    assert saleable == {}
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
 def test_seeded_random_style_opponent_replays_are_reproducible(tmp_path: Path):
     first_path = tmp_path / "random-first.json"
     second_path = tmp_path / "random-second.json"

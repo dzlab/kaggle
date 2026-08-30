@@ -437,10 +437,10 @@ def build_market_orders(state: Any, plan: Any) -> list[list[Any]]:
     # for a 30-day episode, with hour 23 retained for direct callers.
     final_turn = day >= season_days - 1 and hour >= 22
 
-    # Do not sell while a worker is still carrying goods.  The terminal
-    # cleanup window gets those goods into the shed first.
-    if final_turn and _has_carried_goods(state):
-        return []
+    # Do not sell carried goods.  Policy.act sequences cleanup before the
+    # final market window; retaining this flag also makes direct callers safe
+    # without suppressing liquidation of already-shed inventory.
+    carried_at_final = final_turn and _has_carried_goods(state)
 
     # Protect the remaining wheat needed by living animals before selling.
     carried_wheat = sum(_counts(inventory).get("WHEAT", 0) for inventory in _inventories(state))
@@ -514,7 +514,9 @@ def build_market_orders(state: Any, plan: Any) -> list[list[Any]]:
             animal_buys += affordable
 
     if final_turn:
-        sale_items = [(item, quantity) for item, quantity in shed.items() if item in PRODUCTS]
+        sale_items = [] if carried_at_final else [
+            (item, quantity) for item, quantity in shed.items() if item in PRODUCTS
+        ]
     elif sell_intents:
         requested: dict[str, int] = {}
         sell_all = False
@@ -910,6 +912,11 @@ class Policy:
         if not isinstance(visible_hands, Sequence) or isinstance(visible_hands, (str, bytes)):
             visible_hands = [worker for worker in workers if worker["index"] != 0]
         hands = [commands.get(index + 1, [PASS]) for index in range(len(visible_hands))]
-        market = [] if terminal_cleanup else build_market_orders(state, market_plan)
+        final_liquidation_window = _whole(_get(state, "hour")) >= 22
+        market = (
+            build_market_orders(state, market_plan)
+            if not terminal_cleanup or (final_liquidation_window and not _has_carried_goods(state))
+            else []
+        )
         self.memory.sell_batches = [order for order in market if order[0] == "SELL"]
         return {"farmer": farmer, "hands": hands, "market": market}
