@@ -122,6 +122,17 @@ def test_seed4_random_replay_accepts_natural_boundary_decay():
     assert record["missed_basic_needs"] == 0
 
 
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+@pytest.mark.parametrize("opponent", ["pass", "random", "starter"])
+def test_animal_heavy_seed17_preserves_required_needs(opponent):
+    from scripts.evaluate import run_game
+
+    record = run_game(variant="animal-heavy", opponent=opponent, seed=17, steps=720)
+
+    assert record["framework_error"] is False
+    assert record["missed_basic_needs"] == 0
+
+
 def test_percentile_uses_linear_interpolation():
     from scripts.evaluate import percentile
 

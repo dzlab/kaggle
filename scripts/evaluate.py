@@ -2200,6 +2200,20 @@ def _empty_animal_target(observation: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _animal_units_owned(observation: Mapping[str, Any]) -> int:
+    """Count placed and carried animals before applying a portfolio bias."""
+    shed = _mapping(_mapping(observation.get("private")).get("shed"))
+    carried = sum(
+        int(_number(shed.get(species)) or 0)
+        for species in _ANIMAL_NAMES
+    )
+    placed = sum(
+        1 for tile in _tiles(observation)
+        if _animal_state(tile).get("animal") in _ANIMAL_NAMES
+    )
+    return carried + placed
+
+
 def _apply_ablations(action: Mapping[str, Any], observation: Mapping[str, Any], ablations: Mapping[str, bool]) -> dict[str, Any]:
     result = {"farmer": list(action.get("farmer", ["PASS"])), "hands": [list(command) for command in action.get("hands", ())],
               "market": _market_orders(action)}
@@ -2266,7 +2280,12 @@ def apply_variant(action: Mapping[str, Any], observation: Mapping[str, Any], var
         pass
     elif variant == "animal-heavy":
         target = _empty_animal_target(observation)
-        if target:
+        # Keep one deliberate animal-heavy increment, then leave all later
+        # market orders untouched so the production planner can preserve its
+        # hiring and basic-needs reservations.  Replacing every seed order
+        # with an animal purchase exhausts that reserve and causes avoidable
+        # FEED misses.
+        if target and _animal_units_owned(observation) < 2:
             for order in result["market"]:
                 if order[0] == "BUY_SEED":
                     order[:] = ["BUY_ANIMAL", target, 1]
