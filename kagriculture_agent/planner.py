@@ -15,9 +15,9 @@ from collections.abc import Iterable, Mapping, Sequence
 from math import inf, isfinite
 from typing import Any
 
-from .constants import ANIMALS, CROPS, MARKET_I0
+from .constants import ANIMALS, CROPS, LAND_ORDER, LAND_PRICES, MARKET_I0, SHOPS, season_days
 from .economics import forecast_crop, market_price, sell_batch_value
-from .observation import shed_access_tiles
+from .observation import parse_observation, shed_access_tiles
 from .routing import distance, is_locked_tile, normalize_position, route_to
 from .types import EpisodeMemory, Position, Task, WorkerAssignment
 
@@ -67,6 +67,14 @@ def _safe_quantity(value: Any) -> int | float:
     return int(quantity) if quantity.is_integer() else quantity
 
 
+def _number(value: Any, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return number if isfinite(number) else default
+
+
 def _hand_counts(value: Any) -> dict[str, int]:
     if isinstance(value, Mapping):
         return {str(item): int(quantity) for item, quantity in (
@@ -79,6 +87,24 @@ def _hand_counts(value: Any) -> dict[str, int]:
                 counts[item] = counts.get(item, 0) + 1
         return counts
     return {}
+
+
+def _held_inventory(value: Any) -> dict[str, int]:
+    """Count worker-held items without confusing them with shed stock."""
+    counts: dict[str, int] = {}
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return counts
+    for hand in value:
+        if isinstance(hand, Mapping):
+            for item, quantity in hand.items():
+                safe = _safe_quantity(quantity)
+                if safe > 0:
+                    counts[str(item)] = counts.get(str(item), 0) + int(safe)
+        elif isinstance(hand, Sequence) and not isinstance(hand, (str, bytes)):
+            for item in hand:
+                if isinstance(item, str):
+                    counts[item] = counts.get(item, 0) + 1
+    return counts
 
 
 def _grid_size(tiles: Any) -> int | None:
@@ -102,9 +128,16 @@ def normalize_planner_state(state: Any) -> dict[str, Any]:
         seeds = hands
     inventory = source.get("inventory")
     if not isinstance(inventory, Mapping) or not inventory:
-        inventory = private.get("shed")
-    if not isinstance(inventory, Mapping) or not inventory:
-        inventory = hands
+        # Canonical engine observations expose shed stock separately from
+        # worker-held inventories.  Prefer the latter when present; falling
+        # back to shed stock is retained for the flat planner contract used
+        # by callers and tests that have no inventory list.
+        if "inventories" in private:
+            inventory = _held_inventory(private.get("inventories"))
+        elif hands:
+            inventory = hands
+        else:
+            inventory = private.get("shed")
     board_size = source.get("board_size")
     try:
         board_size = int(board_size)
@@ -396,6 +429,186 @@ def _shed_target(state: Any, board_size: int) -> Position:
     return valid_access_tiles[0] if valid_access_tiles else Position(0, 0)
 
 
+_MACRO_CROPS = ("WHEAT", "CARROT", "TOMATO", "MELON")
+_MACRO_MODES = ("cash", "demand", "balanced", "animal")
+
+
+def _state_cash(state: Mapping[str, Any]) -> float:
+    farm = _mapping(state.get("farm"))
+    value = state.get("cash", farm.get("money", 0))
+    try:
+        cash = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return cash if isfinite(cash) and cash >= 0 else 0.0
+
+
+def _town_demand(state: Mapping[str, Any]) -> set[str]:
+    town = _mapping(state.get("town"))
+    shops = town.get("unlocked_shops", ())
+    if not isinstance(shops, Sequence) or isinstance(shops, (str, bytes)):
+        return set()
+    return {item for shop in shops for item in SHOPS.get(shop, ())}
+
+
+def _portfolio_scenarios(state: Mapping[str, Any], day: int) -> list[dict[str, Any]]:
+    """Evaluate a deterministic 4x4 crop/posture portfolio matrix."""
+    horizon = max(1, min(season_days - day, 12))
+    demand = _town_demand(state)
+    prices = _observed_prices(state)
+    scenarios: list[dict[str, Any]] = []
+    for crop in _MACRO_CROPS:
+        for mode in _MACRO_MODES:
+            try:
+                forecast = forecast_crop(
+                    crop, start_day=day, horizon=horizon,
+                    watering_days=range(day, day + horizon), prices=prices,
+                    market_inventory=_observed_inventory(crop, state),
+                    seed_owned=True, fixed_price_mode=bool(prices),
+                )
+                score = float(forecast.get("net_cash", 0.0))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                score = 0.0
+            quote = _observed_quote(crop, state)
+            # Keep the live quote material in the portfolio decision.  The
+            # forecast is deliberately conservative for crops whose harvest
+            # is outside the short horizon, but a strong observed quote is
+            # still actionable information for the next planting decision.
+            score += quote * 3.0
+            if crop in demand:
+                score += quote * (2.0 if mode == "demand" else 0.5)
+            if mode == "cash" and not CROPS[crop]["ongoing"]:
+                score += 25.0
+            if mode == "balanced":
+                score += quote
+            if mode == "animal":
+                score += max((_observed_quote(product, state) for product in ("EGG", "MILK", "WOOL") if product in demand), default=0.0)
+            scenarios.append({"crop": crop, "mode": mode, "score": score})
+    return scenarios
+
+
+def _preferred_animal(state: Mapping[str, Any], demand: set[str]) -> str:
+    product_order = ("EGG", "MILK", "WOOL")
+    for product in product_order:
+        if product in demand:
+            return {"EGG": "GOOSE", "MILK": "COW", "WOOL": "SHEEP"}[product]
+    return max(ANIMALS, key=lambda animal: (_observed_quote(ANIMALS[animal]["product"], state), animal))
+
+
+def _placed_animal_count(state: Mapping[str, Any]) -> int:
+    count = 0
+    for _position_value, tile in _tiles(state):
+        entity = _entity_state(tile, "animal")
+        if entity is not None and _upper(_get(entity, "species", _get(entity, "animal", ""))) in ANIMALS:
+            count += 1
+    return count
+
+
+def _compatible_structure(state: Mapping[str, Any], animal: str) -> tuple[Position | None, Position | None]:
+    structure = ANIMALS[animal]["structure"]
+    empty: Position | None = None
+    for position, tile in _tiles(state):
+        if is_locked_tile(tile):
+            continue
+        kind = _tile_kind(tile)
+        if kind == structure and _entity_state(tile, "animal") is None:
+            return position, empty
+        if empty is None and _is_empty(tile):
+            empty = position
+    return None, empty
+
+
+def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None) -> dict[str, Any]:
+    """Choose a live portfolio and executable macro intents from observations.
+
+    The returned intent list is internal policy output, not an externally
+    supplied approval channel.  It is deliberately conservative: every market
+    intent is still passed through ``build_market_orders`` for cash, capacity,
+    land-order, and ten-order legality checks.
+    """
+    raw_state = _mapping(state)
+    if "farm" not in raw_state and "farms" in raw_state:
+        state = parse_observation(state)
+    normalized = normalize_planner_state(state)
+    day = _day(normalized, memory or EpisodeMemory())
+    hour = _get(normalized, "hour", 0)
+    try:
+        hour = max(0, int(hour))
+    except (TypeError, ValueError, OverflowError):
+        hour = 0
+    scenarios = _portfolio_scenarios(normalized, day)
+    selected = max(enumerate(scenarios), key=lambda item: (item[1]["score"], -item[0]))[1]
+    demand = _town_demand(normalized)
+    animal = _preferred_animal(normalized, demand)
+    farm = _mapping(normalized.get("farm"))
+    private = _mapping(normalized.get("private"))
+    seeds = normalized.get("seeds", {})
+    shed = private.get("shed", normalized.get("inventory", {}))
+    seeds = seeds if isinstance(seeds, Mapping) else {}
+    shed = shed if isinstance(shed, Mapping) else {}
+    cash = _state_cash(normalized)
+    intents: list[list[Any]] = []
+    tasks: list[Task] = []
+    if day < season_days - 1:
+        seed_cost = float(CROPS[selected["crop"]]["seed"])
+        seed_purchase_planned = _safe_quantity(seeds.get(selected["crop"], 0)) <= 0 and cash >= seed_cost
+        if seed_purchase_planned:
+            intents.append(["BUY_SEED", selected["crop"], 1])
+
+        # Keep the portfolio executable across the market/unit-action split:
+        # a seed bought this turn is available to the assigned worker on the
+        # next observation, so schedule the planting task now instead of
+        # waiting for an externally supplied intent.
+        plant_crop = selected["crop"] if seed_purchase_planned or _safe_quantity(seeds.get(selected["crop"], 0)) > 0 else ""
+        if not plant_crop:
+            available_seeds = [crop for crop in CROPS if _safe_quantity(seeds.get(crop, 0)) > 0]
+            plant_crop = max(available_seeds, key=lambda crop: (_observed_quote(crop, normalized), crop), default="")
+        if plant_crop:
+            plant_target = next((position for position, tile in _tiles(normalized)
+                                 if not is_locked_tile(tile) and _is_empty(tile)), None)
+            if plant_target is not None:
+                tasks.append(Task("PLANT", plant_target, 30, day,
+                                  _observed_quote(plant_crop, normalized), item=plant_crop))
+
+        has_unfertilized_crop = any(
+            _crop(tile) is not None and _number(_get(tile, "fertilized_until_day", -1)) < day
+            for _position_value, tile in _tiles(normalized)
+        )
+        if has_unfertilized_crop and _safe_quantity(shed.get("FERTILIZER", 0)) <= 0 and cash >= _observed_quote("FERTILIZER", normalized):
+            intents.append(["BUY_PRODUCT", "FERTILIZER", 1])
+
+        unlocked = farm.get("unlocked_quadrants", normalized.get("unlocked_quadrants", ["NW"]))
+        if not isinstance(unlocked, Sequence) or isinstance(unlocked, (str, bytes)):
+            unlocked = ["NW"]
+        land_index = len(unlocked) - 1
+        reserve = max(100.0, seed_cost)
+        if 0 <= land_index < len(LAND_ORDER) and cash >= float(LAND_PRICES[land_index]) + reserve:
+            intents.append(["BUY_LAND"])
+
+        hands = farm.get("hands", ())
+        hand_count = len(hands) if isinstance(hands, Sequence) and not isinstance(hands, (str, bytes)) else 0
+        hires_today = _safe_quantity(farm.get("hires_today", 0))
+        if hour == 0 and hand_count < 2 and hires_today == 0 and cash >= 100.0 + reserve:
+            intents.append(["HIRE"])
+
+        compatible, empty = _compatible_structure(normalized, animal)
+        animal_in_storage = _safe_quantity(shed.get(animal, 0)) > 0
+        if _placed_animal_count(normalized) == 0 and not animal_in_storage and (compatible is not None or empty is not None):
+            if cash >= float(ANIMALS[animal]["cost"]) + reserve:
+                intents.append(["BUY_ANIMAL", animal, 1])
+        if compatible is not None and animal_in_storage:
+            tasks.append(Task("ANIMAL", compatible, 40, None, float(ANIMALS[animal]["cost"])))
+        elif empty is not None and not _placed_animal_count(normalized):
+            kind = "BUILD_PASTURE" if ANIMALS[animal]["structure"] == "PASTURE" else "BUILD_COOP"
+            tasks.append(Task(kind, empty, 35, None, 1.0))
+    return {
+        "portfolio": {"crop": selected["crop"], "mode": selected["mode"], "animal": animal, "score": selected["score"]},
+        "scenario_count": len(scenarios),
+        "market_intents": intents,
+        "tasks": tasks,
+    }
+
+
 def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Task]:
     """Build a stable one-day plan from a typed or mapping-shaped state."""
     state = normalize_planner_state(state)
@@ -417,6 +630,9 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
         if crop:
             if _needs_today(tile, "needs_water", "watered_today", "watered"):
                 _add(plan, "WATER", position, 100, day, 1)
+            if _number(_get(tile, "fertilized_until_day", -1)) < day and _safe_quantity(
+                    _mapping(state.get("inventory")).get("FERTILIZER", 0)) > 0:
+                _add(plan, "FERTILIZE", position, 92, day, 1)
             age = _crop_age(tile, day)
             crop_rules = CROPS[crop]
             # Non-ongoing crops have their first decay step on the day after

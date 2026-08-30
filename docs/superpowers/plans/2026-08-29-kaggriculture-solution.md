@@ -4,7 +4,7 @@
 
 **Goal:** Build, locally validate, and submit a robust model-based Kaggriculture agent that maximizes the probability of beating another agent over 720 turns under randomized shops and a shared dynamic market.
 
-**Architecture:** Use a deterministic observation-to-action policy with a small per-episode memory, an explicit daily macro planner, and a shortest-path task scheduler for the farmer and temporary farm hands. The planner will score crop, animal, land, hiring, fertilizer, and selling decisions with the exact published game mechanics, while the policy layer converts the selected tasks into one legal action per unit and up to ten ordered market orders per turn.
+**Architecture:** Use a deterministic observation-to-action policy with a small per-episode memory, an explicit daily macro planner, and a shortest-path task scheduler for the farmer and temporary farm hands. The planner autonomously scores a 16-scenario crop/posture portfolio from live shop and market state, then makes guarded crop, animal, land, hiring, fertilizer, and selling decisions with the exact published game mechanics. The policy layer converts the selected tasks into one legal action per unit and up to ten ordered market orders per turn.
 
 **Tech Stack:** Python >=3.11, `kaggle-environments==1.32.7`, pytest as a dev dependency, standard library (`dataclasses`, `heapq`, `collections`, `math`, `json`), optional pandas only for offline replay analysis. Use `uv sync` and `uv run` for the local environment.
 

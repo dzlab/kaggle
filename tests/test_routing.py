@@ -154,6 +154,20 @@ def test_daily_plan_uses_observed_quotes_not_player_inventory_or_curve_overrides
     assert sell.value == 28
 
 
+def test_daily_plan_schedules_fertilizer_from_live_shed_state():
+    state = _state(
+        day=2,
+        tiles={pos(1, 1): {"crop": "TOMATO", "planted_day": 0,
+                           "yield_units": 1, "watered_today": True,
+                           "fertilized_until_day": -1}},
+        inventory={"FERTILIZER": 1},
+    )
+
+    plan = build_daily_plan(state, EpisodeMemory())
+
+    assert any(task.kind == "FERTILIZE" and task.target == pos(1, 1) for task in plan)
+
+
 def test_planner_sanitizes_nonfinite_and_negative_shed_quantities():
     from math import inf, isnan
 

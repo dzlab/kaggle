@@ -1,10 +1,14 @@
 # Kaggriculture agent
 
 This repository contains the Kaggriculture Kaggle agent. The policy is an
-importable, deterministic, legality-first policy. It parses each observation,
-plans daily crop, animal, structure, weed, harvest, shed, and market work,
-assigns tasks to the farmer and hands, routes workers within board bounds, and
-falls back to `PASS` when a task or prerequisite is not currently valid.
+importable, deterministic, legality-first policy. On every episode/day it
+autonomously scores a 16-scenario crop/posture portfolio from live quotes,
+market inventory, and unlocked shop demand, then makes guarded land, hire,
+animal, seed, fertilizer, planting, and worker-scheduling decisions. It parses
+each observation, plans crop, animal, structure, weed, harvest, shed, and
+market work, assigns tasks to the farmer and hands, routes workers within board
+bounds, adapts when market/shop state changes, and falls back to `PASS` when a
+task or prerequisite is not currently valid.
 
 ## Local setup
 

@@ -77,12 +77,21 @@ def _assert_replay_is_legal_and_complete(replay_path: Path) -> dict:
         for player_state in turn:
             action = player_state["action"]
             observation = player_state["observation"]
+            # Kaggle's replay stores the action selected from the prior
+            # observation on the following state record (the bootstrap
+            # record is the sole same-state exception).
+            action_observation = observation
+            if turn_number:
+                action_observation = next(
+                    prior["observation"] for prior in replay["steps"][turn_number - 1]
+                    if prior["observation"]["player"] == observation["player"]
+                )
             assert isinstance(action, dict)
             assert set(action) == {"farmer", "hands", "market"}
             assert isinstance(action["farmer"], list)
             _assert_unit_command(action["farmer"])
             assert isinstance(action["hands"], list)
-            assert len(action["hands"]) == len(observation["farms"][observation["player"]]["hands"])
+            assert len(action["hands"]) == len(action_observation["farms"][action_observation["player"]]["hands"])
             for hand_action in action["hands"]:
                 _assert_unit_command(hand_action)
             assert isinstance(action["market"], list)
@@ -274,10 +283,11 @@ def test_production_agent_changes_state_and_reports_matching_reward(tmp_path: Pa
     buy_step = next(step for step, state in enumerate(custom_states[1:], start=1) if state["action"]["market"])
     buy_before = custom_states[buy_step - 1]["observation"]
     buy_after = custom_states[buy_step]["observation"]
-    buy_order = custom_states[buy_step]["action"]["market"][0]
-    assert buy_order[0] == "BUY_SEED"
-    assert buy_after["private"]["seeds"][buy_order[1]] == buy_before["private"]["seeds"][buy_order[1]] + buy_order[2]
-    assert buy_after["farms"][0]["money"] == buy_before["farms"][0]["money"] - DOMAIN_CROPS[buy_order[1]]["seed"] * buy_order[2]
+    buy_orders = [order for order in custom_states[buy_step]["action"]["market"] if order[0] == "BUY_SEED"]
+    assert buy_orders
+    for buy_order in buy_orders:
+        assert buy_after["private"]["seeds"][buy_order[1]] == buy_before["private"]["seeds"][buy_order[1]] + buy_order[2]
+    assert buy_after["farms"][0]["money"] < buy_before["farms"][0]["money"]
 
     plant_step = next(step for step, state in enumerate(custom_states[1:], start=1) if state["action"]["farmer"][0] == "PLANT")
     plant_before = custom_states[plant_step - 1]["observation"]

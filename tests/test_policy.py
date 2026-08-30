@@ -317,6 +317,77 @@ def test_policy_emits_explicit_macro_market_intents():
         assert expected in policy_module.Policy().act(obs)["market"]
 
 
+def test_autonomous_macro_plan_covers_portfolio_and_growth_actions():
+    from kagriculture_agent.planner import build_autonomous_macro_plan
+
+    board = [[None for _ in range(5)] for _ in range(5)]
+    board[0][0] = {"kind": "COOP"}
+    board[0][1] = {"kind": "PLANT", "crop": "TOMATO", "planted_day": 0,
+                   "yield_units": 1, "watered_today": True, "fertilized_until_day": -1}
+    state = observation(day=4, hour=0, hands=[], tiles=board, money=5_000,
+                        seeds={"TOMATO": 0}, market={"TOMATO": 90, "WHEAT": 25},
+                        inventories=[[] for _ in range(1)])
+    state["town"] = {"unlocked_shops": ["PIZZA_SHOP"]}
+
+    macro = build_autonomous_macro_plan(state)
+    kinds = [intent[0] for intent in macro["market_intents"]]
+
+    assert macro["scenario_count"] == 16
+    assert macro["portfolio"]["crop"] in {"WHEAT", "CARROT", "TOMATO", "MELON"}
+    assert {"BUY_LAND", "HIRE", "BUY_ANIMAL", "BUY_PRODUCT", "BUY_SEED"} <= set(kinds)
+    assert any(task.kind == "PLANT" and task.item == macro["portfolio"]["crop"] for task in macro["tasks"])
+
+
+def test_policy_autonomously_adapts_seed_and_animal_choices_to_shop_and_market_state():
+    from kagriculture_agent.planner import build_autonomous_macro_plan
+
+    base = observation(day=4, hour=1, hands=[], tiles=[[{"kind": "PASTURE"} for _ in range(5)] for _ in range(5)],
+                       money=2_000, seeds={}, inventories=[[]])
+    base["town"] = {"unlocked_shops": ["BAKERY"]}
+    base["market"] = {"prices": {"WHEAT": 5, "CARROT": 100, "TOMATO": 20, "MELON": 1},
+                       "inventory": {"WHEAT": 10_000, "CARROT": 10_000, "TOMATO": 10_000, "MELON": 10_000}}
+    demand_plan = build_autonomous_macro_plan(base)
+
+    base["town"] = {"unlocked_shops": ["PIZZA_SHOP"]}
+    base["market"]["prices"] = {"WHEAT": 100, "CARROT": 5, "TOMATO": 120, "MELON": 250}
+    market_plan = build_autonomous_macro_plan(base)
+
+    assert demand_plan["portfolio"]["crop"] != market_plan["portfolio"]["crop"]
+    assert demand_plan["portfolio"]["animal"] == "GOOSE"
+
+
+def test_policy_replans_autonomous_portfolio_when_live_market_changes():
+    base = observation(day=4, hour=1, hands=[], tiles=[[None for _ in range(5)] for _ in range(5)],
+                       money=2_000, seeds={}, inventories=[[]])
+    base["town"] = {"unlocked_shops": ["BAKERY"]}
+    base["market"] = {"prices": {"WHEAT": 5, "CARROT": 100, "TOMATO": 20, "MELON": 1},
+                       "inventory": {"WHEAT": 10_000, "CARROT": 10_000, "TOMATO": 10_000, "MELON": 10_000}}
+    policy = policy_module.Policy()
+    policy.act(base)
+    first_crop = policy.memory.diagnostics["portfolio"]["crop"]
+
+    base["market"]["prices"] = {"WHEAT": 100, "CARROT": 5, "TOMATO": 120, "MELON": 250}
+    base["town"] = {"unlocked_shops": ["PIZZA_SHOP"]}
+    policy.act(base)
+
+    assert policy.memory.diagnostics["portfolio"]["crop"] != first_crop
+
+
+def test_policy_uses_autonomous_macro_orders_without_external_intents():
+    board = [[None for _ in range(5)] for _ in range(5)]
+    board[0][0] = {"kind": "COOP"}
+    obs = observation(day=4, hour=0, hands=[], tiles=board, money=5_000,
+                      seeds={}, inventories=[[]])
+    obs["town"] = {"unlocked_shops": ["BAKERY"]}
+
+    action = policy_module.Policy().act(obs)
+
+    assert any(order[0] == "BUY_LAND" for order in action["market"])
+    assert any(order[0] == "HIRE" for order in action["market"])
+    assert any(order[0] == "BUY_ANIMAL" for order in action["market"])
+    assert len(action["market"]) <= 10
+
+
 def test_buy_product_is_restricted_to_feed_and_fertilizer():
     state = {
         "cash": 1_000, "private": {"shed": {}, "seeds": {}},

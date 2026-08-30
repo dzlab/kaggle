@@ -25,6 +25,7 @@ class Task:
     deadline: Deadline
     value: float
     sell_all: bool = False
+    item: str | None = None
 
 
 @dataclass

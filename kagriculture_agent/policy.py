@@ -10,7 +10,7 @@ from .constants import ANIMALS, CROPS, LAND_PRICES, PRODUCTS, max_market_orders,
 from .economics import feed_reserve, market_price, market_regime
 from .memory import PolicyMemory
 from .observation import is_shed_adjacent, parse_observation as _parse_observation, shed_access_tiles
-from .planner import assign_tasks, build_daily_plan, normalize_planner_state
+from .planner import assign_tasks, build_autonomous_macro_plan, build_daily_plan, normalize_planner_state
 from .routing import is_locked_tile, normalize_position, next_move
 from .types import Position, Task, WorkerAssignment
 
@@ -589,11 +589,16 @@ def _task_action(state: Any, worker_index: int, task: Task, position: Position) 
                 if _position(candidate) == position:
                     item = str(_get(candidate, "species", _get(candidate, "animal", ""))).upper()
                     break
+        if not item:
+            structure_kind = _structure_kind(tile)
+            item = next((candidate for candidate in ANIMALS
+                         if ANIMALS[candidate]["structure"] == structure_kind
+                         and inventory.get(candidate, 0) > 0), "")
         if item in ANIMALS and ANIMALS[item]["structure"] == _structure_kind(tile) and _animal(tile) is None and not (isinstance(tile, Mapping) and "animal" in tile):
             return f"PLACE {item} 1" if inventory.get(item, 0) else PASS
         return PASS
     if kind == "PLANT":
-        crop = str(_get(task, "crop", "")).upper()
+        crop = str(_get(task, "crop", _get(task, "item", ""))).upper()
         if not crop:
             crop = str(target).upper() if isinstance(target, str) else "WHEAT"
         seeds = _mapping(_get(state, "seeds", _private(state).get("seeds", {})))
@@ -730,25 +735,33 @@ class Policy:
     def __init__(self) -> None:
         self.memory = PolicyMemory()
 
-    def _replan(self, state: Mapping[str, Any], regime: Mapping[str, str]) -> list[WorkerAssignment]:
+    def _replan(self, state: Mapping[str, Any], regime: Mapping[str, str],
+                macro: Mapping[str, Any] | None = None) -> list[WorkerAssignment]:
         normalized = _state_for_planner(state)
         plan = build_daily_plan(normalized, self.memory)
+        macro = macro or build_autonomous_macro_plan(normalized, self.memory)
+        plan.extend(task for task in macro.get("tasks", ()) if isinstance(task, Task))
         assignments = assign_tasks(plan, normalized.get("workers", ()), normalized)
         self.memory.assignments = assignments
         self.memory.market_regime = dict(regime)
         self.memory.diagnostics["plan_size"] = len(plan)
+        self.memory.diagnostics["portfolio"] = dict(macro.get("portfolio", {}))
+        self.memory.diagnostics["scenario_count"] = macro.get("scenario_count", 0)
         return assignments
 
     def act(self, obs: Any) -> dict[str, Any]:
         state = parse_observation(obs)
         regime = market_regime(_prices(state), _market_inventory(state))
+        shops = _get(_get(state, "town", {}), "unlocked_shops", ())
+        regime["shops"] = "|".join(str(shop) for shop in shops) if isinstance(shops, Sequence) and not isinstance(shops, (str, bytes)) else ""
+        macro = build_autonomous_macro_plan(state, self.memory)
         reset = self.memory.observe_time(_get(state, "day"), _get(state, "hour"))
         workers = _worker_records(state)
         hour_zero = _whole(_get(state, "hour")) == 0
         regime_changed = bool(self.memory.market_regime) and dict(regime) != self.memory.market_regime
         assignments_valid = all(_assignment_valid(state, assignment) for assignment in self.memory.assignments)
         if reset or hour_zero or regime_changed or not self.memory.assignments or not assignments_valid:
-            assignments = self._replan(state, regime)
+            assignments = self._replan(state, regime, macro)
         else:
             assignments = self.memory.assignments
         by_worker = {assignment.worker_index: assignment for assignment in assignments}
@@ -759,6 +772,7 @@ class Policy:
                 commands[worker["index"]] = _unit_command(drop)
         farmer = commands.get(0, [PASS])
         market_plan = build_daily_plan(_state_for_planner(state), self.memory)
+        market_plan.extend(macro.get("market_intents", ()))
         market_plan.extend(_explicit_market_intents(obs, state))
         seeds = _mapping(_get(state, "private", {})).get("seeds", {})
         has_seed = isinstance(seeds, Mapping) and any(_whole(quantity) > 0 for quantity in seeds.values())
