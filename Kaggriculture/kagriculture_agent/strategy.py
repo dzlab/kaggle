@@ -64,18 +64,14 @@ def select_strategy(state: object) -> StrategySpec:
     return STRATEGIES["melon"]
 
 
-def market_order_score(item: str, quantity: int, state: object, urgency: float) -> float:
-    """Score a sale from sequential post-sale quotes and its price impact."""
+def market_sale_quotes(item: str, quantity: int, state: object) -> list[int]:
+    """Return sequential sale quotes anchored to the observed current price."""
     try:
         quantity = max(0, min(int(quantity), shed_capacity))
     except (TypeError, ValueError, OverflowError):
         quantity = 0
-    try:
-        urgency = float(urgency)
-    except (TypeError, ValueError, OverflowError):
-        urgency = 0.0
     if quantity == 0:
-        return urgency
+        return []
 
     raw_state = state if isinstance(state, Mapping) else {}
     market = raw_state.get("market", {})
@@ -133,6 +129,18 @@ def market_order_score(item: str, quantity: int, state: object, urgency: float) 
         quotes.append(quote)
         if quote > PRICE_FLOOR:
             current_inventory += 1
-    average_quote = sum(quotes) / quantity
-    impact_penalty = max(0.0, quotes[0] - average_quote) * quantity
+    return quotes
+
+
+def market_order_score(item: str, quantity: int, state: object, urgency: float) -> float:
+    """Score a sale from sequential post-sale quotes and its price impact."""
+    try:
+        urgency = float(urgency)
+    except (TypeError, ValueError, OverflowError):
+        urgency = 0.0
+    quotes = market_sale_quotes(item, quantity, state)
+    if not quotes:
+        return urgency
+    average_quote = sum(quotes) / len(quotes)
+    impact_penalty = max(0.0, quotes[0] - average_quote) * len(quotes)
     return sum(quotes) - impact_penalty + urgency

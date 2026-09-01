@@ -21,7 +21,7 @@ from .planner import (
     normalize_planner_state,
 )
 from .routing import is_locked_tile, normalize_position, next_move
-from .strategy import StrategySpec, get_strategy, market_order_score, select_strategy
+from .strategy import StrategySpec, get_strategy, market_order_score, market_sale_quotes, select_strategy
 from .types import Position, Task, WorkerAssignment
 
 
@@ -272,23 +272,7 @@ def _buy_product_quote(item: str, state: Any, unit_offset: int = 0) -> float:
 
 def _sale_proceeds(item: str, quantity: int, state: Any) -> float:
     """Estimate sequential proceeds for a sale order using observed prices."""
-    quantity = _whole(quantity)
-    if quantity <= 0:
-        return 0.0
-    if item in _prices(state):
-        return quantity * _quote(item, state)
-    inventory = _number(_market_inventory(state).get(item, 10_000), 10_000)
-    params = _market_params(state)
-    proceeds = 0.0
-    for _ in range(quantity):
-        try:
-            price = float(market_price(item, inventory, params))
-        except (KeyError, TypeError, ValueError, OverflowError):
-            price = 0.0
-        proceeds += price
-        if price > 1:
-            inventory += 1
-    return proceeds
+    return float(sum(market_sale_quotes(item, _whole(quantity), state)))
 
 
 def _animals(state: Any) -> dict[str, int]:

@@ -1289,6 +1289,36 @@ def test_default_policy_uses_sale_proceeds_before_purchase_without_strategy():
     assert orders == [["SELL", "MELON", 1], ["BUY_SEED", "WHEAT", 1]]
 
 
+def test_sequential_sale_proceeds_do_not_overstate_following_purchase_affordability():
+    from kagriculture_agent.strategy import StrategySpec
+
+    state = {
+        "day": 4,
+        "hour": 3,
+        "cash": 0,
+        "private": {"shed": {"MELON": 4}, "seeds": {}},
+        "market": {
+            "prices": {"MELON": 100},
+            "inventory": {"MELON": 10},
+            "params": {
+                "MELON": {
+                    "base": 100,
+                    "I0": 10,
+                    "T": 1,
+                    "above_func": "sq",
+                    "above_target": 3.6,
+                },
+            },
+        },
+    }
+    strategy = StrategySpec("steep-sale", ("MELON",), ("COW",), 10, 1, 0)
+
+    assert policy_module._sale_proceeds("MELON", 4, state) == 103
+    assert policy_module.build_market_orders(
+        state, [["BUY_ANIMAL", "COW", 1], ["SELL", "MELON", 4]], strategy,
+    ) == [["SELL", "MELON", 4]]
+
+
 def test_order_market_intents_bounds_sell_batch_with_selected_strategy():
     from kagriculture_agent.strategy import StrategySpec
 
