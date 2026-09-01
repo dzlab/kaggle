@@ -158,6 +158,31 @@ def test_variant_policy_requires_explicit_route_mode_for_mixed():
     assert stable.policy.strategy_name == "mixed"
 
 
+def test_variant_policy_applies_ablations_and_sanitization_to_route_candidates():
+    from scripts.evaluate import VariantPolicy
+
+    observation = {
+        "player": 0,
+        "farms": [{"money": 100, "farmer": [0, 0], "hands": [], "tiles": [[None]]}],
+        "private": {"seeds": {}, "shed": {}},
+        "market": {"prices": {}, "inventory": {}},
+    }
+    route_policy = lambda _observation: {
+        "farmer": ["EAST"], "hands": [], "market": [["BUY_LAND"]],
+    }
+    candidate = VariantPolicy(
+        "mixed",
+        ablations={
+            "route_scheduling": False, "market_batch_sizing": True,
+            "shop_adaptation": True, "land_purchase": False, "animals": True,
+        },
+        route_candidate=True,
+        route_policy=route_policy,
+    )
+
+    assert candidate(observation) == {"farmer": ["PASS"], "hands": [], "market": []}
+
+
 def test_worker_uses_candidate_factory_for_route_candidate(monkeypatch):
     import scripts.evaluation_worker as worker
 

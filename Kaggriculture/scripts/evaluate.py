@@ -2866,7 +2866,9 @@ class VariantPolicy:
     def __call__(self, obs: Mapping[str, Any], _configuration: Mapping[str, Any] | None = None) -> dict[str, Any]:
         configuration = _configuration if _configuration is not None else self.configuration
         if self.is_route_candidate:
-            return self._act(obs)
+            action = self._act(obs)
+            adjusted = _apply_ablations(action, obs, self.ablations)
+            return _sanitize_action(adjusted, obs, action, configuration)
         return apply_variant(self._act(obs), obs, self.variant, self.ablations, configuration)
 
 
