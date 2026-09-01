@@ -2120,6 +2120,20 @@ def test_opponent_signal_discards_history_after_town_demand_refresh():
     }) is None
 
 
+def test_opponent_signal_normalizes_set_shops_before_detecting_demand_refresh():
+    from kagriculture_agent.strategy import OpponentMarketSignal
+
+    signal = OpponentMarketSignal()
+    signal.observe({"market": {"inventory": {"MELON": 20}}, "town": {"unlocked_shops": {"BAKERY"}}})
+    signal.observe({"market": {"inventory": {"MELON": 16}}, "town": {"unlocked_shops": frozenset({"BAKERY"})}})
+
+    assert signal.observe({
+        "market": {"inventory": {"MELON": 12}},
+        "town": {"unlocked_shops": {"PET_CAFE"}},
+    }) is None
+    assert signal.history == {"MELON": [12.0]}
+
+
 def test_opponent_signal_history_clears_on_memory_reset():
     memory = policy_module.PolicyMemory()
     memory.opponent_signal.observe({"market": {"inventory": {"MELON": 20}}})

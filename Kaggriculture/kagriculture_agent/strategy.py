@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, Sequence, Set
 from math import isfinite
 
 from .constants import MARKET_I0, PRICE_FLOOR, PRODUCTS, SHOP_DEMANDS, shed_capacity
@@ -50,7 +50,7 @@ def _public_market_inventory(state: object) -> Mapping[str, object]:
 def _demand_snapshot(value: object) -> tuple[object, ...] | None:
     if isinstance(value, Mapping):
         return tuple(sorted((str(key).upper(), repr(item)) for key, item in value.items()))
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+    if isinstance(value, (Sequence, Set)) and not isinstance(value, (str, bytes, bytearray)):
         return tuple(sorted(str(item).upper() for item in value))
     return None
 
@@ -69,7 +69,7 @@ def _public_town_demand(state: object) -> tuple[tuple[object, ...] | None, bool]
         if key in town:
             return _demand_snapshot(town.get(key)), explicit_refresh
     shops = town.get("unlocked_shops")
-    if isinstance(shops, Sequence) and not isinstance(shops, (str, bytes, bytearray)):
+    if isinstance(shops, (Sequence, Set)) and not isinstance(shops, (str, bytes, bytearray)):
         demand = {
             item
             for shop in shops
