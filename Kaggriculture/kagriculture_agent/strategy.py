@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
+from math import isfinite
 
 from .constants import MARKET_I0, PRICE_FLOOR, shed_capacity
 from .economics import market_price
@@ -76,9 +77,34 @@ def market_order_score(item: str, quantity: int, state: object, urgency: float) 
     if quantity == 0:
         return urgency
 
-    market = state.get("market", {}) if isinstance(state, Mapping) else {}
+    raw_state = state if isinstance(state, Mapping) else {}
+    market = raw_state.get("market", {})
     market = market if isinstance(market, Mapping) else {}
-    inventory = market.get("inventory", MARKET_I0)
+    observed_prices = next(
+        (value for value in (
+            raw_state.get("observed_prices"),
+            raw_state.get("market_prices"),
+            market.get("prices"),
+            raw_state.get("prices"),
+        ) if isinstance(value, Mapping)),
+        market,
+    )
+    observed_price = observed_prices.get(item) if isinstance(observed_prices, Mapping) else None
+    try:
+        observed_price = float(observed_price)
+    except (TypeError, ValueError, OverflowError):
+        observed_price = None
+    if observed_price is not None and not isfinite(observed_price):
+        observed_price = None
+
+    inventory = next(
+        (value for value in (
+            raw_state.get("observed_market_inventory"),
+            raw_state.get("market_inventory"),
+            market.get("inventory"),
+        ) if value is not None),
+        MARKET_I0,
+    )
     if isinstance(inventory, Mapping):
         inventory = inventory.get(item, MARKET_I0)
     try:
@@ -86,11 +112,24 @@ def market_order_score(item: str, quantity: int, state: object, urgency: float) 
     except (TypeError, ValueError, OverflowError):
         inventory = float(MARKET_I0)
     params = market.get("params", market.get("price_params"))
+    if not isinstance(params, Mapping):
+        params = raw_state.get("market_params", raw_state.get("price_params"))
 
     quotes: list[int] = []
     current_inventory = inventory
+    try:
+        curve_anchor = market_price(item, current_inventory, params)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        curve_anchor = None
     for _ in range(quantity):
-        quote = market_price(item, current_inventory, params)
+        try:
+            curve_quote = market_price(item, current_inventory, params)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            curve_quote = PRICE_FLOOR
+        if observed_price is None or curve_anchor is None:
+            quote = curve_quote
+        else:
+            quote = max(PRICE_FLOOR, int(round(observed_price + curve_quote - curve_anchor)))
         quotes.append(quote)
         if quote > PRICE_FLOOR:
             current_inventory += 1

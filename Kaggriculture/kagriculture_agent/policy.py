@@ -14,6 +14,7 @@ from .planner import (
     _fits_same_day_deadline,
     _feed_animal_counts,
     _is_live_owned_placed_animal,
+    _owned_animal_counts,
     assign_tasks,
     build_autonomous_macro_plan,
     build_daily_plan,
@@ -275,7 +276,7 @@ def _animals(state: Any) -> dict[str, int]:
 
 def _existing_animal_units(state: Any) -> int:
     """Count each owned animal once for strategy-cap enforcement."""
-    return sum(_animals(state).values())
+    return sum(_owned_animal_counts(_state_for_planner(state)).values())
 
 
 def _is_adjacent_to_shed(state: Any, position: Any) -> bool:
@@ -355,11 +356,11 @@ def _intent(item: Any) -> tuple[str, str | None, int] | None:
         kind = str(item[0]).upper()
         if kind in {"HIRE", "BUY_LAND", "SELL_ALL"} and len(item) == 1:
             return kind, None, 1
+        if kind == "SELL_ALL":
+            return kind, None, _requested_quantity(item)
         if len(item) < 2:
             return None
         name = str(item[1]).upper()
-        if kind == "SELL_ALL":
-            return None
         return kind, name, _requested_quantity(item)
     kind = str(_get(item, "kind", "")).upper()
     if kind not in {"BUY_SEED", "BUY_ANIMAL", "BUY_PRODUCT", "SELL", "SELL_ALL", "HIRE", "BUY_LAND"}:
@@ -371,8 +372,8 @@ def _intent(item: Any) -> tuple[str, str | None, int] | None:
         return "SELL_ALL", None, _requested_quantity(item)
     if kind == "SELL" and name is None:
         return None
-    if kind == "SELL_ALL" and name is not None:
-        return None
+    if kind == "SELL_ALL":
+        return kind, None, _requested_quantity(item)
     return kind, str(name).upper() if name is not None else None, _requested_quantity(item)
 
 
@@ -455,6 +456,34 @@ def _purchase_cost(kind: str, item: str | None, state: Any) -> float:
             first, second = second, first + second
         return max(1.0, multiplier * first)
     return 0.0
+
+
+def _intent_purchase_cost(intents: Sequence[Sequence[Any]], state: Any) -> float:
+    """Estimate approved purchase cash using the observed sequential quotes."""
+    total = 0.0
+    product_buys: dict[str, int] = {}
+    for kind, item, requested in intents:
+        quantity = _whole(requested, 1)
+        if kind == "BUY_PRODUCT":
+            item_name = item or ""
+            already_bought = product_buys.get(item_name, 0)
+            total += sum(
+                _buy_product_quote(item_name, state, already_bought + offset)
+                for offset in range(quantity)
+            )
+            product_buys[item_name] = already_bought + quantity
+        elif kind in {"BUY_SEED", "BUY_ANIMAL", "BUY_LAND", "HIRE"}:
+            total += quantity * _purchase_cost(kind, item, state)
+    return total
+
+
+def _sell_batch_limit(strategy: StrategySpec | None) -> int:
+    if strategy is None:
+        return DEFAULT_SHED_CAPACITY
+    try:
+        return max(1, min(DEFAULT_SHED_CAPACITY, int(strategy.max_sell_batch)))
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_SHED_CAPACITY
 
 
 def _days_left(state: Any) -> int:
@@ -618,12 +647,13 @@ def build_market_orders(state: Any, plan: Any,
     else:
         sale_items = []
     sale_orders: list[list[Any]] = []
+    batch_limit = _sell_batch_limit(strategy)
     sale_items = sorted(
         sale_items,
         key=lambda entry: (-market_order_score(entry[0], entry[1], state, urgency=0), entry[0]),
     )
     for item, quantity in sale_items:
-        quantity = min(_whole(quantity), shed.get(item, 0))
+        quantity = min(_whole(quantity), shed.get(item, 0), batch_limit)
         if item == "WHEAT":
             quantity = min(quantity, max(0, shed.get(item, 0) - shed_wheat_reserve))
         if (

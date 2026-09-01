@@ -551,7 +551,7 @@ def _planned_crop_count(state: Mapping[str, Any], strategy: StrategySpec | None)
 
 
 def _planned_animal_count(state: Mapping[str, Any]) -> int:
-    return sum(_safe_quantity(quantity) for quantity in _feed_animal_counts(state).values())
+    return sum(_safe_quantity(quantity) for quantity in _owned_animal_counts(state).values())
 
 
 def _compatible_structure(state: Mapping[str, Any], animal: str) -> tuple[Position | None, Position | None]:
@@ -601,6 +601,20 @@ def _feed_animal_counts(state: Mapping[str, Any]) -> dict[str, int]:
         seen.update(identity_keys)
         counts[species] = counts.get(species, 0) + 1
 
+    return counts
+
+
+def _owned_animal_counts(state: Mapping[str, Any]) -> dict[str, int]:
+    """Count live animals once and add owned animal units held in the shed."""
+    counts = _feed_animal_counts(state)
+    private = _mapping(_get(state, "private", {}))
+    shed = private.get("shed", _get(state, "shed", _get(state, "inventory", {})))
+    if not isinstance(shed, Mapping):
+        return counts
+    for species in ANIMALS:
+        quantity = int(_safe_quantity(shed.get(species, 0)))
+        if quantity:
+            counts[species] = counts.get(species, 0) + quantity
     return counts
 
 

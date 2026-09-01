@@ -185,6 +185,23 @@ def test_market_order_score_adds_urgency_after_market_impact():
     )
 
 
+def test_market_order_score_anchors_sequential_impact_to_observed_price():
+    from kagriculture_agent.strategy import market_order_score
+
+    state = {
+        "market": {
+            "prices": {"MELON": 250},
+            "inventory": {"MELON": 20},
+        },
+    }
+
+    single = market_order_score("MELON", 1, state, urgency=0)
+    batch = market_order_score("MELON", 4, state, urgency=0)
+
+    assert single == pytest.approx(250)
+    assert batch <= single * 4
+
+
 def test_forecast_crop_counts_planting_day_watering_miss_and_bonus_window():
     miss = forecast_crop("WHEAT", horizon=5, watering_days={1, 2, 3, 4})
     watered_on_planting_day = forecast_crop(
