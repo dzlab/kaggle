@@ -19,6 +19,7 @@ from .constants import ANIMALS, CROPS, LAND_ORDER, LAND_PRICES, MARKET_I0, PRODU
 from .economics import forecast_crop, market_price, sell_batch_value
 from .observation import parse_observation, shed_access_tiles
 from .routing import distance, is_locked_tile, normalize_position, route_to
+from .strategy import StrategySpec
 from .types import EpisodeMemory, Position, Task, WorkerAssignment
 
 _BASIC_NEEDS = frozenset({"WATER", "FEED", "CARE"})
@@ -453,13 +454,16 @@ def _town_demand(state: Mapping[str, Any]) -> set[str]:
     return {item for shop in safe_shops for item in SHOPS.get(shop, ())}
 
 
-def _portfolio_scenarios(state: Mapping[str, Any], day: int) -> list[dict[str, Any]]:
+def _portfolio_scenarios(state: Mapping[str, Any], day: int,
+                         strategy: StrategySpec | None = None) -> list[dict[str, Any]]:
     """Evaluate a deterministic 5x4 crop/posture portfolio matrix."""
     horizon = max(1, min(season_days - day, 12))
     demand = _town_demand(state)
     prices = _observed_prices(state)
+    allowed_crops = set(strategy.crops) if strategy is not None else set(_MACRO_CROPS)
+    crops = tuple(crop for crop in _MACRO_CROPS if crop in allowed_crops) or _MACRO_CROPS
     scenarios: list[dict[str, Any]] = []
-    for crop in _MACRO_CROPS:
+    for crop in crops:
         for mode in _MACRO_MODES:
             try:
                 forecast = forecast_crop(
@@ -489,12 +493,16 @@ def _portfolio_scenarios(state: Mapping[str, Any], day: int) -> list[dict[str, A
     return scenarios
 
 
-def _preferred_animal(state: Mapping[str, Any], demand: set[str]) -> str:
+def _preferred_animal(state: Mapping[str, Any], demand: set[str],
+                      allowed_animals: Sequence[str] | None = None) -> str:
     product_order = ("EGG", "MILK", "WOOL")
+    animals = tuple(animal for animal in ANIMALS
+                    if allowed_animals is None or animal in allowed_animals) or tuple(ANIMALS)
     for product in product_order:
-        if product in demand:
-            return {"EGG": "GOOSE", "MILK": "COW", "WOOL": "SHEEP"}[product]
-    return max(ANIMALS, key=lambda animal: (_observed_quote(ANIMALS[animal]["product"], state), animal))
+        candidate = {"EGG": "GOOSE", "MILK": "COW", "WOOL": "SHEEP"}[product]
+        if product in demand and candidate in animals:
+            return candidate
+    return max(animals, key=lambda animal: (_observed_quote(ANIMALS[animal]["product"], state), animal))
 
 
 def _placed_animal_count(state: Mapping[str, Any]) -> int:
@@ -630,7 +638,8 @@ def _has_basic_need_deadline(state: Any, day: int | None = None) -> bool:
     )
 
 
-def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None) -> dict[str, Any]:
+def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
+                                strategy: StrategySpec | None = None) -> dict[str, Any]:
     """Choose a live portfolio and executable macro intents from observations.
 
     The returned intent list is internal policy output, not an externally
@@ -648,10 +657,10 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None) 
         hour = max(0, int(hour))
     except (TypeError, ValueError, OverflowError):
         hour = 0
-    scenarios = _portfolio_scenarios(normalized, day)
+    scenarios = _portfolio_scenarios(normalized, day, strategy)
     selected = max(enumerate(scenarios), key=lambda item: (item[1]["score"], -item[0]))[1]
     demand = _town_demand(normalized)
-    animal = _preferred_animal(normalized, demand)
+    animal = _preferred_animal(normalized, demand, strategy.animals if strategy is not None else None)
     farm = _mapping(normalized.get("farm"))
     private = _mapping(normalized.get("private"))
     seeds = normalized.get("seeds", {})

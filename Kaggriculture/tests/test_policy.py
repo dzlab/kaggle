@@ -154,6 +154,73 @@ def test_auto_policy_selects_once_from_opening_state():
     assert policy.memory.selected_strategy == chosen
 
 
+def test_auto_policy_does_not_reselect_on_duplicate_opening_observation():
+    policy = policy_module.Policy(strategy="auto")
+
+    policy.act(observation(day=0, hour=0))
+    chosen = policy.memory.selected_strategy
+    duplicate = observation(day=0, hour=0)
+    duplicate["town"] = {"unlocked_shops": ["YARN_STORE"]}
+
+    policy.act(duplicate)
+
+    assert chosen == "melon"
+    assert policy.memory.selected_strategy == chosen
+
+
+def test_auto_policy_reselects_after_a_genuine_time_reset():
+    policy = policy_module.Policy(strategy="auto")
+
+    policy.act(observation(day=0, hour=0))
+    policy.act(observation(day=0, hour=1))
+    reset = observation(day=0, hour=0)
+    reset["town"] = {"unlocked_shops": ["YARN_STORE"]}
+
+    policy.act(reset)
+
+    assert policy.memory.selected_strategy == "premium"
+
+
+def test_auto_policy_forwards_selected_strategy_spec_to_macro_planner(monkeypatch):
+    from kagriculture_agent.strategy import get_strategy
+
+    calls = []
+
+    def fake_macro(state, memory, strategy=None):
+        calls.append(strategy)
+        return {"portfolio": {}, "scenario_count": 0, "market_intents": [], "tasks": []}
+
+    monkeypatch.setattr(policy_module, "build_autonomous_macro_plan", fake_macro)
+    policy = policy_module.Policy(strategy="auto")
+
+    policy.act(observation(day=0, hour=0))
+
+    assert calls == [get_strategy("melon")]
+
+
+def test_macro_planner_consumes_strategy_spec_for_portfolio_candidates():
+    from kagriculture_agent.planner import build_autonomous_macro_plan
+    from kagriculture_agent.strategy import get_strategy
+
+    state = observation(
+        market={
+            "TOMATO": 1_000,
+            "WHEAT": 1,
+            "CARROT": 1,
+            "STRAWBERRY": 1,
+            "MELON": 1,
+        },
+    )
+
+    portfolio = build_autonomous_macro_plan(
+        state,
+        strategy=get_strategy("premium"),
+    )["portfolio"]
+
+    assert portfolio["crop"] in get_strategy("premium").crops
+    assert portfolio["crop"] != "TOMATO"
+
+
 def test_named_policy_keeps_requested_strategy_when_shops_change():
     policy = policy_module.Policy(strategy="premium")
 

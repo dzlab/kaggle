@@ -905,13 +905,15 @@ class Policy:
         regime["shops"] = "|".join(str(shop) for shop in shops) if isinstance(shops, Sequence) and not isinstance(shops, (str, bytes)) else ""
         selected_strategy = self.memory.selected_strategy
         reset = self.memory.observe_time(_get(state, "day"), _get(state, "hour"))
+        strategy_spec = None
         if self.strategy_name == "auto":
             reset_reason = self.memory.diagnostics.get("reset_reason")
             if reset and reset_reason == "day_start" and selected_strategy is not None:
                 self.memory.selected_strategy = selected_strategy
             if self.memory.selected_strategy is None:
                 self.memory.selected_strategy = select_strategy(state).name
-        macro = build_autonomous_macro_plan(state, self.memory)
+            strategy_spec = get_strategy(self.memory.selected_strategy)
+        macro = build_autonomous_macro_plan(state, self.memory, strategy_spec)
         workers = _worker_records(state)
         worker_indices = tuple(sorted(worker["index"] for worker in workers))
         workers_changed = worker_indices != self.memory.diagnostics.get("worker_indices")

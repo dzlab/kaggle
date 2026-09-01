@@ -37,6 +37,8 @@ class PolicyMemory(PlannerMemory):
             return False
         previous = (self.last_day, self.last_hour)
         if (current_day, current_hour) == (0, 0):
+            if previous == (0, 0):
+                return False
             self.reset(day=0, hour=0, reason="episode_start")
             return True
         if previous != (-1, -1) and (current_day, current_hour) < previous:
