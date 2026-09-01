@@ -145,9 +145,9 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
             error=f"{type(exc).__name__}: {exc}",
         )
 
-    is_route_candidate = candidate_value in CANDIDATES and variant_value is None
+    is_route_candidate = variant in CANDIDATES
     try:
-        route_policy = candidate_policy(candidate_value) if is_route_candidate else None
+        route_policy = candidate_policy(variant) if is_route_candidate else None
         candidate = VariantPolicy(
             variant, ablations, env.configuration, is_route_candidate, route_policy,
         )

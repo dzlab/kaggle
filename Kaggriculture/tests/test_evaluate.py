@@ -569,6 +569,31 @@ def test_worker_runs_from_project_root_in_a_fresh_interpreter(seat):
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+@pytest.mark.parametrize("request_key", ["candidate", "variant"])
+@pytest.mark.parametrize("name", ["current", "melon", "premium", "mixed"])
+def test_worker_runs_stable_candidates_through_both_request_aliases(request_key, name):
+    project_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "scripts/evaluation_worker.py"],
+        input=json.dumps({
+            request_key: name, "opponent": "pass", "seed": 1,
+            "steps": 8, "seat": 0,
+        }) + "\n",
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    response = json.loads(result.stdout)
+    assert response["candidate"] == name
+    assert response["variant"] == name
+    assert response["framework_error"] is False
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
 def test_run_game_real_worker_seat_one_returns_candidate_metrics(monkeypatch):
     from scripts.evaluate import run_game
 
