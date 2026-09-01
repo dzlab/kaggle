@@ -170,6 +170,22 @@ def test_replay_record_rejects_boolean_quantities():
     assert result["framework_error"] is True
 
 
+@pytest.mark.parametrize("mutate", [
+    lambda replay: replay["steps"][0][0]["observation"]["farms"][0].__setitem__("money", "100"),
+    lambda replay: replay["steps"][0][0]["observation"].__setitem__("step", "0"),
+    lambda replay: replay["steps"][0][0]["observation"]["farms"][0]["farmer"].__setitem__(0, "0"),
+    lambda replay: replay["steps"][0][0]["observation"]["private"]["shed"].__setitem__("WHEAT", "1"),
+    lambda replay: replay["rewards"].__setitem__(0, "100"),
+])
+def test_nonlegacy_replay_rejects_numeric_strings_in_strict_fields(mutate):
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    mutate(replay)
+
+    assert replay_record(replay, variant="mixed", opponent="pass", seed=1)["framework_error"] is True
+
+
 def test_run_evaluation_rejects_conflicting_variant_aliases(monkeypatch):
     from scripts.evaluate import run_evaluation
 
@@ -252,6 +268,20 @@ def test_paired_seed_summary_has_confidence_metrics_and_both_seats():
     assert 0.0 <= summary["wilson_win_rate"]["lower"] <= summary["wilson_win_rate"]["upper"] <= 1.0
     assert set(summary["bootstrap_bank_differential"].keys()) == {"lower", "upper"}
     json.dumps(summary, allow_nan=False)
+
+
+def test_paired_seed_summary_confidence_interval_uses_paired_seeds():
+    from scripts.evaluate import _wilson_interval, paired_seed_summary
+
+    records = [
+        _metric_record(seat=seat, seed=seed, outcome=outcome, differential=1)
+        for seed, outcome in ((1, "win"), (2, "loss"))
+        for seat in (0, 1)
+    ]
+
+    summary = paired_seed_summary(records)
+
+    assert summary["wilson_win_rate"] == _wilson_interval(1.0, 2)
 
 
 def test_paired_seed_summary_reports_duplicate_pairs_separately():
@@ -1013,6 +1043,34 @@ def test_report_groups_records_by_candidate_identity():
     assert document["results"]["animal-heavy"]["pass"]["wins"] == 1
 
 
+def test_report_exposes_per_candidate_pairs_and_promotion_decisions():
+    from scripts.evaluate import build_result_document
+
+    records = [
+        _metric_record(seat=seat, seed=seed, candidate=candidate,
+                       outcome="win" if candidate == "challenger" else "loss",
+                       differential=10 if candidate == "challenger" else 1)
+        for candidate in ("baseline", "challenger")
+        for seed in (1, 2)
+        for seat in (0, 1)
+    ]
+
+    document = build_result_document(
+        config={"candidates": ["baseline", "challenger"], "opponents": ["pass"],
+                "min_valid_games": 1},
+        records=records,
+    )
+
+    assert document["metadata"]["baseline_convention"] == (
+        "the first configured candidate is the baseline for promotion decisions"
+    )
+    assert list(document["paired_summaries"]) == ["baseline", "challenger"]
+    assert document["paired_summaries"]["challenger"]["paired_games"] == 2
+    assert document["promotion_decisions"]["baseline"]["status"] == "baseline"
+    assert document["promotion_decisions"]["challenger"]["status"] == "promote"
+    json.dumps(document, allow_nan=False)
+
+
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
 def test_quick_starter_replay_does_not_require_full_season_liquidation():
     from scripts.evaluate import run_game
@@ -1204,8 +1262,8 @@ def test_isolated_ablation_execution_keeps_each_toggle_separate(monkeypatch):
 
     calls = []
 
-    def fake_run_game(*, variant, opponent, seed, steps, ablations=None):
-        calls.append((variant, opponent, seed, dict(ablations or {})))
+    def fake_run_game(*, variant, opponent, seed, steps, seat, ablations=None):
+        calls.append((variant, opponent, seed, seat, dict(ablations or {})))
         return {
             "variant": variant, "opponent": opponent, "seed": seed, "outcome": "tie",
             "final_bank": 10, "opponent_final_bank": 10, "framework_error": False,
@@ -1218,11 +1276,15 @@ def test_isolated_ablation_execution_keeps_each_toggle_separate(monkeypatch):
         ablations=[("animals", False), ("land_purchase", False)],
     )
 
-    assert [call[3] for call in calls] == [
+    assert [call[4] for call in calls] == [
+        {"animals": True, "land_purchase": True, "market_batch_sizing": True, "route_scheduling": True, "shop_adaptation": True},
         {"animals": True, "land_purchase": True, "market_batch_sizing": True, "route_scheduling": True, "shop_adaptation": True},
         {"animals": False, "land_purchase": True, "market_batch_sizing": True, "route_scheduling": True, "shop_adaptation": True},
+        {"animals": False, "land_purchase": True, "market_batch_sizing": True, "route_scheduling": True, "shop_adaptation": True},
+        {"animals": True, "land_purchase": False, "market_batch_sizing": True, "route_scheduling": True, "shop_adaptation": True},
         {"animals": True, "land_purchase": False, "market_batch_sizing": True, "route_scheduling": True, "shop_adaptation": True},
     ]
+    assert [call[3] for call in calls] == [0, 1, 0, 1, 0, 1]
     assert set(result["ablation_records"]) == {"animals", "land_purchase"}
 
 

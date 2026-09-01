@@ -67,6 +67,18 @@ _NORMALIZED_NUMERIC_FIELDS = frozenset({
     "price_floor_sales", "missed_basic_needs",
 })
 _WORKER_OUTCOMES = frozenset({"win", "loss", "tie", "framework_error"})
+_STRICT_NUMERIC_FIELDS = frozenset({
+    "seed", "step", "day", "hour", "money", "hires_today", "yield_units",
+    "max_lifespan_step", "consecutive_unwatered", "planted_day",
+    "fertilized_until_day", "placed_day", "consecutive_unfed",
+    "pending_care_bonus", "quantity", "price", "amount", "episodeSteps",
+    "actTimeout", "runTimeout", "boardSize", "startingMoney",
+    "maxMarketOrdersPerTurn", "turnsPerDay", "shedCapacity", "weedSpawnChance",
+    "townShopUnlockInterval", "townShopSellInterval", "townCenterSellInterval",
+    "farmHandCostMult",
+})
+_STRICT_QUANTITY_MAPPING_FIELDS = frozenset({"inventory", "prices", "shed", "seeds"})
+_BASELINE_CONVENTION = "the first configured candidate is the baseline for promotion decisions"
 
 
 def _positive_int(value: str) -> int:
@@ -286,7 +298,10 @@ def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         for seat_record in (seat_zero, seat_one):
             outcome_counts[seat_record["outcome"]] += 1
 
-    trials = len(pairs) * 2
+    # The two seat games for a seed are paired observations, not independent
+    # Bernoulli trials.  Confidence must therefore be calculated over paired
+    # seeds to avoid overstating certainty from the seating swap.
+    trials = len(pairs)
     successes = sum(pair_scores)
     wilson = _wilson_interval(successes, trials)
     bootstrap = _bootstrap_interval(pair_differentials, pair_keys)
@@ -361,6 +376,69 @@ def _number(value: Any) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if number == number and abs(number) != float("inf") else None
+
+
+def _strict_numeric_scalar(value: Any) -> bool:
+    """Accept only finite JSON numeric scalars, never strings or booleans."""
+    return isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def _strict_engine_numeric_values(value: Any, *, in_configuration: bool = False,
+                                  numeric: bool = False) -> bool:
+    """Reject numeric strings and non-numeric values in strict engine fields.
+
+    Compact unit fixtures intentionally use abbreviated values and are excluded
+    by the caller.  Real engine envelopes use typed JSON numbers, so coercing a
+    string such as ``"100"`` would hide replay tampering.
+    """
+    if numeric:
+        return _strict_numeric_scalar(value)
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if key == "specification":
+                # This is the engine's JSON schema, whose numeric-looking
+                # values are descriptive metadata rather than replay data.
+                continue
+            child_in_configuration = in_configuration or key == "configuration"
+            if key == "rewards":
+                if not isinstance(child, Sequence) or isinstance(child, (str, bytes)) \
+                        or any(not _strict_numeric_scalar(reward) for reward in child):
+                    return False
+            elif key in _STRICT_NUMERIC_FIELDS:
+                if child is None:
+                    if key == "seed" and child_in_configuration:
+                        continue
+                    return False
+                if not _strict_engine_numeric_values(
+                    child, in_configuration=child_in_configuration, numeric=True,
+                ):
+                    return False
+            elif key in _STRICT_QUANTITY_MAPPING_FIELDS:
+                if not isinstance(child, Mapping):
+                    return False
+                if any(not _strict_numeric_scalar(quantity) for quantity in child.values()):
+                    return False
+            elif key == "inventories":
+                if not isinstance(child, Sequence) or isinstance(child, (str, bytes)):
+                    return False
+                if any(
+                    not isinstance(inventory, Mapping)
+                    or any(not _strict_numeric_scalar(quantity) for quantity in inventory.values())
+                    for inventory in child
+                ):
+                    return False
+            elif not _strict_engine_numeric_values(child, in_configuration=child_in_configuration):
+                return False
+        return True
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return all(_strict_engine_numeric_values(item, in_configuration=in_configuration) for item in value)
+    if isinstance(value, str):
+        try:
+            float(value)
+        except (TypeError, ValueError, OverflowError):
+            return True
+        return False
+    return True
 
 
 def _crop_data(crop: Any) -> Mapping[str, Any] | None:
@@ -484,6 +562,8 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
     if not _valid_engine_provenance(replay):
         return False
     legacy_compact = _legacy_compact_fixture(replay)
+    if not legacy_compact and not _strict_engine_numeric_values(replay):
+        return False
     for optional_mapping in ("metadata",):
         if optional_mapping in replay and not isinstance(replay[optional_mapping], Mapping):
             return False
@@ -2149,9 +2229,9 @@ def _strict_quantity_mapping(value: Any, allowed_items: set[str] | frozenset[str
     if not isinstance(value, Mapping):
         return False
     for item, raw_quantity in value.items():
-        quantity = _number(raw_quantity)
-        if (not isinstance(item, str) or item not in allowed_items or quantity is None
-                or quantity < 0 or int(quantity) != quantity):
+        if (not isinstance(item, str) or item not in allowed_items
+                or not _strict_numeric_scalar(raw_quantity)
+                or raw_quantity < 0 or int(raw_quantity) != raw_quantity):
             return False
     return True
 
@@ -2960,6 +3040,38 @@ def _select_default(records: Sequence[Mapping[str, Any]], variants: Sequence[str
     ))[0]
 
 
+def _candidate_records(records: Sequence[Mapping[str, Any]], candidate: str) -> list[Mapping[str, Any]]:
+    return [record for record in records if _record_candidate(record) == candidate]
+
+
+def _candidate_metrics(records: Sequence[Mapping[str, Any]], candidates: Sequence[str],
+                      *, min_valid_games: int) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build deterministic paired summaries and promotion decisions by candidate."""
+    summaries = {
+        candidate: paired_seed_summary(_candidate_records(records, candidate))
+        for candidate in candidates
+    }
+    decisions: dict[str, Any] = {}
+    if candidates:
+        baseline_candidate = candidates[0]
+        baseline_records = _candidate_records(records, baseline_candidate)
+        for candidate in candidates:
+            candidate_summary = summaries[candidate]
+            if candidate == baseline_candidate:
+                decisions[candidate] = {
+                    "status": "baseline",
+                    "reasons": [],
+                    "candidate": candidate_summary,
+                    "baseline": candidate_summary,
+                }
+            else:
+                decisions[candidate] = promotion_decision(
+                    _candidate_records(records, candidate), baseline_records,
+                    min_valid_games=min_valid_games,
+                )
+    return summaries, decisions
+
+
 def _normalized_report_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """Remove output-directory dependence from metadata while retaining names."""
     normalized = dict(config)
@@ -2991,12 +3103,21 @@ def _normalized_command(command: Sequence[str] | None) -> list[str]:
 def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mapping[str, Any]], command: Sequence[str] | None = None,
                           ablation_records: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
                           ablation_configs: Mapping[str, Mapping[str, bool]] | None = None) -> dict[str, Any]:
-    variants = list(config.get("candidates", config.get("variants", ())))
+    variants = list(dict.fromkeys(config.get("candidates", config.get("variants", ()))))
     opponents = list(config.get("opponents", ()))
+    min_valid_games = config.get("min_valid_games", 20)
+    if type(min_valid_games) is not int or min_valid_games < 1:
+        raise ValueError("min_valid_games must be a positive integer")
     results = _group_results(records, variants, opponents)
+    paired_summaries, promotion_decisions = _candidate_metrics(
+        records, variants, min_valid_games=min_valid_games,
+    )
     ablations = {}
     for component, component_records in (ablation_records or {}).items():
         component_results = _group_results(component_records, variants, opponents)
+        component_summaries, component_decisions = _candidate_metrics(
+            component_records, variants, min_valid_games=min_valid_games,
+        )
         contribution = {}
         for variant in variants:
             contribution[variant] = {}
@@ -3012,6 +3133,8 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
             "config": dict((ablation_configs or {}).get(component, {})),
             "results": component_results,
             "contribution": contribution,
+            "paired_summaries": component_summaries,
+            "promotion_decisions": component_decisions,
         }
     return {
         "schema_version": 1,
@@ -3020,6 +3143,8 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
             "config": _normalized_report_config(config),
             "engine": "kaggle-environments",
             "engine_version": ENGINE_VERSION,
+            "baseline_convention": _BASELINE_CONVENTION,
+            "baseline_candidate": variants[0] if variants else None,
             "replay_summary": (
                 Path(str(config["replay_summary"])).name
                 if config.get("replay_summary") is not None else None
@@ -3027,6 +3152,8 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
         },
         "selected_default": _select_default(records, variants),
         "results": results,
+        "paired_summaries": paired_summaries,
+        "promotion_decisions": promotion_decisions,
         "ablations": ablations,
     }
 
