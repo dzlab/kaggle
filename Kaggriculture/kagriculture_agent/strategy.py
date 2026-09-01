@@ -37,14 +37,14 @@ STRATEGIES = {
 _SALEABLE_MARKET_ITEMS = frozenset(PRODUCTS) - {"FERTILIZER"}
 
 
-def _public_market_inventory(state: object) -> Mapping[str, object]:
+def _public_market_inventory(state: object) -> Mapping[str, object] | None:
     if not isinstance(state, Mapping):
-        return {}
+        return None
     market = state.get("market", {})
     if not isinstance(market, Mapping):
-        return {}
-    inventory = market.get("inventory", {})
-    return inventory if isinstance(inventory, Mapping) else {}
+        return None
+    inventory = market.get("inventory")
+    return inventory if isinstance(inventory, Mapping) else None
 
 
 def _demand_snapshot(value: object) -> tuple[object, ...] | None:
@@ -117,16 +117,36 @@ class OpponentMarketSignal:
             self.history.clear()
             self._previous_inventory.clear()
 
-        candidate: str | None = None
-        self.evidence = 0
+        if inventory is None:
+            self.history.clear()
+            self._previous_inventory.clear()
+            self.evidence = 0
+            self._previous_demand = demand
+            self._has_demand_observation = True
+            return None
+
+        normalized_inventory: dict[str, float] = {}
         for raw_item, raw_value in inventory.items():
-            item = str(raw_item).upper()
             try:
                 value = float(raw_value)
             except (TypeError, ValueError, OverflowError):
-                continue
+                normalized_inventory = {}
+                break
             if not isfinite(value):
-                continue
+                normalized_inventory = {}
+                break
+            normalized_inventory[str(raw_item).upper()] = value
+        if len(normalized_inventory) != len(inventory):
+            self.history.clear()
+            self._previous_inventory.clear()
+            self.evidence = 0
+            self._previous_demand = demand
+            self._has_demand_observation = True
+            return None
+
+        candidate: str | None = None
+        self.evidence = 0
+        for item, value in normalized_inventory.items():
             previous = self._previous_inventory.get(item)
             values = self.history.get(item, [])
             if previous is None:
@@ -214,7 +234,7 @@ def select_strategy(state: object) -> StrategySpec:
     raw_shops = town.get("unlocked_shops", ())
     if isinstance(raw_shops, str):
         raw_shops = (raw_shops,)
-    elif not isinstance(raw_shops, Sequence) or isinstance(raw_shops, (bytes, bytearray)):
+    elif not isinstance(raw_shops, (Sequence, Set)) or isinstance(raw_shops, (bytes, bytearray)):
         return STRATEGIES["melon"]
 
     shops = {str(shop).upper() for shop in raw_shops}

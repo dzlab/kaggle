@@ -68,6 +68,15 @@ def test_select_strategy_uses_pet_cafe_signal():
     assert select_strategy(state).name == "mixed"
 
 
+@pytest.mark.parametrize("shops", [{"PET_CAFE"}, frozenset({"PET_CAFE"})])
+def test_select_strategy_accepts_set_like_unlocked_shops(shops):
+    from kagriculture_agent.strategy import select_strategy
+
+    state = {"town": {"unlocked_shops": shops}}
+
+    assert select_strategy(state).name == "mixed"
+
+
 @pytest.mark.parametrize("shop", ["YARN_STORE", "ICE_CREAM_SHOP"])
 def test_select_strategy_uses_premium_shop_signals(shop):
     from kagriculture_agent.strategy import select_strategy
@@ -2086,6 +2095,25 @@ def test_opponent_signal_requires_three_consistent_observations():
     assert signal.observe({"market": {"inventory": {"MELON": 20}}}) is None
     assert signal.observe({"market": {"inventory": {"MELON": 16}}}) is None
     assert signal.observe({"market": {"inventory": {"MELON": 12}}}) == "MELON"
+
+
+@pytest.mark.parametrize("bad_market", [
+    {"market": {}},
+    {"market": {"inventory": {"MELON": "not-a-number"}}},
+    {"market": {"inventory": []}},
+])
+def test_opponent_signal_clears_inventory_evidence_after_invalid_public_inventory(bad_market):
+    from kagriculture_agent.strategy import OpponentMarketSignal
+
+    signal = OpponentMarketSignal()
+    signal.observe({"market": {"inventory": {"MELON": 20}}})
+    signal.observe({"market": {"inventory": {"MELON": 16}}})
+
+    assert signal.observe(bad_market) is None
+    assert signal.history == {}
+    assert signal.evidence == 0
+    assert signal.observe({"market": {"inventory": {"MELON": 12}}}) is None
+    assert signal.observe({"market": {"inventory": {"MELON": 8}}}) is None
 
 
 def test_price_floor_disables_front_running():
