@@ -2122,11 +2122,14 @@ def _midday_board_changes_valid(pre: Mapping[str, Any], post: Mapping[str, Any],
         return False
     size = _board_size(pre, configuration)
     commands = [action.get("farmer"), *list(action.get("hands", ()))]
+    blocked_plant_crops = _blocked_plant_crops(action, pre)
     tile_operations = {"PLANT", "WATER", "HARVEST", "FERTILIZE", "FEED", "CARE", "COLLECT_FERTILIZER",
                        "DIG", "BUILD_COOP", "BUILD_PASTURE", "PLACE"}
     target_commands: dict[tuple[int, int], list[Sequence[Any]]] = {}
     for index, command in enumerate(commands):
         if isinstance(command, Sequence) and not isinstance(command, (str, bytes)) and command and command[0] in tile_operations:
+            if command[0] == "PLANT" and command[1] in blocked_plant_crops:
+                continue
             position = _worker_position(pre, index)
             if position is not None:
                 target_commands.setdefault(position, []).append(command)
@@ -2435,6 +2438,25 @@ def _strict_private_inventories(observation: Mapping[str, Any]) -> bool:
     return all(_strict_quantity_mapping(inventory, _ITEM_NAMES) for inventory in raw)
 
 
+def _blocked_plant_crops(action: Mapping[str, Any], observation: Mapping[str, Any]) -> set[str]:
+    """Return crops whose same-turn plant requests exceed available seeds."""
+    commands = [action.get("farmer"), *list(action.get("hands", ()))]
+    requests = Counter(
+        command[1]
+        for command in commands
+        if isinstance(command, Sequence)
+        and not isinstance(command, (str, bytes))
+        and len(command) > 1
+        and command[0] == "PLANT"
+        and isinstance(command[1], str)
+    )
+    seeds = _private_seeds(observation)
+    return {
+        crop for crop, count in requests.items()
+        if count > (_number(seeds.get(crop)) or 0)
+    }
+
+
 def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], action: Mapping[str, Any],
                              configuration: Mapping[str, Any] | None = None,
                              market_result: Mapping[str, Any] | None = None,
@@ -2512,6 +2534,7 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
         expected_inventories = None
         expected_shed = None
     expected_seeds = dict(_positive_quantities(simulated.get("seeds")))
+    blocked_plant_crops = _blocked_plant_crops(action, pre)
 
     def add_quantity(values: dict[str, float], item: str, amount: float) -> None:
         values[item] = values.get(item, 0.0) + amount
@@ -2542,6 +2565,10 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
             return False
 
         if allow_invalid_unit_noop and not state_valid:
+            continue
+        if operation == "PLANT" and command[1] in blocked_plant_crops:
+            # The engine atomically drops every same-crop PLANT request when
+            # the combined demand exceeds the player's available seeds.
             continue
 
         pre_tile = _tile_at_position(pre, position)

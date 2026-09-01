@@ -2033,6 +2033,31 @@ def test_replay_actions_are_validated_against_the_preceding_observation():
     assert record["outcome"] == "win"
 
 
+def test_replay_accepts_engine_atomic_noop_for_duplicate_plant_requests():
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    for turn in replay["steps"]:
+        observation = turn[0]["observation"]
+        farm = observation["farms"][0]
+        farm["farmer"] = [0, 0]
+        farm["hands"] = [[1, 0]]
+        farm["tiles"] = [[None for _ in range(4)] for _ in range(4)]
+        observation["private"] = {
+            "seeds": {"MELON": 1}, "shed": {}, "inventories": [{}, {}],
+        }
+    replay["steps"][0][0]["action"]["hands"] = [["PASS"]]
+    replay["steps"][1][0]["action"] = {
+        "farmer": ["PLANT", "MELON"],
+        "hands": [["PLANT", "MELON"]],
+        "market": [],
+    }
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is False
+
+
 def test_replay_rejects_tampered_plant_without_post_state_effect():
     from scripts.evaluate import replay_record
 
