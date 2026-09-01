@@ -526,6 +526,28 @@ def test_market_orders_reserve_feed_wheat_and_never_sell_more_than_shed():
     assert len(orders) <= 10
 
 
+def test_market_orders_do_not_reserve_strategy_wheat_without_live_animals():
+    from kagriculture_agent.strategy import StrategySpec
+
+    state = {
+        "day": 4,
+        "hour": 3,
+        "cash": 500,
+        "animals": [],
+        "private": {"shed": {"WHEAT": 2}, "seeds": {}},
+        "market": {"prices": {"WHEAT": 10}},
+    }
+    strategy = StrategySpec("crop-only", ("WHEAT",), (), 10, 0, 20)
+
+    orders = policy_module.build_market_orders(
+        state,
+        [Task("SELL", Position(2, 2), 75, 4, 100, sell_all=True)],
+        strategy,
+    )
+
+    assert orders == [["SELL", "WHEAT", 2]]
+
+
 def test_market_orders_do_not_spend_cash_reserved_for_feed_or_exceed_ten_orders():
     state = {
         "day": 4,

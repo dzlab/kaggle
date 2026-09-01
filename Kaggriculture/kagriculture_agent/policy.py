@@ -472,9 +472,11 @@ def build_market_orders(state: Any, plan: Any,
 
     # Protect the remaining wheat needed by living animals before selling.
     carried_wheat = sum(_counts(inventory).get("WHEAT", 0) for inventory in _inventories(state))
+    animal_counts = _animals(state)
+    strategy_reserve = strategy.reserve_wheat if strategy is not None and animal_counts else 0
     total_feed_wheat = feed_reserve(
-        _animals(state), _days_left(state), 0,
-        strategy.reserve_wheat if strategy is not None else 0,
+        animal_counts, _days_left(state), 0,
+        strategy_reserve,
     )
     existing_wheat = shed.get("WHEAT", 0) + carried_wheat
     required_wheat = max(0, total_feed_wheat - existing_wheat)
