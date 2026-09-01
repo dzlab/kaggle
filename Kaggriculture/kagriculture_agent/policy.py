@@ -451,8 +451,14 @@ def build_market_orders(state: Any, plan: Any,
                 or (intent[0] == "BUY_ANIMAL" and intent[1] not in allowed_animals)
             )
         ]
+        crop_capacity = max(
+            0,
+            _whole(strategy.max_crop_units)
+            - sum(1 for _, tile in _iter_tiles(state) if _crop(tile) in allowed_crops),
+        )
         animal_capacity = max(0, _whole(strategy.max_animal_units) - _existing_animal_units(state))
     else:
+        crop_capacity = None
         animal_capacity = None
     # The engine records the action selected from the preceding observation;
     # hour 22 is therefore the last reliably executable liquidation window
@@ -512,6 +518,10 @@ def build_market_orders(state: Any, plan: Any,
         if kind == "HIRE" and item is not None:
             continue
         quantity = 1 if kind in {"HIRE", "BUY_LAND"} else requested
+        if kind == "BUY_SEED" and crop_capacity is not None:
+            quantity = min(quantity, crop_capacity)
+            if quantity <= 0:
+                continue
         if kind == "BUY_PRODUCT":
             affordable, purchase_cost = 0, 0.0
             already_bought = product_buys.get(item or "", 0)
@@ -541,6 +551,8 @@ def build_market_orders(state: Any, plan: Any,
             product_buys[item or ""] = product_buys.get(item or "", 0) + affordable
         elif kind == "BUY_ANIMAL":
             animal_buys += affordable
+        elif kind == "BUY_SEED" and crop_capacity is not None:
+            crop_capacity -= affordable
 
     if final_turn:
         sale_items = [] if carried_at_final else [

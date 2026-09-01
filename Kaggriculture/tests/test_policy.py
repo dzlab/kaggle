@@ -1256,6 +1256,62 @@ def test_market_orders_clamp_animal_buys_to_total_strategy_cap():
     ]
 
 
+def test_market_orders_skip_explicit_seed_intents_when_crop_cap_is_zero():
+    from kagriculture_agent.strategy import StrategySpec
+
+    state = {
+        "day": 4, "hour": 2, "cash": 10_000,
+        "tiles": [[None]],
+        "private": {"shed": {}, "seeds": {}},
+        "market": {"prices": {"WHEAT": 1}},
+    }
+    strategy = StrategySpec("no-crops", ("WHEAT",), (), 0, 10, 0)
+
+    orders = policy_module.build_market_orders(
+        state, [["BUY_SEED", "WHEAT", 2]], strategy,
+    )
+
+    assert orders == []
+
+
+def test_market_orders_clamp_explicit_seed_intents_to_remaining_crop_cap():
+    from kagriculture_agent.strategy import StrategySpec
+
+    state = {
+        "day": 4, "hour": 2, "cash": 10_000,
+        "tiles": [[{"kind": "PLANT", "crop": "WHEAT"}, None]],
+        "private": {"shed": {}, "seeds": {}},
+        "market": {"prices": {"WHEAT": 1}},
+    }
+    strategy = StrategySpec("two-crops", ("WHEAT",), (), 2, 10, 0)
+
+    orders = policy_module.build_market_orders(
+        state, [["BUY_SEED", "WHEAT", 3]], strategy,
+    )
+
+    assert orders == [["BUY_SEED", "WHEAT", 1]]
+
+
+def test_market_orders_apply_crop_cap_across_duplicate_explicit_seed_intents():
+    from kagriculture_agent.strategy import StrategySpec
+
+    state = {
+        "day": 4, "hour": 2, "cash": 10_000,
+        "tiles": [[{"kind": "PLANT", "crop": "WHEAT"}, {"kind": "PLANT", "crop": "WHEAT"}, None]],
+        "private": {"shed": {}, "seeds": {}},
+        "market": {"prices": {"WHEAT": 1}},
+    }
+    strategy = StrategySpec("three-crops", ("WHEAT",), (), 3, 10, 0)
+
+    orders = policy_module.build_market_orders(
+        state,
+        [["BUY_SEED", "WHEAT", 2], ["BUY_SEED", "WHEAT", 2]],
+        strategy,
+    )
+
+    assert orders == [["BUY_SEED", "WHEAT", 1]]
+
+
 def test_policy_rejects_explicit_animal_intent_when_existing_units_reach_cap():
     board = [[None for _ in range(5)] for _ in range(5)]
     for index in range(12):
