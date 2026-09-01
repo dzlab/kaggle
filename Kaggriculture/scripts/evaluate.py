@@ -57,6 +57,7 @@ ABLATION_COMPONENTS = (
 _DEFAULT_ABLATIONS = {component: True for component in ABLATION_COMPONENTS}
 _BUYABLE_PRODUCTS = frozenset({"WHEAT", "FERTILIZER"})
 _PRODUCT_NAMES = frozenset(PRODUCTS)
+_SALEABLE_PRODUCTS = _PRODUCT_NAMES - {"FERTILIZER"}
 _ANIMAL_NAMES = frozenset(ANIMALS)
 _ITEM_NAMES = _PRODUCT_NAMES | _ANIMAL_NAMES
 _WORKER_TIMEOUT_SECONDS = 120
@@ -868,6 +869,11 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
             ]
             if any(inventories is None or any(inventory for inventory in inventories) for inventories in final_inventories):
                 return False
+            if any(
+                _has_saleable_shed_goods(_mapping(states[-1].get("observation")))
+                for states in (own_states, other_states)
+            ):
+                return False
     else:
         final_inventories = _private_inventories(_mapping(own_states[-1].get("observation")))
         if final_inventories is None or any(inventory for inventory in final_inventories):
@@ -888,6 +894,15 @@ def _requires_full_liquidation(configuration: Mapping[str, Any] | None, step_cou
             or int(turns) != turns or int(turns) < 1):
         return False
     return int(episode_steps) == step_count and int(episode_steps) >= int(turns) * season_days
+
+
+def _has_saleable_shed_goods(observation: Mapping[str, Any]) -> bool:
+    """Return whether the terminal shed still contains goods that should sell."""
+    shed = _mapping(_mapping(observation.get("private")).get("shed"))
+    return any(
+        item in _SALEABLE_PRODUCTS and (_number(quantity) or 0) > 0
+        for item, quantity in shed.items()
+    )
 
 
 def _time_progression_valid(pre: Mapping[str, Any], post: Mapping[str, Any],

@@ -78,6 +78,45 @@ def _strict_two_turn_replay():
     return replay
 
 
+def _full_season_replay_with_terminal_shed(item):
+    """Return a strict full-season replay with one persistent shed residue."""
+    from kagriculture_agent.constants import season_days
+
+    episode_steps = season_days * 24
+    farm = {
+        "money": 100, "farmer": [1, 1], "hands": [], "hires_today": 0,
+        "tiles": [[None for _ in range(4)] for _ in range(4)],
+        "unlocked_quadrants": ["NW"],
+    }
+
+    def observation(player, step):
+        farms = [farm] if player == 0 else [{"money": 100}, farm]
+        return {
+            "player": player, "step": step, "day": step // 24, "hour": step % 24,
+            "farms": farms,
+            "private": {"seeds": {}, "shed": {item: 1}, "inventories": [{}]},
+            "market": {"prices": {}, "inventory": {}},
+        }
+
+    steps = []
+    for step in range(episode_steps):
+        status = "DONE" if step == episode_steps - 1 else "ACTIVE"
+        steps.append([
+            {"observation": observation(0, step), "action": {"farmer": ["PASS"], "hands": [], "market": []},
+             "status": status, "info": {}},
+            {"observation": observation(1, step), "action": {"farmer": ["PASS"], "hands": [], "market": []},
+             "status": status, "info": {}},
+        ])
+
+    replay = _engine_envelope({
+        "steps": steps, "rewards": [100, 100], "statuses": ["DONE", "DONE"], "info": {},
+    }, legacy_compact_fixture=False)
+    replay["configuration"]["episodeSteps"] = episode_steps
+    replay["configuration"]["boardSize"] = 4
+    replay["specification"]["action"] = {"type": "object"}
+    return replay
+
+
 def test_cli_parses_seed_opponent_variant_and_quick_options():
     from scripts.evaluate import parse_args
 
@@ -2920,6 +2959,20 @@ def test_replay_rejects_final_carried_inventory_even_when_transition_is_consiste
 
     assert record["framework_error"] is True
     assert record["outcome"] == "framework_error"
+
+
+@pytest.mark.parametrize(
+    ("item", "framework_error"),
+    [("WHEAT", True), ("FERTILIZER", False)],
+)
+def test_complete_season_replay_validates_terminal_shed_liquidation(item, framework_error):
+    from scripts.evaluate import replay_record
+
+    replay = _full_season_replay_with_terminal_shed(item)
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is framework_error
 
 
 def test_transition_effects_accept_drop_capacity_discard():
