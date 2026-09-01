@@ -36,6 +36,7 @@ from kagriculture_agent.constants import (  # noqa: E402
     season_days,
     shed_capacity,
 )
+from kagriculture_agent.candidates import CANDIDATES, candidate_policy  # noqa: E402
 from kagriculture_agent.economics import market_price  # noqa: E402
 from kagriculture_agent.observation import is_shed_adjacent  # noqa: E402
 from kagriculture_agent.planner import _has_basic_need_deadline  # noqa: E402
@@ -44,6 +45,7 @@ from scripts.run_local import OPPONENTS, _deterministic_random_agent  # noqa: E4
 
 
 VARIANTS = ("conservative", "mixed", "melon-heavy", "demand-reactive", "animal-heavy")
+EVALUATION_NAMES = tuple(dict.fromkeys((*CANDIDATES, *VARIANTS)))
 ABLATION_COMPONENTS = (
     "route_scheduling",
     "market_batch_sizing",
@@ -99,6 +101,14 @@ def _variant_list(values: Sequence[str] | None) -> list[str]:
     return list(dict.fromkeys(selected))
 
 
+def _candidate_list(values: Sequence[str] | None) -> list[str]:
+    selected = list(values or ("mixed",))
+    unknown = [value for value in selected if value not in EVALUATION_NAMES]
+    if unknown:
+        raise ValueError(f"unsupported candidate(s): {', '.join(unknown)}")
+    return list(dict.fromkeys(selected))
+
+
 def parse_ablation(value: str) -> tuple[str, bool]:
     """Parse ``component=on|off`` for a component already present in policy."""
     try:
@@ -122,14 +132,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="candidate seats to evaluate (0 and 1 are supported)")
     parser.add_argument("--variant", action="append", dest="single_variants", choices=VARIANTS)
     parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=None)
-    parser.add_argument("--candidates", nargs="+", choices=VARIANTS, default=None)
+    parser.add_argument("--candidates", nargs="+", choices=EVALUATION_NAMES, default=None)
     parser.add_argument("--ablation", action="append", type=parse_ablation, default=[], metavar="COMPONENT=on|off")
     parser.add_argument("--quick", action="store_true", help="use a small default batch suitable for local tests")
     args = parser.parse_args(argv)
     if args.variants is not None and args.candidates is not None and args.variants != args.candidates:
         parser.error("--variants and --candidates must match when both are supplied")
     selected_alias = args.candidates if args.candidates is not None else args.variants
-    args.candidates = _variant_list((selected_alias or []) + (args.single_variants or []))
+    args.candidates = _candidate_list((selected_alias or []) + (args.single_variants or []))
     args.variants = list(args.candidates)
     if args.quick:
         if args.seeds == 30:
@@ -2821,20 +2831,38 @@ def apply_variant(action: Mapping[str, Any], observation: Mapping[str, Any], var
 
 
 class VariantPolicy:
-    """Fresh stateful policy instance with evaluator-only variant adjustments."""
+    """Fresh stateful route candidate or legacy evaluator variant."""
 
     def __init__(self, variant: str, ablations: Mapping[str, bool] | None = None,
-                 configuration: Mapping[str, Any] | None = None) -> None:
-        if variant not in VARIANTS:
+                 configuration: Mapping[str, Any] | None = None,
+                 route_candidate: bool | None = None,
+                 route_policy: Any = None) -> None:
+        if variant not in VARIANTS and variant not in CANDIDATES:
             raise ValueError(f"unsupported variant: {variant}")
         self.variant = variant
         self.ablations = dict(ablations or _DEFAULT_ABLATIONS)
         self.configuration = dict(configuration or {})
-        self.policy = Policy()
+        # ``mixed`` is also a long-standing legacy variant alias. Preserve
+        # its old behavior by default; candidate requests pass True explicitly
+        # from the isolated worker when they mean the stable route.
+        self.is_route_candidate = (
+            variant in CANDIDATES and variant != "mixed"
+            if route_candidate is None else bool(route_candidate)
+        )
+        if self.is_route_candidate and variant not in CANDIDATES:
+            raise ValueError(f"unsupported candidate: {variant}")
+        if self.is_route_candidate:
+            self._act = route_policy or candidate_policy(variant)
+            self.policy = getattr(self._act, "__self__", None)
+        else:
+            self.policy = Policy()
+            self._act = self.policy.act
 
     def __call__(self, obs: Mapping[str, Any], _configuration: Mapping[str, Any] | None = None) -> dict[str, Any]:
         configuration = _configuration if _configuration is not None else self.configuration
-        return apply_variant(self.policy.act(obs), obs, self.variant, self.ablations, configuration)
+        if self.is_route_candidate:
+            return self._act(obs)
+        return apply_variant(self._act(obs), obs, self.variant, self.ablations, configuration)
 
 
 def _worker_failure(*, variant: str, opponent: str, seed: int, seat: int, error: str) -> dict[str, Any]:
@@ -2898,8 +2926,8 @@ def _resolve_variant(variant: str | None, candidate: str | None) -> str:
     if variant is not None and candidate is not None and variant != candidate:
         raise ValueError("variant and candidate must match when both are supplied")
     selected = candidate if candidate is not None else variant
-    if selected not in VARIANTS:
-        raise ValueError(f"unsupported variant: {selected}")
+    if selected not in EVALUATION_NAMES:
+        raise ValueError(f"unsupported variant or candidate: {selected}")
     return selected
 
 
@@ -2911,7 +2939,7 @@ def _resolve_candidates(variants: Sequence[str] | None,
     selected = list(candidates if candidates is not None else variants or ("mixed",))
     if allow_unknown:
         return list(dict.fromkeys(selected))
-    return _variant_list(selected)
+    return _candidate_list(selected) if candidates is not None else _variant_list(selected)
 
 
 def run_game(*, variant: str | None = None, candidate: str | None = None,
@@ -2925,7 +2953,7 @@ def run_game(*, variant: str | None = None, candidate: str | None = None,
     if type(seat) is not int or seat not in (0, 1):
         raise ValueError("seat must be 0 or 1")
     payload = {
-        "variant": variant,
+        ("candidate" if candidate is not None else "variant"): variant,
         "opponent": opponent,
         "seed": seed,
         "steps": steps,

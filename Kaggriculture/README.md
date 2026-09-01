@@ -45,31 +45,42 @@ against `pass`, deterministic `random`, or `starter` opponents and writes a
 JSON replay to `replays/` by default. Generated logs belong in `logs/`; both
 directories are kept in the repository with `.gitkeep` files.
 
-## Seeded evaluation
+## Seeded evaluation and route promotion
 
-Run reproducible local games with the evaluator. It uses the same seed set for
-every selected variant/opponent pair and writes a stable JSON report:
+The stable development candidates are `current`, `melon`, `premium`, and
+`mixed`. Evaluate all candidates against the same opponents, seeds, and both
+seat orders with a full-season matrix:
 
 ```bash
 UV_CACHE_DIR=/private/tmp/kagriculture-uv-cache uv run python scripts/evaluate.py \
   --seeds 30 --start-seed 0 --steps 720 \
-  --opponents pass random starter \
-  --variants conservative mixed melon-heavy demand-reactive animal-heavy \
-  --output reports/evaluation.json
+  --opponents pass random starter --seats 0 1 \
+  --candidates current melon premium mixed \
+  --output reports/route-development.json
 ```
 
+After development, rerun only surviving candidates on a disjoint holdout seed
+range, for example `--start-seed 100 --seeds 10`, with the same full-season,
+three-opponent, two-seat configuration. A holdout result is promotion evidence
+only when it records every requested seat/seed pair, has zero framework errors,
+zero missed basic needs, a non-negative fifth-percentile paired bank
+differential, and improves on `current` in seat-balanced win rate and median
+paired bank differential. These gates are applied before score comparisons; a
+candidate is never selected because of mean bank alone, and a `--quick` smoke
+batch is for feasibility checks only.
+
+Reports include the exact matrix, per-game records, paired summaries,
+confidence bounds, and ordered discard reasons. The default production entry
+point remains `Policy()`/`current`; update `main.py` only after a full holdout
+report has selected a named candidate. Legacy evaluator variants such as
+`conservative`, `melon-heavy`, `demand-reactive`, and `animal-heavy` remain
+available through `--variants` and `--variant` for regression coverage, but
+they are not the stable route-candidate names.
+
 The default report path is `reports/evaluation.json`; each report also gets a
-compact replay-record sidecar at `reports/evaluation.replays.json` (or beside
-an explicitly selected output). Use `--quick` for a 2-seed, 96-step smoke
-batch. `--variant NAME` may be repeated as an alternative to `--variants`. The
-report includes outcome counts, win rate, bank statistics, bank differential,
-framework-error rate, shed overflow, price-floor sales, and replay-observable
-missed watering/feeding basic needs. `CARE` is an optional production bonus and
-is intentionally excluded from that required-needs metric. The
-`selected_default` field chooses the variant by
-lowest framework-error rate first, then aggregate win rate, then median final
-bank. This prevents a less reliable variant from outranking a zero-failure
-variant.
+compact replay-record sidecar beside it. Use `--quick` for a 2-seed, 96-step
+smoke batch, and do not commit generated reports unless a report is explicitly
+part of the requested artifact.
 
 Replay validation requires empty carried inventories only when the replay
 reaches the configured full-season length (720 turns with the default
@@ -111,15 +122,23 @@ entrypoint during an early import smoke test:
 uv run python -c "from main import agent; print(callable(agent))"
 ```
 
-Because this repository's `main.py` imports `kagriculture_agent`, the complete
-standalone submission form is the multi-file tarball below. It keeps `main.py`
-at the archive root and includes only runtime package files:
+Because `main.py` imports `kagriculture_agent`, the complete standalone
+submission form is the multi-file tarball below. It keeps `main.py` at the
+archive root and includes only runtime package files, including
+`kagriculture_agent/candidates.py` and its route dependencies. Do not package
+tests, reports, replay logs, plan files, or development documentation:
 
 ```bash
 tar --exclude='__pycache__' -czf /tmp/kaggriculture-submission.tar.gz \
   -C . main.py kagriculture_agent
 tar -tzf /tmp/kaggriculture-submission.tar.gz
 ```
+
+Before submission, verify the archive contains `main.py` and the complete
+runtime package and does not contain `tests/`, `reports/`, or `docs/`. Candidate
+factories are evaluation/development APIs; production still imports the
+default current policy unless promotion gates provide explicit holdout
+evidence.
 
 The project metadata and lockfile support Python 3.11+ and the local `uv`
 workflow; for example, run `uv sync`, `uv run pytest -q`, or

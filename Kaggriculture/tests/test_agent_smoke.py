@@ -18,6 +18,26 @@ from scripts.run_local import run_episode
 CROPS = {"WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON"}
 PRODUCTS = {"WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON", "EGG", "MILK", "WOOL", "FERTILIZER"}
 ANIMALS = {"GOOSE", "COW", "SHEEP"}
+
+
+@pytest.mark.parametrize("name", ["current", "melon", "premium", "mixed"])
+def test_candidate_policy_factory_returns_named_policy(name):
+    from kagriculture_agent.candidates import CANDIDATES, candidate_policy
+    from kagriculture_agent.policy import Policy
+
+    assert CANDIDATES == ("current", "melon", "premium", "mixed")
+    action = candidate_policy(name)({"step": 0})
+
+    assert isinstance(candidate_policy(name).__self__, Policy)
+    assert candidate_policy(name).__self__.strategy_name == name
+    assert action == {"farmer": ["PASS"], "hands": [], "market": []}
+
+
+def test_candidate_policy_factory_rejects_unknown_name():
+    from kagriculture_agent.candidates import candidate_policy
+
+    with pytest.raises(ValueError, match="unsupported candidate"):
+        candidate_policy("unknown")
 UNIT_NO_ARGUMENTS = {
     "NORTH", "SOUTH", "EAST", "WEST", "PASS", "DROP", "WATER", "HARVEST",
     "FERTILIZE", "BUILD_COOP", "BUILD_PASTURE", "FEED", "COLLECT_FERTILIZER",

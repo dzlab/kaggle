@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.evaluate import (
+    EVALUATION_NAMES,
     OPPONENTS,
     VARIANTS,
     VariantPolicy,
@@ -29,6 +30,7 @@ from scripts.evaluate import (
     _resolve_variant,
     replay_record,
 )
+from kagriculture_agent.candidates import CANDIDATES, candidate_policy
 
 
 class EvaluatorFailure(RuntimeError):
@@ -36,13 +38,16 @@ class EvaluatorFailure(RuntimeError):
 
 
 class _GuardedCandidate:
-    def __init__(self, candidate: Any) -> None:
+    def __init__(self, candidate: Any, *, accepts_configuration: bool = True) -> None:
         self.candidate = candidate
+        self.accepts_configuration = accepts_configuration
         self.failure: EvaluatorFailure | None = None
 
     def __call__(self, observation: Any, configuration: Any = None) -> Any:
         try:
-            return self.candidate(observation, configuration)
+            if self.accepts_configuration:
+                return self.candidate(observation, configuration)
+            return self.candidate(observation)
         except Exception as exc:
             self.failure = EvaluatorFailure(
                 f"candidate policy failure: {type(exc).__name__}: {exc}"
@@ -85,7 +90,7 @@ def _request_failure(request: Mapping[str, Any], error: str) -> dict[str, Any]:
     seat = _request_value(request, "seat", 0)
     if variant is None:
         variant = candidate
-    if not isinstance(variant, str) or variant not in VARIANTS:
+    if not isinstance(variant, str) or variant not in EVALUATION_NAMES:
         variant = "mixed"
     if not isinstance(opponent, str) or opponent not in OPPONENTS:
         opponent = "pass"
@@ -140,8 +145,12 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
             error=f"{type(exc).__name__}: {exc}",
         )
 
+    is_route_candidate = candidate_value in CANDIDATES and variant_value is None
     try:
-        candidate = VariantPolicy(variant, ablations, env.configuration)
+        route_policy = candidate_policy(candidate_value) if is_route_candidate else None
+        candidate = VariantPolicy(
+            variant, ablations, env.configuration, is_route_candidate, route_policy,
+        )
     except Exception as exc:
         raise EvaluatorFailure(
             f"candidate policy construction failure: {type(exc).__name__}: {exc}"

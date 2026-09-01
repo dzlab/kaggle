@@ -22,6 +22,7 @@ def test_git_archive_contains_root_entrypoint_and_agent_package():
     assert "main.py" in names
     assert "kagriculture_agent/__init__.py" in names
     assert "kagriculture_agent/policy.py" in names
+    assert "kagriculture_agent/candidates.py" in names
 
 
 def test_archived_root_entrypoint_executes(monkeypatch, tmp_path):

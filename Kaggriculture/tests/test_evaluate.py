@@ -122,6 +122,59 @@ def test_cli_parses_candidates_as_compatibility_alias_for_variants():
     assert args.variants == ["mixed", "animal-heavy"]
 
 
+def test_cli_accepts_stable_route_candidates():
+    from scripts.evaluate import parse_args
+
+    args = parse_args(["--candidates", "current", "melon", "premium", "mixed"])
+
+    assert args.candidates == ["current", "melon", "premium", "mixed"]
+
+
+def test_variant_policy_constructs_real_route_candidate_policy():
+    from scripts.evaluate import VariantPolicy
+
+    candidate = VariantPolicy("premium")
+
+    assert candidate.policy.strategy_name == "premium"
+
+
+def test_worker_uses_candidate_factory_for_route_candidate(monkeypatch):
+    import scripts.evaluation_worker as worker
+
+    calls = []
+
+    class FakeEnvironment:
+        configuration = {}
+
+        def run(self, agents):
+            calls.append(agents)
+
+        def toJSON(self):
+            return {}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "kaggle_environments",
+        type("FakeKaggleEnvironments", (), {"make": lambda *args, **kwargs: FakeEnvironment()})(),
+    )
+    monkeypatch.setattr(worker, "candidate_policy", lambda name: calls.append(name) or (lambda obs: {}))
+    monkeypatch.setattr(
+        worker,
+        "replay_record",
+        lambda *args, **kwargs: {
+            "candidate": "melon", "variant": "melon", "opponent": "pass", "seed": 1,
+            "seat": 0, "outcome": "tie", "final_bank": 0, "opponent_final_bank": 0,
+            "bank_differential": 0, "framework_error": False, "shed_overflow": 0,
+            "price_floor_sales": 0, "missed_basic_needs": 0,
+        },
+    )
+
+    result = worker.run_request({"candidate": "melon", "opponent": "pass", "seed": 1, "steps": 2})
+
+    assert result["candidate"] == "melon"
+    assert calls[0] == "melon"
+
+
 def test_cli_rejects_conflicting_variant_and_candidate_aliases():
     from scripts.evaluate import parse_args
 
