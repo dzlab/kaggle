@@ -839,10 +839,12 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None,
         crop = _crop(tile)
         if kind == "WEED":
             _add(plan, "WEED", position, 80, day, 10)
-        if crop and crop in allowed_crops:
+        if crop:
             if _needs_today(tile, "needs_water", "watered_today", "watered"):
                 _add(plan, "WATER", position, 100, day, 1, item=crop)
-            if _number(_get(tile, "fertilized_until_day", -1)) < day and has_fertilizer:
+            if (crop in allowed_crops
+                    and _number(_get(tile, "fertilized_until_day", -1)) < day
+                    and has_fertilizer):
                 _add(plan, "FERTILIZE", position, 97, None, 1, item=crop)
             age = _crop_age(tile, day)
             crop_rules = CROPS[crop]
@@ -871,13 +873,14 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None,
             animal_position = _position(animal_entity) or position
             species = _upper(_get(animal_entity, "species", _get(animal_entity, "animal", _get(animal_entity, "kind", ""))))
             animal_value = float(ANIMALS.get(species, {}).get("cost", 1))
-            if species in allowed_animals:
+            if species in allowed_animals or species in ANIMALS:
                 if _needs_today(animal_entity, "needs_feed", "fed_today", "fed"):
                     _add(plan, "FEED", animal_position, 100, day, 1, item=species)
                 if _needs_today(animal_entity, "needs_care", "cared_today", "cared"):
                     _add(plan, "CARE", animal_position, 95, day, animal_value, item=species)
-                if _get(animal_entity, "fertilizer_available") is True:
+                if species in allowed_animals and _get(animal_entity, "fertilizer_available") is True:
                     _add(plan, "COLLECT_FERTILIZER", animal_position, 96, day, 1, item=species)
+            if species in allowed_animals:
                 if (_get(animal_entity, "needs_placement", False)
                         or _get(animal_entity, "placed") is False
                         or _get(animal_entity, "owned") is False):
@@ -899,8 +902,6 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None,
             continue
         species = _upper(_get(animal, "species", _get(animal, "kind", "")))
         value = float(ANIMALS.get(species, {}).get("cost", 1))
-        if species not in allowed_animals:
-            continue
         if _needs_today(animal, "needs_feed", "fed_today", "fed"):
             _add(plan, "FEED", position, 100, day, 1, item=species)
         if _needs_today(animal, "needs_care", "cared_today", "cared"):
@@ -948,11 +949,29 @@ def _worker_info(worker: Any, fallback_index: int) -> tuple[int, str, Position |
     return index, role, _position(_get(worker, "position", worker))
 
 
-def _task_allowed(task: Task, strategy: StrategySpec | None) -> bool:
+def _task_allowed(task: Task, strategy: StrategySpec | None, state: Mapping[str, Any] | None = None) -> bool:
     if strategy is None:
         return True
     kind = str(task.kind).upper()
     item = str(task.item or "").upper()
+    if kind in {"WATER", "HARVEST"} and item and item not in strategy.crops:
+        target = _target_position(task.target)
+        if state is None or target is None:
+            return False
+        return any(
+            position == target and _crop(tile) == item
+            for position, tile in _tiles(state)
+        )
+    if kind in {"FEED", "CARE"} and item and item not in strategy.animals:
+        target = _target_position(task.target)
+        if state is None or target is None:
+            return False
+        return any(
+            position == target
+            and (entity := _entity_state(tile, "animal")) is not None
+            and _upper(_get(entity, "species", _get(entity, "animal", ""))) == item
+            for position, tile in _tiles(state)
+        )
     if kind in {"PLANT", "WATER", "FERTILIZE", "HARVEST"} and item:
         return item in strategy.crops
     if kind in {"FEED", "CARE", "COLLECT_FERTILIZER", "ANIMAL", "PLACE"} and item:
@@ -1134,7 +1153,7 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
     for task in plan:
         if not isinstance(task, Task):
             continue
-        if not _task_allowed(task, strategy):
+        if not _task_allowed(task, strategy, state):
             continue
         try:
             task_value = float(task.value)

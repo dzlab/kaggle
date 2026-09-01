@@ -348,11 +348,13 @@ def test_named_policy_applies_route_allowlists_to_tasks_and_market_orders(strate
     board = [[None for _ in range(5)] for _ in range(5)]
     board[0][0] = {
         "kind": "PLANT", "crop": "TOMATO", "needs_water": True,
-        "watered_today": False, "planted_day": 0,
+        "watered_today": False, "planted_day": 0, "planted_age": 8,
+        "yield_units": 1,
     }
     board[0][1] = {
         "kind": "COOP", "animal": {"species": "GOOSE", "needs_feed": True,
-                                      "fed_today": False},
+                                      "fed_today": False, "needs_care": True,
+                                      "cared_today": False},
     }
     obs = observation(
         day=4, hour=0, hands=[[2, 0]], tiles=board, seeds={"TOMATO": 1},
@@ -366,8 +368,11 @@ def test_named_policy_applies_route_allowlists_to_tasks_and_market_orders(strate
     policy = policy_module.Policy(strategy=strategy_name)
     action = policy.act(obs)
 
-    assert all(
-        task.item not in {"TOMATO", "GOOSE"}
+    maintenance = {(assignment.task.kind, assignment.task.item)
+                   for assignment in policy.memory.assignments}
+    assert {("WATER", "TOMATO"), ("FEED", "GOOSE")} & maintenance
+    assert not any(
+        task.kind in {"PLANT", "ANIMAL"} and task.item in {"TOMATO", "GOOSE"}
         for assignment in policy.memory.assignments
         for task in [assignment.task]
     )
@@ -1228,6 +1233,42 @@ def test_market_does_not_buy_into_a_full_shed():
     ])
 
     assert sum(order[2] for order in orders if order[0] == "BUY_PRODUCT") <= 1
+
+
+def test_market_orders_clamp_animal_buys_to_total_strategy_cap():
+    from kagriculture_agent.strategy import StrategySpec
+
+    state = {
+        "day": 4, "hour": 2, "cash": 10_000,
+        "tiles": [[{"kind": "COOP", "animal": {"species": "COW"}}]],
+        "private": {"shed": {"COW": 1}, "seeds": {}},
+        "market": {"prices": {"WHEAT": 1}},
+    }
+    strategy = StrategySpec("three-animals", ("WHEAT",), ("COW",), 10, 3, 0)
+
+    orders = policy_module.build_market_orders(state, [
+        ["BUY_ANIMAL", "COW", 3],
+        ["BUY_ANIMAL", "COW", 2],
+    ], strategy)
+
+    assert [order for order in orders if order[:2] == ["BUY_ANIMAL", "COW"]] == [
+        ["BUY_ANIMAL", "COW", 1],
+    ]
+
+
+def test_policy_rejects_explicit_animal_intent_when_existing_units_reach_cap():
+    board = [[None for _ in range(5)] for _ in range(5)]
+    for index in range(12):
+        board[index // 5][index % 5] = {"kind": "COOP", "animal": {"species": "COW"}}
+    obs = observation(
+        day=28, hour=1, hands=[], tiles=board, seeds={"WHEAT": 1},
+        shed={"WHEAT": 30}, inventories=[[]], money=10_000,
+    )
+    obs["market_intents"] = [["BUY_ANIMAL", "COW", 2]]
+
+    action = policy_module.Policy(strategy="premium").act(obs)
+
+    assert not any(order[:2] == ["BUY_ANIMAL", "COW"] for order in action["market"])
 
 
 def test_policy_handles_midseason_full_shed_animal_and_locked_observations():

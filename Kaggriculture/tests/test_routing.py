@@ -95,6 +95,54 @@ def test_daily_plan_prioritizes_urgent_water_feed_and_care():
     assert all(task.deadline is not None for task in plan if task.kind in {"WATER", "FEED", "CARE"})
 
 
+def test_named_strategy_keeps_maintenance_for_existing_disallowed_assets():
+    from kagriculture_agent.strategy import StrategySpec
+
+    workers = [
+        {"index": 0, "role": "FARMER", "position": pos(0, 0)},
+        {"index": 1, "role": "WORKER", "position": pos(1, 0)},
+        {"index": 2, "role": "WORKER", "position": pos(2, 0)},
+        {"index": 3, "role": "WORKER", "position": pos(3, 0)},
+    ]
+    state = _state(
+        day=4,
+        workers=workers,
+        tiles={
+            pos(0, 1): {
+                "kind": "PLANT", "crop": "TOMATO", "needs_water": True,
+                "watered_today": False, "planted_day": 0, "planted_age": 8,
+                "yield_units": 1,
+            },
+            pos(1, 1): {
+                "kind": "COOP",
+                "animal": {
+                    "species": "GOOSE", "needs_feed": True, "fed_today": False,
+                    "needs_care": True, "cared_today": False,
+                },
+            },
+        },
+        seeds={"TOMATO": 2},
+        market={"prices": {"TOMATO": 100}},
+    )
+    strategy = StrategySpec("melon-only", ("MELON",), ("COW",), 10, 10, 0)
+
+    plan = build_daily_plan(state, EpisodeMemory(), strategy)
+    assignments = assign_tasks(plan, workers, state, strategy)
+
+    planned = {(task.kind, task.item) for task in plan}
+    assigned = {(assignment.task.kind, assignment.task.item) for assignment in assignments}
+    assert {
+        ("WATER", "TOMATO"), ("HARVEST", "TOMATO"),
+        ("FEED", "GOOSE"), ("CARE", "GOOSE"),
+    } <= planned
+    assert {
+        ("WATER", "TOMATO"), ("HARVEST", "TOMATO"),
+        ("FEED", "GOOSE"), ("CARE", "GOOSE"),
+    } <= assigned
+    assert not {(task.kind, task.item) for task in plan
+                if task.kind in {"PLANT", "ANIMAL"}}
+
+
 def test_daily_plan_schedules_positive_harvest_before_decay():
     state = _state(
         day=2,

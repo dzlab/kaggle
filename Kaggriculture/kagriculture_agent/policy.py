@@ -285,6 +285,13 @@ def _animals(state: Any) -> dict[str, int]:
     return tile_counts or raw_counts
 
 
+def _existing_animal_units(state: Any) -> int:
+    """Count placed and shed animals for strategy-cap enforcement."""
+    placed = sum(_animals(state).values())
+    stored = sum(_whole(_shed(state).get(species, 0)) for species in ANIMALS)
+    return placed + stored
+
+
 def _is_adjacent_to_shed(state: Any, position: Any) -> bool:
     position = _position(position)
     if position is None:
@@ -444,6 +451,9 @@ def build_market_orders(state: Any, plan: Any,
                 or (intent[0] == "BUY_ANIMAL" and intent[1] not in allowed_animals)
             )
         ]
+        animal_capacity = max(0, _whole(strategy.max_animal_units) - _existing_animal_units(state))
+    else:
+        animal_capacity = None
     # The engine records the action selected from the preceding observation;
     # hour 22 is therefore the last reliably executable liquidation window
     # for a 30-day episode, with hour 23 retained for direct callers.
@@ -515,6 +525,10 @@ def build_market_orders(state: Any, plan: Any,
                 purchase_cost += unit_cost
             unit_cost = purchase_cost
         else:
+            if kind == "BUY_ANIMAL" and animal_capacity is not None:
+                quantity = min(quantity, max(0, animal_capacity - animal_buys))
+                if quantity <= 0:
+                    continue
             unit_cost = _purchase_cost(kind, item, state)
             room = shed_room - sum(product_buys.values()) - animal_buys if kind == "BUY_ANIMAL" else quantity
             affordable = min(quantity, max(0, room), int(max(0.0, cash - spend) // unit_cost)) if unit_cost > 0 else 0
