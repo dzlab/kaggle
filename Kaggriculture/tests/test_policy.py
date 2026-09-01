@@ -548,15 +548,15 @@ def test_mixed_animal_representations_merge_for_feed_and_cap_without_duplicates(
         "private": {"shed": {}, "seeds": {}},
         "market": {"prices": {"WHEAT": 10}},
     }
-    strategy = StrategySpec("two-animals", ("WHEAT",), ("GOOSE", "COW"), 10, 2, 0)
+    strategy = StrategySpec("two-animals", ("WHEAT",), ("GOOSE", "COW"), 10, 2, 8)
 
     assert _feed_animal_counts(state) == {"GOOSE": 1, "COW": 1}
     assert policy_module._animals(state) == {"GOOSE": 1, "COW": 1}
     assert not any(task.kind == "ANIMAL" for task in build_daily_plan(state, strategy=strategy))
-    assert policy_module.build_market_orders(state, [], strategy) == [["BUY_PRODUCT", "WHEAT", 52]]
+    assert policy_module.build_market_orders(state, [], strategy) == [["BUY_PRODUCT", "WHEAT", 60]]
     assert policy_module.build_market_orders(
         state, [["BUY_ANIMAL", "COW", 1]], strategy,
-    ) == [["BUY_PRODUCT", "WHEAT", 52]]
+    ) == [["BUY_PRODUCT", "WHEAT", 60]]
 
 
 def test_market_orders_do_not_reserve_strategy_wheat_without_live_animals():
@@ -952,7 +952,7 @@ def test_feed_reserve_counts_each_tile_embedded_animal_of_same_species():
     assert ["BUY_PRODUCT", "WHEAT", 60] in orders
 
 
-def test_buy_product_uses_post_buy_quote_and_market_price_parameters():
+def test_buy_product_honors_observed_price_over_market_price_parameters():
     state = {
         "day": 4, "hour": 2, "cash": 150,
         "private": {"shed": {}, "seeds": {}},
@@ -968,7 +968,7 @@ def test_buy_product_uses_post_buy_quote_and_market_price_parameters():
 
     orders = policy_module.build_market_orders(state, [["BUY_PRODUCT", "WHEAT", 2]])
 
-    assert orders == [["BUY_PRODUCT", "WHEAT", 1]]
+    assert orders == [["BUY_PRODUCT", "WHEAT", 2]]
 
 
 def test_multiple_product_orders_charge_total_unit_cost_only_once():

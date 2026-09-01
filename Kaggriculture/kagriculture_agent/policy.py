@@ -258,6 +258,9 @@ def _quote(item: str, state: Any, *, seed: bool = False) -> float:
 
 
 def _buy_product_quote(item: str, state: Any, unit_offset: int = 0) -> float:
+    prices = _prices(state)
+    if item in prices:
+        return max(1.0, _number(prices[item], 1.0))
     inventory = _number(_market_inventory(state).get(item, 10_000), 10_000)
     try:
         return float(market_price(item, inventory - 1 - unit_offset, _market_params(state)))
@@ -270,10 +273,8 @@ def _animals(state: Any) -> dict[str, int]:
 
 
 def _existing_animal_units(state: Any) -> int:
-    """Count placed and shed animals for strategy-cap enforcement."""
-    placed = sum(_animals(state).values())
-    stored = sum(_whole(_shed(state).get(species, 0)) for species in ANIMALS)
-    return placed + stored
+    """Count each owned animal once for strategy-cap enforcement."""
+    return sum(_animals(state).values())
 
 
 def _is_adjacent_to_shed(state: Any, position: Any) -> bool:

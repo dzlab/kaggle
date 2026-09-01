@@ -172,6 +172,29 @@ def test_named_strategy_keeps_state_animal_maintenance_when_not_embedded_in_tile
     }
 
 
+def test_daily_plan_deduplicates_tile_and_listed_animal_maintenance():
+    animal = {
+        "id": "goose-1", "species": "GOOSE", "needs_feed": True,
+        "fed_today": False, "needs_care": True, "cared_today": False,
+    }
+    state = _state(
+        day=4,
+        tiles={pos(1, 1): {"kind": "COOP", "animal": animal}},
+        animals=[{**animal, "position": pos(1, 1)}],
+    )
+
+    maintenance = [
+        (task.kind, task.target, task.item)
+        for task in build_daily_plan(state, EpisodeMemory())
+        if task.kind in {"FEED", "CARE"}
+    ]
+
+    assert maintenance == [
+        ("FEED", pos(1, 1), "GOOSE"),
+        ("CARE", pos(1, 1), "GOOSE"),
+    ]
+
+
 def test_daily_plan_schedules_positive_harvest_before_decay():
     state = _state(
         day=2,

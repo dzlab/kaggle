@@ -415,6 +415,21 @@ def _add(plan: list[Task], kind: str, target: Any, priority: int, deadline: int 
     plan.append(Task(kind, target, priority, deadline, numeric_value, item=item))
 
 
+def _deduplicate_maintenance(plan: list[Task]) -> list[Task]:
+    """Remove duplicate maintenance emitted for merged tile/list views."""
+    seen: set[tuple[str, Position | Any, str | None]] = set()
+    result: list[Task] = []
+    for task in plan:
+        if task.kind in {"FEED", "CARE", "COLLECT_FERTILIZER"}:
+            target = _target_position(task.target) or task.target
+            key = (task.kind, target, task.item)
+            if key in seen:
+                continue
+            seen.add(key)
+        result.append(task)
+    return result
+
+
 def _inventory(state: Any) -> Mapping[str, Any]:
     value = _get(state, "inventory", _get(_get(state, "farm", {}), "hands", {}))
     return value if isinstance(value, Mapping) else {}
@@ -953,7 +968,7 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None,
             if value > 0:
                 plan.append(Task("SELL", shed_target, 75, day, value, sell_all=True))
 
-    return plan
+    return _deduplicate_maintenance(plan)
 
 
 def _worker_info(worker: Any, fallback_index: int) -> tuple[int, str, Position | None]:
