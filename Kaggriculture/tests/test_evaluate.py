@@ -122,6 +122,22 @@ def test_cli_parses_candidates_as_compatibility_alias_for_variants():
     assert args.variants == ["mixed", "animal-heavy"]
 
 
+def test_cli_rejects_conflicting_variant_and_candidate_aliases():
+    from scripts.evaluate import parse_args
+
+    with pytest.raises(SystemExit):
+        parse_args(["--variants", "mixed", "--candidates", "animal-heavy"])
+
+
+def test_cli_preserves_single_variant_behavior():
+    from scripts.evaluate import parse_args
+
+    args = parse_args(["--variant", "animal-heavy"])
+
+    assert args.candidates == ["animal-heavy"]
+    assert args.variants == ["animal-heavy"]
+
+
 @pytest.mark.parametrize("path", [
     ("steps", 0, 0, "observation", "player", True),
     ("rewards", 0, None, None, None, True),
@@ -238,6 +254,24 @@ def test_paired_seed_summary_has_confidence_metrics_and_both_seats():
     json.dumps(summary, allow_nan=False)
 
 
+def test_paired_seed_summary_reports_duplicate_pairs_separately():
+    from scripts.evaluate import paired_seed_summary, promotion_decision
+
+    records = [
+        _metric_record(seat=0, seed=1, outcome="win", differential=10),
+        _metric_record(seat=0, seed=1, outcome="win", differential=11),
+        _metric_record(seat=1, seed=1, outcome="win", differential=10),
+    ]
+
+    summary = paired_seed_summary(records)
+
+    assert summary["missing_seat_pairs"] == 0
+    assert summary["duplicate_seat_pairs"] == 1
+    assert promotion_decision(records, [], min_valid_games=1)["reasons"] == [
+        "duplicate_seat_pairs"
+    ]
+
+
 def test_promotion_decision_applies_discard_gates_in_order():
     from scripts.evaluate import promotion_decision
 
@@ -280,6 +314,30 @@ def test_promotion_decision_compares_baseline_only_after_gates():
 
     assert decision["status"] == "promote"
     assert decision["reasons"] == []
+
+
+def test_promotion_decision_uses_baseline_median_and_requires_it():
+    from scripts.evaluate import promotion_decision
+
+    candidate = [
+        _metric_record(seat=seat, seed=seed, outcome="win", differential=differential)
+        for seed, differential in enumerate((0, 0, 100), start=1)
+        for seat in (0, 1)
+    ]
+    baseline = [
+        _metric_record(seat=seat, seed=seed, outcome="loss", differential=10, candidate="current")
+        for seed in (1, 2, 3)
+        for seat in (0, 1)
+    ]
+
+    decision = promotion_decision(candidate, baseline, min_valid_games=1)
+
+    assert decision["candidate"]["mean_paired_bank_differential"] > decision["baseline"]["mean_paired_bank_differential"]
+    assert decision["candidate"]["median_paired_bank_differential"] < decision["baseline"]["median_paired_bank_differential"]
+    assert decision["reasons"] == ["no_paired_improvement"]
+    assert promotion_decision(candidate, [], min_valid_games=1)["reasons"] == [
+        "no_paired_improvement"
+    ]
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -773,6 +831,39 @@ def test_run_evaluation_forwards_seats_to_every_matrix(monkeypatch):
     assert [call["seats"] for call in calls] == [[0, 1], [0, 1]]
 
 
+def test_run_matrix_defaults_to_both_seats_without_running_real_games(monkeypatch):
+    from scripts.evaluate import run_matrix
+
+    calls = []
+    monkeypatch.setattr("scripts.evaluate.run_game", lambda **kwargs: calls.append(kwargs) or kwargs)
+
+    run_matrix(variants=["mixed"], opponents=["pass"], seeds=[1], steps=2)
+
+    assert [call["seat"] for call in calls] == [0, 1]
+
+
+def test_run_evaluation_defaults_to_both_seats_without_running_real_games(monkeypatch):
+    from scripts.evaluate import run_evaluation
+
+    calls = []
+
+    def fake_run_matrix(**kwargs):
+        calls.append(kwargs)
+        return {"records": []}
+
+    monkeypatch.setattr("scripts.evaluate.run_matrix", fake_run_matrix)
+
+    run_evaluation(variants=["mixed"], opponents=["pass"], seeds=[1], steps=2)
+
+    assert calls == [{
+        "variants": ["mixed"], "opponents": ["pass"], "seeds": [1], "steps": 2,
+        "ablations": {
+            "route_scheduling": True, "market_batch_sizing": True,
+            "shop_adaptation": True, "land_purchase": True, "animals": True,
+        }, "seats": [0, 1],
+    }]
+
+
 def test_run_matrix_forwards_candidate_seats_and_keeps_seed_pairs_ordered(monkeypatch):
     from scripts.evaluate import run_matrix
 
@@ -1027,8 +1118,8 @@ def test_run_matrix_executes_variant_opponent_cartesian_product_with_same_seeds(
 
     calls = []
 
-    def fake_run_game(*, variant, opponent, seed, steps):
-        calls.append((variant, opponent, seed, steps))
+    def fake_run_game(*, variant, opponent, seed, steps, seat):
+        calls.append((variant, opponent, seed, steps, seat))
         return {
             "variant": variant,
             "opponent": opponent,
@@ -1050,12 +1141,13 @@ def test_run_matrix_executes_variant_opponent_cartesian_product_with_same_seeds(
         steps=16,
     )
 
-    assert len(result["records"]) == 8
+    assert len(result["records"]) == 16
     assert calls == [
-        (variant, opponent, seed, 16)
+        (variant, opponent, seed, 16, seat)
         for variant in ["mixed", "melon-heavy"]
         for opponent in ["pass", "starter"]
         for seed in [4, 9]
+        for seat in [0, 1]
     ]
 
 
@@ -1829,6 +1921,22 @@ def test_transition_effects_rejects_boundary_inventory_or_farmer_reset_tampering
     assert not _transition_effects_valid(
         pre, post, {"farmer": ["FEED"], "hands": [], "market": []}, {}, market_result,
     )
+
+
+@pytest.mark.parametrize("worker_field", ["farmer", "hands"])
+def test_transition_effects_rejects_boolean_worker_coordinates(worker_field):
+    from scripts.evaluate import _transition_effects_valid
+
+    pre, post, market_result = _boundary_feed_replay_states()
+    if worker_field == "farmer":
+        pre["farms"][0][worker_field] = [True, 0]
+        action = {"farmer": ["FEED"], "hands": [], "market": []}
+    else:
+        pre["farms"][0][worker_field] = [[True, 0]]
+        pre["private"]["inventories"].append({})
+        action = {"farmer": ["FEED"], "hands": [["PASS"]], "market": []}
+
+    assert not _transition_effects_valid(pre, post, action, {}, market_result)
 
 
 def test_transition_effects_accepts_midday_hire_spawn_and_new_inventory():

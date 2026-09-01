@@ -114,9 +114,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ablation", action="append", type=parse_ablation, default=[], metavar="COMPONENT=on|off")
     parser.add_argument("--quick", action="store_true", help="use a small default batch suitable for local tests")
     args = parser.parse_args(argv)
-    args.candidates = _variant_list(
-        (args.candidates or []) + (args.variants or []) + (args.single_variants or [])
-    )
+    if args.variants is not None and args.candidates is not None and args.variants != args.candidates:
+        parser.error("--variants and --candidates must match when both are supplied")
+    selected_alias = args.candidates if args.candidates is not None else args.variants
+    args.candidates = _variant_list((selected_alias or []) + (args.single_variants or []))
     args.variants = list(args.candidates)
     if args.quick:
         if args.seeds == 30:
@@ -266,8 +267,10 @@ def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         if len(seats[0]) == 1 and len(seats[1]) == 1 and all(_metric_record_is_valid(item) for item in (seats[0][0], seats[1][0])):
             pairs.append((key, seats[0][0], seats[1][0]))
         else:
-            missing += 1
-            duplicate += int(len(seats[0]) > 1 or len(seats[1]) > 1)
+            if len(seats[0]) == 0 or len(seats[1]) == 0 or (len(seats[0]) == 1 and len(seats[1]) == 1):
+                missing += 1
+            if len(seats[0]) > 1 or len(seats[1]) > 1:
+                duplicate += 1
 
     pair_scores = []
     pair_differentials = []
@@ -325,15 +328,17 @@ def promotion_decision(
         reasons.append("missed_basic_needs")
     elif any(candidate["valid_records_by_seat"][str(seat)] < min_valid_games for seat in (0, 1)):
         reasons.append("insufficient_valid_games")
-    elif candidate["missing_seat_pairs"] or candidate["duplicate_seat_pairs"]:
+    elif candidate["missing_seat_pairs"]:
         reasons.append("missing_seat_pairs")
+    elif candidate["duplicate_seat_pairs"]:
+        reasons.append("duplicate_seat_pairs")
     elif candidate["fifth_percentile_bank_differential"] is None or candidate["fifth_percentile_bank_differential"] < 0:
         reasons.append("negative_tail")
     elif (
         baseline["seat_balanced_win_rate"] is None
-        or baseline["mean_paired_bank_differential"] is None
+        or baseline["median_paired_bank_differential"] is None
         or candidate["seat_balanced_win_rate"] <= baseline["seat_balanced_win_rate"]
-        or candidate["mean_paired_bank_differential"] <= baseline["mean_paired_bank_differential"]
+        or candidate["median_paired_bank_differential"] <= baseline["median_paired_bank_differential"]
     ):
         reasons.append("no_paired_improvement")
     return {
@@ -1431,6 +1436,8 @@ def _worker_position(observation: Mapping[str, Any], worker_index: int) -> tuple
         return None
     position = positions[worker_index]
     if not isinstance(position, Sequence) or isinstance(position, (str, bytes)) or len(position) != 2:
+        return None
+    if any(type(coordinate) is not int for coordinate in position):
         return None
     try:
         return int(position[0]), int(position[1])
@@ -2862,7 +2869,7 @@ def run_matrix(*, variants: Sequence[str] | None = None,
     seed_values = list(seeds)
     for seed in seed_values:
         _validate_game_parameters(seed, steps)
-    seat_values = [0] if seats is None else list(seats)
+    seat_values = [0, 1] if seats is None else list(seats)
     invalid_seats = [seat for seat in seat_values if type(seat) is not int or seat not in (0, 1)]
     if invalid_seats:
         raise ValueError(f"unsupported seat(s): {', '.join(map(str, invalid_seats))}")
@@ -2875,8 +2882,7 @@ def run_matrix(*, variants: Sequence[str] | None = None,
                         "candidate" if candidates is not None else "variant": variant,
                         "opponent": opponent, "seed": seed, "steps": steps,
                     }
-                    if seats is not None:
-                        kwargs["seat"] = seat
+                    kwargs["seat"] = seat
                     if ablations is not None:
                         kwargs["ablations"] = ablations
                     record = run_game(**kwargs)
@@ -2904,9 +2910,10 @@ def run_evaluation(*, variants: Sequence[str] | None = None,
     baseline_config = dict(_DEFAULT_ABLATIONS)
     selected = _resolve_candidates(variants, candidates)
     candidate_kwargs = {"candidates": selected} if candidates is not None else {"variants": selected}
+    resolved_seats = [0, 1] if seats is None else list(seats)
     baseline = run_matrix(
         **candidate_kwargs, opponents=opponents, seeds=seeds, steps=steps,
-        ablations=baseline_config, seats=seats,
+        ablations=baseline_config, seats=resolved_seats,
     )["records"]
     ablation_records: dict[str, list[dict[str, Any]]] = {}
     ablation_configs: dict[str, dict[str, bool]] = {}
@@ -2916,7 +2923,7 @@ def run_evaluation(*, variants: Sequence[str] | None = None,
         ablation_configs[component] = config
         ablation_records[component] = run_matrix(
             **candidate_kwargs, opponents=opponents, seeds=seeds, steps=steps,
-            ablations=config, seats=seats,
+            ablations=config, seats=resolved_seats,
         )["records"]
     return {"records": baseline, "ablation_records": ablation_records, "ablation_configs": ablation_configs}
 
