@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import subprocess
 import sys
 from collections.abc import Mapping, Sequence
+from numbers import Real
 from pathlib import Path
 from statistics import mean, median
 from typing import Any
@@ -51,6 +54,17 @@ _BUYABLE_PRODUCTS = frozenset({"WHEAT", "FERTILIZER"})
 _PRODUCT_NAMES = frozenset(PRODUCTS)
 _ANIMAL_NAMES = frozenset(ANIMALS)
 _ITEM_NAMES = _PRODUCT_NAMES | _ANIMAL_NAMES
+_WORKER_TIMEOUT_SECONDS = 120
+_NORMALIZED_RECORD_FIELDS = frozenset({
+    "variant", "opponent", "seed", "seat", "outcome", "final_bank",
+    "opponent_final_bank", "bank_differential", "framework_error",
+    "shed_overflow", "price_floor_sales", "missed_basic_needs",
+})
+_NORMALIZED_NUMERIC_FIELDS = frozenset({
+    "final_bank", "opponent_final_bank", "bank_differential", "shed_overflow",
+    "price_floor_sales", "missed_basic_needs",
+})
+_WORKER_OUTCOMES = frozenset({"win", "loss", "tie", "framework_error"})
 
 
 def _positive_int(value: str) -> int:
@@ -90,12 +104,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--opponents", nargs="+", choices=OPPONENTS, default=["pass", "random", "starter"])
     parser.add_argument("--steps", type=_positive_int, default=720)
     parser.add_argument("--output", type=Path, default=Path("reports/evaluation.json"))
+    parser.add_argument("--seats", nargs="+", type=int, choices=(0, 1), default=[0],
+                        help="candidate seats to evaluate (0 and 1 are supported)")
     parser.add_argument("--variant", action="append", dest="single_variants", choices=VARIANTS)
     parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=None)
+    parser.add_argument("--candidates", nargs="+", choices=VARIANTS, default=None)
     parser.add_argument("--ablation", action="append", type=parse_ablation, default=[], metavar="COMPONENT=on|off")
     parser.add_argument("--quick", action="store_true", help="use a small default batch suitable for local tests")
     args = parser.parse_args(argv)
-    args.variants = _variant_list((args.variants or []) + (args.single_variants or []))
+    args.candidates = _variant_list(
+        (args.candidates or []) + (args.variants or []) + (args.single_variants or [])
+    )
+    args.variants = list(args.candidates)
     if args.quick:
         if args.seeds == 30:
             args.seeds = 2
@@ -275,8 +295,10 @@ def _valid_action_schema(action: Any, observation: Mapping[str, Any], configurat
 
 def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, Any]],
                   other_states: Sequence[Mapping[str, Any]], configuration: Mapping[str, Any] | None = None,
-                  *, expected_seed: int | None = None) -> bool:
+                  *, expected_seed: int | None = None, candidate_player: int = 0) -> bool:
     if not isinstance(replay, Mapping):
+        return False
+    if expected_seed is not None and type(expected_seed) is not int:
         return False
     if not _valid_engine_provenance(replay):
         return False
@@ -312,9 +334,12 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
             return False
     if len(own_states) != len(steps) or len(other_states) != len(steps):
         return False
+    if type(candidate_player) is not int or candidate_player not in (0, 1):
+        return False
+    states_by_role = (own_states, other_states)
     previous_observations = {
-        0: _mapping(own_states[0].get("observation")),
-        1: _mapping(other_states[0].get("observation")),
+        candidate_player: _mapping(states_by_role[0][0].get("observation")),
+        1 - candidate_player: _mapping(states_by_role[1][0].get("observation")),
     }
     for index, turn in enumerate(steps):
         if not isinstance(turn, Sequence) or isinstance(turn, (str, bytes)) or len(turn) != 2:
@@ -340,7 +365,7 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
                 return False
             if not _valid_action_schema(
                 state["action"], previous_observations[player], configuration,
-                state_aware=player == 0, validate_market=False,
+                state_aware=player == candidate_player, validate_market=False,
             ):
                 return False
         if players != {0, 1}:
@@ -374,7 +399,7 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
                 if not _transition_effects_valid(
                     observations[player], current_observations[player], actions[player], configuration,
                     market_result=market_result, player_index=player, allow_compact=legacy_compact,
-                    market_observation=observations[0], allow_invalid_unit_noop=player == 1,
+                    market_observation=observations[0], allow_invalid_unit_noop=player != candidate_player,
                 ):
                     return False
         expected_status = "DONE" if index == len(steps) - 1 else "ACTIVE"
@@ -390,7 +415,8 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
     if any(bank is None for bank in final_banks):
         return False
     if not legacy_compact:
-        if rewards is None or any(final_banks[player] != _number(rewards[player]) for player in (0, 1)):
+        reward_by_role = (rewards[candidate_player], rewards[1 - candidate_player]) if rewards is not None else ()
+        if rewards is None or any(final_banks[player] != _number(reward_by_role[player]) for player in (0, 1)):
             return False
         if _requires_full_liquidation(configuration, len(steps)):
             final_inventories = [
@@ -696,11 +722,15 @@ def _price_floor_sales(state: Mapping[str, Any], observation: Mapping[str, Any] 
     return int(result["floor_sales"][0]) if result is not None else 0
 
 
-def _framework_error_record(*, variant: str, opponent: str, seed: int) -> dict[str, Any]:
-    return {
+def _framework_error_record(*, variant: str, opponent: str, seed: int, seat: int = 0,
+                            error: str | None = None) -> dict[str, Any]:
+    normalized_seat = seat if type(seat) is int and seat in (0, 1) else 0
+    record = {
+        "candidate": variant,
         "variant": variant,
         "opponent": opponent,
         "seed": seed,
+        "seat": normalized_seat,
         "outcome": "framework_error",
         "final_bank": None,
         "opponent_final_bank": None,
@@ -710,17 +740,32 @@ def _framework_error_record(*, variant: str, opponent: str, seed: int) -> dict[s
         "price_floor_sales": 0,
         "missed_basic_needs": 0,
     }
+    if error:
+        record["error"] = str(error)[:1000]
+    return record
 
 
-def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, seed: int) -> dict[str, Any]:
+def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, seed: int,
+                   seat: int = 0) -> dict[str, Any]:
     """Extract one game record from the engine replay JSON."""
+    if type(seed) is not int:
+        return _framework_error_record(
+            variant=variant, opponent=opponent, seed=0, seat=seat,
+            error="seed must be an integer",
+        )
+    if type(seat) is not int or seat not in (0, 1):
+        return _framework_error_record(
+            variant=variant, opponent=opponent, seed=seed, seat=seat,
+            error="seat must be 0 or 1",
+        )
     if not isinstance(replay, Mapping):
-        return _framework_error_record(variant=variant, opponent=opponent, seed=seed)
-    own_states = _player_states(replay, 0)
-    other_states = _player_states(replay, 1)
+        return _framework_error_record(variant=variant, opponent=opponent, seed=seed, seat=seat)
+    own_states = _player_states(replay, seat)
+    other_states = _player_states(replay, 1 - seat)
     replay_configuration = _mapping(replay.get("configuration"))
     framework_error = not _valid_replay(
         replay, own_states, other_states, replay_configuration, expected_seed=seed,
+        candidate_player=seat,
     )
     own_bank = _final_bank(own_states[-1] if own_states else None)
     other_bank = _final_bank(other_states[-1] if other_states else None)
@@ -767,9 +812,11 @@ def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, se
         if not is_bootstrap:
             missed_needs += _missed_needs_at_boundary(pre, is_boundary, post, state, replay_configuration)
     return {
+        "candidate": variant,
         "variant": variant,
         "opponent": opponent,
         "seed": seed,
+        "seat": seat,
         "outcome": outcome,
         "final_bank": own_bank,
         "opponent_final_bank": other_bank,
@@ -781,12 +828,22 @@ def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, se
     }
 
 
-def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, seed: int) -> dict[str, Any]:
+def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, seed: int,
+                  seat: int = 0, candidate_player: int | None = None) -> dict[str, Any]:
     """Extract one replay record, classifying malformed replay data safely."""
-    try:
-        return _replay_record(replay, variant=variant, opponent=opponent, seed=seed)
-    except TypeError:
-        return _framework_error_record(variant=variant, opponent=opponent, seed=seed)
+    if type(seat) is not int or seat not in (0, 1):
+        return _framework_error_record(
+            variant=variant, opponent=opponent, seed=seed, seat=0,
+            error="seat must be 0 or 1",
+        )
+    if candidate_player is not None:
+        if type(candidate_player) is not int or candidate_player not in (0, 1):
+            return _framework_error_record(
+                variant=variant, opponent=opponent, seed=seed, seat=seat,
+                error="candidate_player must be 0 or 1",
+            )
+        seat = candidate_player
+    return _replay_record(replay, variant=variant, opponent=opponent, seed=seed, seat=seat)
 
 
 def _farm_observation(observation: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -2478,41 +2535,186 @@ class VariantPolicy:
         return apply_variant(self.policy.act(obs), obs, self.variant, self.ablations, configuration)
 
 
-def run_game(*, variant: str, opponent: str, seed: int, steps: int, ablations: Mapping[str, bool] | None = None) -> dict[str, Any]:
-    """Run one seeded game and return its normalized replay record."""
+def _worker_failure(*, variant: str, opponent: str, seed: int, seat: int, error: str) -> dict[str, Any]:
+    return _framework_error_record(
+        variant=variant, opponent=opponent, seed=seed, seat=seat, error=error,
+    )
+
+
+def _validate_game_parameters(seed: Any, steps: Any) -> None:
+    if type(seed) is not int:
+        raise ValueError("seed must be an integer")
+    if type(steps) is not int or steps < 1:
+        raise ValueError("steps must be a positive integer")
+
+
+def _finite_number_or_none(value: Any) -> bool:
+    if value is None or isinstance(value, bool) or not isinstance(value, Real):
+        return value is None
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
+
+
+def _worker_record_error(record: Mapping[str, Any], *, variant: str, opponent: str,
+                         seed: int, seat: int) -> str | None:
+    missing = _NORMALIZED_RECORD_FIELDS - record.keys()
+    if missing:
+        return f"missing normalized record fields: {', '.join(sorted(missing))}"
+    if "candidate" in record and (type(record["candidate"]) is not str or record["candidate"] != variant):
+        return "worker candidate does not match request"
+    if record["variant"] != variant:
+        return "worker variant does not match request"
+    if record["opponent"] != opponent:
+        return "worker opponent does not match request"
+    if type(record["seed"]) is not int or record["seed"] != seed:
+        return "worker seed must be the requested integer seed"
+    if type(record["seat"]) is not int or record["seat"] not in (0, 1) or record["seat"] != seat:
+        return "worker seat must be the requested integer seat"
+    if not isinstance(record["outcome"], str) or record["outcome"] not in _WORKER_OUTCOMES:
+        return "worker outcome is unsupported"
+    if type(record["framework_error"]) is not bool:
+        return "worker framework_error must be boolean"
+    is_framework_error = record["outcome"] == "framework_error"
+    if record["framework_error"] != is_framework_error:
+        return "worker framework_error disagrees with outcome"
+    financial_fields = {"final_bank", "opponent_final_bank", "bank_differential"}
+    malformed_numbers = []
+    for field in _NORMALIZED_NUMERIC_FIELDS:
+        value = record[field]
+        if is_framework_error and field in financial_fields and value is None:
+            continue
+        if not _finite_number_or_none(value) or value is None:
+            malformed_numbers.append(field)
+    if malformed_numbers:
+        return f"worker numeric fields are malformed: {', '.join(sorted(malformed_numbers))}"
+    return None
+
+
+def _resolve_variant(variant: str | None, candidate: str | None) -> str:
+    if variant is not None and candidate is not None and variant != candidate:
+        raise ValueError("variant and candidate must match when both are supplied")
+    selected = candidate if candidate is not None else variant
+    if selected not in VARIANTS:
+        raise ValueError(f"unsupported variant: {selected}")
+    return selected
+
+
+def _resolve_candidates(variants: Sequence[str] | None,
+                        candidates: Sequence[str] | None) -> list[str]:
+    if variants is not None and candidates is not None and list(variants) != list(candidates):
+        raise ValueError("variants and candidates must match when both are supplied")
+    return _variant_list(candidates if candidates is not None else variants)
+
+
+def run_game(*, variant: str | None = None, candidate: str | None = None,
+             opponent: str, seed: int, steps: int, seat: int = 0,
+             ablations: Mapping[str, bool] | None = None) -> dict[str, Any]:
+    """Run one seeded game in a fresh worker and return its normalized record."""
+    variant = _resolve_variant(variant, candidate)
     if opponent not in OPPONENTS:
         raise ValueError(f"unsupported opponent: {opponent}")
+    _validate_game_parameters(seed, steps)
+    if type(seat) is not int or seat not in (0, 1):
+        raise ValueError("seat must be 0 or 1")
+    payload = {
+        "variant": variant,
+        "opponent": opponent,
+        "seed": seed,
+        "steps": steps,
+        "seat": seat,
+    }
+    if ablations is not None:
+        payload["ablations"] = dict(ablations)
     try:
-        from kaggle_environments import make
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("kaggle-environments is required for evaluation") from exc
-    env = make("kaggriculture", configuration={"episodeSteps": steps, "seed": seed}, debug=False)
-    opponent_agent = _deterministic_random_agent(seed) if opponent == "random" else opponent
-    env.run([VariantPolicy(variant, ablations, env.configuration), opponent_agent])
-    return replay_record(env.toJSON(), variant=variant, opponent=opponent, seed=seed)
+        completed = subprocess.run(
+            [sys.executable, "scripts/evaluation_worker.py"],
+            input=json.dumps(payload, sort_keys=True) + "\n",
+            text=True,
+            capture_output=True,
+            timeout=_WORKER_TIMEOUT_SECONDS,
+            cwd=PROJECT_ROOT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return _worker_failure(
+            variant=variant, opponent=opponent, seed=seed, seat=seat,
+            error=f"worker timeout after {_WORKER_TIMEOUT_SECONDS} seconds",
+        )
+    except Exception as exc:
+        return _worker_failure(
+            variant=variant, opponent=opponent, seed=seed, seat=seat,
+            error=f"worker launch failed: {exc}",
+        )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "worker exited without diagnostics").strip()
+        return _worker_failure(
+            variant=variant, opponent=opponent, seed=seed, seat=seat,
+            error=f"worker exited with status {completed.returncode}: {detail}",
+        )
+    try:
+        from scripts.evaluation_worker import decode_worker_result
+
+        record = decode_worker_result(completed.stdout)
+    except (ValueError, TypeError) as exc:
+        return _worker_failure(
+            variant=variant, opponent=opponent, seed=seed, seat=seat,
+            error=f"invalid worker result: {exc}",
+        )
+    record_error = _worker_record_error(record, variant=variant, opponent=opponent, seed=seed, seat=seat)
+    if record_error:
+        return _worker_failure(
+            variant=variant, opponent=opponent, seed=seed, seat=seat,
+            error=f"invalid worker result: {record_error}",
+        )
+    return record
 
 
-def run_matrix(*, variants: Sequence[str], opponents: Sequence[str], seeds: Sequence[int], steps: int,
-               ablations: Mapping[str, bool] | None = None) -> dict[str, Any]:
+def run_matrix(*, variants: Sequence[str] | None = None,
+               candidates: Sequence[str] | None = None,
+               opponents: Sequence[str], seeds: Sequence[int], steps: int,
+               ablations: Mapping[str, bool] | None = None,
+               seats: Sequence[int] | None = None) -> dict[str, Any]:
     """Run the Cartesian product in stable input order with identical seeds."""
-    variants = _variant_list(variants)
+    selected = _resolve_candidates(variants, candidates)
     opponents = list(opponents)
     invalid = [opponent for opponent in opponents if opponent not in OPPONENTS]
     if invalid:
         raise ValueError(f"unsupported opponent(s): {', '.join(invalid)}")
+    _validate_game_parameters(0, steps)
+    seed_values = list(seeds)
+    for seed in seed_values:
+        _validate_game_parameters(seed, steps)
+    seat_values = [0] if seats is None else list(seats)
+    invalid_seats = [seat for seat in seat_values if type(seat) is not int or seat not in (0, 1)]
+    if invalid_seats:
+        raise ValueError(f"unsupported seat(s): {', '.join(map(str, invalid_seats))}")
     records = []
-    for variant in variants:
+    for variant in selected:
         for opponent in opponents:
-            for seed in seeds:
-                kwargs = {"variant": variant, "opponent": opponent, "seed": int(seed), "steps": steps}
-                if ablations is not None:
-                    kwargs["ablations"] = ablations
-                records.append(run_game(**kwargs))
+            for seed in seed_values:
+                for seat in seat_values:
+                    kwargs = {
+                        "candidate" if candidates is not None else "variant": variant,
+                        "opponent": opponent, "seed": seed, "steps": steps,
+                    }
+                    if seats is not None:
+                        kwargs["seat"] = seat
+                    if ablations is not None:
+                        kwargs["ablations"] = ablations
+                    record = run_game(**kwargs)
+                    if candidates is not None and isinstance(record, Mapping):
+                        record = {**dict(record), "candidate": variant}
+                    records.append(record)
     return {"records": records}
 
 
-def run_evaluation(*, variants: Sequence[str], opponents: Sequence[str], seeds: Sequence[int], steps: int,
-                   ablations: Sequence[tuple[str, bool]] = ()) -> dict[str, Any]:
+def run_evaluation(*, variants: Sequence[str] | None = None,
+                   candidates: Sequence[str] | None = None,
+                   opponents: Sequence[str], seeds: Sequence[int], steps: int,
+                   ablations: Sequence[tuple[str, bool]] = (),
+                   seats: Sequence[int] | None = None) -> dict[str, Any]:
     """Run a baseline and isolated one-component ablations.
 
     Every ablation starts from the same all-enabled baseline. Repeating a
@@ -2524,7 +2726,11 @@ def run_evaluation(*, variants: Sequence[str], opponents: Sequence[str], seeds: 
     if len(components) != len(set(components)):
         raise ValueError("each ablation component may be requested only once")
     baseline_config = dict(_DEFAULT_ABLATIONS)
-    baseline = run_matrix(variants=variants, opponents=opponents, seeds=seeds, steps=steps, ablations=baseline_config)["records"]
+    candidate_kwargs = {"candidates": candidates} if candidates is not None else {"variants": variants}
+    baseline = run_matrix(
+        **candidate_kwargs, opponents=opponents, seeds=seeds, steps=steps,
+        ablations=baseline_config, seats=seats,
+    )["records"]
     ablation_records: dict[str, list[dict[str, Any]]] = {}
     ablation_configs: dict[str, dict[str, bool]] = {}
     for component, enabled in requested:
@@ -2532,7 +2738,8 @@ def run_evaluation(*, variants: Sequence[str], opponents: Sequence[str], seeds: 
         config[component] = enabled
         ablation_configs[component] = config
         ablation_records[component] = run_matrix(
-            variants=variants, opponents=opponents, seeds=seeds, steps=steps, ablations=config
+            **candidate_kwargs, opponents=opponents, seeds=seeds, steps=steps,
+            ablations=config, seats=seats,
         )["records"]
     return {"records": baseline, "ablation_records": ablation_records, "ablation_configs": ablation_configs}
 
@@ -2541,7 +2748,9 @@ def _group_results(records: Sequence[Mapping[str, Any]], variants: Sequence[str]
     return {
         variant: {
             opponent: aggregate_records([
-                record for record in records if record.get("variant") == variant and record.get("opponent") == opponent
+                record for record in records
+                if record.get("candidate", record.get("variant")) == variant
+                and record.get("opponent") == opponent
             ])
             for opponent in opponents
         }
@@ -2552,7 +2761,10 @@ def _group_results(records: Sequence[Mapping[str, Any]], variants: Sequence[str]
 def _select_default(records: Sequence[Mapping[str, Any]], variants: Sequence[str]) -> str:
     scored = []
     for variant in variants:
-        summary = aggregate_records([record for record in records if record.get("variant") == variant])
+        summary = aggregate_records([
+            record for record in records
+            if record.get("candidate", record.get("variant")) == variant
+        ])
         scored.append((variant, summary))
     if not scored:
         return "mixed"
@@ -2595,7 +2807,7 @@ def _normalized_command(command: Sequence[str] | None) -> list[str]:
 def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mapping[str, Any]], command: Sequence[str] | None = None,
                           ablation_records: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
                           ablation_configs: Mapping[str, Mapping[str, bool]] | None = None) -> dict[str, Any]:
-    variants = list(config.get("variants", ()))
+    variants = list(config.get("candidates", config.get("variants", ())))
     opponents = list(config.get("opponents", ()))
     results = _group_results(records, variants, opponents)
     ablations = {}
@@ -2648,6 +2860,7 @@ def write_result_document(path: str | Path, document: Mapping[str, Any], *, reco
     sidecar_records.sort(key=lambda record: (
         str(record.get("ablation", "")), str(record.get("variant", "")),
         str(record.get("opponent", "")), int(record.get("seed", 0)),
+        int(record.get("seat", 0)),
     ))
     sidecar.write_text(json.dumps({"schema_version": 1, "records": sidecar_records}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     return sidecar
@@ -2664,12 +2877,17 @@ def main(argv: list[str] | None = None) -> int:
         "seed_values": seeds,
         "steps": args.steps,
         "opponents": list(args.opponents),
+        "candidates": list(args.candidates),
         "variants": list(args.variants),
+        "seats": list(args.seats),
         "ablations": [f"{component}={'on' if enabled else 'off'}" for component, enabled in args.ablation],
         "replay_summary": sidecar.name,
         "quick": args.quick,
     }
-    evaluation = run_evaluation(variants=args.variants, opponents=args.opponents, seeds=seeds, steps=args.steps, ablations=args.ablation)
+    evaluation = run_evaluation(
+        candidates=args.candidates, opponents=args.opponents, seeds=seeds, steps=args.steps,
+        ablations=args.ablation, seats=args.seats,
+    )
     document = build_result_document(
         config=config, records=evaluation["records"],
         command=["scripts/evaluate.py", *([*sys.argv[1:]] if argv is None else argv)],

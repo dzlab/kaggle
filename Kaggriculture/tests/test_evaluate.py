@@ -1,4 +1,7 @@
 import json
+import io
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -101,6 +104,661 @@ def test_cli_default_output_is_under_reports():
     from scripts.evaluate import parse_args
 
     assert parse_args([]).output == Path("reports/evaluation.json")
+
+
+def test_cli_parses_requested_seats():
+    from scripts.evaluate import parse_args
+
+    assert parse_args(["--seats", "0", "1"]).seats == [0, 1]
+
+
+def test_cli_parses_candidates_as_compatibility_alias_for_variants():
+    from scripts.evaluate import parse_args
+
+    args = parse_args(["--candidates", "mixed", "animal-heavy"])
+
+    assert args.candidates == ["mixed", "animal-heavy"]
+    assert args.variants == ["mixed", "animal-heavy"]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"seed": True},
+    {"seed": 1.0},
+    {"steps": True},
+    {"steps": 2.0},
+    {"steps": 0},
+])
+def test_run_game_rejects_non_integer_seed_or_steps(kwargs):
+    from scripts.evaluate import run_game
+
+    parameters = {"seed": 1, "steps": 2}
+    parameters.update(kwargs)
+    with pytest.raises(ValueError):
+        run_game(variant="mixed", opponent="pass", **parameters)
+
+
+def test_run_matrix_rejects_invalid_seed_and_steps_before_running(monkeypatch):
+    from scripts.evaluate import run_matrix
+
+    monkeypatch.setattr("scripts.evaluate.run_game", lambda **kwargs: pytest.fail("run_game should not run"))
+
+    with pytest.raises(ValueError):
+        run_matrix(variants=["mixed"], opponents=["pass"], seeds=[1, True], steps=2)
+    with pytest.raises(ValueError):
+        run_matrix(variants=["mixed"], opponents=["pass"], seeds=[1], steps=True)
+
+
+def test_worker_rejects_boolean_seat_in_request_and_failure_record():
+    from scripts.evaluation_worker import _request_failure, run_request
+
+    request = {
+        "variant": "mixed", "opponent": "pass", "seed": 1,
+        "steps": 2, "seat": True,
+    }
+    result = run_request(request)
+    failure = _request_failure(request, "invalid seat")
+
+    assert result["framework_error"] is True
+    assert result["seat"] == 0
+    assert failure["framework_error"] is True
+    assert failure["seat"] == 0
+
+
+def test_worker_rejects_boolean_seat_directly_in_main(monkeypatch, capsys):
+    import scripts.evaluation_worker as worker
+
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(json.dumps({
+            "variant": "mixed", "opponent": "pass", "seed": 1,
+            "steps": 2, "seat": True,
+        }) + "\n"),
+    )
+
+    assert worker.main() == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["framework_error"] is True
+
+
+def test_replay_record_rejects_boolean_seat_and_candidate_player():
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+
+    seat_result = replay_record(replay, variant="mixed", opponent="pass", seed=1, seat=True)
+    candidate_result = replay_record(
+        replay, variant="mixed", opponent="pass", seed=1, candidate_player=True,
+    )
+
+    assert seat_result["framework_error"] is True
+    assert candidate_result["framework_error"] is True
+
+
+def test_replay_record_and_validation_reject_boolean_seed_aliases():
+    from scripts.evaluate import _mapping, _player_states, _valid_replay, replay_record
+
+    replay = _strict_two_turn_replay()
+    own_states = _player_states(replay, 0)
+    other_states = _player_states(replay, 1)
+    configuration = _mapping(replay["configuration"])
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=True)
+
+    assert record["framework_error"] is True
+    assert _valid_replay(
+        replay, own_states, other_states, configuration,
+        expected_seed=True, candidate_player=0,
+    ) is False
+
+
+@pytest.mark.parametrize("seat", [0, 1])
+def test_worker_runs_from_project_root_in_a_fresh_interpreter(seat):
+    project_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "scripts/evaluation_worker.py"],
+        input=json.dumps({
+            "variant": "mixed", "opponent": "pass", "seed": 1,
+            "steps": 8, "seat": seat,
+        }) + "\n",
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    response = json.loads(result.stdout)
+    assert response["variant"] == "mixed"
+    assert response["opponent"] == "pass"
+    assert response["seed"] == 1
+    assert response["seat"] == seat
+    assert response["framework_error"] is False
+    assert response["outcome"] in {"win", "loss", "tie"}
+    assert response["final_bank"] is not None
+    assert response["opponent_final_bank"] is not None
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_run_game_real_worker_seat_one_returns_candidate_metrics(monkeypatch):
+    from scripts.evaluate import run_game
+
+    monkeypatch.setattr("scripts.evaluate._WORKER_TIMEOUT_SECONDS", 30)
+    record = run_game(variant="mixed", opponent="pass", seed=1, steps=8, seat=1)
+
+    assert record["framework_error"] is False
+    assert record["seat"] == 1
+    assert record["outcome"] in {"win", "loss", "tie"}
+    assert record["final_bank"] is not None
+    assert record["opponent_final_bank"] is not None
+    assert record["bank_differential"] is not None
+
+
+def test_worker_orders_candidate_and_opponent_by_seat():
+    from scripts.evaluation_worker import _ordered_agents
+
+    candidate = object()
+    opponent = object()
+
+    assert _ordered_agents(candidate, opponent, 0) == [candidate, opponent]
+    assert _ordered_agents(candidate, opponent, 1) == [opponent, candidate]
+
+
+def test_nonzero_worker_exit_is_normalized_as_framework_failure(monkeypatch):
+    import scripts.evaluate as evaluate
+
+    monkeypatch.setattr(
+        evaluate.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 7, stdout="", stderr="worker exploded",
+        ),
+    )
+
+    record = evaluate.run_game(variant="mixed", opponent="pass", seed=4, steps=2)
+
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+    assert "worker exited with status 7" in record["error"]
+
+
+def test_worker_timeout_is_normalized_as_framework_failure(monkeypatch):
+    import scripts.evaluate as evaluate
+
+    def fail_worker(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(evaluate.subprocess, "run", fail_worker)
+
+    record = evaluate.run_game(variant="mixed", opponent="pass", seed=4, steps=2, seat=1)
+
+    assert record["seat"] == 1
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+    assert "timeout" in record["error"].lower()
+
+
+def _complete_worker_record():
+    return {
+        "variant": "mixed",
+        "opponent": "pass",
+        "seed": 4,
+        "seat": 1,
+        "outcome": "tie",
+        "final_bank": 100.0,
+        "opponent_final_bank": 100.0,
+        "bank_differential": 0.0,
+        "framework_error": False,
+        "shed_overflow": 0.0,
+        "price_floor_sales": 0,
+        "missed_basic_needs": 0,
+    }
+
+
+@pytest.mark.parametrize("field,value", [
+    ("framework_error", True),
+    ("outcome", "framework_error"),
+    ("final_bank", None),
+    ("opponent_final_bank", None),
+    ("bank_differential", None),
+    ("shed_overflow", None),
+    ("price_floor_sales", None),
+    ("missed_basic_needs", None),
+])
+def test_worker_result_rejects_contradictory_or_incomplete_success(monkeypatch, field, value):
+    import scripts.evaluate as evaluate
+
+    response = _complete_worker_record()
+    response[field] = value
+    monkeypatch.setattr(
+        evaluate.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout=json.dumps(response) + "\n", stderr="",
+        ),
+    )
+
+    record = evaluate.run_game(variant="mixed", opponent="pass", seed=4, steps=2, seat=1)
+
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+    assert "invalid worker result" in record["error"]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("variant", "conservative"),
+    ("opponent", "starter"),
+    ("seed", True),
+    ("seat", True),
+    ("seat", 2),
+    ("outcome", "invalid"),
+    ("outcome", []),
+    ("framework_error", 1),
+    ("final_bank", True),
+    ("bank_differential", "not-a-number"),
+    ("shed_overflow", float("nan")),
+    ("price_floor_sales", float("inf")),
+])
+def test_worker_result_must_match_request_and_normalized_types(monkeypatch, field, value):
+    import scripts.evaluate as evaluate
+
+    response = _complete_worker_record()
+    response[field] = value
+    monkeypatch.setattr(
+        evaluate.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout=json.dumps(response) + "\n", stderr="",
+        ),
+    )
+
+    record = evaluate.run_game(variant="mixed", opponent="pass", seed=4, steps=2, seat=1)
+
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+    assert "invalid worker result" in record["error"]
+
+
+def test_worker_evaluator_exception_is_reported_on_stderr_and_exits_nonzero(monkeypatch, capsys):
+    import scripts.evaluation_worker as worker
+
+    def fail_replay(*args, **kwargs):
+        raise ValueError("replay validator exploded")
+
+    monkeypatch.setattr(worker, "replay_record", fail_replay)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(json.dumps({
+            "variant": "mixed", "opponent": "pass", "seed": 1,
+            "steps": 2, "seat": 0,
+        }) + "\n"),
+    )
+
+    assert worker.main() == 1
+    captured = capsys.readouterr()
+    assert "replay validator exploded" in captured.err
+    assert captured.out == ""
+
+
+def test_worker_rejects_a_second_json_request(monkeypatch, capsys):
+    import scripts.evaluation_worker as worker
+
+    request = json.dumps({
+        "variant": "mixed", "opponent": "pass", "seed": 1,
+        "steps": 2, "seat": 0,
+    })
+    monkeypatch.setattr(sys, "stdin", io.StringIO(f"{request}\n{{}}\n"))
+
+    assert worker.main() == 1
+    captured = capsys.readouterr()
+    assert "exactly one JSON request" in captured.err
+    assert captured.out == ""
+
+
+def test_worker_candidate_construction_failure_is_evaluator_failure(monkeypatch, capsys):
+    import scripts.evaluation_worker as worker
+
+    def fail_constructor(*args, **kwargs):
+        raise RuntimeError("constructor exploded")
+
+    monkeypatch.setattr(worker, "VariantPolicy", fail_constructor)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(json.dumps({
+            "variant": "mixed", "opponent": "pass", "seed": 1,
+            "steps": 2, "seat": 0,
+        }) + "\n"),
+    )
+
+    assert worker.main() == 1
+    captured = capsys.readouterr()
+    assert "candidate policy construction failure" in captured.err
+    assert captured.out == ""
+
+
+def test_worker_candidate_invocation_failure_is_evaluator_failure(monkeypatch, capsys):
+    import scripts.evaluation_worker as worker
+
+    class FakeEnvironment:
+        configuration = {}
+
+        def run(self, agents):
+            agents[0]({}, {})
+
+        def toJSON(self):
+            return {}
+
+    def fail_candidate(*args, **kwargs):
+        raise RuntimeError("candidate exploded")
+
+    monkeypatch.setattr(worker, "VariantPolicy", lambda *args, **kwargs: fail_candidate)
+    monkeypatch.setitem(
+        sys.modules,
+        "kaggle_environments",
+        type("FakeKaggleEnvironments", (), {"make": lambda *args, **kwargs: FakeEnvironment()})(),
+    )
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(json.dumps({
+            "variant": "mixed", "opponent": "pass", "seed": 1,
+            "steps": 2, "seat": 0,
+        }) + "\n"),
+    )
+
+    assert worker.main() == 1
+    captured = capsys.readouterr()
+    assert "candidate policy failure" in captured.err
+    assert captured.out == ""
+
+
+@pytest.mark.parametrize("failure", ["make", "run", "toJSON"])
+def test_worker_engine_failures_are_framework_records(monkeypatch, capsys, failure):
+    import scripts.evaluation_worker as worker
+
+    class FakeEnvironment:
+        configuration = {}
+
+        def run(self, agents):
+            if failure == "run":
+                raise RuntimeError("engine run exploded")
+
+        def toJSON(self):
+            if failure == "toJSON":
+                raise RuntimeError("engine serialization exploded")
+            return {}
+
+    if failure == "make":
+        def make(*args, **kwargs):
+            raise RuntimeError("engine make exploded")
+    else:
+        make = lambda *args, **kwargs: FakeEnvironment()
+    monkeypatch.setitem(
+        sys.modules,
+        "kaggle_environments",
+        type("FakeKaggleEnvironments", (), {"make": staticmethod(make)})(),
+    )
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(json.dumps({
+            "variant": "mixed", "opponent": "pass", "seed": 1,
+            "steps": 2, "seat": 0,
+        }) + "\n"),
+    )
+
+    assert worker.main() == 0
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert result["framework_error"] is True
+    assert result["error"]
+    assert "engine" in result["error"]
+
+
+def test_replay_type_error_is_not_normalized_as_framework_failure(monkeypatch, capsys):
+    import scripts.evaluate as evaluate
+    import scripts.evaluation_worker as worker
+
+    def fail_replay(*args, **kwargs):
+        raise TypeError("unexpected evaluator type error")
+
+    monkeypatch.setattr(evaluate, "_replay_record", fail_replay)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(json.dumps({
+            "variant": "mixed", "opponent": "pass", "seed": 1,
+            "steps": 2, "seat": 0,
+        }) + "\n"),
+    )
+
+    assert worker.main() == 1
+    captured = capsys.readouterr()
+    assert "unexpected evaluator type error" in captured.err
+    assert captured.out == ""
+
+
+def test_sidecar_sort_order_includes_seat(tmp_path):
+    from scripts.evaluate import write_result_document
+
+    records = [
+        {"ablation": "baseline", "variant": "mixed", "opponent": "pass", "seed": 1, "seat": 1},
+        {"ablation": "baseline", "variant": "mixed", "opponent": "pass", "seed": 1, "seat": 0},
+    ]
+    path = tmp_path / "evaluation.json"
+    write_result_document(path, {}, records=records)
+
+    ordered = json.loads(path.with_name("evaluation.replays.json").read_text())["records"]
+
+    assert [record["seat"] for record in ordered] == [0, 1]
+
+
+def test_malformed_successful_worker_output_is_normalized(monkeypatch):
+    import scripts.evaluate as evaluate
+
+    monkeypatch.setattr(
+        evaluate.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout=json.dumps({"framework_error": False, "outcome": "tie"}) + "\n", stderr="",
+        ),
+    )
+
+    record = evaluate.run_game(variant="mixed", opponent="pass", seed=4, steps=2, seat=1)
+
+    required = {
+        "variant", "opponent", "seed", "seat", "outcome", "final_bank",
+        "opponent_final_bank", "bank_differential", "framework_error",
+        "shed_overflow", "price_floor_sales", "missed_basic_needs",
+    }
+    assert required <= record.keys()
+    assert record["framework_error"] is True
+    assert "missing normalized record fields" in record["error"]
+
+
+def test_worker_runner_exception_is_normalized_as_framework_failure(monkeypatch):
+    import scripts.evaluate as evaluate
+
+    def raise_runner(*args, **kwargs):
+        raise RuntimeError("runner exploded")
+
+    monkeypatch.setattr(evaluate.subprocess, "run", raise_runner)
+
+    record = evaluate.run_game(variant="mixed", opponent="pass", seed=4, steps=2)
+
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+    assert "runner exploded" in record["error"]
+
+
+def test_run_evaluation_forwards_seats_to_every_matrix(monkeypatch):
+    from scripts.evaluate import run_evaluation
+
+    calls = []
+
+    def fake_run_matrix(**kwargs):
+        calls.append(kwargs)
+        return {"records": []}
+
+    monkeypatch.setattr("scripts.evaluate.run_matrix", fake_run_matrix)
+    run_evaluation(
+        variants=["mixed"], opponents=["pass"], seeds=[1], steps=2,
+        seats=[0, 1], ablations=[("animals", False)],
+    )
+
+    assert [call["seats"] for call in calls] == [[0, 1], [0, 1]]
+
+
+def test_run_matrix_forwards_candidate_seats_and_keeps_seed_pairs_ordered(monkeypatch):
+    from scripts.evaluate import run_matrix
+
+    calls = []
+
+    def fake_run_game(**kwargs):
+        calls.append(kwargs)
+        return kwargs
+
+    monkeypatch.setattr("scripts.evaluate.run_game", fake_run_game)
+    result = run_matrix(
+        variants=["mixed"], opponents=["pass"], seeds=[4, 9], steps=2,
+        seats=[0, 1],
+    )
+
+    assert result["records"] == calls
+    assert [(call["seat"], call["seed"]) for call in calls] == [
+        (0, 4), (1, 4), (0, 9), (1, 9),
+    ]
+    assert all(
+        {call["variant"], call["opponent"], call["steps"]} == {"mixed", "pass", 2}
+        for call in calls
+    )
+
+
+def test_run_matrix_accepts_candidates_and_forwards_each_seat_and_seed(monkeypatch):
+    from scripts.evaluate import run_matrix
+
+    calls = []
+
+    def fake_run_game(**kwargs):
+        calls.append(kwargs)
+        return {
+            **_complete_worker_record(),
+            "candidate": kwargs["candidate"],
+            "variant": kwargs["candidate"],
+            "opponent": kwargs["opponent"],
+            "seed": kwargs["seed"],
+            "seat": kwargs["seat"],
+            "error": "worker diagnostic",
+        }
+
+    monkeypatch.setattr("scripts.evaluate.run_game", fake_run_game)
+    result = run_matrix(
+        candidates=["animal-heavy"], opponents=["pass"], seeds=[4, 9], steps=2,
+        seats=[0, 1],
+    )
+
+    assert [(call["candidate"], call["opponent"], call["seed"], call["seat"], call["steps"])
+            for call in calls] == [
+        ("animal-heavy", "pass", 4, 0, 2),
+        ("animal-heavy", "pass", 4, 1, 2),
+        ("animal-heavy", "pass", 9, 0, 2),
+        ("animal-heavy", "pass", 9, 1, 2),
+    ]
+    assert [set(record) for record in result["records"]] == [
+        {"candidate", "variant", "opponent", "seed", "seat", "outcome",
+         "final_bank", "opponent_final_bank", "bank_differential", "framework_error",
+         "shed_overflow", "price_floor_sales", "missed_basic_needs", "error"},
+    ] * 4
+    assert [record["candidate"] for record in result["records"]] == ["animal-heavy"] * 4
+    assert [record["error"] for record in result["records"]] == ["worker diagnostic"] * 4
+
+
+def test_run_evaluation_accepts_candidates_and_forwards_candidate_identity(monkeypatch):
+    from scripts.evaluate import run_evaluation
+
+    calls = []
+
+    def fake_run_matrix(**kwargs):
+        calls.append(kwargs)
+        return {"records": []}
+
+    monkeypatch.setattr("scripts.evaluate.run_matrix", fake_run_matrix)
+    run_evaluation(
+        candidates=["mixed"], opponents=["pass"], seeds=[1], steps=2,
+        seats=[0, 1], ablations=[("animals", False)],
+    )
+
+    assert [call["candidates"] for call in calls] == [["mixed"], ["mixed"]]
+    assert [call["seats"] for call in calls] == [[0, 1], [0, 1]]
+
+
+def test_main_includes_seats_in_evaluation_and_report_config(monkeypatch, tmp_path):
+    import scripts.evaluate as evaluate
+
+    captured = {}
+
+    def fake_run_evaluation(**kwargs):
+        captured["evaluation"] = kwargs
+        return {"records": [], "ablation_records": {}, "ablation_configs": {}}
+
+    def fake_build_result_document(**kwargs):
+        captured["config"] = kwargs["config"]
+        return {"selected_default": "mixed"}
+
+    monkeypatch.setattr(evaluate, "run_evaluation", fake_run_evaluation)
+    monkeypatch.setattr(evaluate, "build_result_document", fake_build_result_document)
+    monkeypatch.setattr(evaluate, "write_result_document", lambda *args, **kwargs: None)
+
+    assert evaluate.main([
+        "--seeds", "1", "--steps", "2", "--seats", "0", "1",
+        "--output", str(tmp_path / "evaluation.json"),
+    ]) == 0
+    assert captured["evaluation"]["seats"] == [0, 1]
+    assert captured["config"]["seats"] == [0, 1]
+
+
+def test_main_exposes_candidates_in_evaluation_and_report_config(monkeypatch, tmp_path):
+    import scripts.evaluate as evaluate
+
+    captured = {}
+
+    def fake_run_evaluation(**kwargs):
+        captured["evaluation"] = kwargs
+        return {"records": [], "ablation_records": {}, "ablation_configs": {}}
+
+    def fake_build_result_document(**kwargs):
+        captured["config"] = kwargs["config"]
+        return {"selected_default": "animal-heavy"}
+
+    monkeypatch.setattr(evaluate, "run_evaluation", fake_run_evaluation)
+    monkeypatch.setattr(evaluate, "build_result_document", fake_build_result_document)
+    monkeypatch.setattr(evaluate, "write_result_document", lambda *args, **kwargs: None)
+
+    assert evaluate.main([
+        "--seeds", "1", "--steps", "2", "--candidates", "animal-heavy",
+        "--output", str(tmp_path / "evaluation.json"),
+    ]) == 0
+    assert captured["evaluation"]["candidates"] == ["animal-heavy"]
+    assert captured["config"]["candidates"] == ["animal-heavy"]
+
+
+def test_report_groups_records_by_candidate_identity():
+    from scripts.evaluate import build_result_document
+
+    document = build_result_document(
+        config={"opponents": ["pass"], "candidates": ["animal-heavy"]},
+        records=[{
+            "candidate": "animal-heavy", "variant": "mixed", "opponent": "pass", "seed": 1,
+            "outcome": "win", "final_bank": 100, "opponent_final_bank": 50,
+            "bank_differential": 50, "framework_error": False,
+            "shed_overflow": 0, "price_floor_sales": 0, "missed_basic_needs": 0,
+        }],
+    )
+
+    assert document["results"]["animal-heavy"]["pass"]["wins"] == 1
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
