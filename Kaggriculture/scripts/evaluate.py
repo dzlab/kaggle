@@ -777,6 +777,8 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
         return False
     if type(candidate_player) is not int or candidate_player not in (0, 1):
         return False
+    if not own_states or not other_states:
+        return False
     states_by_role = (own_states, other_states)
     previous_observations = {
         candidate_player: _mapping(states_by_role[0][0].get("observation")),

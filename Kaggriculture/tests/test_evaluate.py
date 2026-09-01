@@ -2938,6 +2938,25 @@ def test_invalid_or_missing_replay_states_are_framework_failures():
     assert summary["wins"] == summary["losses"] == summary["ties"] == 0
 
 
+def test_replay_missing_a_player_state_is_a_framework_failure():
+    from scripts.evaluate import replay_record
+
+    class TruthyEmptySteps(list):
+        def __bool__(self):
+            return True
+
+    replay = _engine_envelope({
+        "steps": TruthyEmptySteps(),
+        "statuses": ["DONE", "DONE"],
+        "info": {},
+    })
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+
+
 def test_top_level_failure_status_is_counted_even_with_complete_states():
     from scripts.evaluate import replay_record
 
