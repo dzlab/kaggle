@@ -94,6 +94,12 @@ namespaces; do not supply both request keys or both CLI modes. Legacy variants
 such as `conservative`, `melon-heavy`, `demand-reactive`, and `animal-heavy`
 are not accepted by the stable `--candidates` path.
 
+In a report, `selected_candidate` is populated only after holdout evidence has
+passed the promotion gates. With no holdout records, `selected_candidate` is
+`null`; `selected_default` may retain the development-only choice for
+backward compatibility, and `selected_default_source` is `development_only`.
+When holdout evidence is present, that source is `holdout`.
+
 The default report path is `reports/evaluation.json`; each report also gets a
 compact replay-record sidecar beside it. Use `--quick` for a 2-seed, 96-step
 smoke batch, and do not commit generated reports unless a report is explicitly

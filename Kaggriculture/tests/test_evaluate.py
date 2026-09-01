@@ -566,6 +566,40 @@ def test_promotion_decision_compares_baseline_only_after_gates():
     assert decision["reasons"] == []
 
 
+@pytest.mark.parametrize("issue", ["missing", "duplicate", "extra"])
+def test_promotion_decision_rejects_non_exact_expected_matrix(issue):
+    from scripts.evaluate import promotion_decision
+
+    expected_matrix = [("pass", 1, 0), ("pass", 1, 1)]
+    candidate = [
+        _metric_record(seat=seat, seed=1, opponent="pass", outcome="win", differential=10)
+        for seat in (0, 1)
+    ]
+    baseline = [
+        _metric_record(
+            seat=seat, seed=1, opponent="pass", candidate="current",
+            outcome="loss", differential=1,
+        )
+        for seat in (0, 1)
+    ]
+    if issue == "missing":
+        candidate.pop()
+    elif issue == "duplicate":
+        candidate.append(dict(candidate[0]))
+    else:
+        candidate.extend([
+            _metric_record(seat=seat, seed=1, opponent="starter", outcome="win", differential=100)
+            for seat in (0, 1)
+        ])
+
+    decision = promotion_decision(
+        candidate, baseline, min_valid_games=1, expected_matrix=expected_matrix,
+    )
+
+    assert decision["status"] == "discard"
+    assert decision["matrix_completeness"][issue]
+
+
 def test_promotion_decision_uses_baseline_median_and_requires_it():
     from scripts.evaluate import promotion_decision
 
@@ -1483,6 +1517,71 @@ def test_holdout_report_controls_selection_and_exposes_holdout_decisions():
     assert document["metadata"]["holdout"]["selected_candidate"] == "baseline"
     assert document["metadata"]["manifest"]["schema_version"] == 2
     json.dumps(document, allow_nan=False)
+
+
+def test_partial_holdout_cannot_populate_selected_candidate():
+    from scripts.evaluate import build_result_document
+
+    development = [
+        _metric_record(
+            seat=seat, seed=1, candidate=candidate,
+            outcome="win" if candidate == "challenger" else "tie",
+            differential=2 if candidate == "challenger" else 1,
+        )
+        for candidate in ("baseline", "challenger")
+        for seat in (0, 1)
+    ]
+    partial_holdout = [
+        _metric_record(
+            seat=seat, seed=100, candidate=candidate,
+            outcome="win" if candidate == "challenger" else "tie",
+            differential=100 if candidate == "challenger" else 1,
+        )
+        for candidate in ("baseline", "challenger")
+        for seat in (0, 1)
+    ]
+
+    document = build_result_document(
+        config={
+            "candidates": ["baseline", "challenger"], "opponents": ["pass"],
+            "seed_values": [1], "holdout_seed_values": [100, 101],
+            "seats": [0, 1], "min_valid_games": 1,
+        },
+        records=development, holdout_records=partial_holdout,
+    )
+
+    assert document["selected_candidate"] is None
+    assert document["holdout"]["selected_candidate"] is None
+    assert document["holdout_promotion_decisions"]["challenger"]["status"] == "discard"
+    assert document["holdout_promotion_decisions"]["challenger"]["matrix_completeness"]["missing"]
+
+
+def test_no_holdout_report_labels_development_only_default_selection():
+    from scripts.evaluate import build_result_document
+
+    records = [
+        _metric_record(
+            seat=seat, seed=1, candidate=candidate,
+            outcome="win" if candidate == "challenger" else "tie",
+            differential=2 if candidate == "challenger" else 1,
+        )
+        for candidate in ("baseline", "challenger")
+        for seat in (0, 1)
+    ]
+
+    document = build_result_document(
+        config={
+            "candidates": ["baseline", "challenger"], "opponents": ["pass"],
+            "seed_values": [1], "seats": [0, 1], "min_valid_games": 1,
+        },
+        records=records,
+    )
+
+    assert document["selected_candidate"] is None
+    assert document["selected_default"] == "challenger"
+    assert document["selected_default_source"] == "development_only"
+    assert document["metadata"]["selected_candidate"] is None
+    assert document["metadata"]["selected_default_source"] == "development_only"
 
 
 def test_sidecar_sort_uses_candidate_and_canonical_record_tiebreaker(tmp_path):

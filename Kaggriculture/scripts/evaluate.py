@@ -13,6 +13,7 @@ import math
 import random
 import subprocess
 import sys
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from numbers import Real
 from pathlib import Path
@@ -382,8 +383,72 @@ def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _normalize_expected_matrix(
+    expected_matrix: Sequence[tuple[str, int, int]] | None,
+) -> list[tuple[str, int, int]] | None:
+    if expected_matrix is None:
+        return None
+    normalized = []
+    for coordinate in expected_matrix:
+        if not isinstance(coordinate, Sequence) or isinstance(coordinate, (str, bytes)) \
+                or len(coordinate) != 3:
+            raise ValueError("expected_matrix coordinates must be (opponent, seed, seat) triples")
+        opponent, seed, seat = coordinate
+        if type(opponent) is not str or type(seed) is not int or type(seat) is not int \
+                or seat not in (0, 1):
+            raise ValueError("expected_matrix coordinates must contain (str, int, 0|1)")
+        normalized.append((opponent, seed, seat))
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("expected_matrix coordinates must be unique")
+    return normalized
+
+
+def _matrix_completeness(
+    records: Sequence[Mapping[str, Any]],
+    expected_matrix: Sequence[tuple[str, int, int]] | None,
+) -> dict[str, Any] | None:
+    if expected_matrix is None:
+        return None
+    expected = _normalize_expected_matrix(expected_matrix)
+    assert expected is not None
+    expected_set = set(expected)
+    observed = Counter()
+    invalid_records = 0
+    for record in records:
+        if not isinstance(record, Mapping):
+            invalid_records += 1
+            continue
+        opponent = record.get("opponent")
+        seed = record.get("seed")
+        seat = record.get("seat")
+        if type(opponent) is not str or type(seed) is not int or type(seat) is not int \
+                or seat not in (0, 1):
+            invalid_records += 1
+            continue
+        observed[(opponent, seed, seat)] += 1
+    missing = sorted(expected_set - observed.keys(), key=lambda key: tuple(str(value) for value in key))
+    duplicate = sorted(
+        (key for key, count in observed.items() if count > 1),
+        key=lambda key: tuple(str(value) for value in key),
+    )
+    extra = sorted(
+        (key for key in observed if key not in expected_set),
+        key=lambda key: tuple(str(value) for value in key),
+    )
+    return {
+        "expected": [list(coordinate) for coordinate in expected],
+        "expected_count": len(expected),
+        "observed_count": sum(observed.values()) + invalid_records,
+        "missing": [list(coordinate) for coordinate in missing],
+        "duplicate": [list(coordinate) for coordinate in duplicate],
+        "extra": [list(coordinate) for coordinate in extra],
+        "invalid_records": invalid_records,
+    }
+
+
 def _safety_gate_reasons(records: Sequence[Mapping[str, Any]], summary: Mapping[str, Any], *,
-                        min_valid_games: int) -> list[str]:
+                        min_valid_games: int,
+                        expected_matrix: Sequence[tuple[str, int, int]] | None = None) -> list[str]:
     """Return ordered reasons a candidate is unsafe for promotion or selection.
 
     Reports written from pre-seat evaluator fixtures may not contain a ``seat``
@@ -395,6 +460,17 @@ def _safety_gate_reasons(records: Sequence[Mapping[str, Any]], summary: Mapping[
         return ["framework_error"]
     if any(_record_has_missed_basic_needs(record) for record in mappings):
         return ["missed_basic_needs"]
+    matrix_completeness = _matrix_completeness(mappings, expected_matrix)
+    if matrix_completeness is not None:
+        matrix_reasons = []
+        if matrix_completeness["missing"]:
+            matrix_reasons.append("missing_expected_matrix_records")
+        if matrix_completeness["duplicate"]:
+            matrix_reasons.append("duplicate_expected_matrix_records")
+        if matrix_completeness["extra"] or matrix_completeness["invalid_records"]:
+            matrix_reasons.append("extra_expected_matrix_records")
+        if matrix_reasons:
+            return matrix_reasons
     if not any("seat" in record for record in mappings):
         return []
     if any(summary["valid_records_by_seat"][str(seat)] < min_valid_games for seat in (0, 1)):
@@ -422,17 +498,29 @@ def promotion_decision(
     baseline_records: Sequence[Mapping[str, Any]],
     *,
     min_valid_games: int = 20,
+    expected_matrix: Sequence[tuple[str, int, int]] | None = None,
 ) -> dict[str, Any]:
-    """Apply ordered safety gates before comparing a candidate with baseline."""
+    """Apply ordered safety gates before comparing a candidate with baseline.
+
+    When ``expected_matrix`` is provided, both record sets must contain exactly
+    one record for every requested ``(opponent, seed, seat)`` coordinate.
+    Omitting it preserves the legacy caller contract.
+    """
     if type(min_valid_games) is not int or min_valid_games < 1:
         raise ValueError("min_valid_games must be a positive integer")
     records = list(records)
     baseline_records = list(baseline_records)
+    expected_matrix = _normalize_expected_matrix(expected_matrix)
     candidate = paired_seed_summary(records)
     baseline = paired_seed_summary(baseline_records)
-    reasons = _safety_gate_reasons(records, candidate, min_valid_games=min_valid_games)
+    candidate_matrix = _matrix_completeness(records, expected_matrix)
+    baseline_matrix = _matrix_completeness(baseline_records, expected_matrix)
+    reasons = _safety_gate_reasons(
+        records, candidate, min_valid_games=min_valid_games, expected_matrix=expected_matrix,
+    )
     baseline_safety_reasons = _safety_gate_reasons(
         baseline_records, baseline, min_valid_games=min_valid_games,
+        expected_matrix=expected_matrix,
     )
     if not reasons and baseline_safety_reasons:
         reasons.append("baseline_not_eligible")
@@ -449,6 +537,8 @@ def promotion_decision(
         "baseline_safety_gate_reasons": baseline_safety_reasons,
         "candidate": candidate,
         "baseline": baseline,
+        "matrix_completeness": candidate_matrix,
+        "baseline_matrix_completeness": baseline_matrix,
     }
 
 
@@ -3182,7 +3272,9 @@ def _candidate_records(records: Sequence[Mapping[str, Any]], candidate: str) -> 
 
 
 def _candidate_metrics(records: Sequence[Mapping[str, Any]], candidates: Sequence[str],
-                      *, min_valid_games: int) -> tuple[dict[str, Any], dict[str, Any]]:
+                      *, min_valid_games: int,
+                      expected_matrix: Sequence[tuple[str, int, int]] | None = None,
+                      ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build deterministic paired summaries and promotion decisions by candidate."""
     summaries = {
         candidate: paired_seed_summary(_candidate_records(records, candidate))
@@ -3194,6 +3286,7 @@ def _candidate_metrics(records: Sequence[Mapping[str, Any]], candidates: Sequenc
         baseline_records = _candidate_records(records, baseline_candidate)
         baseline_reasons = _safety_gate_reasons(
             baseline_records, summaries[baseline_candidate], min_valid_games=min_valid_games,
+            expected_matrix=expected_matrix,
         )
         for candidate in candidates:
             candidate_summary = summaries[candidate]
@@ -3203,11 +3296,14 @@ def _candidate_metrics(records: Sequence[Mapping[str, Any]], candidates: Sequenc
                     "reasons": baseline_reasons,
                     "candidate": candidate_summary,
                     "baseline": candidate_summary,
+                    "matrix_completeness": _matrix_completeness(
+                        baseline_records, expected_matrix,
+                    ),
                 }
             else:
                 decisions[candidate] = promotion_decision(
                     _candidate_records(records, candidate), baseline_records,
-                    min_valid_games=min_valid_games,
+                    min_valid_games=min_valid_games, expected_matrix=expected_matrix,
                 )
     return summaries, decisions
 
@@ -3267,6 +3363,25 @@ def _config_seed_values(config: Mapping[str, Any]) -> list[int]:
     return []
 
 
+def _configured_matrix(config: Mapping[str, Any], opponents: Sequence[str], seats: Sequence[int], *,
+                      holdout: bool = False) -> list[tuple[str, int, int]] | None:
+    if "seats" not in config:
+        return None
+    if holdout:
+        values = config.get("holdout_seed_values", config.get("holdout_seeds"))
+        if values is None:
+            return None
+        seeds = [int(seed) for seed in values]
+    else:
+        if "seed_values" not in config and "seeds" not in config:
+            return None
+        seeds = _config_seed_values(config)
+    return [
+        (str(opponent), int(seed), int(seat))
+        for opponent in opponents for seed in seeds for seat in seats
+    ]
+
+
 def _select_paired_candidate(candidates: Sequence[str], summaries: Mapping[str, Mapping[str, Any]],
                              development_decisions: Mapping[str, Mapping[str, Any]],
                              holdout_decisions: Mapping[str, Mapping[str, Any]]) -> str | None:
@@ -3302,19 +3417,24 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
     if type(min_valid_games) is not int or min_valid_games < 1:
         raise ValueError("min_valid_games must be a positive integer")
     results = _group_results(records, variants, opponents)
+    seats = list(config.get("seats", (0, 1)))
+    expected_development_matrix = _configured_matrix(config, opponents, seats)
     paired_summaries, promotion_decisions = _candidate_metrics(
         records, variants, min_valid_games=min_valid_games,
+        expected_matrix=expected_development_matrix,
     )
     seed_values = _config_seed_values(config)
-    seats = list(config.get("seats", (0, 1)))
     manifest = build_manifest(
         candidates=variants, opponents=opponents, seeds=seed_values,
         steps=config.get("steps", 720), seats=seats, command=command,
     )
     holdout_document = None
-    selected_candidate = _select_default(
+    development_selected_default = _select_default(
         records, variants, promotion_decisions=promotion_decisions,
     )
+    selected_candidate = None
+    selected_default = development_selected_default
+    selected_default_source = "development_only"
     if holdout_records is not None:
         holdout_seed_values = [
             int(seed) for seed in config.get(
@@ -3322,8 +3442,10 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
             ) or ()
         ]
         holdout_results = _group_results(holdout_records, variants, opponents)
+        expected_holdout_matrix = _configured_matrix(config, opponents, seats, holdout=True)
         holdout_paired_summaries, holdout_promotion_decisions = _candidate_metrics(
             holdout_records, variants, min_valid_games=min_valid_games,
+            expected_matrix=expected_holdout_matrix,
         )
         for candidate in variants:
             promotion_decisions[candidate] = {
@@ -3334,6 +3456,8 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
             variants, holdout_paired_summaries, promotion_decisions,
             holdout_promotion_decisions,
         )
+        selected_default = selected_candidate
+        selected_default_source = "holdout"
         holdout_manifest = build_manifest(
             candidates=variants, opponents=opponents, seeds=holdout_seed_values,
             steps=config.get("steps", 720), seats=seats, command=command,
@@ -3350,6 +3474,7 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
         component_results = _group_results(component_records, variants, opponents)
         component_summaries, component_decisions = _candidate_metrics(
             component_records, variants, min_valid_games=min_valid_games,
+            expected_matrix=expected_development_matrix,
         )
         contribution = {}
         for variant in variants:
@@ -3382,13 +3507,16 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
         ),
         "manifest": manifest,
         "selected_candidate": selected_candidate,
+        "selected_default": selected_default,
+        "selected_default_source": selected_default_source,
         "holdout": holdout_document,
     }
     document = {
         "schema_version": 1,
         "manifest": manifest,
         "metadata": metadata,
-        "selected_default": selected_candidate,
+        "selected_default": selected_default,
+        "selected_default_source": selected_default_source,
         "selected_candidate": selected_candidate,
         "results": results,
         "paired_summaries": paired_summaries,
