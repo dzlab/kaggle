@@ -550,10 +550,7 @@ def build_market_orders(state: Any, plan: Any,
     else:
         crop_capacity = None
         animal_capacity = None
-    cash_needed = (
-        strategy is not None
-        and _intent_purchase_cost(intents, state) > cash
-    )
+    cash_needed = _intent_purchase_cost(intents, state) > cash
     intents = order_market_intents(
         intents, cash_needed=cash_needed, strategy=strategy, state=state,
     )

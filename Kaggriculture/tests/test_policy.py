@@ -1273,6 +1273,22 @@ def test_market_orders_use_preceding_sale_proceeds_for_affordable_purchase(purch
     assert purchase in orders
 
 
+def test_default_policy_uses_sale_proceeds_before_purchase_without_strategy():
+    state = {
+        "day": 4,
+        "hour": 3,
+        "cash": 5,
+        "private": {"shed": {"MELON": 1}, "seeds": {}},
+        "market": {"prices": {"MELON": 25, "WHEAT": 10}},
+    }
+
+    orders = policy_module.build_market_orders(
+        state, [["BUY_SEED", "WHEAT", 1], ["SELL", "MELON", 1]],
+    )
+
+    assert orders == [["SELL", "MELON", 1], ["BUY_SEED", "WHEAT", 1]]
+
+
 def test_order_market_intents_bounds_sell_batch_with_selected_strategy():
     from kagriculture_agent.strategy import StrategySpec
 
