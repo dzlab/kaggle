@@ -870,10 +870,11 @@ class Policy:
 
     def _replan(self, state: Mapping[str, Any], regime: Mapping[str, str],
                 macro: Mapping[str, Any] | None = None,
-                protected: Sequence[WorkerAssignment] = ()) -> list[WorkerAssignment]:
+                protected: Sequence[WorkerAssignment] = (),
+                strategy: StrategySpec | None = None) -> list[WorkerAssignment]:
         normalized = _state_for_planner(state)
-        macro = macro or build_autonomous_macro_plan(normalized, self.memory)
-        plan = build_daily_plan(normalized, self.memory)
+        macro = macro or build_autonomous_macro_plan(normalized, self.memory, strategy)
+        plan = build_daily_plan(normalized, self.memory, strategy)
         # Reserve the macro infrastructure tile before daily planting fills
         # the first empty square. This keeps BUILD_* and the selected crop
         # executable as separate tasks rather than competing for one tile.
@@ -888,19 +889,17 @@ class Policy:
         plan.extend(task for task in macro.get("tasks", ()) if isinstance(task, Task))
         protected_workers = {_whole(_get(assignment, "worker_index")) for assignment in protected}
         protected_tasks = {
-            (str(_get(assignment.task, "kind", "")).upper(),
-             _position(_task_target(assignment.task)),
-             str(_get(assignment.task, "item", "") or "").upper())
+            self._task_identity(assignment.task)
             for assignment in protected
         }
         plan = [task for task in plan if (
-            str(task.kind).upper(), _position(task.target), str(task.item or "").upper()
-        ) not in protected_tasks]
+            self._task_identity(task) not in protected_tasks
+        )]
         available_workers = [
             worker for worker in normalized.get("workers", ())
             if _whole(_get(worker, "index")) not in protected_workers
         ]
-        assignments = assign_tasks(plan, available_workers, normalized)
+        assignments = assign_tasks(plan, available_workers, normalized, strategy)
         assignments.extend(protected)
         self.memory.assignments = assignments
         self.memory.market_regime = dict(regime)
@@ -911,6 +910,14 @@ class Policy:
             sorted(_whole(_get(worker, "index")) for worker in normalized.get("workers", ()))
         )
         return assignments
+
+    @staticmethod
+    def _task_identity(task: Task) -> tuple[Any, ...]:
+        kind = str(_get(task, "kind", "")).upper()
+        target = _position(_task_target(task))
+        if kind == "FEED":
+            return kind, target
+        return kind, target, str(_get(task, "item", "") or "").upper()
 
     def act(self, obs: Any) -> dict[str, Any]:
         state = parse_observation(obs)
@@ -927,6 +934,8 @@ class Policy:
             if self.memory.selected_strategy is None:
                 self.memory.selected_strategy = select_strategy(state).name
             strategy_spec = get_strategy(self.memory.selected_strategy)
+        elif self.strategy_name != "current":
+            strategy_spec = get_strategy(self.strategy_name)
         macro = build_autonomous_macro_plan(state, self.memory, strategy_spec)
         workers = _worker_records(state)
         worker_indices = tuple(sorted(worker["index"] for worker in workers))
@@ -936,7 +945,7 @@ class Policy:
         assignments_valid = all(_assignment_valid(state, assignment) for assignment in self.memory.assignments)
         if reset or hour_zero or workers_changed or regime_changed or not self.memory.assignments or not assignments_valid:
             protected = self._carried_assignments(state) if not reset and not hour_zero else ()
-            assignments = self._replan(state, regime, macro, protected)
+            assignments = self._replan(state, regime, macro, protected, strategy_spec)
         else:
             assignments = self.memory.assignments
         by_worker = {assignment.worker_index: assignment for assignment in assignments}
@@ -961,7 +970,7 @@ class Policy:
                 if drop is not None:
                     commands[worker["index"]] = _unit_command(drop)
         farmer = commands.get(0, [PASS])
-        market_plan = build_daily_plan(_state_for_planner(state), self.memory)
+        market_plan = build_daily_plan(_state_for_planner(state), self.memory, strategy_spec)
         market_plan.extend(macro.get("market_intents", ()))
         market_plan.extend(_explicit_market_intents(obs, state))
         seeds = _mapping(_get(state, "private", {})).get("seeds", {})
@@ -974,7 +983,7 @@ class Policy:
         hands = [commands.get(index + 1, [PASS]) for index in range(len(visible_hands))]
         final_liquidation_window = _whole(_get(state, "hour")) >= 22
         market = (
-            build_market_orders(state, market_plan)
+            build_market_orders(state, market_plan, strategy_spec)
             if not terminal_cleanup or (final_liquidation_window and not _has_carried_goods(state))
             else []
         )

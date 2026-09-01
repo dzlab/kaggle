@@ -343,6 +343,95 @@ def test_named_policy_keeps_requested_strategy_when_shops_change():
     assert policy.memory.selected_strategy is None
 
 
+@pytest.mark.parametrize("strategy_name", ["melon", "premium", "mixed"])
+def test_named_policy_applies_route_allowlists_to_tasks_and_market_orders(strategy_name):
+    board = [[None for _ in range(5)] for _ in range(5)]
+    board[0][0] = {
+        "kind": "PLANT", "crop": "TOMATO", "needs_water": True,
+        "watered_today": False, "planted_day": 0,
+    }
+    board[0][1] = {
+        "kind": "COOP", "animal": {"species": "GOOSE", "needs_feed": True,
+                                      "fed_today": False},
+    }
+    obs = observation(
+        day=4, hour=0, hands=[[2, 0]], tiles=board, seeds={"TOMATO": 1},
+        inventories=[[], []], money=5_000,
+    )
+    obs["market_intents"] = [
+        ["BUY_SEED", "TOMATO", 1],
+        ["BUY_ANIMAL", "GOOSE", 1],
+    ]
+
+    policy = policy_module.Policy(strategy=strategy_name)
+    action = policy.act(obs)
+
+    assert all(
+        task.item not in {"TOMATO", "GOOSE"}
+        for assignment in policy.memory.assignments
+        for task in [assignment.task]
+    )
+    assert ["BUY_SEED", "TOMATO", 1] not in action["market"]
+    assert ["BUY_ANIMAL", "GOOSE", 1] not in action["market"]
+
+
+def test_zero_strategy_caps_skip_autonomous_production_without_crashing():
+    from kagriculture_agent.planner import build_autonomous_macro_plan
+    from kagriculture_agent.strategy import StrategySpec
+
+    strategy = StrategySpec("zero", ("WHEAT",), ("COW",), 0, 0, 0)
+    state = observation(
+        day=0, hour=1, hands=[], tiles=[[None for _ in range(5)] for _ in range(5)],
+        seeds={}, inventories=[[]], money=5_000,
+    )
+
+    macro = build_autonomous_macro_plan(state, strategy=strategy)
+
+    assert not any(intent[0] in {"BUY_SEED", "BUY_ANIMAL"} for intent in macro["market_intents"])
+    assert not any(task.kind in {"PLANT", "ANIMAL"} for task in macro["tasks"])
+
+
+def test_policy_forwards_named_strategy_to_all_planning_and_market_paths(monkeypatch):
+    from kagriculture_agent.strategy import get_strategy
+
+    spec = get_strategy("premium")
+    macro_calls = []
+    daily_calls = []
+    assignment_calls = []
+    market_calls = []
+
+    def fake_macro(state, memory, strategy=None):
+        macro_calls.append(strategy)
+        return {"portfolio": {}, "scenario_count": 0, "market_intents": [], "tasks": []}
+
+    def fake_daily(state, memory=None, strategy=None):
+        daily_calls.append(strategy)
+        return []
+
+    def fake_assign(plan, workers, state, strategy=None):
+        assignment_calls.append(strategy)
+        return []
+
+    def fake_market(state, plan, strategy=None):
+        market_calls.append(strategy)
+        return []
+
+    monkeypatch.setattr(policy_module, "build_autonomous_macro_plan", fake_macro)
+    monkeypatch.setattr(policy_module, "build_daily_plan", fake_daily)
+    monkeypatch.setattr(policy_module, "assign_tasks", fake_assign)
+    monkeypatch.setattr(policy_module, "build_market_orders", fake_market)
+
+    policy = policy_module.Policy(strategy="premium")
+    state = policy_module.parse_observation(observation(day=0, hour=0))
+    policy.act(state)
+    policy._replan(state, {}, strategy=spec)
+
+    assert macro_calls == [spec, spec]
+    assert daily_calls == [spec, spec, spec]
+    assert assignment_calls == [spec, spec]
+    assert market_calls == [spec]
+
+
 def test_planner_sanitizes_invalid_seed_quantities_and_nonfinite_task_values():
     from kagriculture_agent.planner import assign_tasks, build_daily_plan, normalize_planner_state
 

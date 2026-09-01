@@ -635,7 +635,8 @@ def _feed_purchase_needed(state: Mapping[str, Any], day: int, counts: Mapping[st
     return missing, cash_after
 
 
-def _has_basic_need_deadline(state: Any, day: int | None = None) -> bool:
+def _has_basic_need_deadline(state: Any, day: int | None = None,
+                             strategy: StrategySpec | None = None) -> bool:
     """Return whether a required watering or feeding task is due today."""
     raw_state = _mapping(state)
     if "farm" not in raw_state and "farms" in raw_state:
@@ -646,7 +647,7 @@ def _has_basic_need_deadline(state: Any, day: int | None = None) -> bool:
         task.kind in {"WATER", "FEED"}
         and task.deadline is not None
         and task.deadline <= current_day
-        for task in build_daily_plan(normalized, EpisodeMemory())
+        for task in build_daily_plan(normalized, EpisodeMemory(), strategy)
     )
 
 
@@ -672,6 +673,7 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
     scenarios = _portfolio_scenarios(normalized, day, strategy)
     selected = max(enumerate(scenarios), key=lambda item: (item[1]["score"], -item[0]))[1]
     demand = _town_demand(normalized)
+    allowed_crops = set(strategy.crops) if strategy is not None else set(CROPS)
     allowed_animals = set(strategy.animals) if strategy is not None else set(ANIMALS)
     animal = _preferred_animal(normalized, demand, allowed_animals)
     farm = _mapping(normalized.get("farm"))
@@ -695,7 +697,7 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
     cash = _state_cash(normalized)
     intents: list[list[Any]] = []
     tasks: list[Task] = []
-    deadline_needs = _has_basic_need_deadline(normalized, day)
+    deadline_needs = _has_basic_need_deadline(normalized, day, strategy)
     _compatible_target, structure_target = _compatible_structure(normalized, animal)
     if day < season_days - 2:
         seed_cost = float(CROPS[selected["crop"]]["seed"])
@@ -946,6 +948,18 @@ def _worker_info(worker: Any, fallback_index: int) -> tuple[int, str, Position |
     return index, role, _position(_get(worker, "position", worker))
 
 
+def _task_allowed(task: Task, strategy: StrategySpec | None) -> bool:
+    if strategy is None:
+        return True
+    kind = str(task.kind).upper()
+    item = str(task.item or "").upper()
+    if kind in {"PLANT", "WATER", "FERTILIZE", "HARVEST"} and item:
+        return item in strategy.crops
+    if kind in {"FEED", "CARE", "COLLECT_FERTILIZER", "ANIMAL", "PLACE"} and item:
+        return item in strategy.animals
+    return True
+
+
 def _task_key(task: Task) -> tuple[Any, ...]:
     target = _target_position(task.target)
     coordinate = (target.x, target.y) if target is not None else repr(task.target)
@@ -1104,7 +1118,8 @@ def _fits_same_day_deadline(task: Task, worker: tuple[int, str, Position | None]
     return _task_turn_budget(task, worker, state, board_size) <= remaining_turns
 
 
-def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any) -> list[WorkerAssignment]:
+def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any,
+                 strategy: StrategySpec | None = None) -> list[WorkerAssignment]:
     """Assign at most one exclusive task per worker with deterministic priorities."""
     state = normalize_planner_state(state)
     explicit_workers = list(workers) if workers is not None else []
@@ -1119,6 +1134,8 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
     for task in plan:
         if not isinstance(task, Task):
             continue
+        if not _task_allowed(task, strategy):
+            continue
         try:
             task_value = float(task.value)
         except (TypeError, ValueError, OverflowError):
@@ -1130,6 +1147,17 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
         if current is None or _task_sort_key(task, day) < _task_sort_key(current, day):
             unique[key] = task
     tasks = sorted(unique.values(), key=lambda task: _task_sort_key(task, day))
+    if strategy is not None:
+        crop_cap = max(0, int(strategy.max_crop_units))
+        planned_crop_count = _planned_crop_count(state, strategy)
+        bounded_tasks = []
+        for task in tasks:
+            if task.kind == "PLANT":
+                if planned_crop_count >= crop_cap:
+                    continue
+                planned_crop_count += 1
+            bounded_tasks.append(task)
+        tasks = bounded_tasks
     infos = sorted((_worker_info(worker, index) for index, worker in enumerate(explicit_workers)), key=lambda item: (item[0], item[2].y if item[2] else inf, item[2].x if item[2] else inf))
     if not infos:
         return []
