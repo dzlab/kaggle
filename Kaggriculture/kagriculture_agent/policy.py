@@ -18,7 +18,7 @@ from .planner import (
     normalize_planner_state,
 )
 from .routing import is_locked_tile, normalize_position, next_move
-from .strategy import get_strategy
+from .strategy import get_strategy, select_strategy
 from .types import Position, Task, WorkerAssignment
 
 
@@ -832,7 +832,8 @@ class Policy:
     """Stateful deterministic policy with reset-safe episode memory."""
 
     def __init__(self, strategy: str = "current") -> None:
-        get_strategy(strategy)
+        if strategy != "auto":
+            get_strategy(strategy)
         self.strategy_name = strategy
         self.memory = PolicyMemory()
 
@@ -902,8 +903,15 @@ class Policy:
         regime = market_regime(_prices(state), _market_inventory(state))
         shops = _get(_get(state, "town", {}), "unlocked_shops", ())
         regime["shops"] = "|".join(str(shop) for shop in shops) if isinstance(shops, Sequence) and not isinstance(shops, (str, bytes)) else ""
-        macro = build_autonomous_macro_plan(state, self.memory)
+        selected_strategy = self.memory.selected_strategy
         reset = self.memory.observe_time(_get(state, "day"), _get(state, "hour"))
+        if self.strategy_name == "auto":
+            reset_reason = self.memory.diagnostics.get("reset_reason")
+            if reset and reset_reason == "day_start" and selected_strategy is not None:
+                self.memory.selected_strategy = selected_strategy
+            if self.memory.selected_strategy is None:
+                self.memory.selected_strategy = select_strategy(state).name
+        macro = build_autonomous_macro_plan(state, self.memory)
         workers = _worker_records(state)
         worker_indices = tuple(sorted(worker["index"] for worker in workers))
         workers_changed = worker_indices != self.memory.diagnostics.get("worker_indices")

@@ -52,6 +52,42 @@ def test_get_strategy_reports_unknown_name():
     assert str(exc_info.value) == "unsupported strategy: not-a-route"
 
 
+def test_select_strategy_prefers_melon_without_shop_signal():
+    from kagriculture_agent.strategy import select_strategy
+
+    state = {"cash": 3000, "town": {"unlocked_shops": []}, "market": {"prices": {}, "inventory": {}}}
+
+    assert select_strategy(state).name == "melon"
+
+
+def test_select_strategy_uses_pet_cafe_signal():
+    from kagriculture_agent.strategy import select_strategy
+
+    state = {"cash": 3000, "town": {"unlocked_shops": ["PET_CAFE"]}, "market": {"prices": {}, "inventory": {}}}
+
+    assert select_strategy(state).name == "mixed"
+
+
+@pytest.mark.parametrize("shop", ["YARN_STORE", "ICE_CREAM_SHOP"])
+def test_select_strategy_uses_premium_shop_signals(shop):
+    from kagriculture_agent.strategy import select_strategy
+
+    state = {"town": {"unlocked_shops": [shop]}}
+
+    assert select_strategy(state).name == "premium"
+
+
+@pytest.mark.parametrize(
+    "state",
+    [None, [], {"town": None}, {"town": {"unlocked_shops": None}},
+     {"town": {"unlocked_shops": [{}, [], None]}}],
+)
+def test_select_strategy_falls_back_for_malformed_state(state):
+    from kagriculture_agent.strategy import select_strategy
+
+    assert select_strategy(state).name == "melon"
+
+
 def observation(*, day=0, hour=0, hands=None, tiles=None, shed=None,
                 seeds=None, inventories=None, money=3_000, market=None):
     hands = [[1, 0], [2, 0]] if hands is None else hands
@@ -103,6 +139,31 @@ def test_policy_emits_one_legal_command_per_visible_worker_and_bounded_market():
     assert all(command_is_legal(command) for command in action["hands"])
     assert isinstance(action["market"], list)
     assert len(action["market"]) <= 10
+
+
+def test_auto_policy_selects_once_from_opening_state():
+    policy = policy_module.Policy(strategy="auto")
+
+    policy.act(observation(day=0, hour=0))
+    chosen = policy.memory.selected_strategy
+    later = observation(day=0, hour=1)
+    later["town"] = {"unlocked_shops": ["YARN_STORE"]}
+    policy.act(later)
+
+    assert chosen == "melon"
+    assert policy.memory.selected_strategy == chosen
+
+
+def test_named_policy_keeps_requested_strategy_when_shops_change():
+    policy = policy_module.Policy(strategy="premium")
+
+    policy.act(observation(day=0, hour=0))
+    later = observation(day=0, hour=1)
+    later["town"] = {"unlocked_shops": ["PET_CAFE"]}
+    policy.act(later)
+
+    assert policy.strategy_name == "premium"
+    assert policy.memory.selected_strategy is None
 
 
 def test_planner_sanitizes_invalid_seed_quantities_and_nonfinite_task_values():
