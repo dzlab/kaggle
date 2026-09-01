@@ -1297,6 +1297,82 @@ def test_market_orders_count_shed_animals_against_strategy_cap():
     ) == []
 
 
+def test_worker_held_animals_count_toward_planner_and_policy_caps_once():
+    from kagriculture_agent.planner import (
+        _feed_animal_counts,
+        _owned_animal_counts,
+        build_daily_plan,
+    )
+    from kagriculture_agent.strategy import StrategySpec
+
+    tiles = [[None for _ in range(3)] for _ in range(3)]
+    tiles[0][0] = {
+        "kind": "COOP",
+        "animal": {"id": "goose-placed", "species": "GOOSE"},
+    }
+    state = {
+        "day": 4,
+        "hour": 2,
+        "cash": 10_000,
+        "tiles": tiles,
+        # The public animal list repeats the tile observation.
+        "animals": [{"id": "goose-placed", "species": "GOOSE", "position": [0, 0]}],
+        "desired_animals": [{"species": "GOOSE", "position": [1, 0], "owned": False}],
+        "private": {
+            "shed": {"GOOSE": 1},
+            "inventories": [{"GOOSE": 1}],
+            "seeds": {},
+        },
+        "market": {"prices": {"WHEAT": 1}},
+    }
+    strategy = StrategySpec("three-goose-cap", ("WHEAT",), ("GOOSE",), 10, 3, 0)
+
+    assert _feed_animal_counts(state) == {"GOOSE": 2}
+    assert _owned_animal_counts(state) == {"GOOSE": 3}
+    assert not any(
+        task.kind == "ANIMAL"
+        for task in build_daily_plan(state, strategy=strategy)
+    )
+    assert policy_module._animals(state) == {"GOOSE": 2}
+    assert policy_module._existing_animal_units(state) == 3
+    assert not any(
+        order[:2] == ["BUY_ANIMAL", "GOOSE"]
+        for order in policy_module.build_market_orders(
+            state, [["BUY_ANIMAL", "GOOSE", 1]], strategy,
+        )
+    )
+
+
+def test_worker_held_animals_join_live_feed_reserve_without_double_counting():
+    from kagriculture_agent.strategy import StrategySpec
+
+    state = {
+        "day": 29,
+        "hour": 5,
+        "cash": 0,
+        "tiles": [[{
+            "kind": "COOP",
+            "animal": {"id": "goose-placed", "species": "GOOSE"},
+        }]],
+        "animals": [{"id": "goose-placed", "species": "GOOSE", "position": [0, 0]}],
+        "private": {
+            "shed": {"GOOSE": 1, "WHEAT": 30},
+            "inventories": [{"GOOSE": 1}],
+            "seeds": {},
+        },
+        "market": {"prices": {"WHEAT": 10, "GOOSE": 1}},
+    }
+    strategy = StrategySpec("reserve-carried-goose", ("WHEAT",), ("GOOSE",), 10, 3, 4)
+
+    orders = policy_module.build_market_orders(
+        state, [["SELL", "WHEAT", 30]], strategy,
+    )
+
+    # One placed + one carried live unit needs 2 feed wheat plus the route
+    # reserve; the shed animal is owned for the cap but not yet live.
+    assert orders == [["SELL", "WHEAT", 24]]
+
+
 def test_unowned_and_unplaced_animals_are_excluded_from_all_lifecycle_counts():
     from kagriculture_agent.planner import _feed_animal_counts, _placed_animal_count, build_daily_plan
 

@@ -95,16 +95,32 @@ def _held_inventory(value: Any) -> dict[str, int]:
     counts: dict[str, int] = {}
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         return counts
+
+    def add(item: Any, quantity: Any = 1) -> None:
+        if not isinstance(item, str):
+            return
+        safe = _safe_quantity(quantity)
+        if safe > 0:
+            key = item.upper()
+            counts[key] = counts.get(key, 0) + int(safe)
+
     for hand in value:
         if isinstance(hand, Mapping):
-            for item, quantity in hand.items():
-                safe = _safe_quantity(quantity)
-                if safe > 0:
-                    counts[str(item)] = counts.get(str(item), 0) + int(safe)
+            item = _get(hand, "item", _get(hand, "kind", _get(hand, "name", _get(hand, "species"))))
+            if item is not None:
+                add(item, _get(hand, "quantity", 1))
+            else:
+                for item, quantity in hand.items():
+                    add(item, quantity)
         elif isinstance(hand, Sequence) and not isinstance(hand, (str, bytes)):
             for item in hand:
                 if isinstance(item, str):
-                    counts[item] = counts.get(item, 0) + 1
+                    add(item)
+                elif isinstance(item, Mapping):
+                    add(
+                        _get(item, "item", _get(item, "kind", _get(item, "name", _get(item, "species")))),
+                        _get(item, "quantity", 1),
+                    )
     return counts
 
 
@@ -569,7 +585,7 @@ def _compatible_structure(state: Mapping[str, Any], animal: str) -> tuple[Positi
 
 
 def _feed_animal_counts(state: Mapping[str, Any]) -> dict[str, int]:
-    """Count live tile and state-listed animals, merging duplicate observations."""
+    """Count live animals and carried units, merging duplicate observations."""
     counts: dict[str, int] = {}
     seen: set[tuple[str, Any]] = set()
 
@@ -600,6 +616,19 @@ def _feed_animal_counts(state: Mapping[str, Any]) -> dict[str, int]:
             continue
         seen.update(identity_keys)
         counts[species] = counts.get(species, 0) + 1
+
+    private = _mapping(_get(state, "private", {}))
+    inventories = private.get("inventories")
+    if isinstance(inventories, Sequence) and not isinstance(inventories, (str, bytes)):
+        held = _held_inventory(inventories)
+    elif "inventory" in state and not isinstance(private.get("shed"), Mapping):
+        held = _held_inventory((_get(state, "inventory", ()),))
+    else:
+        held = {}
+    for species in ANIMALS:
+        quantity = int(_safe_quantity(held.get(species, 0)))
+        if quantity:
+            counts[species] = counts.get(species, 0) + quantity
 
     return counts
 
