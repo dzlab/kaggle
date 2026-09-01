@@ -32,4 +32,4 @@ def get_strategy(name: str) -> StrategySpec:
     try:
         return STRATEGIES[name]
     except KeyError as exc:
-        raise ValueError("unsupported strategy") from exc
+        raise ValueError(f"unsupported strategy: {name}") from exc

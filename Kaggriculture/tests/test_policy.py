@@ -21,8 +21,35 @@ def test_policy_defaults_to_current_strategy():
 def test_unknown_strategy_is_rejected():
     from kagriculture_agent.policy import Policy
 
-    with pytest.raises(ValueError, match="unsupported strategy"):
+    with pytest.raises(ValueError, match="unsupported strategy: not-a-route"):
         Policy(strategy="not-a-route")
+
+
+def test_strategy_registry_has_expected_names_and_values():
+    from kagriculture_agent.strategy import STRATEGIES, StrategySpec
+
+    assert STRATEGIES == {
+        "current": StrategySpec(
+            "current",
+            ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON"),
+            ("GOOSE", "COW", "SHEEP"),
+            10000,
+            10000,
+            8,
+        ),
+        "melon": StrategySpec("melon", ("WHEAT", "MELON"), ("COW", "SHEEP"), 80, 9, 12),
+        "premium": StrategySpec("premium", ("WHEAT", "MELON"), ("COW", "SHEEP"), 48, 12, 16),
+        "mixed": StrategySpec("mixed", ("WHEAT", "CARROT", "MELON"), ("COW", "SHEEP"), 64, 9, 12),
+    }
+
+
+def test_get_strategy_reports_unknown_name():
+    from kagriculture_agent.strategy import get_strategy
+
+    with pytest.raises(ValueError) as exc_info:
+        get_strategy("not-a-route")
+
+    assert str(exc_info.value) == "unsupported strategy: not-a-route"
 
 
 def observation(*, day=0, hour=0, hands=None, tiles=None, shed=None,
@@ -1232,3 +1259,11 @@ def test_policy_memory_clears_per_day_work_at_hour_zero():
     assert memory.sell_batches == []
     assert memory.market_regime == {}
     assert memory.diagnostics["reset_reason"] == "day_start"
+
+
+def test_policy_memory_reset_clears_selected_strategy():
+    memory = policy_module.PolicyMemory(selected_strategy="premium")
+
+    memory.reset()
+
+    assert memory.selected_strategy is None
