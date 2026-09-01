@@ -966,11 +966,21 @@ def _task_allowed(task: Task, strategy: StrategySpec | None, state: Mapping[str,
         target = _target_position(task.target)
         if state is None or target is None:
             return False
-        return any(
+        if any(
             position == target
             and (entity := _entity_state(tile, "animal")) is not None
             and _upper(_get(entity, "species", _get(entity, "animal", ""))) == item
             for position, tile in _tiles(state)
+        ):
+            return True
+        animals = _get(state, "animals", ()) or ()
+        if isinstance(animals, Mapping):
+            animals = (animals,)
+        return any(
+            _position(animal) == target
+            and _upper(_get(animal, "species", _get(animal, "animal", _get(animal, "kind", "")))) == item
+            for animal in animals
+            if isinstance(animal, Mapping)
         )
     if kind in {"PLANT", "WATER", "FERTILIZE", "HARVEST"} and item:
         return item in strategy.crops

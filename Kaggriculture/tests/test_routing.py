@@ -143,6 +143,35 @@ def test_named_strategy_keeps_maintenance_for_existing_disallowed_assets():
                 if task.kind in {"PLANT", "ANIMAL"}}
 
 
+def test_named_strategy_keeps_state_animal_maintenance_when_not_embedded_in_tiles():
+    from kagriculture_agent.strategy import StrategySpec
+
+    workers = [
+        {"index": 0, "role": "FARMER", "position": pos(0, 0)},
+        {"index": 1, "role": "WORKER", "position": pos(1, 0)},
+    ]
+    state = _state(
+        day=4,
+        workers=workers,
+        tiles={},
+        animals=[{
+            "position": pos(2, 1), "species": "GOOSE", "needs_feed": True,
+            "fed_today": False, "needs_care": True, "cared_today": False,
+        }],
+    )
+    strategy = StrategySpec("cow-only", ("WHEAT",), ("COW",), 10, 10, 0)
+
+    plan = build_daily_plan(state, EpisodeMemory(), strategy)
+    assignments = assign_tasks(plan, workers, state, strategy)
+
+    assert {(task.kind, task.item) for task in plan} >= {
+        ("FEED", "GOOSE"), ("CARE", "GOOSE"),
+    }
+    assert {(assignment.task.kind, assignment.task.item) for assignment in assignments} >= {
+        ("FEED", "GOOSE"), ("CARE", "GOOSE"),
+    }
+
+
 def test_daily_plan_schedules_positive_harvest_before_decay():
     state = _state(
         day=2,
