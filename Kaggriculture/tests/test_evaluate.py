@@ -113,13 +113,13 @@ def test_cli_parses_requested_seats():
     assert parse_args(["--seats", "0", "1"]).seats == [0, 1]
 
 
-def test_cli_parses_candidates_as_compatibility_alias_for_variants():
+def test_cli_preserves_legacy_variants_as_a_separate_selection_mode():
     from scripts.evaluate import parse_args
 
-    args = parse_args(["--candidates", "mixed", "animal-heavy"])
+    args = parse_args(["--variants", "mixed", "animal-heavy"])
 
-    assert args.candidates == ["mixed", "animal-heavy"]
     assert args.variants == ["mixed", "animal-heavy"]
+    assert args.candidates is None
 
 
 def test_cli_accepts_stable_route_candidates():
@@ -128,6 +128,14 @@ def test_cli_accepts_stable_route_candidates():
     args = parse_args(["--candidates", "current", "melon", "premium", "mixed"])
 
     assert args.candidates == ["current", "melon", "premium", "mixed"]
+    assert args.variants is None
+
+
+def test_cli_rejects_legacy_variant_names_on_stable_candidate_path():
+    from scripts.evaluate import parse_args
+
+    with pytest.raises(SystemExit):
+        parse_args(["--candidates", "animal-heavy"])
 
 
 def test_variant_policy_constructs_real_route_candidate_policy():
@@ -136,6 +144,18 @@ def test_variant_policy_constructs_real_route_candidate_policy():
     candidate = VariantPolicy("premium")
 
     assert candidate.policy.strategy_name == "premium"
+
+
+def test_variant_policy_requires_explicit_route_mode_for_mixed():
+    from scripts.evaluate import VariantPolicy
+
+    legacy = VariantPolicy("mixed")
+    stable = VariantPolicy("mixed", route_candidate=True)
+
+    assert legacy.is_route_candidate is False
+    assert legacy.policy.strategy_name == "current"
+    assert stable.is_route_candidate is True
+    assert stable.policy.strategy_name == "mixed"
 
 
 def test_worker_uses_candidate_factory_for_route_candidate(monkeypatch):
@@ -175,6 +195,55 @@ def test_worker_uses_candidate_factory_for_route_candidate(monkeypatch):
     assert calls[0] == "melon"
 
 
+def test_worker_keeps_variant_mixed_on_legacy_policy_path(monkeypatch):
+    import scripts.evaluation_worker as worker
+
+    captured = {}
+
+    class FakeEnvironment:
+        configuration = {}
+
+        def run(self, agents):
+            captured["agents"] = agents
+
+        def toJSON(self):
+            return {}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "kaggle_environments",
+        type("FakeKaggleEnvironments", (), {"make": staticmethod(lambda *args, **kwargs: FakeEnvironment())})(),
+    )
+
+    class FakeVariantPolicy:
+        def __init__(self, variant, ablations, configuration, route_candidate, route_policy):
+            captured["variant"] = variant
+            captured["route_candidate"] = route_candidate
+            captured["route_policy"] = route_policy
+
+        def __call__(self, observation, configuration=None):
+            return {"farmer": ["PASS"], "hands": [], "market": []}
+
+    monkeypatch.setattr(worker, "VariantPolicy", FakeVariantPolicy)
+    monkeypatch.setattr(
+        worker,
+        "replay_record",
+        lambda *args, **kwargs: {
+            "candidate": "mixed", "variant": "mixed", "opponent": "pass", "seed": 1,
+            "seat": 0, "outcome": "tie", "final_bank": 0, "opponent_final_bank": 0,
+            "bank_differential": 0, "framework_error": False, "shed_overflow": 0,
+            "price_floor_sales": 0, "missed_basic_needs": 0,
+        },
+    )
+
+    result = worker.run_request({"variant": "mixed", "opponent": "pass", "seed": 1, "steps": 2})
+
+    assert result["variant"] == "mixed"
+    assert captured["variant"] == "mixed"
+    assert captured["route_candidate"] is False
+    assert captured["route_policy"] is None
+
+
 def test_cli_rejects_conflicting_variant_and_candidate_aliases():
     from scripts.evaluate import parse_args
 
@@ -187,8 +256,8 @@ def test_cli_preserves_single_variant_behavior():
 
     args = parse_args(["--variant", "animal-heavy"])
 
-    assert args.candidates == ["animal-heavy"]
     assert args.variants == ["animal-heavy"]
+    assert args.candidates is None
 
 
 @pytest.mark.parametrize("path", [
@@ -244,7 +313,7 @@ def test_run_evaluation_rejects_conflicting_variant_aliases(monkeypatch):
 
     monkeypatch.setattr("scripts.evaluate.run_matrix", lambda **kwargs: pytest.fail("must not run"))
 
-    with pytest.raises(ValueError, match="variants and candidates must match"):
+    with pytest.raises(ValueError, match="variants and candidates are separate modes"):
         run_evaluation(
             variants=["mixed"], candidates=["animal-heavy"],
             opponents=["pass"], seeds=[1], steps=2,
@@ -569,14 +638,13 @@ def test_worker_runs_from_project_root_in_a_fresh_interpreter(seat):
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
-@pytest.mark.parametrize("request_key", ["candidate", "variant"])
 @pytest.mark.parametrize("name", ["current", "melon", "premium", "mixed"])
-def test_worker_runs_stable_candidates_through_both_request_aliases(request_key, name):
+def test_worker_runs_stable_candidates_through_candidate_request(name):
     project_root = Path(__file__).resolve().parents[1]
     result = subprocess.run(
         [sys.executable, "scripts/evaluation_worker.py"],
         input=json.dumps({
-            request_key: name, "opponent": "pass", "seed": 1,
+            "candidate": name, "opponent": "pass", "seed": 1,
             "steps": 8, "seat": 0,
         }) + "\n",
         cwd=project_root,
@@ -591,6 +659,27 @@ def test_worker_runs_stable_candidates_through_both_request_aliases(request_key,
     assert response["candidate"] == name
     assert response["variant"] == name
     assert response["framework_error"] is False
+
+
+def test_worker_rejects_ambiguous_variant_and_candidate_request():
+    project_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "scripts/evaluation_worker.py"],
+        input=json.dumps({
+            "variant": "mixed", "candidate": "mixed", "opponent": "pass",
+            "seed": 1, "steps": 8, "seat": 0,
+        }) + "\n",
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    response = json.loads(result.stdout)
+    assert response["framework_error"] is True
+    assert "separate modes" in response["error"]
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
@@ -1042,23 +1131,23 @@ def test_run_matrix_accepts_candidates_and_forwards_each_seat_and_seed(monkeypat
 
     monkeypatch.setattr("scripts.evaluate.run_game", fake_run_game)
     result = run_matrix(
-        candidates=["animal-heavy"], opponents=["pass"], seeds=[4, 9], steps=2,
+        candidates=["mixed"], opponents=["pass"], seeds=[4, 9], steps=2,
         seats=[0, 1],
     )
 
     assert [(call["candidate"], call["opponent"], call["seed"], call["seat"], call["steps"])
             for call in calls] == [
-        ("animal-heavy", "pass", 4, 0, 2),
-        ("animal-heavy", "pass", 4, 1, 2),
-        ("animal-heavy", "pass", 9, 0, 2),
-        ("animal-heavy", "pass", 9, 1, 2),
+        ("mixed", "pass", 4, 0, 2),
+        ("mixed", "pass", 4, 1, 2),
+        ("mixed", "pass", 9, 0, 2),
+        ("mixed", "pass", 9, 1, 2),
     ]
     assert [set(record) for record in result["records"]] == [
         {"candidate", "variant", "opponent", "seed", "seat", "outcome",
          "final_bank", "opponent_final_bank", "bank_differential", "framework_error",
          "shed_overflow", "price_floor_sales", "missed_basic_needs", "error"},
     ] * 4
-    assert [record["candidate"] for record in result["records"]] == ["animal-heavy"] * 4
+    assert [record["candidate"] for record in result["records"]] == ["mixed"] * 4
     assert [record["error"] for record in result["records"]] == ["worker diagnostic"] * 4
 
 
@@ -1117,18 +1206,18 @@ def test_main_exposes_candidates_in_evaluation_and_report_config(monkeypatch, tm
 
     def fake_build_result_document(**kwargs):
         captured["config"] = kwargs["config"]
-        return {"selected_default": "animal-heavy"}
+        return {"selected_default": "mixed"}
 
     monkeypatch.setattr(evaluate, "run_evaluation", fake_run_evaluation)
     monkeypatch.setattr(evaluate, "build_result_document", fake_build_result_document)
     monkeypatch.setattr(evaluate, "write_result_document", lambda *args, **kwargs: None)
 
     assert evaluate.main([
-        "--seeds", "1", "--steps", "2", "--candidates", "animal-heavy",
+        "--seeds", "1", "--steps", "2", "--candidates", "mixed",
         "--output", str(tmp_path / "evaluation.json"),
     ]) == 0
-    assert captured["evaluation"]["candidates"] == ["animal-heavy"]
-    assert captured["config"]["candidates"] == ["animal-heavy"]
+    assert captured["evaluation"]["candidates"] == ["mixed"]
+    assert captured["config"]["candidates"] == ["mixed"]
 
 
 def test_report_groups_records_by_candidate_identity():
@@ -1178,7 +1267,7 @@ def test_report_exposes_per_candidate_pairs_and_promotion_decisions():
 def test_report_rejects_conflicting_variant_and_candidate_config_aliases():
     from scripts.evaluate import build_result_document
 
-    with pytest.raises(ValueError, match="variants and candidates must match"):
+    with pytest.raises(ValueError, match="variants and candidates are separate modes"):
         build_result_document(
             config={"variants": ["mixed"], "candidates": ["animal-heavy"], "opponents": ["pass"]},
             records=[],

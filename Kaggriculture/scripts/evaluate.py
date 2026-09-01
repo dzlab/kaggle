@@ -103,7 +103,7 @@ def _variant_list(values: Sequence[str] | None) -> list[str]:
 
 def _candidate_list(values: Sequence[str] | None) -> list[str]:
     selected = list(values or ("mixed",))
-    unknown = [value for value in selected if value not in EVALUATION_NAMES]
+    unknown = [value for value in selected if value not in CANDIDATES]
     if unknown:
         raise ValueError(f"unsupported candidate(s): {', '.join(unknown)}")
     return list(dict.fromkeys(selected))
@@ -132,15 +132,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="candidate seats to evaluate (0 and 1 are supported)")
     parser.add_argument("--variant", action="append", dest="single_variants", choices=VARIANTS)
     parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=None)
-    parser.add_argument("--candidates", nargs="+", choices=EVALUATION_NAMES, default=None)
+    parser.add_argument(
+        "--candidates", nargs="+", choices=CANDIDATES, default=None,
+        help="stable route candidates; use --variants/--variant for legacy evaluator variants",
+    )
     parser.add_argument("--ablation", action="append", type=parse_ablation, default=[], metavar="COMPONENT=on|off")
     parser.add_argument("--quick", action="store_true", help="use a small default batch suitable for local tests")
     args = parser.parse_args(argv)
-    if args.variants is not None and args.candidates is not None and args.variants != args.candidates:
-        parser.error("--variants and --candidates must match when both are supplied")
-    selected_alias = args.candidates if args.candidates is not None else args.variants
-    args.candidates = _candidate_list((selected_alias or []) + (args.single_variants or []))
-    args.variants = list(args.candidates)
+    if args.variants is not None and args.candidates is not None:
+        parser.error("--variants and --candidates are separate modes; supply only one")
+    if args.candidates is not None:
+        if args.single_variants:
+            parser.error("--variant cannot be combined with stable --candidates")
+        args.candidates = _candidate_list(args.candidates)
+        args.variants = None
+    else:
+        args.variants = _variant_list((args.variants or []) + (args.single_variants or []))
+        args.candidates = None
     if args.quick:
         if args.seeds == 30:
             args.seeds = 2
@@ -2843,7 +2851,7 @@ class VariantPolicy:
         self.ablations = dict(ablations or _DEFAULT_ABLATIONS)
         self.configuration = dict(configuration or {})
         self.is_route_candidate = (
-            variant in CANDIDATES
+            variant in CANDIDATES and variant != "mixed"
             if route_candidate is None else bool(route_candidate)
         )
         if self.is_route_candidate and variant not in CANDIDATES:
@@ -2920,19 +2928,22 @@ def _worker_record_error(record: Mapping[str, Any], *, variant: str, opponent: s
 
 
 def _resolve_variant(variant: str | None, candidate: str | None) -> str:
-    if variant is not None and candidate is not None and variant != candidate:
-        raise ValueError("variant and candidate must match when both are supplied")
-    selected = candidate if candidate is not None else variant
-    if selected not in EVALUATION_NAMES:
-        raise ValueError(f"unsupported variant or candidate: {selected}")
-    return selected
+    if variant is not None and candidate is not None:
+        raise ValueError("variant and candidate are separate modes; supply only one")
+    if candidate is not None:
+        if candidate not in CANDIDATES:
+            raise ValueError(f"unsupported candidate: {candidate}")
+        return candidate
+    if variant not in VARIANTS:
+        raise ValueError(f"unsupported variant: {variant}")
+    return variant
 
 
 def _resolve_candidates(variants: Sequence[str] | None,
                         candidates: Sequence[str] | None, *,
                         allow_unknown: bool = False) -> list[str]:
-    if variants is not None and candidates is not None and list(variants) != list(candidates):
-        raise ValueError("variants and candidates must match when both are supplied")
+    if variants is not None and candidates is not None:
+        raise ValueError("variants and candidates are separate modes; supply only one")
     selected = list(candidates if candidates is not None else variants or ("mixed",))
     if allow_unknown:
         return list(dict.fromkeys(selected))
@@ -3270,17 +3281,22 @@ def main(argv: list[str] | None = None) -> int:
         "seed_values": seeds,
         "steps": args.steps,
         "opponents": list(args.opponents),
-        "candidates": list(args.candidates),
-        "variants": list(args.variants),
+        "candidates": list(args.candidates) if args.candidates is not None else None,
+        "variants": list(args.variants) if args.variants is not None else None,
         "seats": list(args.seats),
         "ablations": [f"{component}={'on' if enabled else 'off'}" for component, enabled in args.ablation],
         "replay_summary": sidecar.name,
         "quick": args.quick,
     }
-    evaluation = run_evaluation(
-        candidates=args.candidates, opponents=args.opponents, seeds=seeds, steps=args.steps,
-        ablations=args.ablation, seats=args.seats,
-    )
+    evaluation_kwargs = {
+        "opponents": args.opponents, "seeds": seeds, "steps": args.steps,
+        "ablations": args.ablation, "seats": args.seats,
+    }
+    if args.candidates is not None:
+        evaluation_kwargs["candidates"] = args.candidates
+    else:
+        evaluation_kwargs["variants"] = args.variants
+    evaluation = run_evaluation(**evaluation_kwargs)
     document = build_result_document(
         config=config, records=evaluation["records"],
         command=["scripts/evaluate.py", *([*sys.argv[1:]] if argv is None else argv)],

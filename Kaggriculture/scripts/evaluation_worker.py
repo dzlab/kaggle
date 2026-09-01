@@ -145,7 +145,9 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
             error=f"{type(exc).__name__}: {exc}",
         )
 
-    is_route_candidate = variant in CANDIDATES
+    # The request key is the namespace.  ``mixed`` intentionally exists in
+    # both namespaces, so its spelling alone cannot determine the policy.
+    is_route_candidate = candidate_value is not None
     try:
         route_policy = candidate_policy(variant) if is_route_candidate else None
         candidate = VariantPolicy(

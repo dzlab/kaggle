@@ -72,10 +72,15 @@ batch is for feasibility checks only.
 Reports include the exact matrix, per-game records, paired summaries,
 confidence bounds, and ordered discard reasons. The default production entry
 point remains `Policy()`/`current`; update `main.py` only after a full holdout
-report has selected a named candidate. Legacy evaluator variants such as
-`conservative`, `melon-heavy`, `demand-reactive`, and `animal-heavy` remain
-available through `--variants` and `--variant` for regression coverage, but
-they are not the stable route-candidate names.
+report has selected a named candidate. The evaluator has two explicit,
+non-interchangeable namespaces: `--variants` and repeated `--variant` select
+legacy evaluator variants, while `--candidates` selects stable route
+candidates. The API uses the same distinction: `variant="mixed"` keeps the
+legacy `Policy()` plus `apply_variant` behavior, and `candidate="mixed"`
+selects `Policy(strategy="mixed")`. `mixed` intentionally exists in both
+namespaces; do not supply both request keys or both CLI modes. Legacy variants
+such as `conservative`, `melon-heavy`, `demand-reactive`, and `animal-heavy`
+are not accepted by the stable `--candidates` path.
 
 The default report path is `reports/evaluation.json`; each report also gets a
 compact replay-record sidecar beside it. Use `--quick` for a 2-seed, 96-step
