@@ -265,7 +265,8 @@ def test_paired_seed_summary_has_confidence_metrics_and_both_seats():
     assert summary["missing_seat_pairs"] == 1
     assert summary["seat_balanced_win_rate"] == 0.5
     assert summary["mean_paired_bank_differential"] == 3.0
-    assert 0.0 <= summary["wilson_win_rate"]["lower"] <= summary["wilson_win_rate"]["upper"] <= 1.0
+    assert summary["wilson_win_rate"] is None
+    assert 0.0 <= summary["bootstrap_seat_balanced_win_rate"]["lower"] <= summary["bootstrap_seat_balanced_win_rate"]["upper"] <= 1.0
     assert set(summary["bootstrap_bank_differential"].keys()) == {"lower", "upper"}
     json.dumps(summary, allow_nan=False)
 
@@ -282,6 +283,31 @@ def test_paired_seed_summary_confidence_interval_uses_paired_seeds():
     summary = paired_seed_summary(records)
 
     assert summary["wilson_win_rate"] == _wilson_interval(1.0, 2)
+
+
+def test_bootstrap_confidence_intervals_use_approximately_95_percent_coverage():
+    from scripts.evaluate import paired_seed_summary
+
+    records = [
+        _metric_record(seat=seat, seed=seed, outcome=outcome, differential=differential)
+        for seed, outcome, differential in ((1, "win", -10), (2, "loss", 10), (3, "win", 30))
+        for seat in (0, 1)
+    ]
+
+    summary = paired_seed_summary(records)
+
+    assert summary["bootstrap_seat_balanced_win_rate"]["lower"] >= 0.0
+    assert summary["bootstrap_seat_balanced_win_rate"]["upper"] <= 1.0
+    assert summary["bootstrap_bank_differential"]["lower"] <= summary["fifth_percentile_bank_differential"]
+
+
+def test_nonlegacy_replay_allows_numeric_strings_in_opaque_metadata():
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    replay["metadata"]["run_id"] = "2026"
+
+    assert replay_record(replay, variant="mixed", opponent="pass", seed=1)["framework_error"] is False
 
 
 def test_paired_seed_summary_reports_duplicate_pairs_separately():
@@ -1069,6 +1095,77 @@ def test_report_exposes_per_candidate_pairs_and_promotion_decisions():
     assert document["promotion_decisions"]["baseline"]["status"] == "baseline"
     assert document["promotion_decisions"]["challenger"]["status"] == "promote"
     json.dumps(document, allow_nan=False)
+
+
+def test_report_rejects_conflicting_variant_and_candidate_config_aliases():
+    from scripts.evaluate import build_result_document
+
+    with pytest.raises(ValueError, match="variants and candidates must match"):
+        build_result_document(
+            config={"variants": ["mixed"], "candidates": ["animal-heavy"], "opponents": ["pass"]},
+            records=[],
+        )
+
+
+def test_report_does_not_select_candidate_that_fails_safety_gates():
+    from scripts.evaluate import build_result_document
+
+    records = [
+        _metric_record(seat=seat, seed=1, candidate="baseline", outcome="tie", differential=1)
+        for seat in (0, 1)
+    ] + [
+        _metric_record(seat=seat, seed=1, candidate="challenger", outcome="win", differential=100,
+                       missed_basic_needs=1)
+        for seat in (0, 1)
+    ]
+
+    document = build_result_document(
+        config={"candidates": ["baseline", "challenger"], "opponents": ["pass"], "min_valid_games": 1},
+        records=records,
+    )
+
+    assert document["promotion_decisions"]["challenger"]["status"] == "discard"
+    assert document["promotion_decisions"]["challenger"]["reasons"] == ["missed_basic_needs"]
+    assert document["selected_default"] == "baseline"
+
+
+def test_report_has_no_default_when_baseline_fails_safety_gates():
+    from scripts.evaluate import build_result_document
+
+    records = [
+        _metric_record(seat=seat, seed=1, candidate="baseline", outcome="tie", differential=1,
+                       framework_error=(seat == 1))
+        for seat in (0, 1)
+    ] + [
+        _metric_record(seat=seat, seed=1, candidate="challenger", outcome="win", differential=100)
+        for seat in (0, 1)
+    ]
+
+    document = build_result_document(
+        config={"candidates": ["baseline", "challenger"], "opponents": ["pass"], "min_valid_games": 1},
+        records=records,
+    )
+
+    assert document["promotion_decisions"]["baseline"]["status"] == "discard"
+    assert document["promotion_decisions"]["baseline"]["reasons"] == ["framework_error"]
+    assert document["selected_default"] is None
+
+
+def test_sidecar_sort_uses_candidate_and_canonical_record_tiebreaker(tmp_path):
+    from scripts.evaluate import write_result_document
+
+    records = [
+        {"candidate": "z", "variant": "mixed", "opponent": "pass", "seed": 1, "seat": 0, "payload": {"b": 1, "a": 2}},
+        {"candidate": "a", "variant": "mixed", "opponent": "pass", "seed": 1, "seat": 0, "payload": {"z": 1}},
+        {"candidate": "a", "variant": "mixed", "opponent": "pass", "seed": 1, "seat": 0, "payload": {"a": 1}},
+    ]
+
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    write_result_document(first, {}, records=list(reversed(records)))
+    write_result_document(second, {}, records=records)
+
+    assert first.with_name("first.replays.json").read_bytes().replace(b"first", b"second") == second.with_name("second.replays.json").read_bytes()
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")

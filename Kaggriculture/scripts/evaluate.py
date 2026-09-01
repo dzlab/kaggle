@@ -234,9 +234,12 @@ def _wilson_interval(successes: float, trials: int) -> dict[str, float | None]:
     }
 
 
-def _bootstrap_interval(values: Sequence[float], keys: Sequence[tuple[Any, ...]]) -> dict[str, float | None]:
+def _bootstrap_interval(values: Sequence[float], keys: Sequence[tuple[Any, ...]], *,
+                       lower_percent: float = 2.5, upper_percent: float = 97.5) -> dict[str, float | None]:
     if not values:
         return {"lower": None, "upper": None}
+    if not 0.0 <= lower_percent <= upper_percent <= 100.0:
+        raise ValueError("bootstrap interval bounds must be ordered percentages")
     seed_material = json.dumps(
         [[*key, float(value)] for key, value in zip(keys, values)],
         sort_keys=True, separators=(",", ":"),
@@ -246,8 +249,8 @@ def _bootstrap_interval(values: Sequence[float], keys: Sequence[tuple[Any, ...]]
     for _ in range(_BOOTSTRAP_SAMPLES):
         samples.append(mean(values[rng.randrange(len(values))] for _ in values))
     return {
-        "lower": float(percentile(samples, 5)),
-        "upper": float(percentile(samples, 95)),
+        "lower": float(percentile(samples, lower_percent)),
+        "upper": float(percentile(samples, upper_percent)),
     }
 
 
@@ -299,11 +302,15 @@ def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             outcome_counts[seat_record["outcome"]] += 1
 
     # The two seat games for a seed are paired observations, not independent
-    # Bernoulli trials.  Confidence must therefore be calculated over paired
-    # seeds to avoid overstating certainty from the seating swap.
-    trials = len(pairs)
-    successes = sum(pair_scores)
-    wilson = _wilson_interval(successes, trials)
+    # Bernoulli trials.  Wilson is valid only when every paired score is a
+    # genuine Bernoulli outcome; split wins/losses and ties use the paired
+    # bootstrap instead.
+    binary_scores = [score for score in pair_scores if score in (0.0, 1.0)]
+    wilson = (
+        _wilson_interval(sum(binary_scores), len(binary_scores))
+        if len(binary_scores) == len(pair_scores) else None
+    )
+    bootstrap_win_rate = _bootstrap_interval(pair_scores, pair_keys)
     bootstrap = _bootstrap_interval(pair_differentials, pair_keys)
     return {
         "record_count": len(records),
@@ -319,8 +326,44 @@ def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "median_paired_bank_differential": float(median(pair_differentials)) if pair_differentials else None,
         "fifth_percentile_bank_differential": percentile(pair_differentials, 5),
         "wilson_win_rate": wilson,
+        "bootstrap_seat_balanced_win_rate": bootstrap_win_rate,
         "bootstrap_bank_differential": bootstrap,
     }
+
+
+def _safety_gate_reasons(records: Sequence[Mapping[str, Any]], summary: Mapping[str, Any], *,
+                        min_valid_games: int) -> list[str]:
+    """Return ordered reasons a candidate is unsafe for promotion or selection.
+
+    Reports written from pre-seat evaluator fixtures may not contain a ``seat``
+    field. They retain legacy aggregate-selection behavior; seat-aware
+    evaluations must satisfy the complete paired-game safety contract.
+    """
+    mappings = [record for record in records if isinstance(record, Mapping)]
+    if any(record.get("framework_error") for record in mappings):
+        return ["framework_error"]
+    if any(_record_has_missed_basic_needs(record) for record in mappings):
+        return ["missed_basic_needs"]
+    if not any("seat" in record for record in mappings):
+        return []
+    if any(summary["valid_records_by_seat"][str(seat)] < min_valid_games for seat in (0, 1)):
+        return ["insufficient_valid_games"]
+    if summary["missing_seat_pairs"]:
+        return ["missing_seat_pairs"]
+    if summary["duplicate_seat_pairs"]:
+        return ["duplicate_seat_pairs"]
+    if (
+        summary["fifth_percentile_bank_differential"] is None
+        or summary["fifth_percentile_bank_differential"] < 0
+    ):
+        return ["negative_tail"]
+    return []
+
+
+def _passes_safety_gates(records: Sequence[Mapping[str, Any]], summary: Mapping[str, Any], *,
+                         min_valid_games: int) -> bool:
+    """Return whether a candidate is eligible for default selection."""
+    return not _safety_gate_reasons(records, summary, min_valid_games=min_valid_games)
 
 
 def promotion_decision(
@@ -336,20 +379,13 @@ def promotion_decision(
     baseline_records = list(baseline_records)
     candidate = paired_seed_summary(records)
     baseline = paired_seed_summary(baseline_records)
-    reasons: list[str] = []
-    if any(record.get("framework_error") for record in records if isinstance(record, Mapping)):
-        reasons.append("framework_error")
-    elif any(_record_has_missed_basic_needs(record) for record in records if isinstance(record, Mapping)):
-        reasons.append("missed_basic_needs")
-    elif any(candidate["valid_records_by_seat"][str(seat)] < min_valid_games for seat in (0, 1)):
-        reasons.append("insufficient_valid_games")
-    elif candidate["missing_seat_pairs"]:
-        reasons.append("missing_seat_pairs")
-    elif candidate["duplicate_seat_pairs"]:
-        reasons.append("duplicate_seat_pairs")
-    elif candidate["fifth_percentile_bank_differential"] is None or candidate["fifth_percentile_bank_differential"] < 0:
-        reasons.append("negative_tail")
-    elif (
+    reasons = _safety_gate_reasons(records, candidate, min_valid_games=min_valid_games)
+    baseline_safety_reasons = _safety_gate_reasons(
+        baseline_records, baseline, min_valid_games=min_valid_games,
+    )
+    if not reasons and baseline_safety_reasons:
+        reasons.append("baseline_not_eligible")
+    elif not reasons and (
         baseline["seat_balanced_win_rate"] is None
         or baseline["median_paired_bank_differential"] is None
         or candidate["seat_balanced_win_rate"] <= baseline["seat_balanced_win_rate"]
@@ -359,6 +395,7 @@ def promotion_decision(
     return {
         "status": "promote" if not reasons else "discard",
         "reasons": reasons,
+        "baseline_safety_gate_reasons": baseline_safety_reasons,
         "candidate": candidate,
         "baseline": baseline,
     }
@@ -395,6 +432,8 @@ def _strict_engine_numeric_values(value: Any, *, in_configuration: bool = False,
         return _strict_numeric_scalar(value)
     if isinstance(value, Mapping):
         for key, child in value.items():
+            if key in {"metadata", "custom"}:
+                continue
             if key == "specification":
                 # This is the engine's JSON schema, whose numeric-looking
                 # values are descriptive metadata rather than replay data.
@@ -2865,10 +2904,14 @@ def _resolve_variant(variant: str | None, candidate: str | None) -> str:
 
 
 def _resolve_candidates(variants: Sequence[str] | None,
-                        candidates: Sequence[str] | None) -> list[str]:
+                        candidates: Sequence[str] | None, *,
+                        allow_unknown: bool = False) -> list[str]:
     if variants is not None and candidates is not None and list(variants) != list(candidates):
         raise ValueError("variants and candidates must match when both are supplied")
-    return _variant_list(candidates if candidates is not None else variants)
+    selected = list(candidates if candidates is not None else variants or ("mixed",))
+    if allow_unknown:
+        return list(dict.fromkeys(selected))
+    return _variant_list(selected)
 
 
 def run_game(*, variant: str | None = None, candidate: str | None = None,
@@ -3022,7 +3065,13 @@ def _group_results(records: Sequence[Mapping[str, Any]], variants: Sequence[str]
     }
 
 
-def _select_default(records: Sequence[Mapping[str, Any]], variants: Sequence[str]) -> str:
+def _select_default(records: Sequence[Mapping[str, Any]], variants: Sequence[str], *,
+                    promotion_decisions: Mapping[str, Mapping[str, Any]] | None = None) -> str | None:
+    if promotion_decisions is not None:
+        variants = [
+            variant for variant in variants
+            if promotion_decisions.get(variant, {}).get("status") in {"baseline", "promote"}
+        ]
     scored = []
     for variant in variants:
         summary = aggregate_records([
@@ -3031,7 +3080,7 @@ def _select_default(records: Sequence[Mapping[str, Any]], variants: Sequence[str
         ])
         scored.append((variant, summary))
     if not scored:
-        return "mixed"
+        return None
     return min(scored, key=lambda item: (
         item[1]["framework_error_rate"],
         -item[1]["win_rate"],
@@ -3055,12 +3104,15 @@ def _candidate_metrics(records: Sequence[Mapping[str, Any]], candidates: Sequenc
     if candidates:
         baseline_candidate = candidates[0]
         baseline_records = _candidate_records(records, baseline_candidate)
+        baseline_reasons = _safety_gate_reasons(
+            baseline_records, summaries[baseline_candidate], min_valid_games=min_valid_games,
+        )
         for candidate in candidates:
             candidate_summary = summaries[candidate]
             if candidate == baseline_candidate:
                 decisions[candidate] = {
-                    "status": "baseline",
-                    "reasons": [],
+                    "status": "baseline" if not baseline_reasons else "discard",
+                    "reasons": baseline_reasons,
                     "candidate": candidate_summary,
                     "baseline": candidate_summary,
                 }
@@ -3103,7 +3155,9 @@ def _normalized_command(command: Sequence[str] | None) -> list[str]:
 def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mapping[str, Any]], command: Sequence[str] | None = None,
                           ablation_records: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
                           ablation_configs: Mapping[str, Mapping[str, bool]] | None = None) -> dict[str, Any]:
-    variants = list(dict.fromkeys(config.get("candidates", config.get("variants", ()))))
+    variants = _resolve_candidates(
+        config.get("variants"), config.get("candidates"), allow_unknown=True,
+    )
     opponents = list(config.get("opponents", ()))
     min_valid_games = config.get("min_valid_games", 20)
     if type(min_valid_games) is not int or min_valid_games < 1:
@@ -3150,7 +3204,9 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
                 if config.get("replay_summary") is not None else None
             ),
         },
-        "selected_default": _select_default(records, variants),
+        "selected_default": _select_default(
+            records, variants, promotion_decisions=promotion_decisions,
+        ),
         "results": results,
         "paired_summaries": paired_summaries,
         "promotion_decisions": promotion_decisions,
@@ -3169,9 +3225,10 @@ def write_result_document(path: str | Path, document: Mapping[str, Any], *, reco
     for component, component_records in (ablation_records or {}).items():
         sidecar_records.extend({"ablation": component, **dict(record)} for record in component_records)
     sidecar_records.sort(key=lambda record: (
-        str(record.get("ablation", "")), str(record.get("variant", "")),
-        str(record.get("opponent", "")), int(record.get("seed", 0)),
-        int(record.get("seat", 0)),
+        str(record.get("ablation", "")), _record_candidate(record),
+        str(record.get("variant", "")), str(record.get("opponent", "")),
+        str(record.get("seed", "")), str(record.get("seat", "")),
+        json.dumps(record, sort_keys=True, separators=(",", ":")),
     ))
     sidecar.write_text(json.dumps({"schema_version": 1, "records": sidecar_records}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     return sidecar
