@@ -538,30 +538,47 @@ def _compatible_structure(state: Mapping[str, Any], animal: str) -> tuple[Positi
 
 
 def _feed_animal_counts(state: Mapping[str, Any]) -> dict[str, int]:
-    """Count placed and stored animals without double-counting observations."""
+    """Count live tile and state-listed animals, merging duplicate observations."""
     counts: dict[str, int] = {}
-    placed: dict[str, int] = {}
-    for _position_value, tile in _tiles(state):
+    seen: set[tuple[str, Any]] = set()
+
+    observations: list[tuple[Any, Position | None]] = []
+    for position, tile in _tiles(state):
         animal = _entity_state(tile, "animal")
-        species = _upper(_get(animal, "species", _get(animal, "animal", ""))) if animal else ""
-        if species in ANIMALS:
-            placed[species] = placed.get(species, 0) + 1
-    if placed:
-        counts.update(placed)
-    else:
-        observed = _get(state, "animals", ())
-        if isinstance(observed, Mapping):
-            observed = (observed,)
-        if isinstance(observed, Sequence) and not isinstance(observed, (str, bytes)):
-            for animal in observed:
-                species = _upper(_get(animal, "species", _get(animal, "animal", _get(animal, "kind", ""))))
-                if species in ANIMALS and _get(animal, "owned", True) is not False:
-                    counts[species] = counts.get(species, 0) + 1
+        if animal is not None:
+            observations.append((animal, _position(_get(animal, "position")) or position))
+
+    observed = _get(state, "animals", ())
+    if isinstance(observed, Mapping):
+        observed = (observed,)
+    if isinstance(observed, Sequence) and not isinstance(observed, (str, bytes)):
+        observations.extend((animal, _position(_get(animal, "position"))) for animal in observed)
+
+    for animal, position in observations:
+        species = _upper(_get(animal, "species", _get(animal, "animal", _get(animal, "kind", ""))))
+        if (species not in ANIMALS
+                or _get(animal, "owned", True) is False
+                or _get(animal, "placed", True) is False):
+            continue
+        identity_keys = {
+            (field, str(_get(animal, field)))
+            for field in ("id", "animal_id", "entity_id", "uid")
+            if _get(animal, field) is not None
+        }
+        if position is not None:
+            identity_keys.add(("position", position))
+        if identity_keys & seen:
+            continue
+        seen.update(identity_keys)
+        counts[species] = counts.get(species, 0) + 1
+
     private = _mapping(state.get("private"))
     shed = private.get("shed", state.get("shed", {}))
     if isinstance(shed, Mapping):
         for species in ANIMALS:
-            counts[species] = counts.get(species, 0) + _safe_quantity(shed.get(species, 0))
+            quantity = _safe_quantity(shed.get(species, 0))
+            if quantity:
+                counts[species] = counts.get(species, 0) + quantity
     return counts
 
 

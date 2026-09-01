@@ -526,6 +526,39 @@ def test_market_orders_reserve_feed_wheat_and_never_sell_more_than_shed():
     assert len(orders) <= 10
 
 
+def test_mixed_animal_representations_merge_for_feed_and_cap_without_duplicates():
+    from kagriculture_agent.planner import _feed_animal_counts, build_daily_plan
+    from kagriculture_agent.strategy import StrategySpec
+
+    tiles = [[None for _ in range(5)] for _ in range(5)]
+    tiles[0][0] = {
+        "kind": "COOP",
+        "animal": {"id": "goose-1", "species": "GOOSE"},
+    }
+    state = {
+        "day": 4,
+        "hour": 3,
+        "cash": 1_000,
+        "tiles": tiles,
+        "animals": [
+            {"id": "goose-1", "species": "GOOSE", "position": [0, 0]},
+            {"id": "cow-1", "species": "COW", "position": [1, 0]},
+        ],
+        "desired_animals": [{"species": "COW", "position": [2, 0], "owned": False}],
+        "private": {"shed": {}, "seeds": {}},
+        "market": {"prices": {"WHEAT": 10}},
+    }
+    strategy = StrategySpec("two-animals", ("WHEAT",), ("GOOSE", "COW"), 10, 2, 0)
+
+    assert _feed_animal_counts(state) == {"GOOSE": 1, "COW": 1}
+    assert policy_module._animals(state) == {"GOOSE": 1, "COW": 1}
+    assert not any(task.kind == "ANIMAL" for task in build_daily_plan(state, strategy=strategy))
+    assert policy_module.build_market_orders(state, [], strategy) == [["BUY_PRODUCT", "WHEAT", 52]]
+    assert policy_module.build_market_orders(
+        state, [["BUY_ANIMAL", "COW", 1]], strategy,
+    ) == [["BUY_PRODUCT", "WHEAT", 52]]
+
+
 def test_market_orders_do_not_reserve_strategy_wheat_without_live_animals():
     from kagriculture_agent.strategy import StrategySpec
 
@@ -1225,7 +1258,7 @@ def test_final_day_market_orders_liquidate_saleable_shed_inventory():
 
     orders = policy_module.build_market_orders(state, [])
 
-    assert orders == [["SELL", "FERTILIZER", 2], ["SELL", "WHEAT", 4]]
+    assert orders == [["SELL", "WHEAT", 4]]
 
 
 def test_final_turn_skips_feed_and_normal_purchases_before_liquidation():

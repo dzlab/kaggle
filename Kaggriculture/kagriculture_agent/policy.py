@@ -12,6 +12,7 @@ from .memory import PolicyMemory
 from .observation import is_shed_adjacent, parse_observation as _parse_observation, shed_access_tiles
 from .planner import (
     _fits_same_day_deadline,
+    _feed_animal_counts,
     assign_tasks,
     build_autonomous_macro_plan,
     build_daily_plan,
@@ -265,24 +266,7 @@ def _buy_product_quote(item: str, state: Any, unit_offset: int = 0) -> float:
 
 
 def _animals(state: Any) -> dict[str, int]:
-    raw_counts: dict[str, int] = {}
-    raw_animals = _get(state, "animals", _get(_get(state, "farm", {}), "animals", ())) or ()
-    if isinstance(raw_animals, Mapping):
-        raw_animals = [raw_animals]
-    values = raw_animals if isinstance(raw_animals, Sequence) and not isinstance(raw_animals, (str, bytes)) else ()
-    for animal in values:
-        species = str(_get(animal, "species", _get(animal, "animal", _get(animal, "kind", ""))) or "").upper()
-        if species in ANIMALS and _get(animal, "owned", True) is not False:
-            raw_counts[species] = raw_counts.get(species, 0) + 1
-    tile_counts: dict[str, int] = {}
-    for _, tile in _iter_tiles(state):
-        entity = _animal(tile)
-        if entity is None:
-            continue
-        species = str(_get(entity, "species", _get(entity, "animal", _get(entity, "kind", ""))) or "").upper()
-        if species in ANIMALS and _get(entity, "placed", True) is not False:
-            tile_counts[species] = tile_counts.get(species, 0) + 1
-    return tile_counts or raw_counts
+    return _feed_animal_counts(_state_for_planner(state))
 
 
 def _existing_animal_units(state: Any) -> int:
@@ -558,7 +542,7 @@ def build_market_orders(state: Any, plan: Any,
 
     if final_turn:
         sale_items = [] if carried_at_final else [
-            (item, quantity) for item, quantity in shed.items() if item in PRODUCTS
+            (item, quantity) for item, quantity in shed.items() if item in _SALEABLE_PRODUCTS
         ]
     elif sell_intents:
         requested: dict[str, int] = {}
