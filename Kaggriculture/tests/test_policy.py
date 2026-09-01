@@ -221,6 +221,116 @@ def test_macro_planner_consumes_strategy_spec_for_portfolio_candidates():
     assert portfolio["crop"] != "TOMATO"
 
 
+def test_daily_plan_filters_crop_tasks_to_strategy_allowlist_and_cap():
+    from kagriculture_agent.planner import build_daily_plan
+    from kagriculture_agent.strategy import StrategySpec
+
+    state = {
+        "day": 2,
+        "board_size": 3,
+        "tiles": [[None, None, None] for _ in range(3)],
+        "seeds": {"TOMATO": 3, "WHEAT": 3},
+        "inventory": {},
+        "workers": [],
+    }
+    strategy = StrategySpec("wheat-only", ("WHEAT",), (), 1, 0, 0)
+
+    plant_tasks = [
+        task for task in build_daily_plan(state, strategy=strategy)
+        if task.kind == "PLANT"
+    ]
+
+    assert len(plant_tasks) == 1
+    assert plant_tasks[0].item == "WHEAT"
+
+
+def test_daily_plan_filters_animal_tasks_to_strategy_allowlist_and_cap():
+    from kagriculture_agent.planner import build_daily_plan
+    from kagriculture_agent.strategy import StrategySpec
+
+    state = {
+        "day": 2,
+        "board_size": 3,
+        "tiles": [[None for _ in range(3)] for _ in range(3)],
+        "animals": [],
+        "desired_animals": [
+            {"species": "GOOSE", "position": [0, 0], "owned": False},
+            {"species": "GOOSE", "position": [1, 0], "owned": False},
+            {"species": "COW", "position": [2, 0], "owned": False},
+        ],
+        "inventory": {},
+        "workers": [],
+    }
+    strategy = StrategySpec("one-cow", ("WHEAT",), ("COW",), 10, 1, 0)
+
+    animal_tasks = [
+        task for task in build_daily_plan(state, strategy=strategy)
+        if task.kind == "ANIMAL"
+    ]
+
+    assert len(animal_tasks) == 1
+    assert animal_tasks[0].item == "COW"
+
+
+def test_macro_plan_caps_animal_purchases_by_strategy():
+    from kagriculture_agent.planner import build_autonomous_macro_plan
+    from kagriculture_agent.strategy import StrategySpec
+
+    board = [[None for _ in range(5)] for _ in range(5)]
+    board[0][0] = {"kind": "COOP"}
+    state = observation(day=0, hour=1, hands=[], tiles=board, money=5_000,
+                        shed={}, seeds={}, inventories=[[]])
+    strategy = StrategySpec("no-animals", ("WHEAT",), ("COW",), 10, 0, 0)
+
+    macro = build_autonomous_macro_plan(state, strategy=strategy)
+
+    assert not any(intent[0] == "BUY_ANIMAL" for intent in macro["market_intents"])
+    assert not any(task.kind == "ANIMAL" for task in macro["tasks"])
+
+
+def test_macro_plan_uses_strategy_reserve_wheat_for_feed_purchase():
+    from kagriculture_agent.planner import build_autonomous_macro_plan
+    from kagriculture_agent.strategy import StrategySpec
+
+    board = [[None for _ in range(5)] for _ in range(5)]
+    board[0][0] = {"kind": "PASTURE", "animal": {"species": "COW", "fed_today": False}}
+    state = observation(day=0, hour=1, hands=[], tiles=board, money=5_000,
+                        shed={}, seeds={}, inventories=[[]])
+    base = StrategySpec("base", ("WHEAT",), ("COW",), 10, 10, 0)
+    reserved = StrategySpec("reserved", ("WHEAT",), ("COW",), 10, 10, 20)
+
+    def wheat_purchase(strategy):
+        return next(
+            intent[2] for intent in build_autonomous_macro_plan(state, strategy=strategy)["market_intents"]
+            if intent[0] == "BUY_PRODUCT" and intent[1] == "WHEAT"
+        )
+
+    assert wheat_purchase(reserved) > wheat_purchase(base)
+
+
+def test_auto_policy_never_schedules_crop_excluded_by_selected_route():
+    policy = policy_module.Policy(strategy="auto")
+    state = observation(
+        day=0,
+        hour=0,
+        hands=[[1, 0], [2, 0]],
+        tiles=[[None for _ in range(5)] for _ in range(5)],
+        seeds={"TOMATO": 1, "WHEAT": 1},
+        money=5_000,
+        market={"TOMATO": 1_000, "WHEAT": 1, "MELON": 1},
+    )
+
+    policy.act(state)
+
+    assert policy.memory.selected_strategy == "melon"
+    plant_tasks = [
+        assignment.task for assignment in policy.memory.assignments
+        if assignment.task.kind == "PLANT"
+    ]
+    assert plant_tasks
+    assert all(task.item in {"WHEAT", "MELON"} for task in plant_tasks)
+
+
 def test_named_policy_keeps_requested_strategy_when_shops_change():
     policy = policy_module.Policy(strategy="premium")
 

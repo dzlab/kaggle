@@ -18,7 +18,7 @@ from .planner import (
     normalize_planner_state,
 )
 from .routing import is_locked_tile, normalize_position, next_move
-from .strategy import get_strategy, select_strategy
+from .strategy import StrategySpec, get_strategy, select_strategy
 from .types import Position, Task, WorkerAssignment
 
 
@@ -421,7 +421,8 @@ def _days_left(state: Any) -> int:
     return max(0, season_days - _whole(_get(state, "day", 0)))
 
 
-def build_market_orders(state: Any, plan: Any) -> list[list[Any]]:
+def build_market_orders(state: Any, plan: Any,
+                        strategy: StrategySpec | None = None) -> list[list[Any]]:
     """Turn approved intents into bounded, affordable, legal market orders."""
     state = _state_for_planner(state)
     day, hour = _whole(_get(state, "day", 0)), _whole(_get(state, "hour", 0))
@@ -433,6 +434,16 @@ def build_market_orders(state: Any, plan: Any) -> list[list[Any]]:
     animal_buys = 0
     shed_room = max(0, DEFAULT_SHED_CAPACITY - sum(shed.values()))
     intents = _approved_intents(plan)
+    allowed_crops = set(strategy.crops) if strategy is not None else set(CROPS)
+    allowed_animals = set(strategy.animals) if strategy is not None else set(ANIMALS)
+    if strategy is not None:
+        intents = [
+            intent for intent in intents
+            if not (
+                (intent[0] == "BUY_SEED" and intent[1] not in allowed_crops)
+                or (intent[0] == "BUY_ANIMAL" and intent[1] not in allowed_animals)
+            )
+        ]
     # The engine records the action selected from the preceding observation;
     # hour 22 is therefore the last reliably executable liquidation window
     # for a 30-day episode, with hour 23 retained for direct callers.
@@ -445,7 +456,10 @@ def build_market_orders(state: Any, plan: Any) -> list[list[Any]]:
 
     # Protect the remaining wheat needed by living animals before selling.
     carried_wheat = sum(_counts(inventory).get("WHEAT", 0) for inventory in _inventories(state))
-    total_feed_wheat = feed_reserve(_animals(state), _days_left(state), 0)
+    total_feed_wheat = feed_reserve(
+        _animals(state), _days_left(state), 0,
+        strategy.reserve_wheat if strategy is not None else 0,
+    )
     existing_wheat = shed.get("WHEAT", 0) + carried_wheat
     required_wheat = max(0, total_feed_wheat - existing_wheat)
     shed_wheat_reserve = max(0, total_feed_wheat - carried_wheat)

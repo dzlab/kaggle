@@ -514,6 +514,15 @@ def _placed_animal_count(state: Mapping[str, Any]) -> int:
     return count
 
 
+def _planned_crop_count(state: Mapping[str, Any], strategy: StrategySpec | None) -> int:
+    allowed = set(strategy.crops) if strategy is not None else set(CROPS)
+    return sum(1 for _position_value, tile in _tiles(state) if (_crop(tile) or "") in allowed)
+
+
+def _planned_animal_count(state: Mapping[str, Any]) -> int:
+    return sum(_safe_quantity(quantity) for quantity in _feed_animal_counts(state).values())
+
+
 def _compatible_structure(state: Mapping[str, Any], animal: str) -> tuple[Position | None, Position | None]:
     structure = ANIMALS[animal]["structure"]
     empty: Position | None = None
@@ -607,7 +616,7 @@ def _intent_purchase_cost(intents: Sequence[Sequence[Any]], state: Mapping[str, 
 
 def _feed_purchase_needed(state: Mapping[str, Any], day: int, counts: Mapping[str, int],
                           intents: Sequence[Sequence[Any]], cash: float,
-                          wheat_price: float) -> tuple[int, float]:
+                          wheat_price: float, reserve_wheat: int = 0) -> tuple[int, float]:
     """Return missing full-season feed and cash after buying that feed."""
     days = max(0, season_days - day)
     already_planned = sum(
@@ -617,7 +626,10 @@ def _feed_purchase_needed(state: Mapping[str, Any], day: int, counts: Mapping[st
         and len(intent) >= 3 and str(intent[0]).upper() == "BUY_PRODUCT"
         and str(intent[1]).upper() == "WHEAT"
     )
-    required = sum(max(0, int(quantity)) for quantity in counts.values()) * days
+    required = (
+        sum(max(0, int(quantity)) for quantity in counts.values()) * days
+        + max(0, int(reserve_wheat))
+    )
     missing = max(0, required - int(_staged_wheat(state)) - already_planned)
     cash_after = cash - _intent_purchase_cost(intents, state) - missing * max(0.0, wheat_price)
     return missing, cash_after
@@ -660,17 +672,23 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
     scenarios = _portfolio_scenarios(normalized, day, strategy)
     selected = max(enumerate(scenarios), key=lambda item: (item[1]["score"], -item[0]))[1]
     demand = _town_demand(normalized)
-    animal = _preferred_animal(normalized, demand, strategy.animals if strategy is not None else None)
+    allowed_animals = set(strategy.animals) if strategy is not None else set(ANIMALS)
+    animal = _preferred_animal(normalized, demand, allowed_animals)
     farm = _mapping(normalized.get("farm"))
     private = _mapping(normalized.get("private"))
     seeds = normalized.get("seeds", {})
     shed = private.get("shed", normalized.get("inventory", {}))
     seeds = seeds if isinstance(seeds, Mapping) else {}
     shed = shed if isinstance(shed, Mapping) else {}
-    stored_animals = [candidate for candidate in ANIMALS if _safe_quantity(shed.get(candidate, 0)) > 0]
+    stored_animals = [candidate for candidate in ANIMALS
+                      if candidate in allowed_animals and _safe_quantity(shed.get(candidate, 0)) > 0]
     if stored_animals and animal not in stored_animals:
         animal = stored_animals[0]
     animal_counts = _feed_animal_counts(normalized)
+    planned_crop_count = _planned_crop_count(normalized, strategy)
+    planned_animal_count = _planned_animal_count(normalized)
+    crop_cap = strategy.max_crop_units if strategy is not None else None
+    animal_cap = strategy.max_animal_units if strategy is not None else None
     wheat_staged = _staged_wheat(normalized)
     wheat_price = _observed_quote("WHEAT", normalized)
     feed_required = bool(animal_counts)
@@ -681,7 +699,12 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
     _compatible_target, structure_target = _compatible_structure(normalized, animal)
     if day < season_days - 2:
         seed_cost = float(CROPS[selected["crop"]]["seed"])
-        seed_purchase_planned = _safe_quantity(seeds.get(selected["crop"], 0)) <= 0 and cash >= seed_cost
+        can_plan_crop = crop_cap is None or planned_crop_count < crop_cap
+        seed_purchase_planned = (
+            can_plan_crop
+            and _safe_quantity(seeds.get(selected["crop"], 0)) <= 0
+            and cash >= seed_cost
+        )
         if seed_purchase_planned:
             intents.append(["BUY_SEED", selected["crop"], 1])
 
@@ -691,9 +714,10 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
         # waiting for an externally supplied intent.
         plant_crop = selected["crop"] if seed_purchase_planned or _safe_quantity(seeds.get(selected["crop"], 0)) > 0 else ""
         if not plant_crop:
-            available_seeds = [crop for crop in CROPS if _safe_quantity(seeds.get(crop, 0)) > 0]
+            available_seeds = [crop for crop in CROPS
+                               if crop in allowed_crops and _safe_quantity(seeds.get(crop, 0)) > 0]
             plant_crop = max(available_seeds, key=lambda crop: (_observed_quote(crop, normalized), crop), default="")
-        if plant_crop:
+        if plant_crop and can_plan_crop:
             plant_target = next((position for position, tile in _tiles(normalized)
                                  if not is_locked_tile(tile) and _is_empty(tile)
                                  and position != structure_target), None)
@@ -715,6 +739,7 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
         if feed_required and wheat_price > 0:
             quantity, cash_after = _feed_purchase_needed(
                 normalized, day, animal_counts, intents, cash, wheat_price,
+                strategy.reserve_wheat if strategy is not None else 0,
             )
             if quantity and cash_after >= reserve:
                 intents.append(["BUY_PRODUCT", "WHEAT", quantity])
@@ -729,11 +754,14 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
 
         compatible, empty = _compatible_structure(normalized, animal)
         animal_in_storage = _safe_quantity(shed.get(animal, 0)) > 0
-        if _placed_animal_count(normalized) == 0 and not animal_in_storage and (compatible is not None or empty is not None):
+        can_plan_animal = animal_cap is None or planned_animal_count < animal_cap
+        if (can_plan_animal and animal and _placed_animal_count(normalized) == 0
+                and not animal_in_storage and (compatible is not None or empty is not None)):
             candidate_counts = dict(animal_counts)
             candidate_counts[animal] = candidate_counts.get(animal, 0) + 1
             quantity, cash_after = _feed_purchase_needed(
                 normalized, day, candidate_counts, intents, cash, wheat_price,
+                strategy.reserve_wheat if strategy is not None else 0,
             )
             if quantity and wheat_price > 0 and cash_after >= float(ANIMALS[animal]["cost"]) + reserve:
                 staged_for_purchase = int(_staged_wheat(normalized)) + sum(
@@ -744,11 +772,13 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
                     intents.append(["BUY_PRODUCT", "WHEAT", quantity])
             quantity_after_planning, candidate_cash_after = _feed_purchase_needed(
                 normalized, day, candidate_counts, intents, cash, wheat_price,
+                strategy.reserve_wheat if strategy is not None else 0,
             )
             if quantity_after_planning == 0 and candidate_cash_after >= float(ANIMALS[animal]["cost"]) + reserve:
                 intents.append(["BUY_ANIMAL", animal, 1])
         unfunded_feed, feed_cash_after = _feed_purchase_needed(
             normalized, day, animal_counts, intents, cash, wheat_price,
+            strategy.reserve_wheat if strategy is not None else 0,
         )
         # Placement consumes already-staged goods and a worker turn; it does
         # not need the discretionary cash cushion used for new purchases.
@@ -776,11 +806,18 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
     }
 
 
-def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Task]:
+def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None,
+                     strategy: StrategySpec | None = None) -> list[Task]:
     """Build a stable one-day plan from a typed or mapping-shaped state."""
     state = normalize_planner_state(state)
     memory = memory or EpisodeMemory()
     day = _day(state, memory)
+    allowed_crops = set(strategy.crops) if strategy is not None else set(CROPS)
+    allowed_animals = set(strategy.animals) if strategy is not None else set(ANIMALS)
+    crop_cap = strategy.max_crop_units if strategy is not None else None
+    animal_cap = strategy.max_animal_units if strategy is not None else None
+    planned_crop_count = _planned_crop_count(state, strategy)
+    planned_animal_count = _planned_animal_count(state)
     try:
         board_size = max(1, int(_get(state, "board_size", 1)))
     except (TypeError, ValueError, OverflowError):
@@ -800,11 +837,11 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
         crop = _crop(tile)
         if kind == "WEED":
             _add(plan, "WEED", position, 80, day, 10)
-        if crop:
+        if crop and crop in allowed_crops:
             if _needs_today(tile, "needs_water", "watered_today", "watered"):
-                _add(plan, "WATER", position, 100, day, 1)
+                _add(plan, "WATER", position, 100, day, 1, item=crop)
             if _number(_get(tile, "fertilized_until_day", -1)) < day and has_fertilizer:
-                _add(plan, "FERTILIZE", position, 97, None, 1)
+                _add(plan, "FERTILIZE", position, 97, None, 1, item=crop)
             age = _crop_age(tile, day)
             crop_rules = CROPS[crop]
             # Non-ongoing crops have their first decay step on the day after
@@ -815,29 +852,35 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
             if lifecycle_ready:
                 value = _harvest_value(crop, tile, age, day, state)
                 if value > 0:
-                    _add(plan, "HARVEST", position, 98, day, value)
+                    _add(plan, "HARVEST", position, 98, day, value, item=crop)
         elif _is_empty(tile) and day < season_days - 2:
             seeds = _get(state, "seeds", {})
             if not isinstance(seeds, Mapping):
                 seeds = {}
-            available = [crop_name for crop_name in CROPS if seeds.get(crop_name, 0) and crop_name in CROPS]
-            if available:
+            available = [crop_name for crop_name in CROPS
+                         if crop_name in allowed_crops and seeds.get(crop_name, 0)]
+            if available and (crop_cap is None or planned_crop_count < crop_cap):
                 crop_name = max(available, key=lambda item: (_observed_quote(item, state), item))
-                _add(plan, "PLANT", position, 20, day, _observed_quote(crop_name, state))
+                _add(plan, "PLANT", position, 20, day, _observed_quote(crop_name, state), item=crop_name)
+                planned_crop_count += 1
 
         animal_entity = _entity_state(tile, "animal")
         if animal_entity is not None:
             animal_position = _position(animal_entity) or position
             species = _upper(_get(animal_entity, "species", _get(animal_entity, "animal", _get(animal_entity, "kind", ""))))
             animal_value = float(ANIMALS.get(species, {}).get("cost", 1))
-            if _needs_today(animal_entity, "needs_feed", "fed_today", "fed"):
-                _add(plan, "FEED", animal_position, 100, day, 1)
-            if _needs_today(animal_entity, "needs_care", "cared_today", "cared"):
-                _add(plan, "CARE", animal_position, 95, day, animal_value)
-            if _get(animal_entity, "fertilizer_available") is True:
-                _add(plan, "COLLECT_FERTILIZER", animal_position, 96, day, 1)
-            if _get(animal_entity, "needs_placement", False) or _get(animal_entity, "placed") is False or _get(animal_entity, "owned") is False:
-                _add(plan, "ANIMAL", animal_position, 94, day, _get(animal_entity, "value", 1), item=species)
+            if species in allowed_animals:
+                if _needs_today(animal_entity, "needs_feed", "fed_today", "fed"):
+                    _add(plan, "FEED", animal_position, 100, day, 1, item=species)
+                if _needs_today(animal_entity, "needs_care", "cared_today", "cared"):
+                    _add(plan, "CARE", animal_position, 95, day, animal_value, item=species)
+                if _get(animal_entity, "fertilizer_available") is True:
+                    _add(plan, "COLLECT_FERTILIZER", animal_position, 96, day, 1, item=species)
+                if (_get(animal_entity, "needs_placement", False)
+                        or _get(animal_entity, "placed") is False
+                        or _get(animal_entity, "owned") is False):
+                    _add(plan, "ANIMAL", animal_position, 94, day,
+                         _get(animal_entity, "value", 1), item=species)
 
         structure_entity = _entity_state(tile, "structure")
         if structure_entity is not None and (
@@ -854,12 +897,14 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
             continue
         species = _upper(_get(animal, "species", _get(animal, "kind", "")))
         value = float(ANIMALS.get(species, {}).get("cost", 1))
+        if species not in allowed_animals:
+            continue
         if _needs_today(animal, "needs_feed", "fed_today", "fed"):
-            _add(plan, "FEED", position, 100, day, 1)
+            _add(plan, "FEED", position, 100, day, 1, item=species)
         if _needs_today(animal, "needs_care", "cared_today", "cared"):
-            _add(plan, "CARE", position, 95, day, value)
+            _add(plan, "CARE", position, 95, day, value, item=species)
         if _get(animal, "fertilizer_available") is True:
-            _add(plan, "COLLECT_FERTILIZER", position, 96, day, 1)
+            _add(plan, "COLLECT_FERTILIZER", position, 96, day, 1, item=species)
 
     for structure in _get(state, "structures", ()) or ():
         if not bool(_get(structure, "built", True)):
@@ -867,7 +912,11 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None) -> list[Tas
     for animal in _get(state, "desired_animals", ()) or ():
         if not bool(_get(animal, "owned", False)):
             species = _upper(_get(animal, "species", _get(animal, "animal", _get(animal, "kind", ""))))
-            _add(plan, "ANIMAL", _position(animal), 94, day, _get(animal, "value", 1), item=species)
+            if (species in allowed_animals
+                    and (animal_cap is None or planned_animal_count < animal_cap)):
+                _add(plan, "ANIMAL", _position(animal), 94, day,
+                     _get(animal, "value", 1), item=species)
+                planned_animal_count += 1
 
     inventory = _inventory(state)
     held = sum(float(_safe_quantity(quantity)) for quantity in inventory.values())

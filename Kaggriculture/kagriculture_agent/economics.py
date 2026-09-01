@@ -430,10 +430,11 @@ def forecast_animal(
     return result
 
 
-def feed_reserve(animals: Mapping[str, Any], days: int, existing_wheat: int = 0) -> int:
-    """Return additional wheat units needed to feed all listed animals."""
+def feed_reserve(animals: Mapping[str, Any], days: int, existing_wheat: int = 0,
+                 reserve_wheat: int = 0) -> int:
+    """Return additional wheat needed for feed plus a requested reserve."""
     count = sum(_whole(number) for number in animals.values()) if isinstance(animals, Mapping) else 0
-    return max(0, count * _whole(days) - _whole(existing_wheat))
+    return max(0, count * _whole(days) + _whole(reserve_wheat) - _whole(existing_wheat))
 
 
 def expected_portfolio_cash(
