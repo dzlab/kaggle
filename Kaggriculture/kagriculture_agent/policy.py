@@ -270,6 +270,27 @@ def _buy_product_quote(item: str, state: Any, unit_offset: int = 0) -> float:
         return 0.0
 
 
+def _sale_proceeds(item: str, quantity: int, state: Any) -> float:
+    """Estimate sequential proceeds for a sale order using observed prices."""
+    quantity = _whole(quantity)
+    if quantity <= 0:
+        return 0.0
+    if item in _prices(state):
+        return quantity * _quote(item, state)
+    inventory = _number(_market_inventory(state).get(item, 10_000), 10_000)
+    params = _market_params(state)
+    proceeds = 0.0
+    for _ in range(quantity):
+        try:
+            price = float(market_price(item, inventory, params))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            price = 0.0
+        proceeds += price
+        if price > 1:
+            inventory += 1
+    return proceeds
+
+
 def _animals(state: Any) -> dict[str, int]:
     return _feed_animal_counts(_state_for_planner(state))
 
@@ -506,7 +527,6 @@ def build_market_orders(state: Any, plan: Any,
     shed = {str(item).upper(): _whole(quantity) for item, quantity in _shed(state).items()}
     cash = _cash(state)
     orders: list[list[Any]] = []
-    spend = 0.0
     product_buys: dict[str, int] = {}
     animal_buys = 0
     shed_room = max(0, DEFAULT_SHED_CAPACITY - sum(shed.values()))
@@ -558,73 +578,6 @@ def build_market_orders(state: Any, plan: Any,
     wheat_price = _buy_product_quote("WHEAT", state)
     sell_intents = [intent for intent in intents if intent[0] in {"SELL", "SELL_ALL"}]
 
-    # Wheat reserved for feed is purchased before discretionary approvals.
-    if not final_turn and required_wheat and wheat_price > 0 and shed_room:
-        affordable = 0
-        purchase_cost = 0.0
-        for offset in range(required_wheat):
-            if affordable >= shed_room:
-                break
-            unit_cost = _buy_product_quote("WHEAT", state, offset)
-            if unit_cost <= 0 or spend + purchase_cost + unit_cost > cash:
-                break
-            affordable += 1
-            purchase_cost += unit_cost
-        if affordable:
-            orders.append(["BUY_PRODUCT", "WHEAT", affordable])
-            spend += purchase_cost
-            product_buys["WHEAT"] = affordable
-
-    for kind, item, requested in intents:
-        if final_turn or len(orders) >= max_market_orders or kind in {"SELL", "SELL_ALL"}:
-            continue
-        if kind == "BUY_SEED" and item not in CROPS:
-            continue
-        if kind == "BUY_ANIMAL" and item not in ANIMALS:
-            continue
-        if kind == "BUY_PRODUCT" and item not in {"WHEAT", "FERTILIZER"}:
-            continue
-        if kind == "BUY_LAND" and item is not None:
-            continue
-        if kind == "HIRE" and item is not None:
-            continue
-        quantity = 1 if kind in {"HIRE", "BUY_LAND"} else requested
-        if kind == "BUY_SEED" and crop_capacity is not None:
-            quantity = min(quantity, crop_capacity)
-            if quantity <= 0:
-                continue
-        if kind == "BUY_PRODUCT":
-            affordable, purchase_cost = 0, 0.0
-            already_bought = product_buys.get(item or "", 0)
-            for offset in range(quantity):
-                if sum(product_buys.values()) + animal_buys + affordable >= shed_room:
-                    break
-                unit_cost = _buy_product_quote(item or "", state, already_bought + offset)
-                if unit_cost <= 0 or spend + purchase_cost + unit_cost > cash:
-                    break
-                affordable += 1
-                purchase_cost += unit_cost
-            unit_cost = purchase_cost
-        else:
-            if kind == "BUY_ANIMAL" and animal_capacity is not None:
-                quantity = min(quantity, max(0, animal_capacity - animal_buys))
-                if quantity <= 0:
-                    continue
-            unit_cost = _purchase_cost(kind, item, state)
-            room = shed_room - sum(product_buys.values()) - animal_buys if kind == "BUY_ANIMAL" else quantity
-            affordable = min(quantity, max(0, room), int(max(0.0, cash - spend) // unit_cost)) if unit_cost > 0 else 0
-        if affordable <= 0:
-            continue
-        order = [kind] if kind in {"HIRE", "BUY_LAND"} else [kind, item, affordable]
-        orders.append(order)
-        spend += unit_cost if kind == "BUY_PRODUCT" else affordable * unit_cost
-        if kind == "BUY_PRODUCT":
-            product_buys[item or ""] = product_buys.get(item or "", 0) + affordable
-        elif kind == "BUY_ANIMAL":
-            animal_buys += affordable
-        elif kind == "BUY_SEED" and crop_capacity is not None:
-            crop_capacity -= affordable
-
     if final_turn:
         sale_items = [] if carried_at_final else [
             (item, quantity) for item, quantity in shed.items() if item in _SALEABLE_PRODUCTS
@@ -664,8 +617,87 @@ def build_market_orders(state: Any, plan: Any,
             and _quote(item, state) <= 1
         ):
             continue
-        if quantity > 0 and len(orders) < max_market_orders:
+        if quantity > 0:
             sale_orders.append(["SELL", item, quantity])
+
+    available_cash = cash
+    available_shed_units = sum(shed.values())
+    if cash_needed:
+        for order in sale_orders:
+            item, quantity = order[1], order[2]
+            available_cash += _sale_proceeds(item, quantity, state)
+            available_shed_units -= quantity
+
+    # Wheat reserved for feed is purchased before discretionary approvals.
+    if not final_turn and required_wheat and wheat_price > 0 and available_shed_units < DEFAULT_SHED_CAPACITY:
+        affordable = 0
+        purchase_cost = 0.0
+        for offset in range(required_wheat):
+            if available_shed_units + affordable >= DEFAULT_SHED_CAPACITY:
+                break
+            unit_cost = _buy_product_quote("WHEAT", state, offset)
+            if unit_cost <= 0 or purchase_cost + unit_cost > available_cash:
+                break
+            affordable += 1
+            purchase_cost += unit_cost
+        if affordable:
+            orders.append(["BUY_PRODUCT", "WHEAT", affordable])
+            available_cash -= purchase_cost
+            available_shed_units += affordable
+            product_buys["WHEAT"] = affordable
+
+    for kind, item, requested in intents:
+        if final_turn or len(orders) >= max_market_orders or kind in {"SELL", "SELL_ALL"}:
+            continue
+        if kind == "BUY_SEED" and item not in CROPS:
+            continue
+        if kind == "BUY_ANIMAL" and item not in ANIMALS:
+            continue
+        if kind == "BUY_PRODUCT" and item not in {"WHEAT", "FERTILIZER"}:
+            continue
+        if kind == "BUY_LAND" and item is not None:
+            continue
+        if kind == "HIRE" and item is not None:
+            continue
+        quantity = 1 if kind in {"HIRE", "BUY_LAND"} else requested
+        if kind == "BUY_SEED" and crop_capacity is not None:
+            quantity = min(quantity, crop_capacity)
+            if quantity <= 0:
+                continue
+        if kind == "BUY_PRODUCT":
+            affordable, purchase_cost = 0, 0.0
+            already_bought = product_buys.get(item or "", 0)
+            for offset in range(quantity):
+                if available_shed_units + affordable >= DEFAULT_SHED_CAPACITY:
+                    break
+                unit_cost = _buy_product_quote(item or "", state, already_bought + offset)
+                if unit_cost <= 0 or purchase_cost + unit_cost > available_cash:
+                    break
+                affordable += 1
+                purchase_cost += unit_cost
+            unit_cost = purchase_cost
+        else:
+            if kind == "BUY_ANIMAL" and animal_capacity is not None:
+                quantity = min(quantity, max(0, animal_capacity - animal_buys))
+                if quantity <= 0:
+                    continue
+            unit_cost = _purchase_cost(kind, item, state)
+            room = DEFAULT_SHED_CAPACITY - available_shed_units if kind == "BUY_ANIMAL" else quantity
+            affordable = min(quantity, max(0, room), int(max(0.0, available_cash) // unit_cost)) if unit_cost > 0 else 0
+        if affordable <= 0:
+            continue
+        order = [kind] if kind in {"HIRE", "BUY_LAND"} else [kind, item, affordable]
+        orders.append(order)
+        purchase_cost = unit_cost if kind == "BUY_PRODUCT" else affordable * unit_cost
+        available_cash -= purchase_cost
+        if kind == "BUY_PRODUCT":
+            product_buys[item or ""] = product_buys.get(item or "", 0) + affordable
+            available_shed_units += affordable
+        elif kind == "BUY_ANIMAL":
+            animal_buys += affordable
+            available_shed_units += affordable
+        elif kind == "BUY_SEED" and crop_capacity is not None:
+            crop_capacity -= affordable
     if cash_needed:
         return (sale_orders + orders)[:max_market_orders]
     return (orders + sale_orders)[:max_market_orders]

@@ -1246,6 +1246,33 @@ def test_order_market_intents_prioritizes_sales_when_cash_is_needed():
     )[0]["kind"] == "SELL"
 
 
+@pytest.mark.parametrize(
+    ("purchase",),
+    [
+        (["BUY_SEED", "WHEAT", 1],),
+        (["BUY_PRODUCT", "WHEAT", 1],),
+    ],
+)
+def test_market_orders_use_preceding_sale_proceeds_for_affordable_purchase(purchase):
+    from kagriculture_agent.strategy import StrategySpec
+
+    state = {
+        "day": 4,
+        "hour": 3,
+        "cash": 5,
+        "private": {"shed": {"MELON": 1}, "seeds": {}},
+        "market": {"prices": {"MELON": 25, "WHEAT": 10}},
+    }
+    strategy = StrategySpec("sale-funded-purchase", ("WHEAT",), (), 10, 0, 0)
+
+    orders = policy_module.build_market_orders(
+        state, [purchase, ["SELL", "MELON", 1]], strategy,
+    )
+
+    assert orders[0] == ["SELL", "MELON", 1]
+    assert purchase in orders
+
+
 def test_order_market_intents_bounds_sell_batch_with_selected_strategy():
     from kagriculture_agent.strategy import StrategySpec
 
