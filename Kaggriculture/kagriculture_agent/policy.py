@@ -13,13 +13,14 @@ from .observation import is_shed_adjacent, parse_observation as _parse_observati
 from .planner import (
     _fits_same_day_deadline,
     _feed_animal_counts,
+    _is_live_owned_placed_animal,
     assign_tasks,
     build_autonomous_macro_plan,
     build_daily_plan,
     normalize_planner_state,
 )
 from .routing import is_locked_tile, normalize_position, next_move
-from .strategy import StrategySpec, get_strategy, select_strategy
+from .strategy import StrategySpec, get_strategy, market_order_score, select_strategy
 from .types import Position, Task, WorkerAssignment
 
 
@@ -159,7 +160,7 @@ def _animal(tile: Any) -> Mapping[str, Any] | None:
     if species not in ANIMALS:
         return None
     merged["species"] = species
-    return merged
+    return merged if _is_live_owned_placed_animal(merged) else None
 
 
 def _worker_records(state: Any) -> list[dict[str, Any]]:
@@ -385,6 +386,53 @@ def _approved_intents(plan: Any) -> list[tuple[str, str | None, int]]:
     return result
 
 
+def order_market_intents(
+    intents: Any,
+    cash_needed: bool = False,
+    strategy: StrategySpec | None = None,
+    state: Any = None,
+) -> list[Any]:
+    """Return legal-shaped intents in deterministic cash-aware priority order."""
+    values = list(intents) if isinstance(intents, Sequence) and not isinstance(intents, (str, bytes)) else [intents]
+    ordered: list[tuple[int, Any, tuple[str, str | None, int]]] = []
+    batch_limit = DEFAULT_SHED_CAPACITY
+    if strategy is not None:
+        try:
+            batch_limit = max(1, min(DEFAULT_SHED_CAPACITY, int(strategy.max_sell_batch)))
+        except (TypeError, ValueError, OverflowError):
+            batch_limit = DEFAULT_SHED_CAPACITY
+    for index, raw in enumerate(values):
+        parsed = _intent(raw)
+        if parsed is None or parsed[2] <= 0:
+            continue
+        kind, item, quantity = parsed
+        if kind == "SELL" and strategy is not None:
+            quantity = min(quantity, batch_limit)
+            if isinstance(raw, Mapping):
+                raw = {**raw, "quantity": quantity}
+            elif isinstance(raw, (list, tuple)) and len(raw) >= 3:
+                raw = [*raw]
+                raw[2] = quantity
+            parsed = kind, item, quantity
+        ordered.append((index, raw, parsed))
+    if not cash_needed:
+        return [raw for _index, raw, _parsed in ordered]
+
+    def sort_key(entry: tuple[int, Any, tuple[str, str | None, int]]) -> tuple[int, float, int]:
+        index, _raw, (kind, item, quantity) = entry
+        if kind not in {"SELL", "SELL_ALL"}:
+            return (1, 0.0, index)
+        score = 0.0
+        if state is not None and item is not None:
+            try:
+                score = market_order_score(item, quantity, state, urgency=0)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                score = 0.0
+        return (0, -score, index)
+
+    return [raw for _index, raw, _parsed in sorted(ordered, key=sort_key)]
+
+
 def _purchase_cost(kind: str, item: str | None, state: Any) -> float:
     if kind == "BUY_SEED":
         return _quote(item or "", state, seed=True)
@@ -411,6 +459,14 @@ def _purchase_cost(kind: str, item: str | None, state: Any) -> float:
 
 def _days_left(state: Any) -> int:
     return max(0, season_days - _whole(_get(state, "day", 0)))
+
+
+def _terminal_liquidation_hour(strategy: StrategySpec | None) -> int:
+    value = strategy.terminal_liquidation_hour if strategy is not None else 22
+    try:
+        return min(23, max(0, int(value)))
+    except (TypeError, ValueError, OverflowError):
+        return 22
 
 
 def build_market_orders(state: Any, plan: Any,
@@ -445,10 +501,14 @@ def build_market_orders(state: Any, plan: Any,
     else:
         crop_capacity = None
         animal_capacity = None
-    # The engine records the action selected from the preceding observation;
-    # hour 22 is therefore the last reliably executable liquidation window
-    # for a 30-day episode, with hour 23 retained for direct callers.
-    final_turn = day >= season_days - 1 and hour >= 22
+    cash_needed = (
+        strategy is not None
+        and _intent_purchase_cost(intents, state) > cash
+    )
+    intents = order_market_intents(
+        intents, cash_needed=cash_needed, strategy=strategy, state=state,
+    )
+    final_turn = day >= season_days - 1 and hour >= _terminal_liquidation_hour(strategy)
 
     # Do not sell carried goods.  Policy.act sequences cleanup before the
     # final market window; retaining this flag also makes direct callers safe
@@ -468,11 +528,6 @@ def build_market_orders(state: Any, plan: Any,
     shed_wheat_reserve = max(0, total_feed_wheat - carried_wheat)
     wheat_price = _buy_product_quote("WHEAT", state)
     sell_intents = [intent for intent in intents if intent[0] in {"SELL", "SELL_ALL"}]
-
-    # The final action has no tomorrow to feed, and all remaining shed goods
-    # should be liquidated rather than funding another purchase.
-    if final_turn:
-        total_feed_wheat = required_wheat = shed_wheat_reserve = 0
 
     # Wheat reserved for feed is purchased before discretionary approvals.
     if not final_turn and required_wheat and wheat_price > 0 and shed_room:
@@ -562,13 +617,28 @@ def build_market_orders(state: Any, plan: Any,
             sale_items = [(item, requested[item]) for item in requested if item in shed]
     else:
         sale_items = []
-    for item, quantity in sorted(sale_items):
+    sale_orders: list[list[Any]] = []
+    sale_items = sorted(
+        sale_items,
+        key=lambda entry: (-market_order_score(entry[0], entry[1], state, urgency=0), entry[0]),
+    )
+    for item, quantity in sale_items:
         quantity = min(_whole(quantity), shed.get(item, 0))
         if item == "WHEAT":
             quantity = min(quantity, max(0, shed.get(item, 0) - shed_wheat_reserve))
+        if (
+            quantity > 0
+            and not final_turn
+            and strategy is not None
+            and strategy.avoid_price_floor_sales
+            and _quote(item, state) <= 1
+        ):
+            continue
         if quantity > 0 and len(orders) < max_market_orders:
-            orders.append(["SELL", item, quantity])
-    return orders[:max_market_orders]
+            sale_orders.append(["SELL", item, quantity])
+    if cash_needed:
+        return (sale_orders + orders)[:max_market_orders]
+    return (orders + sale_orders)[:max_market_orders]
 
 
 def _structure_action(state: Any, target: Position) -> str | None:
@@ -613,7 +683,7 @@ def _task_action(state: Any, worker_index: int, task: Task, position: Position) 
         tile_kind = _tile_kind(tile)
         if tile_kind in {"COOP", "PASTURE", "STRUCTURE"}:
             animal = _animal(tile)
-            if item not in ANIMALS or ANIMALS[item]["structure"] != _structure_kind(tile) or animal is not None or (isinstance(tile, Mapping) and "animal" in tile):
+            if item not in ANIMALS or ANIMALS[item]["structure"] != _structure_kind(tile) or animal is not None:
                 return PASS
         elif not _is_adjacent_to_shed(state, position):
             return PASS
@@ -640,7 +710,7 @@ def _task_action(state: Any, worker_index: int, task: Task, position: Position) 
                          and inventory.get(candidate, 0) > 0), "")
         if item in ANIMALS and inventory.get("WHEAT", 0) <= 0:
             return PASS
-        if item in ANIMALS and ANIMALS[item]["structure"] == _structure_kind(tile) and _animal(tile) is None and not (isinstance(tile, Mapping) and "animal" in tile):
+        if item in ANIMALS and ANIMALS[item]["structure"] == _structure_kind(tile) and _animal(tile) is None:
             return f"PLACE {item} 1" if inventory.get(item, 0) else PASS
         return PASS
     if kind == "PLANT":
@@ -677,7 +747,7 @@ def _task_action(state: Any, worker_index: int, task: Task, position: Position) 
     if kind == "WEED":
         return "DIG" if _tile_kind(tile) == "WEED" else PASS
     if kind == "DIG":
-        return "DIG" if tile is not None and not is_locked_tile(tile) and not (isinstance(tile, Mapping) and "animal" in tile) and _tile_kind(tile) in _TILE_KINDS | {"WEED", "STRUCTURE"} else PASS
+        return "DIG" if tile is not None and not is_locked_tile(tile) and _animal(tile) is None and _tile_kind(tile) in _TILE_KINDS | {"WEED", "STRUCTURE"} else PASS
     if kind in {"BUILD_COOP", "BUILD_PASTURE"}:
         return kind if tile is None else PASS
     return PASS
@@ -832,7 +902,7 @@ def _assignment_valid(state: Any, assignment: WorkerAssignment) -> bool:
         return (
             _structure_kind(tile) == ANIMALS[required]["structure"]
             and _animal(tile) is None
-            and not (isinstance(tile, Mapping) and "animal" in tile)
+            and _animal(tile) is None
         )
     if required is not None and _inventory_for_worker(state, worker_index).get(required, 0) <= 0:
         # Required inputs can be staged in the shed. Keep the assignment
@@ -850,7 +920,7 @@ def _assignment_valid(state: Any, assignment: WorkerAssignment) -> bool:
                 required in ANIMALS
                 and _structure_kind(tile) == ANIMALS[required]["structure"]
                 and _animal(tile) is None
-                and not (isinstance(tile, Mapping) and "animal" in tile)
+                and _animal(tile) is None
             )
     return _task_action(state, worker_index, assignment.task, target) != PASS
 
@@ -964,7 +1034,7 @@ class Policy:
         by_worker = {assignment.worker_index: assignment for assignment in assignments}
         terminal_cleanup = (
             _whole(_get(state, "day")) >= season_days - 1
-            and _whole(_get(state, "hour")) >= 12
+            and _whole(_get(state, "hour")) >= min(12, _terminal_liquidation_hour(strategy_spec))
         )
         if terminal_cleanup:
             commands = {}
@@ -994,7 +1064,9 @@ class Policy:
         if not isinstance(visible_hands, Sequence) or isinstance(visible_hands, (str, bytes)):
             visible_hands = [worker for worker in workers if worker["index"] != 0]
         hands = [commands.get(index + 1, [PASS]) for index in range(len(visible_hands))]
-        final_liquidation_window = _whole(_get(state, "hour")) >= 22
+        final_liquidation_window = (
+            _whole(_get(state, "hour")) >= _terminal_liquidation_hour(strategy_spec)
+        )
         market = (
             build_market_orders(state, market_plan, strategy_spec)
             if not terminal_cleanup or (final_liquidation_window and not _has_carried_goods(state))

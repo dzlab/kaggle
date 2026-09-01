@@ -160,6 +160,31 @@ def test_market_regime_missing_price_uses_inventory_not_floor():
     assert market_regime({}, {"WHEAT": 9_000})["WHEAT"] == "scarce"
 
 
+def test_market_order_score_uses_sequential_post_sale_quotes_and_impact_penalty():
+    from kagriculture_agent.strategy import market_order_score
+
+    state = {
+        "market": {
+            "prices": {"TOMATO": 10, "MELON": 250},
+            "inventory": {"TOMATO": 200, "MELON": 20},
+        },
+    }
+
+    assert market_order_score("MELON", 4, state, urgency=0) > market_order_score(
+        "TOMATO", 40, state, urgency=0,
+    )
+
+
+def test_market_order_score_adds_urgency_after_market_impact():
+    from kagriculture_agent.strategy import market_order_score
+
+    state = {"market": {"inventory": {"MELON": 10}}}
+
+    assert market_order_score("MELON", 1, state, urgency=7) == pytest.approx(
+        market_order_score("MELON", 1, state, urgency=0) + 7,
+    )
+
+
 def test_forecast_crop_counts_planting_day_watering_miss_and_bonus_window():
     miss = forecast_crop("WHEAT", horizon=5, watering_days={1, 2, 3, 4})
     watered_on_planting_day = forecast_crop(

@@ -1236,6 +1236,132 @@ def test_buy_product_is_restricted_to_feed_and_fertilizer():
     assert ["BUY_PRODUCT", "FERTILIZER", 2] in orders
 
 
+def test_order_market_intents_prioritizes_sales_when_cash_is_needed():
+    assert policy_module.order_market_intents(
+        [
+            {"kind": "BUY_SEED", "item": "MELON", "quantity": 1},
+            {"kind": "SELL", "item": "MELON", "quantity": 2},
+        ],
+        cash_needed=True,
+    )[0]["kind"] == "SELL"
+
+
+def test_order_market_intents_bounds_sell_batch_with_selected_strategy():
+    from kagriculture_agent.strategy import StrategySpec
+
+    strategy = StrategySpec(
+        "small-batches", ("WHEAT",), (), 10, 0, 0,
+        max_sell_batch=2,
+    )
+
+    ordered = policy_module.order_market_intents(
+        [["SELL", "WHEAT", 9]], strategy=strategy,
+    )
+
+    assert ordered == [["SELL", "WHEAT", 2]]
+
+
+def test_unowned_and_unplaced_animals_are_excluded_from_all_lifecycle_counts():
+    from kagriculture_agent.planner import _feed_animal_counts, _placed_animal_count, build_daily_plan
+
+    tiles = [[None for _ in range(3)] for _ in range(3)]
+    tiles[0][0] = {
+        "kind": "COOP",
+        "animal": {
+            "species": "GOOSE", "owned": False, "placed": False,
+            "needs_feed": True, "fed_today": False,
+            "needs_care": True, "cared_today": False,
+            "fertilizer_available": True,
+        },
+    }
+    state = {
+        "day": 4, "hour": 2, "cash": 1_000,
+        "tiles": tiles,
+        "animals": [{
+            "species": "GOOSE", "position": [0, 0],
+            "owned": False, "placed": False,
+            "needs_feed": True, "fed_today": False,
+            "needs_care": True, "cared_today": False,
+        }],
+        "private": {"shed": {}, "seeds": {}},
+        "market": {"prices": {"WHEAT": 10}},
+    }
+
+    plan = build_daily_plan(state)
+
+    assert _feed_animal_counts(state) == {}
+    assert _placed_animal_count(state) == 0
+    assert not {task.kind for task in plan} & {"FEED", "CARE", "COLLECT_FERTILIZER"}
+
+
+def test_unplaced_animal_does_not_consume_live_feed_reserve_when_selling_wheat():
+    from kagriculture_agent.strategy import StrategySpec
+
+    state = {
+        "day": 4, "hour": 2, "cash": 0,
+        "tiles": [[{
+            "kind": "COOP",
+            "animal": {"species": "GOOSE", "owned": True, "placed": False},
+        }]],
+        "private": {"shed": {"WHEAT": 2}, "seeds": {}},
+        "market": {"prices": {"WHEAT": 10}},
+    }
+    strategy = StrategySpec("no-live-feed", ("WHEAT",), ("GOOSE",), 10, 10, 20)
+
+    assert policy_module.build_market_orders(
+        state, [["SELL", "WHEAT", 2]], strategy,
+    ) == [["SELL", "WHEAT", 2]]
+
+
+def test_terminal_liquidation_uses_selected_strategy_hour():
+    from kagriculture_agent.strategy import StrategySpec
+
+    state = {
+        "day": 29, "hour": 5, "cash": 0,
+        "private": {"shed": {"MELON": 2}, "seeds": {}},
+        "market": {"prices": {"MELON": 250}},
+    }
+    strategy = StrategySpec(
+        "early-liquidation", ("MELON",), (), 10, 0, 0,
+        terminal_liquidation_hour=5,
+    )
+
+    assert policy_module.build_market_orders(state, [], strategy) == [["SELL", "MELON", 2]]
+
+
+def test_nonterminal_strategy_avoids_floor_sales_but_terminal_liquidation_does_not():
+    from kagriculture_agent.strategy import StrategySpec
+
+    strategy = StrategySpec("no-floor", ("MELON",), (), 10, 0, 0)
+    nonterminal = {
+        "day": 4, "hour": 5, "cash": 0,
+        "private": {"shed": {"MELON": 2}, "seeds": {}},
+        "market": {"prices": {"MELON": 1}},
+    }
+    terminal = {**nonterminal, "day": 29, "hour": 22}
+
+    assert policy_module.build_market_orders(nonterminal, [["SELL", "MELON", 2]], strategy) == []
+    assert policy_module.build_market_orders(terminal, [], strategy) == [["SELL", "MELON", 2]]
+
+
+def test_terminal_liquidation_excludes_fertilizer_and_preserves_live_animal_wheat_reserve():
+    from kagriculture_agent.strategy import StrategySpec
+
+    state = {
+        "day": 29, "hour": 22, "cash": 0,
+        "tiles": [[{"kind": "COOP", "animal": {"species": "GOOSE"}}]],
+        "private": {"shed": {"WHEAT": 30, "MELON": 1, "FERTILIZER": 2}, "seeds": {}},
+        "market": {"prices": {"WHEAT": 10, "MELON": 250, "FERTILIZER": 20}},
+    }
+    strategy = StrategySpec("reserve-terminal", ("WHEAT", "MELON"), ("GOOSE",), 10, 10, 4)
+
+    orders = policy_module.build_market_orders(state, [], strategy)
+
+    assert ["SELL", "MELON", 1] in orders
+    assert ["SELL", "WHEAT", 30] in orders
+    assert not any(order[1] == "FERTILIZER" for order in orders)
+
+
 def test_policy_drops_sale_that_conflicts_with_same_turn_pickup():
     assert policy_module._remove_pickup_sale_conflicts(
         [["SELL", "WHEAT", 7], ["SELL", "MELON", 1]],

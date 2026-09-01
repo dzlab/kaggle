@@ -267,6 +267,20 @@ def _entity_state(tile: Any, entity_name: str) -> dict[str, Any] | None:
     return result
 
 
+def _is_live_owned_placed_animal(animal: Any) -> bool:
+    """Return whether an animal observation is eligible for live maintenance."""
+    if not isinstance(animal, Mapping):
+        return False
+    species = _upper(_get(animal, "species", _get(animal, "animal", _get(animal, "kind", ""))))
+    return (
+        species in ANIMALS
+        and _get(animal, "alive", True) is not False
+        and _get(animal, "dead", False) is not True
+        and _get(animal, "owned", True) is not False
+        and _get(animal, "placed", True) is not False
+    )
+
+
 def _market_section(state: Any) -> Mapping[str, Any]:
     market = _get(state, "market", {})
     return market if isinstance(market, Mapping) else {}
@@ -526,7 +540,7 @@ def _placed_animal_count(state: Mapping[str, Any]) -> int:
     count = 0
     for _position_value, tile in _tiles(state):
         entity = _entity_state(tile, "animal")
-        if entity is not None and _upper(_get(entity, "species", _get(entity, "animal", ""))) in ANIMALS:
+        if _is_live_owned_placed_animal(entity):
             count += 1
     return count
 
@@ -547,7 +561,7 @@ def _compatible_structure(state: Mapping[str, Any], animal: str) -> tuple[Positi
         if is_locked_tile(tile):
             continue
         kind = _tile_kind(tile)
-        if kind == structure and _entity_state(tile, "animal") is None:
+        if kind == structure and not _is_live_owned_placed_animal(_entity_state(tile, "animal")):
             return position, empty
         if empty is None and _is_empty(tile):
             empty = position
@@ -573,9 +587,7 @@ def _feed_animal_counts(state: Mapping[str, Any]) -> dict[str, int]:
 
     for animal, position in observations:
         species = _upper(_get(animal, "species", _get(animal, "animal", _get(animal, "kind", ""))))
-        if (species not in ANIMALS
-                or _get(animal, "owned", True) is False
-                or _get(animal, "placed", True) is False):
+        if not _is_live_owned_placed_animal(animal):
             continue
         identity_keys = {
             (field, str(_get(animal, field)))
@@ -589,13 +601,6 @@ def _feed_animal_counts(state: Mapping[str, Any]) -> dict[str, int]:
         seen.update(identity_keys)
         counts[species] = counts.get(species, 0) + 1
 
-    private = _mapping(state.get("private"))
-    shed = private.get("shed", state.get("shed", {}))
-    if isinstance(shed, Mapping):
-        for species in ANIMALS:
-            quantity = _safe_quantity(shed.get(species, 0))
-            if quantity:
-                counts[species] = counts.get(species, 0) + quantity
     return counts
 
 
@@ -730,7 +735,18 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
     animal_cap = strategy.max_animal_units if strategy is not None else None
     wheat_staged = _staged_wheat(normalized)
     wheat_price = _observed_quote("WHEAT", normalized)
-    feed_required = bool(animal_counts)
+    # Stored animals are owned inventory, not live placed animals. They do
+    # not enter lifecycle maintenance/counts, but their placement still needs
+    # a feed reserve so the resulting placement remains executable.
+    stored_animal_counts = {
+        species: int(_safe_quantity(shed.get(species, 0)))
+        for species in ANIMALS
+        if _safe_quantity(shed.get(species, 0)) > 0
+    }
+    planning_animal_counts = dict(animal_counts)
+    for species, quantity in stored_animal_counts.items():
+        planning_animal_counts[species] = planning_animal_counts.get(species, 0) + quantity
+    feed_required = bool(planning_animal_counts)
     cash = _state_cash(normalized)
     intents: list[list[Any]] = []
     tasks: list[Task] = []
@@ -779,7 +795,7 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
         reserve = max(100.0, seed_cost)
         if feed_required and wheat_price > 0:
             quantity, cash_after = _feed_purchase_needed(
-                normalized, day, animal_counts, intents, cash, wheat_price,
+                normalized, day, planning_animal_counts, intents, cash, wheat_price,
                 strategy.reserve_wheat if strategy is not None else 0,
             )
             if quantity and cash_after >= reserve:
@@ -820,7 +836,7 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
             if quantity_after_planning == 0 and candidate_cash_after >= float(ANIMALS[animal]["cost"]) + reserve:
                 intents.append(["BUY_ANIMAL", animal, 1])
         unfunded_feed, feed_cash_after = _feed_purchase_needed(
-            normalized, day, animal_counts, intents, cash, wheat_price,
+            normalized, day, planning_animal_counts, intents, cash, wheat_price,
             strategy.reserve_wheat if strategy is not None else 0,
         )
         # Placement consumes already-staged goods and a worker turn; it does
@@ -910,7 +926,7 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None,
                 planned_crop_count += 1
 
         animal_entity = _entity_state(tile, "animal")
-        if animal_entity is not None:
+        if animal_entity is not None and _is_live_owned_placed_animal(animal_entity):
             animal_position = _position(animal_entity) or position
             species = _upper(_get(animal_entity, "species", _get(animal_entity, "animal", _get(animal_entity, "kind", ""))))
             animal_value = float(ANIMALS.get(species, {}).get("cost", 1))
@@ -939,7 +955,7 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None,
     animals = _get(state, "animals", ()) or ()
     for animal in animals:
         position = _position(animal)
-        if position is None:
+        if position is None or not _is_live_owned_placed_animal(animal):
             continue
         species = _upper(_get(animal, "species", _get(animal, "kind", "")))
         value = float(ANIMALS.get(species, {}).get("cost", 1))
