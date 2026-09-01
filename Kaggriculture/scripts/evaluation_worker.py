@@ -26,6 +26,7 @@ from scripts.evaluate import (
     VariantPolicy,
     _deterministic_random_agent,
     _framework_error_record,
+    _resolve_variant,
     replay_record,
 )
 
@@ -77,10 +78,13 @@ def _request_value(request: Mapping[str, Any], key: str, default: Any = None) ->
 
 
 def _request_failure(request: Mapping[str, Any], error: str) -> dict[str, Any]:
-    variant = _request_value(request, "variant", "mixed")
+    variant = _request_value(request, "variant")
+    candidate = _request_value(request, "candidate")
     opponent = _request_value(request, "opponent", "pass")
     seed = _request_value(request, "seed", 0)
     seat = _request_value(request, "seat", 0)
+    if variant is None:
+        variant = candidate
     if not isinstance(variant, str) or variant not in VARIANTS:
         variant = "mixed"
     if not isinstance(opponent, str) or opponent not in OPPONENTS:
@@ -98,13 +102,16 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
     """Run and normalize one worker request, including framework failures."""
     if not isinstance(request, Mapping):
         return _request_failure({}, "request must be a JSON object")
-    variant = _request_value(request, "variant")
+    variant_value = _request_value(request, "variant")
+    candidate_value = _request_value(request, "candidate")
     opponent = _request_value(request, "opponent")
     seed = _request_value(request, "seed")
     steps = _request_value(request, "steps")
     seat = _request_value(request, "seat", 0)
-    if type(variant) is not str or variant not in VARIANTS:
-        return _request_failure(request, f"unsupported variant: {variant}")
+    try:
+        variant = _resolve_variant(variant_value, candidate_value)
+    except ValueError as exc:
+        return _request_failure(request, str(exc))
     if type(opponent) is not str or opponent not in OPPONENTS:
         return _request_failure(request, f"unsupported opponent: {opponent}")
     if type(seed) is not int:

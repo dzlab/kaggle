@@ -7,8 +7,10 @@ so parsing and replay aggregation remain usable in offline test environments.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import random
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -104,7 +106,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--opponents", nargs="+", choices=OPPONENTS, default=["pass", "random", "starter"])
     parser.add_argument("--steps", type=_positive_int, default=720)
     parser.add_argument("--output", type=Path, default=Path("reports/evaluation.json"))
-    parser.add_argument("--seats", nargs="+", type=int, choices=(0, 1), default=[0],
+    parser.add_argument("--seats", nargs="+", type=int, choices=(0, 1), default=[0, 1],
                         help="candidate seats to evaluate (0 and 1 are supported)")
     parser.add_argument("--variant", action="append", dest="single_variants", choices=VARIANTS)
     parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=None)
@@ -170,11 +172,185 @@ def aggregate_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+_BOOTSTRAP_SAMPLES = 2000
+_WILSON_Z = 1.959963984540054
+
+
+def _record_candidate(record: Mapping[str, Any]) -> str:
+    """Return the stable candidate identity used by evaluation metrics."""
+    value = record.get("candidate", record.get("variant"))
+    return str(value)
+
+
+def _metric_number(value: Any) -> float | None:
+    number = _number(value)
+    return number if number is not None else None
+
+
+def _metric_record_is_valid(record: Mapping[str, Any]) -> bool:
+    return (
+        type(record.get("seat")) is int
+        and record["seat"] in (0, 1)
+        and record.get("framework_error") is False
+        and record.get("outcome") in {"win", "loss", "tie"}
+        and _metric_number(record.get("bank_differential")) is not None
+    )
+
+
+def _record_has_missed_basic_needs(record: Mapping[str, Any]) -> bool:
+    value = record.get("missed_basic_needs")
+    if isinstance(value, bool):
+        return value
+    number = _metric_number(value)
+    return number is not None and number > 0
+
+
+def _wilson_interval(successes: float, trials: int) -> dict[str, float | None]:
+    if trials < 1:
+        return {"lower": None, "upper": None}
+    proportion = successes / trials
+    z_squared = _WILSON_Z ** 2
+    denominator = 1.0 + z_squared / trials
+    center = (proportion + z_squared / (2.0 * trials)) / denominator
+    margin = _WILSON_Z * math.sqrt(
+        proportion * (1.0 - proportion) / trials + z_squared / (4.0 * trials * trials)
+    ) / denominator
+    return {
+        "lower": float(max(0.0, center - margin)),
+        "upper": float(min(1.0, center + margin)),
+    }
+
+
+def _bootstrap_interval(values: Sequence[float], keys: Sequence[tuple[Any, ...]]) -> dict[str, float | None]:
+    if not values:
+        return {"lower": None, "upper": None}
+    seed_material = json.dumps(
+        [[*key, float(value)] for key, value in zip(keys, values)],
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    rng = random.Random(int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "big"))
+    samples = []
+    for _ in range(_BOOTSTRAP_SAMPLES):
+        samples.append(mean(values[rng.randrange(len(values))] for _ in values))
+    return {
+        "lower": float(percentile(samples, 5)),
+        "upper": float(percentile(samples, 95)),
+    }
+
+
+def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Summarize seed-matched seat pairs with deterministic confidence metrics.
+
+    A pair is valid only when exactly one valid record exists for each seat for
+    the same candidate, opponent, and seed.  Incomplete or duplicate pairs are
+    reported rather than silently folded into the aggregate.
+    """
+    records = list(records)
+    buckets: dict[tuple[str, str, Any], dict[int, list[Mapping[str, Any]]]] = {}
+    valid_by_seat = {0: 0, 1: 0}
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        if _metric_record_is_valid(record):
+            valid_by_seat[record["seat"]] += 1
+        key = (_record_candidate(record), str(record.get("opponent")), record.get("seed"))
+        seat = record.get("seat")
+        if type(seat) is int and seat in (0, 1):
+            buckets.setdefault(key, {0: [], 1: []})[seat].append(record)
+
+    pairs: list[tuple[tuple[str, str, Any], Mapping[str, Any], Mapping[str, Any]]] = []
+    missing = 0
+    duplicate = 0
+    for key in sorted(buckets, key=lambda value: tuple(str(item) for item in value)):
+        seats = buckets[key]
+        if len(seats[0]) == 1 and len(seats[1]) == 1 and all(_metric_record_is_valid(item) for item in (seats[0][0], seats[1][0])):
+            pairs.append((key, seats[0][0], seats[1][0]))
+        else:
+            missing += 1
+            duplicate += int(len(seats[0]) > 1 or len(seats[1]) > 1)
+
+    pair_scores = []
+    pair_differentials = []
+    pair_keys = []
+    outcome_counts = {"win": 0, "loss": 0, "tie": 0}
+    for key, seat_zero, seat_one in pairs:
+        scores = {"win": 1.0, "tie": 0.5, "loss": 0.0}
+        pair_scores.append((scores[seat_zero["outcome"]] + scores[seat_one["outcome"]]) / 2.0)
+        pair_differentials.append(
+            (_metric_number(seat_zero["bank_differential"]) + _metric_number(seat_one["bank_differential"])) / 2.0
+        )
+        pair_keys.append(key)
+        for seat_record in (seat_zero, seat_one):
+            outcome_counts[seat_record["outcome"]] += 1
+
+    trials = len(pairs) * 2
+    successes = sum(pair_scores)
+    wilson = _wilson_interval(successes, trials)
+    bootstrap = _bootstrap_interval(pair_differentials, pair_keys)
+    return {
+        "record_count": len(records),
+        "valid_records_by_seat": {"0": valid_by_seat[0], "1": valid_by_seat[1]},
+        "paired_games": len(pairs),
+        "missing_seat_pairs": missing,
+        "duplicate_seat_pairs": duplicate,
+        "wins": outcome_counts["win"],
+        "losses": outcome_counts["loss"],
+        "ties": outcome_counts["tie"],
+        "seat_balanced_win_rate": float(mean(pair_scores)) if pair_scores else None,
+        "mean_paired_bank_differential": float(mean(pair_differentials)) if pair_differentials else None,
+        "median_paired_bank_differential": float(median(pair_differentials)) if pair_differentials else None,
+        "fifth_percentile_bank_differential": percentile(pair_differentials, 5),
+        "wilson_win_rate": wilson,
+        "bootstrap_bank_differential": bootstrap,
+    }
+
+
+def promotion_decision(
+    records: Sequence[Mapping[str, Any]],
+    baseline_records: Sequence[Mapping[str, Any]],
+    *,
+    min_valid_games: int = 20,
+) -> dict[str, Any]:
+    """Apply ordered safety gates before comparing a candidate with baseline."""
+    if type(min_valid_games) is not int or min_valid_games < 1:
+        raise ValueError("min_valid_games must be a positive integer")
+    records = list(records)
+    baseline_records = list(baseline_records)
+    candidate = paired_seed_summary(records)
+    baseline = paired_seed_summary(baseline_records)
+    reasons: list[str] = []
+    if any(record.get("framework_error") for record in records if isinstance(record, Mapping)):
+        reasons.append("framework_error")
+    elif any(_record_has_missed_basic_needs(record) for record in records if isinstance(record, Mapping)):
+        reasons.append("missed_basic_needs")
+    elif any(candidate["valid_records_by_seat"][str(seat)] < min_valid_games for seat in (0, 1)):
+        reasons.append("insufficient_valid_games")
+    elif candidate["missing_seat_pairs"] or candidate["duplicate_seat_pairs"]:
+        reasons.append("missing_seat_pairs")
+    elif candidate["fifth_percentile_bank_differential"] is None or candidate["fifth_percentile_bank_differential"] < 0:
+        reasons.append("negative_tail")
+    elif (
+        baseline["seat_balanced_win_rate"] is None
+        or baseline["mean_paired_bank_differential"] is None
+        or candidate["seat_balanced_win_rate"] <= baseline["seat_balanced_win_rate"]
+        or candidate["mean_paired_bank_differential"] <= baseline["mean_paired_bank_differential"]
+    ):
+        reasons.append("no_paired_improvement")
+    return {
+        "status": "promote" if not reasons else "discard",
+        "reasons": reasons,
+        "candidate": candidate,
+        "baseline": baseline,
+    }
+
+
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
 def _number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
     try:
         number = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -351,7 +527,7 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
                 return False
             observation = state.get("observation")
             player = _mapping(observation).get("player")
-            if not isinstance(player, int) or player not in {0, 1} or player in players or not isinstance(observation, Mapping):
+            if type(player) is not int or player not in {0, 1} or player in players or not isinstance(observation, Mapping):
                 return False
             players.add(player)
             states_by_player[player] = state
@@ -553,7 +729,7 @@ def _final_bank(state: Mapping[str, Any] | None) -> float | None:
     observation = _mapping(state.get("observation"))
     player = observation.get("player")
     farms = observation.get("farms")
-    if not isinstance(farms, Sequence) or isinstance(farms, (str, bytes)) or not isinstance(player, int):
+    if not isinstance(farms, Sequence) or isinstance(farms, (str, bytes)) or type(player) is not int:
         return None
     if not 0 <= player < len(farms):
         return None
@@ -599,7 +775,7 @@ def _tiles(observation: Mapping[str, Any]) -> Sequence[Any]:
 def _tile_entries(observation: Mapping[str, Any]) -> Sequence[tuple[tuple[int, int], Any]]:
     farms = observation.get("farms")
     player = observation.get("player")
-    if not isinstance(farms, Sequence) or isinstance(farms, (str, bytes)) or not isinstance(player, int):
+    if not isinstance(farms, Sequence) or isinstance(farms, (str, bytes)) or type(player) is not int:
         return ()
     if not 0 <= player < len(farms):
         return ()
@@ -849,7 +1025,7 @@ def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, see
 def _farm_observation(observation: Mapping[str, Any]) -> Mapping[str, Any]:
     farms = observation.get("farms")
     player = observation.get("player")
-    if isinstance(farms, Sequence) and not isinstance(farms, (str, bytes)) and isinstance(player, int) and 0 <= player < len(farms):
+    if isinstance(farms, Sequence) and not isinstance(farms, (str, bytes)) and type(player) is int and 0 <= player < len(farms):
         return _mapping(farms[player])
     return {}
 
@@ -2726,7 +2902,8 @@ def run_evaluation(*, variants: Sequence[str] | None = None,
     if len(components) != len(set(components)):
         raise ValueError("each ablation component may be requested only once")
     baseline_config = dict(_DEFAULT_ABLATIONS)
-    candidate_kwargs = {"candidates": candidates} if candidates is not None else {"variants": variants}
+    selected = _resolve_candidates(variants, candidates)
+    candidate_kwargs = {"candidates": selected} if candidates is not None else {"variants": selected}
     baseline = run_matrix(
         **candidate_kwargs, opponents=opponents, seeds=seeds, steps=steps,
         ablations=baseline_config, seats=seats,

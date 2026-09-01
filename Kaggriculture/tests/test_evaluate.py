@@ -104,6 +104,7 @@ def test_cli_default_output_is_under_reports():
     from scripts.evaluate import parse_args
 
     assert parse_args([]).output == Path("reports/evaluation.json")
+    assert parse_args([]).seats == [0, 1]
 
 
 def test_cli_parses_requested_seats():
@@ -119,6 +120,166 @@ def test_cli_parses_candidates_as_compatibility_alias_for_variants():
 
     assert args.candidates == ["mixed", "animal-heavy"]
     assert args.variants == ["mixed", "animal-heavy"]
+
+
+@pytest.mark.parametrize("path", [
+    ("steps", 0, 0, "observation", "player", True),
+    ("rewards", 0, None, None, None, True),
+    ("steps", 0, 0, "observation", "farms", None),
+])
+def test_replay_record_rejects_boolean_numeric_values(path):
+    replay = _strict_two_turn_replay()
+    if path[0] == "rewards":
+        replay["rewards"][path[1]] = path[-1]
+    elif path[4] == "farms":
+        replay["steps"][path[1]][path[2]][path[3]][path[4]][0]["money"] = True
+    else:
+        replay[path[0]][path[1]][path[2]][path[3]][path[4]] = path[-1]
+
+    from scripts.evaluate import replay_record
+
+    result = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert result["framework_error"] is True
+
+
+def test_replay_record_rejects_boolean_quantities():
+    replay = _strict_two_turn_replay()
+    replay["steps"][0][0]["observation"]["private"]["shed"] = {"WHEAT": True}
+
+    from scripts.evaluate import replay_record
+
+    result = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert result["framework_error"] is True
+
+
+def test_run_evaluation_rejects_conflicting_variant_aliases(monkeypatch):
+    from scripts.evaluate import run_evaluation
+
+    monkeypatch.setattr("scripts.evaluate.run_matrix", lambda **kwargs: pytest.fail("must not run"))
+
+    with pytest.raises(ValueError, match="variants and candidates must match"):
+        run_evaluation(
+            variants=["mixed"], candidates=["animal-heavy"],
+            opponents=["pass"], seeds=[1], steps=2,
+        )
+
+
+def test_worker_accepts_direct_candidate_request(monkeypatch):
+    import scripts.evaluation_worker as worker
+
+    captured = {}
+
+    class FakeEnvironment:
+        configuration = {}
+
+        def run(self, agents):
+            captured["agents"] = agents
+
+        def toJSON(self):
+            return {}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "kaggle_environments",
+        type("FakeKaggleEnvironments", (), {"make": staticmethod(lambda *args, **kwargs: FakeEnvironment())}),
+    )
+    monkeypatch.setattr(worker, "VariantPolicy", lambda variant, *args: captured.setdefault("variant", variant))
+    def fake_replay_record(replay, **kwargs):
+        captured["replay_kwargs"] = kwargs
+        return {
+            "candidate": kwargs["variant"], "variant": kwargs["variant"], "opponent": kwargs["opponent"],
+            "seed": kwargs["seed"], "seat": kwargs["seat"], "outcome": "tie",
+            "final_bank": 0.0, "opponent_final_bank": 0.0, "bank_differential": 0.0,
+            "framework_error": False, "shed_overflow": 0.0, "price_floor_sales": 0.0,
+            "missed_basic_needs": 0.0,
+        }
+    monkeypatch.setattr(worker, "replay_record", fake_replay_record)
+
+    result = worker.run_request({
+        "candidate": "mixed", "opponent": "pass", "seed": 1, "steps": 2, "seat": 1,
+    })
+
+    assert captured["variant"] == "mixed"
+    assert captured["replay_kwargs"]["variant"] == "mixed"
+    assert result["candidate"] == "mixed"
+
+
+def _metric_record(*, seat, seed, outcome, differential, candidate="melon", opponent="pass",
+                   framework_error=False, missed_basic_needs=0):
+    return {
+        "candidate": candidate, "variant": candidate, "opponent": opponent,
+        "seat": seat, "seed": seed, "outcome": outcome,
+        "final_bank": 100.0 + differential, "opponent_final_bank": 100.0,
+        "bank_differential": differential, "framework_error": framework_error,
+        "shed_overflow": 0.0, "price_floor_sales": 0.0,
+        "missed_basic_needs": missed_basic_needs,
+    }
+
+
+def test_paired_seed_summary_has_confidence_metrics_and_both_seats():
+    from scripts.evaluate import paired_seed_summary
+
+    records = [
+        _metric_record(seat=0, seed=1, outcome="win", differential=10),
+        _metric_record(seat=1, seed=1, outcome="loss", differential=-4),
+        _metric_record(seat=0, seed=2, outcome="tie", differential=2),
+    ]
+
+    summary = paired_seed_summary(records)
+
+    assert summary["paired_games"] == 1
+    assert summary["missing_seat_pairs"] == 1
+    assert summary["seat_balanced_win_rate"] == 0.5
+    assert summary["mean_paired_bank_differential"] == 3.0
+    assert 0.0 <= summary["wilson_win_rate"]["lower"] <= summary["wilson_win_rate"]["upper"] <= 1.0
+    assert set(summary["bootstrap_bank_differential"].keys()) == {"lower", "upper"}
+    json.dumps(summary, allow_nan=False)
+
+
+def test_promotion_decision_applies_discard_gates_in_order():
+    from scripts.evaluate import promotion_decision
+
+    framework = [_metric_record(seat=0, seed=1, outcome="win", differential=10, framework_error=True)]
+    assert promotion_decision(framework, [], min_valid_games=1)["reasons"] == ["framework_error"]
+
+    needs = [_metric_record(seat=0, seed=1, outcome="win", differential=10, missed_basic_needs=1)]
+    assert promotion_decision(needs, [], min_valid_games=1)["reasons"] == ["missed_basic_needs"]
+
+    one_seat = [_metric_record(seat=0, seed=1, outcome="win", differential=10)]
+    assert promotion_decision(one_seat, [], min_valid_games=2)["reasons"] == ["insufficient_valid_games"]
+
+    missing_pair = [
+        _metric_record(seat=0, seed=1, outcome="win", differential=10),
+        _metric_record(seat=1, seed=1, outcome="loss", differential=-10),
+        _metric_record(seat=0, seed=2, outcome="win", differential=10),
+    ]
+    assert promotion_decision(missing_pair, [], min_valid_games=1)["reasons"] == ["missing_seat_pairs"]
+
+    negative_tail = [
+        _metric_record(seat=0, seed=1, outcome="win", differential=-10),
+        _metric_record(seat=1, seed=1, outcome="loss", differential=-10),
+    ]
+    assert promotion_decision(negative_tail, [], min_valid_games=1)["reasons"] == ["negative_tail"]
+
+
+def test_promotion_decision_compares_baseline_only_after_gates():
+    from scripts.evaluate import promotion_decision
+
+    candidate = [
+        _metric_record(seat=0, seed=1, outcome="win", differential=10),
+        _metric_record(seat=1, seed=1, outcome="win", differential=10),
+    ]
+    baseline = [
+        _metric_record(seat=0, seed=1, outcome="loss", differential=1, candidate="current"),
+        _metric_record(seat=1, seed=1, outcome="loss", differential=1, candidate="current"),
+    ]
+
+    decision = promotion_decision(candidate, baseline, min_valid_games=1)
+
+    assert decision["status"] == "promote"
+    assert decision["reasons"] == []
 
 
 @pytest.mark.parametrize("kwargs", [
