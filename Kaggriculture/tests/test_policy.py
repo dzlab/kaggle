@@ -396,6 +396,25 @@ def test_zero_strategy_caps_skip_autonomous_production_without_crashing():
     assert not any(task.kind in {"PLANT", "ANIMAL"} for task in macro["tasks"])
 
 
+def test_empty_strategy_spec_emits_no_crop_or_animal_production():
+    from kagriculture_agent.planner import build_autonomous_macro_plan, build_daily_plan
+    from kagriculture_agent.strategy import StrategySpec
+
+    strategy = StrategySpec("empty", (), (), 10, 10, 0)
+    state = observation(
+        day=0, hour=1, hands=[], tiles=[[None for _ in range(5)] for _ in range(5)],
+        seeds={}, inventories=[[]], money=5_000,
+    )
+
+    macro = build_autonomous_macro_plan(state, strategy=strategy)
+    daily = build_daily_plan(state, strategy=strategy)
+
+    assert not any(intent[0] in {"BUY_SEED", "BUY_ANIMAL"} for intent in macro["market_intents"])
+    assert not any(task.kind in {"PLANT", "ANIMAL", "BUILD_COOP", "BUILD_PASTURE"}
+                   for task in macro["tasks"])
+    assert not any(task.kind in {"PLANT", "ANIMAL", "STRUCTURE"} for task in daily)
+
+
 def test_policy_forwards_named_strategy_to_all_planning_and_market_paths(monkeypatch):
     from kagriculture_agent.strategy import get_strategy
 

@@ -476,7 +476,7 @@ def _portfolio_scenarios(state: Mapping[str, Any], day: int,
     demand = _town_demand(state)
     prices = _observed_prices(state)
     allowed_crops = set(strategy.crops) if strategy is not None else set(_MACRO_CROPS)
-    crops = tuple(crop for crop in _MACRO_CROPS if crop in allowed_crops) or _MACRO_CROPS
+    crops = tuple(crop for crop in _MACRO_CROPS if crop in allowed_crops)
     scenarios: list[dict[str, Any]] = []
     for crop in crops:
         for mode in _MACRO_MODES:
@@ -511,8 +511,10 @@ def _portfolio_scenarios(state: Mapping[str, Any], day: int,
 def _preferred_animal(state: Mapping[str, Any], demand: set[str],
                       allowed_animals: Sequence[str] | None = None) -> str:
     product_order = ("EGG", "MILK", "WOOL")
-    animals = tuple(animal for animal in ANIMALS
-                    if allowed_animals is None or animal in allowed_animals) or tuple(ANIMALS)
+    animals = (tuple(ANIMALS) if allowed_animals is None else
+               tuple(animal for animal in ANIMALS if animal in allowed_animals))
+    if not animals:
+        return ""
     for product in product_order:
         candidate = {"EGG": "GOOSE", "MILK": "COW", "WOOL": "SHEEP"}[product]
         if product in demand and candidate in animals:
@@ -703,7 +705,10 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
     except (TypeError, ValueError, OverflowError):
         hour = 0
     scenarios = _portfolio_scenarios(normalized, day, strategy)
-    selected = max(enumerate(scenarios), key=lambda item: (item[1]["score"], -item[0]))[1]
+    selected = (
+        max(enumerate(scenarios), key=lambda item: (item[1]["score"], -item[0]))[1]
+        if scenarios else {"crop": "", "mode": "", "score": 0.0}
+    )
     demand = _town_demand(normalized)
     allowed_crops = set(strategy.crops) if strategy is not None else set(CROPS)
     allowed_animals = set(strategy.animals) if strategy is not None else set(ANIMALS)
@@ -730,10 +735,12 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
     intents: list[list[Any]] = []
     tasks: list[Task] = []
     deadline_needs = _has_basic_need_deadline(normalized, day, strategy)
-    _compatible_target, structure_target = _compatible_structure(normalized, animal)
+    _compatible_target, structure_target = (
+        _compatible_structure(normalized, animal) if animal else (None, None)
+    )
     if day < season_days - 2:
-        seed_cost = float(CROPS[selected["crop"]]["seed"])
-        can_plan_crop = crop_cap is None or planned_crop_count < crop_cap
+        seed_cost = float(CROPS[selected["crop"]]["seed"]) if selected["crop"] else 0.0
+        can_plan_crop = bool(selected["crop"]) and (crop_cap is None or planned_crop_count < crop_cap)
         seed_purchase_planned = (
             can_plan_crop
             and _safe_quantity(seeds.get(selected["crop"], 0)) <= 0
@@ -786,7 +793,9 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
         if hour == 0 and hand_count < 2 and hires_today == 0 and cash >= 100.0 + reserve:
             intents.append(["HIRE"])
 
-        compatible, empty = _compatible_structure(normalized, animal)
+        compatible, empty = (
+            _compatible_structure(normalized, animal) if animal else (None, None)
+        )
         animal_in_storage = _safe_quantity(shed.get(animal, 0)) > 0
         can_plan_animal = animal_cap is None or planned_animal_count < animal_cap
         if (can_plan_animal and animal and _placed_animal_count(normalized) == 0
@@ -829,7 +838,7 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
         hands = farm.get("hands", ())
         hand_count = len(hands) if isinstance(hands, Sequence) and not isinstance(hands, (str, bytes)) else 0
         hires_today = _safe_quantity(farm.get("hires_today", 0))
-        reserve = max(100.0, float(CROPS[selected["crop"]]["seed"]))
+        reserve = max(100.0, float(CROPS[selected["crop"]]["seed"])) if selected["crop"] else 100.0
         if hand_count < 2 and hires_today == 0 and cash >= 100.0 + reserve:
             intents.append(["HIRE"])
     return {
