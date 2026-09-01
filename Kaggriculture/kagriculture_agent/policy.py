@@ -18,6 +18,7 @@ from .planner import (
     normalize_planner_state,
 )
 from .routing import is_locked_tile, normalize_position, next_move
+from .strategy import get_strategy
 from .types import Position, Task, WorkerAssignment
 
 
@@ -830,7 +831,9 @@ def _assignment_valid(state: Any, assignment: WorkerAssignment) -> bool:
 class Policy:
     """Stateful deterministic policy with reset-safe episode memory."""
 
-    def __init__(self) -> None:
+    def __init__(self, strategy: str = "current") -> None:
+        get_strategy(strategy)
+        self.strategy_name = strategy
         self.memory = PolicyMemory()
 
     def _carried_assignments(self, state: Mapping[str, Any]) -> list[WorkerAssignment]:

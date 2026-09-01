@@ -13,12 +13,14 @@ class PolicyMemory(PlannerMemory):
     """Assignments and diagnostics that must never leak across episodes."""
 
     market_regime: dict[str, str] = field(default_factory=dict)
+    selected_strategy: str | None = None
 
     def reset(self, *, day: int = -1, hour: int = -1, reason: str = "manual") -> None:
         self.assignments.clear()
         self.sell_batches.clear()
         self.diagnostics.clear()
         self.market_regime.clear()
+        self.selected_strategy = None
         self.last_day = day
         self.last_hour = hour
         self.diagnostics["reset_reason"] = reason

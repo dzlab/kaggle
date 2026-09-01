@@ -12,6 +12,19 @@ VALID_SIMPLE = {
 }
 
 
+def test_policy_defaults_to_current_strategy():
+    from kagriculture_agent.policy import Policy
+
+    assert Policy().strategy_name == "current"
+
+
+def test_unknown_strategy_is_rejected():
+    from kagriculture_agent.policy import Policy
+
+    with pytest.raises(ValueError, match="unsupported strategy"):
+        Policy(strategy="not-a-route")
+
+
 def observation(*, day=0, hour=0, hands=None, tiles=None, shed=None,
                 seeds=None, inventories=None, money=3_000, market=None):
     hands = [[1, 0], [2, 0]] if hands is None else hands
