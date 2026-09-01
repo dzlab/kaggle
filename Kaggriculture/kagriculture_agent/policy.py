@@ -21,7 +21,14 @@ from .planner import (
     normalize_planner_state,
 )
 from .routing import is_locked_tile, normalize_position, next_move
-from .strategy import StrategySpec, get_strategy, market_order_score, market_sale_quotes, select_strategy
+from .strategy import (
+    StrategySpec,
+    get_strategy,
+    market_order_score,
+    market_sale_quotes,
+    select_strategy,
+    should_front_run,
+)
 from .types import Position, Task, WorkerAssignment
 
 
@@ -971,10 +978,11 @@ def _assignment_valid(state: Any, assignment: WorkerAssignment) -> bool:
 class Policy:
     """Stateful deterministic policy with reset-safe episode memory."""
 
-    def __init__(self, strategy: str = "current") -> None:
+    def __init__(self, strategy: str = "current", *, opponent_signals: bool = False) -> None:
         if strategy != "auto":
             get_strategy(strategy)
         self.strategy_name = strategy
+        self.opponent_signals = bool(opponent_signals)
         self.memory = PolicyMemory()
 
     def _carried_assignments(self, state: Mapping[str, Any]) -> list[WorkerAssignment]:
@@ -1052,6 +1060,10 @@ class Policy:
         regime["shops"] = "|".join(str(shop) for shop in shops) if isinstance(shops, Sequence) and not isinstance(shops, (str, bytes)) else ""
         selected_strategy = self.memory.selected_strategy
         reset = self.memory.observe_time(_get(state, "day"), _get(state, "hour"))
+        opponent_item = (
+            self.memory.opponent_signal.observe(state)
+            if self.opponent_signals else None
+        )
         strategy_spec = None
         if self.strategy_name == "auto":
             reset_reason = self.memory.diagnostics.get("reset_reason")
@@ -1099,6 +1111,8 @@ class Policy:
         market_plan = build_daily_plan(_state_for_planner(state), self.memory, strategy_spec)
         market_plan.extend(macro.get("market_intents", ()))
         market_plan.extend(_explicit_market_intents(obs, state))
+        if opponent_item is not None and self._opponent_presale_allowed(state, opponent_item, strategy_spec):
+            market_plan.append(["SELL", opponent_item, 1])
         seeds = _mapping(_get(state, "private", {})).get("seeds", {})
         has_seed = isinstance(seeds, Mapping) and any(_whole(quantity) > 0 for quantity in seeds.values())
         if not has_seed and _whole(_get(state, "day")) < season_days - 2:
@@ -1118,3 +1132,23 @@ class Policy:
         market = _remove_pickup_sale_conflicts(market, commands)
         self.memory.sell_batches = [order for order in market if order[0] == "SELL"]
         return {"farmer": farmer, "hands": hands, "market": market}
+
+    def _opponent_presale_allowed(self, state: Mapping[str, Any], item: str,
+                                  strategy: StrategySpec | None) -> bool:
+        """Require an owned shed batch before converting a public signal to a sale."""
+        shed = _shed(state)
+        owned = _whole(shed.get(item, 0))
+        if item not in _SALEABLE_PRODUCTS or owned <= 0:
+            return False
+        if item == "WHEAT":
+            carried_wheat = sum(_counts(inventory).get("WHEAT", 0) for inventory in _inventories(state))
+            reserve_wheat = strategy.reserve_wheat if strategy is not None and _animals(state) else 0
+            required_wheat = sum(_animals(state).values()) * _days_left(state) + reserve_wheat
+            if owned <= max(0, required_wheat - carried_wheat):
+                return False
+        return should_front_run(
+            item=item,
+            current_price=_quote(item, state),
+            evidence=self.memory.opponent_signal.evidence,
+            town_refill=self.memory.opponent_signal.town_refill,
+        )

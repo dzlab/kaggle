@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .strategy import OpponentMarketSignal
 from .types import EpisodeMemory as PlannerMemory
 
 
@@ -14,6 +15,7 @@ class PolicyMemory(PlannerMemory):
 
     market_regime: dict[str, str] = field(default_factory=dict)
     selected_strategy: str | None = None
+    opponent_signal: OpponentMarketSignal = field(default_factory=OpponentMarketSignal)
 
     def reset(self, *, day: int = -1, hour: int = -1, reason: str = "manual") -> None:
         self.assignments.clear()
@@ -21,6 +23,7 @@ class PolicyMemory(PlannerMemory):
         self.diagnostics.clear()
         self.market_regime.clear()
         self.selected_strategy = None
+        self.opponent_signal.reset()
         self.last_day = day
         self.last_hour = hour
         self.diagnostics["reset_reason"] = reason

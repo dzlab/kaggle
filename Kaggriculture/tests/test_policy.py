@@ -2076,3 +2076,85 @@ def test_policy_memory_reset_clears_selected_strategy():
     memory.reset()
 
     assert memory.selected_strategy is None
+
+
+def test_opponent_signal_requires_three_consistent_observations():
+    from kagriculture_agent.strategy import OpponentMarketSignal
+
+    signal = OpponentMarketSignal()
+
+    assert signal.observe({"market": {"inventory": {"MELON": 20}}}) is None
+    assert signal.observe({"market": {"inventory": {"MELON": 16}}}) is None
+    assert signal.observe({"market": {"inventory": {"MELON": 12}}}) == "MELON"
+
+
+def test_price_floor_disables_front_running():
+    from kagriculture_agent.strategy import should_front_run
+
+    assert not should_front_run(item="TOMATO", current_price=1, evidence=3, town_refill=False)
+
+
+def test_front_running_requires_strong_evidence_and_no_town_refill():
+    from kagriculture_agent.strategy import should_front_run
+
+    assert not should_front_run("MELON", 250, evidence=2, town_refill=False)
+    assert not should_front_run("MELON", 250, evidence=3, town_refill=True)
+    assert should_front_run("MELON", 250, evidence=3, town_refill=False)
+    assert not should_front_run(
+        "MELON", 250,
+        evidence={"observations": 3, "owned_batch": 0},
+        town_refill=False,
+    )
+
+
+def test_opponent_signal_discards_history_after_town_demand_refresh():
+    from kagriculture_agent.strategy import OpponentMarketSignal
+
+    signal = OpponentMarketSignal()
+    signal.observe({"market": {"inventory": {"MELON": 20}}, "town": {"unlocked_shops": ["BAKERY"]}})
+    signal.observe({"market": {"inventory": {"MELON": 16}}, "town": {"unlocked_shops": ["BAKERY"]}})
+
+    assert signal.observe({
+        "market": {"inventory": {"MELON": 12}},
+        "town": {"unlocked_shops": ["PET_CAFE"]},
+    }) is None
+
+
+def test_opponent_signal_history_clears_on_memory_reset():
+    memory = policy_module.PolicyMemory()
+    memory.opponent_signal.observe({"market": {"inventory": {"MELON": 20}}})
+    memory.opponent_signal.observe({"market": {"inventory": {"MELON": 16}}})
+
+    memory.reset()
+
+    assert memory.opponent_signal.history == {}
+    assert memory.opponent_signal.observe({"market": {"inventory": {"MELON": 12}}}) is None
+
+
+def test_optional_opponent_signal_requires_owned_sellable_batch():
+    policy = policy_module.Policy(opponent_signals=True)
+    first = observation(day=4, hour=1, shed={"MELON": 1})
+    first["market"]["inventory"] = {"MELON": 20}
+    second = deepcopy(first)
+    second["market"]["inventory"] = {"MELON": 16}
+    third = deepcopy(first)
+    third["market"]["inventory"] = {"MELON": 12}
+
+    policy.act(first)
+    policy.act(second)
+    action = policy.act(third)
+
+    assert ["SELL", "MELON", 1] in action["market"]
+
+    no_batch = policy_module.Policy(opponent_signals=True)
+    empty = deepcopy(first)
+    empty["private"]["shed"] = {}
+    empty["market"]["inventory"] = {"MELON": 20}
+    empty_next = deepcopy(empty)
+    empty_next["market"]["inventory"] = {"MELON": 16}
+    empty_last = deepcopy(empty)
+    empty_last["market"]["inventory"] = {"MELON": 12}
+
+    no_batch.act(empty)
+    no_batch.act(empty_next)
+    assert ["SELL", "MELON", 1] not in no_batch.act(empty_last)["market"]

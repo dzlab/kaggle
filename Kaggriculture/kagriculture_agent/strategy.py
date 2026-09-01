@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
 from math import isfinite
 
-from .constants import MARKET_I0, PRICE_FLOOR, shed_capacity
+from .constants import MARKET_I0, PRICE_FLOOR, PRODUCTS, SHOP_DEMANDS, shed_capacity
 from .economics import market_price
 
 
@@ -32,6 +32,167 @@ STRATEGIES = {
     "premium": StrategySpec("premium", ("WHEAT", "MELON"), ("COW", "SHEEP"), 48, 12, 16),
     "mixed": StrategySpec("mixed", ("WHEAT", "CARROT", "MELON"), ("COW", "SHEEP"), 64, 9, 12),
 }
+
+
+_SALEABLE_MARKET_ITEMS = frozenset(PRODUCTS) - {"FERTILIZER"}
+
+
+def _public_market_inventory(state: object) -> Mapping[str, object]:
+    if not isinstance(state, Mapping):
+        return {}
+    market = state.get("market", {})
+    if not isinstance(market, Mapping):
+        return {}
+    inventory = market.get("inventory", {})
+    return inventory if isinstance(inventory, Mapping) else {}
+
+
+def _demand_snapshot(value: object) -> tuple[object, ...] | None:
+    if isinstance(value, Mapping):
+        return tuple(sorted((str(key).upper(), repr(item)) for key, item in value.items()))
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return tuple(sorted(str(item).upper() for item in value))
+    return None
+
+
+def _public_town_demand(state: object) -> tuple[tuple[object, ...] | None, bool]:
+    if not isinstance(state, Mapping):
+        return None, False
+    town = state.get("town", {})
+    if not isinstance(town, Mapping):
+        return None, False
+    explicit_refresh = any(
+        bool(town.get(key))
+        for key in ("demand_refreshed", "demand_refresh", "refill", "refilled")
+    )
+    for key in ("demand", "demands", "requested_items"):
+        if key in town:
+            return _demand_snapshot(town.get(key)), explicit_refresh
+    shops = town.get("unlocked_shops")
+    if isinstance(shops, Sequence) and not isinstance(shops, (str, bytes, bytearray)):
+        demand = {
+            item
+            for shop in shops
+            if isinstance(shop, str)
+            for item in SHOP_DEMANDS.get(shop.upper(), ())
+        }
+        return _demand_snapshot(demand), explicit_refresh
+    return None, explicit_refresh
+
+
+@dataclass
+class OpponentMarketSignal:
+    """Track repeated public market pressure without attributing its source."""
+
+    history: dict[str, list[float]] | None = None
+    _previous_inventory: dict[str, float] | None = None
+    _previous_demand: tuple[object, ...] | None = None
+    _has_demand_observation: bool = False
+    town_refill: bool = False
+    evidence: int = 0
+
+    def __post_init__(self) -> None:
+        if self.history is None:
+            self.history = {}
+        if self._previous_inventory is None:
+            self._previous_inventory = {}
+
+    def reset(self) -> None:
+        self.history.clear()
+        self._previous_inventory.clear()
+        self._previous_demand = None
+        self._has_demand_observation = False
+        self.town_refill = False
+        self.evidence = 0
+
+    def observe(self, state: object) -> str | None:
+        """Return an item only after three strict, monotonic public decreases."""
+        inventory = _public_market_inventory(state)
+        demand, explicit_refresh = _public_town_demand(state)
+        demand_refresh = explicit_refresh or (
+            self._has_demand_observation and demand != self._previous_demand
+        )
+        self.town_refill = demand_refresh
+        if demand_refresh:
+            self.history.clear()
+            self._previous_inventory.clear()
+
+        candidate: str | None = None
+        self.evidence = 0
+        for raw_item, raw_value in inventory.items():
+            item = str(raw_item).upper()
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not isfinite(value):
+                continue
+            previous = self._previous_inventory.get(item)
+            values = self.history.get(item, [])
+            if previous is None:
+                values = [value]
+            elif value < previous:
+                values = [*values, value] if values else [previous, value]
+            else:
+                values = [value]
+            self.history[item] = values[-3:]
+            if len(self.history[item]) == 3 and all(
+                left > right for left, right in zip(self.history[item], self.history[item][1:])
+            ):
+                if candidate is None or item < candidate:
+                    candidate = item
+                self.evidence = max(self.evidence, len(self.history[item]))
+            self._previous_inventory[item] = value
+
+        self._previous_demand = demand
+        self._has_demand_observation = True
+        return candidate
+
+
+def _evidence_count(evidence: object) -> int:
+    if isinstance(evidence, bool):
+        return 0
+    if isinstance(evidence, Mapping):
+        for key in ("strength", "count", "observations", "evidence"):
+            if key in evidence:
+                return _evidence_count(evidence[key])
+        return 0
+    if isinstance(evidence, Sequence) and not isinstance(evidence, (str, bytes, bytearray)):
+        return len(evidence)
+    try:
+        value = int(evidence)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return value if value >= 0 else 0
+
+
+def _evidence_has_owned_batch(evidence: object) -> bool:
+    if not isinstance(evidence, Mapping):
+        return True
+    for key in ("owned_batch", "owned_quantity", "sellable_batch"):
+        if key in evidence:
+            return _evidence_count(evidence[key]) > 0
+    if "prerequisite" in evidence:
+        return bool(evidence["prerequisite"])
+    return True
+
+
+def should_front_run(item: str, current_price: object, evidence: object,
+                     town_refill: object) -> bool:
+    """Allow an opt-in pre-sale only with strong public evidence and a live quote."""
+    item = str(item).upper() if item is not None else ""
+    try:
+        price = float(current_price)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (
+        item in _SALEABLE_MARKET_ITEMS
+        and isfinite(price)
+        and price > PRICE_FLOOR
+        and _evidence_count(evidence) >= 3
+        and _evidence_has_owned_batch(evidence)
+        and not bool(town_refill)
+    )
 
 
 def get_strategy(name: str) -> StrategySpec:
