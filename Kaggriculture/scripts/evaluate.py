@@ -2842,11 +2842,8 @@ class VariantPolicy:
         self.variant = variant
         self.ablations = dict(ablations or _DEFAULT_ABLATIONS)
         self.configuration = dict(configuration or {})
-        # ``mixed`` is also a long-standing legacy variant alias. Preserve
-        # its old behavior by default; candidate requests pass True explicitly
-        # from the isolated worker when they mean the stable route.
         self.is_route_candidate = (
-            variant in CANDIDATES and variant != "mixed"
+            variant in CANDIDATES
             if route_candidate is None else bool(route_candidate)
         )
         if self.is_route_candidate and variant not in CANDIDATES:
