@@ -59,15 +59,27 @@ UV_CACHE_DIR=/private/tmp/kagriculture-uv-cache uv run python scripts/evaluate.p
   --output reports/route-development.json
 ```
 
-After development, rerun only surviving candidates on a disjoint holdout seed
-range, for example `--start-seed 100 --seeds 10`, with the same full-season,
-three-opponent, two-seat configuration. A holdout result is promotion evidence
-only when it records every requested seat/seed pair, has zero framework errors,
-zero missed basic needs, a non-negative fifth-percentile paired bank
-differential, and improves on `current` in seat-balanced win rate and median
-paired bank differential. These gates are applied before score comparisons; a
-candidate is never selected because of mean bank alone, and a `--quick` smoke
-batch is for feasibility checks only.
+Supply holdout seeds explicitly in the same invocation so development and
+holdout games are fixed, disjoint partitions:
+
+```bash
+UV_CACHE_DIR=/private/tmp/kagriculture-uv-cache uv run python scripts/evaluate.py \
+  --seeds 30 --start-seed 0 \
+  --holdout-seeds 100 101 102 103 104 105 106 107 108 109 \
+  --steps 720 --min-valid-games 20 \
+  --opponents pass random starter --seats 0 1 \
+  --candidates current melon premium mixed \
+  --output reports/strategy-gate.json
+```
+
+Holdout evaluation requires both seats and rejects repeated or overlapping
+seeds. A holdout result is promotion evidence only when it records every
+requested seat/seed pair, has zero framework errors, zero missed basic needs, a
+non-negative fifth-percentile paired bank differential, and improves on
+`current` in seat-balanced win rate and median paired bank differential. These
+gates are applied before score comparisons; a candidate is never selected
+because of mean bank alone, and a `--quick` smoke batch is for feasibility
+checks only.
 
 Reports include the exact matrix, per-game records, paired summaries,
 confidence bounds, and ordered discard reasons. The default production entry

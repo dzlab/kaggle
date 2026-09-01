@@ -93,6 +93,24 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def _validate_seed_partition(development_seeds: Sequence[int], holdout_seeds: Sequence[int] | None) -> None:
+    """Reject repeated or overlapping seeds between the two evaluation phases."""
+    development = list(development_seeds)
+    if len(set(development)) != len(development):
+        raise ValueError("development seeds must be unique")
+    if holdout_seeds is None:
+        return
+    holdout = list(holdout_seeds)
+    if len(set(holdout)) != len(holdout):
+        raise ValueError("holdout seeds must be unique")
+    overlap = sorted(set(development).intersection(holdout))
+    if overlap:
+        raise ValueError(
+            "development and holdout seeds must be disjoint; overlapping seed(s): "
+            + ", ".join(map(str, overlap))
+        )
+
+
 def _variant_list(values: Sequence[str] | None) -> list[str]:
     selected = list(values or ("mixed",))
     unknown = [value for value in selected if value not in VARIANTS]
@@ -136,6 +154,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--candidates", nargs="+", choices=CANDIDATES, default=None,
         help="stable route candidates; use --variants/--variant for legacy evaluator variants",
     )
+    parser.add_argument(
+        "--holdout-seeds", nargs="+", type=int, default=None,
+        help="explicit disjoint seeds for the final promotion holdout",
+    )
+    parser.add_argument(
+        "--min-valid-games", type=_positive_int, default=20,
+        help="minimum valid games required for each seat before selection",
+    )
     parser.add_argument("--ablation", action="append", type=parse_ablation, default=[], metavar="COMPONENT=on|off")
     parser.add_argument("--quick", action="store_true", help="use a small default batch suitable for local tests")
     args = parser.parse_args(argv)
@@ -154,6 +180,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             args.seeds = 2
         if args.steps == 720:
             args.steps = 96
+    development_seeds = range(args.start_seed, args.start_seed + args.seeds)
+    try:
+        _validate_seed_partition(development_seeds, args.holdout_seeds)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.holdout_seeds is not None and set(args.seats) != {0, 1}:
+        parser.error("--holdout-seeds requires both candidate seats: --seats 0 1")
     return args
 
 
@@ -3057,7 +3090,9 @@ def run_evaluation(*, variants: Sequence[str] | None = None,
                    candidates: Sequence[str] | None = None,
                    opponents: Sequence[str], seeds: Sequence[int], steps: int,
                    ablations: Sequence[tuple[str, bool]] = (),
-                   seats: Sequence[int] | None = None) -> dict[str, Any]:
+                   seats: Sequence[int] | None = None,
+                   holdout_seeds: Sequence[int] | None = None,
+                   min_valid_games: int = 20) -> dict[str, Any]:
     """Run a baseline and isolated one-component ablations.
 
     Every ablation starts from the same all-enabled baseline. Repeating a
@@ -3065,6 +3100,8 @@ def run_evaluation(*, variants: Sequence[str] | None = None,
     configuration.
     """
     requested = list(ablations)
+    if type(min_valid_games) is not int or min_valid_games < 1:
+        raise ValueError("min_valid_games must be a positive integer")
     components = [component for component, _enabled in requested]
     if len(components) != len(set(components)):
         raise ValueError("each ablation component may be requested only once")
@@ -3072,6 +3109,9 @@ def run_evaluation(*, variants: Sequence[str] | None = None,
     selected = _resolve_candidates(variants, candidates)
     candidate_kwargs = {"candidates": selected} if candidates is not None else {"variants": selected}
     resolved_seats = [0, 1] if seats is None else list(seats)
+    _validate_seed_partition(seeds, holdout_seeds)
+    if holdout_seeds is not None and set(resolved_seats) != {0, 1}:
+        raise ValueError("holdout evaluation requires both candidate seats")
     baseline = run_matrix(
         **candidate_kwargs, opponents=opponents, seeds=seeds, steps=steps,
         ablations=baseline_config, seats=resolved_seats,
@@ -3086,7 +3126,17 @@ def run_evaluation(*, variants: Sequence[str] | None = None,
             **candidate_kwargs, opponents=opponents, seeds=seeds, steps=steps,
             ablations=config, seats=resolved_seats,
         )["records"]
-    return {"records": baseline, "ablation_records": ablation_records, "ablation_configs": ablation_configs}
+    result = {
+        "records": baseline,
+        "ablation_records": ablation_records,
+        "ablation_configs": ablation_configs,
+    }
+    if holdout_seeds is not None:
+        result["holdout_records"] = run_matrix(
+            **candidate_kwargs, opponents=opponents, seeds=list(holdout_seeds), steps=steps,
+            ablations=baseline_config, seats=resolved_seats,
+        )["records"]
+    return result
 
 
 def _group_results(records: Sequence[Mapping[str, Any]], variants: Sequence[str], opponents: Sequence[str]) -> dict[str, Any]:
@@ -3190,9 +3240,60 @@ def _normalized_command(command: Sequence[str] | None) -> list[str]:
     return normalized
 
 
+def build_manifest(*, candidates: Sequence[str], opponents: Sequence[str], seeds: Sequence[int],
+                   steps: int, seats: Sequence[int], command: Sequence[str] | None = None) -> dict[str, Any]:
+    """Return the JSON-compatible, versioned reproducibility manifest."""
+    return {
+        "schema_version": 2,
+        "engine_version": str(ENGINE_VERSION),
+        "steps": int(steps),
+        "seeds": [int(seed) for seed in seeds],
+        "seats": [int(seat) for seat in seats],
+        "opponents": [str(opponent) for opponent in opponents],
+        "candidates": [str(candidate) for candidate in candidates],
+        "python_version": ".".join(map(str, sys.version_info[:3])),
+        "command": _normalized_command(command),
+    }
+
+
+def _config_seed_values(config: Mapping[str, Any]) -> list[int]:
+    values = config.get("seed_values")
+    if values is not None:
+        return [int(seed) for seed in values]
+    count = config.get("seeds", 0)
+    start = config.get("start_seed", 0)
+    if type(count) is int and type(start) is int:
+        return list(range(start, start + count))
+    return []
+
+
+def _select_paired_candidate(candidates: Sequence[str], summaries: Mapping[str, Mapping[str, Any]],
+                             development_decisions: Mapping[str, Mapping[str, Any]],
+                             holdout_decisions: Mapping[str, Mapping[str, Any]]) -> str | None:
+    """Select only candidates that pass both phases using paired metrics."""
+    eligible = []
+    for index, candidate in enumerate(candidates):
+        development = development_decisions.get(candidate, {})
+        holdout = holdout_decisions.get(candidate, {})
+        summary = summaries.get(candidate, {})
+        if development.get("status") not in {"baseline", "promote"}:
+            continue
+        if holdout.get("status") not in {"baseline", "promote"}:
+            continue
+        if summary.get("paired_games", 0) < 1:
+            continue
+        win_rate = summary.get("seat_balanced_win_rate")
+        median_differential = summary.get("median_paired_bank_differential")
+        if win_rate is None or median_differential is None:
+            continue
+        eligible.append((float(win_rate), float(median_differential), -index, candidate))
+    return max(eligible)[3] if eligible else None
+
+
 def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mapping[str, Any]], command: Sequence[str] | None = None,
                           ablation_records: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
-                          ablation_configs: Mapping[str, Mapping[str, bool]] | None = None) -> dict[str, Any]:
+                          ablation_configs: Mapping[str, Mapping[str, bool]] | None = None,
+                          holdout_records: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
     variants = _resolve_candidates(
         config.get("variants"), config.get("candidates"), allow_unknown=True,
     )
@@ -3204,6 +3305,46 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
     paired_summaries, promotion_decisions = _candidate_metrics(
         records, variants, min_valid_games=min_valid_games,
     )
+    seed_values = _config_seed_values(config)
+    seats = list(config.get("seats", (0, 1)))
+    manifest = build_manifest(
+        candidates=variants, opponents=opponents, seeds=seed_values,
+        steps=config.get("steps", 720), seats=seats, command=command,
+    )
+    holdout_document = None
+    selected_candidate = _select_default(
+        records, variants, promotion_decisions=promotion_decisions,
+    )
+    if holdout_records is not None:
+        holdout_seed_values = [
+            int(seed) for seed in config.get(
+                "holdout_seed_values", config.get("holdout_seeds", ())
+            ) or ()
+        ]
+        holdout_results = _group_results(holdout_records, variants, opponents)
+        holdout_paired_summaries, holdout_promotion_decisions = _candidate_metrics(
+            holdout_records, variants, min_valid_games=min_valid_games,
+        )
+        for candidate in variants:
+            promotion_decisions[candidate] = {
+                **promotion_decisions.get(candidate, {}),
+                "holdout": holdout_promotion_decisions.get(candidate),
+            }
+        selected_candidate = _select_paired_candidate(
+            variants, holdout_paired_summaries, promotion_decisions,
+            holdout_promotion_decisions,
+        )
+        holdout_manifest = build_manifest(
+            candidates=variants, opponents=opponents, seeds=holdout_seed_values,
+            steps=config.get("steps", 720), seats=seats, command=command,
+        )
+        holdout_document = {
+            "manifest": holdout_manifest,
+            "results": holdout_results,
+            "paired_summaries": holdout_paired_summaries,
+            "promotion_decisions": holdout_promotion_decisions,
+            "selected_candidate": selected_candidate,
+        }
     ablations = {}
     for component, component_records in (ablation_records or {}).items():
         component_results = _group_results(component_records, variants, opponents)
@@ -3228,32 +3369,43 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
             "paired_summaries": component_summaries,
             "promotion_decisions": component_decisions,
         }
-    return {
-        "schema_version": 1,
-        "metadata": {
-            "command": _normalized_command(command),
-            "config": _normalized_report_config(config),
-            "engine": "kaggle-environments",
-            "engine_version": ENGINE_VERSION,
-            "baseline_convention": _BASELINE_CONVENTION,
-            "baseline_candidate": variants[0] if variants else None,
-            "replay_summary": (
-                Path(str(config["replay_summary"])).name
-                if config.get("replay_summary") is not None else None
-            ),
-        },
-        "selected_default": _select_default(
-            records, variants, promotion_decisions=promotion_decisions,
+    metadata = {
+        "command": _normalized_command(command),
+        "config": _normalized_report_config(config),
+        "engine": "kaggle-environments",
+        "engine_version": ENGINE_VERSION,
+        "baseline_convention": _BASELINE_CONVENTION,
+        "baseline_candidate": variants[0] if variants else None,
+        "replay_summary": (
+            Path(str(config["replay_summary"])).name
+            if config.get("replay_summary") is not None else None
         ),
+        "manifest": manifest,
+        "selected_candidate": selected_candidate,
+        "holdout": holdout_document,
+    }
+    document = {
+        "schema_version": 1,
+        "manifest": manifest,
+        "metadata": metadata,
+        "selected_default": selected_candidate,
+        "selected_candidate": selected_candidate,
         "results": results,
         "paired_summaries": paired_summaries,
         "promotion_decisions": promotion_decisions,
         "ablations": ablations,
     }
+    if holdout_document is not None:
+        document["holdout"] = holdout_document
+        document["holdout_results"] = holdout_document["results"]
+        document["holdout_paired_summaries"] = holdout_document["paired_summaries"]
+        document["holdout_promotion_decisions"] = holdout_document["promotion_decisions"]
+    return document
 
 
 def write_result_document(path: str | Path, document: Mapping[str, Any], *, records: Sequence[Mapping[str, Any]],
-                          ablation_records: Mapping[str, Sequence[Mapping[str, Any]]] | None = None) -> Path:
+                          ablation_records: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
+                          holdout_records: Sequence[Mapping[str, Any]] | None = None) -> Path:
     """Write the report and deterministic compact replay-record sidecar."""
     report_path = Path(path)
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3262,6 +3414,10 @@ def write_result_document(path: str | Path, document: Mapping[str, Any], *, reco
     sidecar_records = [{"ablation": "baseline", **dict(record)} for record in records]
     for component, component_records in (ablation_records or {}).items():
         sidecar_records.extend({"ablation": component, **dict(record)} for record in component_records)
+    sidecar_records.extend(
+        {"ablation": "holdout", "evaluation_split": "holdout", **dict(record)}
+        for record in (holdout_records or ())
+    )
     sidecar_records.sort(key=lambda record: (
         str(record.get("ablation", "")), _record_candidate(record),
         str(record.get("variant", "")), str(record.get("opponent", "")),
@@ -3281,18 +3437,22 @@ def main(argv: list[str] | None = None) -> int:
         "seeds": args.seeds,
         "start_seed": args.start_seed,
         "seed_values": seeds,
+        "holdout_seed_values": list(args.holdout_seeds) if args.holdout_seeds is not None else None,
         "steps": args.steps,
         "opponents": list(args.opponents),
         "candidates": list(args.candidates) if args.candidates is not None else None,
         "variants": list(args.variants) if args.variants is not None else None,
         "seats": list(args.seats),
         "ablations": [f"{component}={'on' if enabled else 'off'}" for component, enabled in args.ablation],
+        "min_valid_games": args.min_valid_games,
         "replay_summary": sidecar.name,
         "quick": args.quick,
     }
     evaluation_kwargs = {
         "opponents": args.opponents, "seeds": seeds, "steps": args.steps,
         "ablations": args.ablation, "seats": args.seats,
+        "holdout_seeds": args.holdout_seeds,
+        "min_valid_games": args.min_valid_games,
     }
     if args.candidates is not None:
         evaluation_kwargs["candidates"] = args.candidates
@@ -3303,9 +3463,18 @@ def main(argv: list[str] | None = None) -> int:
         config=config, records=evaluation["records"],
         command=["scripts/evaluate.py", *([*sys.argv[1:]] if argv is None else argv)],
         ablation_records=evaluation["ablation_records"], ablation_configs=evaluation["ablation_configs"],
+        holdout_records=evaluation.get("holdout_records"),
     )
-    write_result_document(output, document, records=evaluation["records"], ablation_records=evaluation["ablation_records"])
-    games = len(evaluation["records"]) + sum(len(records) for records in evaluation["ablation_records"].values())
+    write_result_document(
+        output, document, records=evaluation["records"],
+        ablation_records=evaluation["ablation_records"],
+        holdout_records=evaluation.get("holdout_records"),
+    )
+    games = (
+        len(evaluation["records"])
+        + sum(len(records) for records in evaluation["ablation_records"].values())
+        + len(evaluation.get("holdout_records", ()))
+    )
     print(json.dumps({"output": str(output), "selected_default": document["selected_default"], "games": games}, sort_keys=True))
     return 0
 

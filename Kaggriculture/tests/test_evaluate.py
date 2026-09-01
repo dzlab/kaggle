@@ -113,6 +113,53 @@ def test_cli_parses_requested_seats():
     assert parse_args(["--seats", "0", "1"]).seats == [0, 1]
 
 
+def test_cli_accepts_explicit_holdout_seeds_and_minimum_valid_games():
+    from scripts.evaluate import parse_args
+
+    args = parse_args([
+        "--candidates", "current", "melon",
+        "--seeds", "4", "--start-seed", "10",
+        "--holdout-seeds", "100", "101",
+        "--min-valid-games", "8",
+    ])
+
+    assert args.holdout_seeds == [100, 101]
+    assert args.min_valid_games == 8
+
+
+def test_cli_rejects_overlapping_development_and_holdout_seeds():
+    from scripts.evaluate import parse_args
+
+    with pytest.raises(SystemExit):
+        parse_args([
+            "--seeds", "3", "--start-seed", "10",
+            "--holdout-seeds", "12", "20",
+        ])
+
+
+def test_build_manifest_is_schema_v2_json_compatible_and_normalized():
+    from scripts.evaluate import build_manifest
+
+    manifest = build_manifest(
+        candidates=["current"], opponents=["pass"], seeds=[3],
+        steps=720, seats=[0, 1],
+        command=["/tmp/project/scripts/evaluate.py", "--output", "/tmp/project/report.json"],
+    )
+
+    assert manifest == {
+        "schema_version": 2,
+        "engine_version": "1.32.7",
+        "steps": 720,
+        "seeds": [3],
+        "seats": [0, 1],
+        "opponents": ["pass"],
+        "candidates": ["current"],
+        "python_version": ".".join(map(str, sys.version_info[:3])),
+        "command": ["scripts/evaluate.py", "--output", "<report>"],
+    }
+    json.dumps(manifest, allow_nan=False)
+
+
 def test_cli_preserves_legacy_variants_as_a_separate_selection_mode():
     from scripts.evaluate import parse_args
 
@@ -1112,6 +1159,26 @@ def test_run_evaluation_defaults_to_both_seats_without_running_real_games(monkey
     }]
 
 
+def test_run_evaluation_keeps_holdout_matrix_disjoint_and_separate(monkeypatch):
+    from scripts.evaluate import run_evaluation
+
+    calls = []
+
+    def fake_run_matrix(**kwargs):
+        calls.append(kwargs)
+        return {"records": [{"seed": seed} for seed in kwargs["seeds"]]}
+
+    monkeypatch.setattr("scripts.evaluate.run_matrix", fake_run_matrix)
+    result = run_evaluation(
+        variants=["mixed"], opponents=["pass"], seeds=[1, 2], steps=2,
+        holdout_seeds=[100, 101], min_valid_games=1,
+    )
+
+    assert [call["seeds"] for call in calls] == [[1, 2], [100, 101]]
+    assert result["records"] == [{"seed": 1}, {"seed": 2}]
+    assert result["holdout_records"] == [{"seed": 100}, {"seed": 101}]
+
+
 def test_run_matrix_forwards_candidate_seats_and_keeps_seed_pairs_ordered(monkeypatch):
     from scripts.evaluate import run_matrix
 
@@ -1245,6 +1312,36 @@ def test_main_exposes_candidates_in_evaluation_and_report_config(monkeypatch, tm
     assert captured["config"]["candidates"] == ["mixed"]
 
 
+def test_main_forwards_holdout_contract_to_evaluation_and_report(monkeypatch, tmp_path):
+    import scripts.evaluate as evaluate
+
+    captured = {}
+
+    def fake_run_evaluation(**kwargs):
+        captured["evaluation"] = kwargs
+        return {"records": [], "ablation_records": {}, "ablation_configs": {}, "holdout_records": []}
+
+    def fake_build_result_document(**kwargs):
+        captured["config"] = kwargs["config"]
+        captured["holdout_records"] = kwargs["holdout_records"]
+        return {"selected_default": "mixed"}
+
+    monkeypatch.setattr(evaluate, "run_evaluation", fake_run_evaluation)
+    monkeypatch.setattr(evaluate, "build_result_document", fake_build_result_document)
+    monkeypatch.setattr(evaluate, "write_result_document", lambda *args, **kwargs: None)
+
+    assert evaluate.main([
+        "--seeds", "2", "--start-seed", "10", "--steps", "2",
+        "--holdout-seeds", "100", "101", "--min-valid-games", "1",
+        "--output", str(tmp_path / "evaluation.json"),
+    ]) == 0
+    assert captured["evaluation"]["holdout_seeds"] == [100, 101]
+    assert captured["evaluation"]["min_valid_games"] == 1
+    assert captured["config"]["holdout_seed_values"] == [100, 101]
+    assert captured["config"]["min_valid_games"] == 1
+    assert captured["holdout_records"] == []
+
+
 def test_report_groups_records_by_candidate_identity():
     from scripts.evaluate import build_result_document
 
@@ -1341,6 +1438,51 @@ def test_report_has_no_default_when_baseline_fails_safety_gates():
     assert document["promotion_decisions"]["baseline"]["status"] == "discard"
     assert document["promotion_decisions"]["baseline"]["reasons"] == ["framework_error"]
     assert document["selected_default"] is None
+
+
+def test_holdout_report_controls_selection_and_exposes_holdout_decisions():
+    from scripts.evaluate import build_result_document
+
+    development = [
+        _metric_record(
+            seat=seat, seed=1, candidate=candidate,
+            outcome="win" if candidate == "challenger" else "tie",
+            differential=2 if candidate == "challenger" else 1,
+        )
+        for candidate in ("baseline", "challenger")
+        for seat in (0, 1)
+    ]
+    holdout = [
+        _metric_record(
+            seat=seat, seed=100, candidate=candidate,
+            outcome="win" if candidate == "challenger" else "tie",
+            differential=100 if candidate == "challenger" else 1,
+            missed_basic_needs=1 if candidate == "challenger" else 0,
+        )
+        for candidate in ("baseline", "challenger")
+        for seat in (0, 1)
+    ]
+
+    document = build_result_document(
+        config={
+            "candidates": ["baseline", "challenger"], "opponents": ["pass"],
+            "seed_values": [1], "holdout_seed_values": [100],
+            "steps": 720, "seats": [0, 1], "min_valid_games": 1,
+        },
+        records=development, holdout_records=holdout,
+        command=["scripts/evaluate.py"],
+    )
+
+    assert document["selected_candidate"] == "baseline"
+    assert document["selected_default"] == "baseline"
+    assert document["holdout"]["selected_candidate"] == "baseline"
+    assert document["holdout_promotion_decisions"]["challenger"]["reasons"] == [
+        "missed_basic_needs"
+    ]
+    assert document["promotion_decisions"]["challenger"]["holdout"]["status"] == "discard"
+    assert document["metadata"]["holdout"]["selected_candidate"] == "baseline"
+    assert document["metadata"]["manifest"]["schema_version"] == 2
+    json.dumps(document, allow_nan=False)
 
 
 def test_sidecar_sort_uses_candidate_and_canonical_record_tiebreaker(tmp_path):
