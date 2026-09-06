@@ -25,7 +25,7 @@ class ReplayValidationError(ValueError):
         return {"code": self.code, "message": str(self), "details": copy.deepcopy(self.details)}
 
 
-@dataclass
+@dataclass(frozen=True)
 class Transition:
     """One candidate action and the state transition it caused."""
 
@@ -36,11 +36,22 @@ class Transition:
     reward: float
     final_bank: float
     opponent_final_bank: float
-    safety_flags: list[str]
+    safety_flags: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "safety_flags", tuple(self.safety_flags))
+
+    @staticmethod
+    def _json_normalize(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {key: Transition._json_normalize(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [Transition._json_normalize(item) for item in value]
+        return value
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached, JSON-compatible representation."""
-        return copy.deepcopy(asdict(self))
+        return copy.deepcopy(self._json_normalize(asdict(self)))
 
     def to_json(self) -> str:
         """Serialize deterministically for stable JSONL output and tests."""
@@ -199,7 +210,7 @@ def transitions_from_replay(
                 reward=float(terminal_reward if index == len(own_states) - 2 else 0.0),
                 final_bank=float(candidate_bank),
                 opponent_final_bank=float(opponent_bank),
-                safety_flags=[],
+                safety_flags=(),
             )
         )
     return transitions

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -19,7 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from kagriculture_agent.constants import ENGINE_VERSION
 from kagriculture_agent.features import FEATURE_SCHEMA_VERSION
-from kagriculture_agent.trajectory import TRANSITION_SCHEMA_VERSION, Transition, transitions_from_replay
+from kagriculture_agent.trajectory import TRANSITION_SCHEMA_VERSION, transitions_from_replay
 
 COLLECTOR_OPPONENTS = ("pass", "random", "starter", "current")
 OPPONENTS = COLLECTOR_OPPONENTS
@@ -33,6 +34,18 @@ def _positive_int(value: str) -> int:
     if number < 1:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return number
+
+
+def _strict_int_values(values: Sequence[Any], name: str, *, allowed: set[int] | None = None) -> list[int]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise ValueError(f"{name} must be a sequence of integers")
+    normalized = list(values)
+    if not normalized or any(type(value) is not int for value in normalized):
+        raise ValueError(f"{name} must contain only integers")
+    if allowed is not None and any(value not in allowed for value in normalized):
+        choices = ", ".join(str(value) for value in sorted(allowed))
+        raise ValueError(f"{name} must contain only {{{choices}}}")
+    return normalized
 
 
 def _run_game_isolated(
@@ -95,15 +108,11 @@ def collect(
     output: str | Path, source_policy_identity: str = "current",
 ) -> dict[str, Any]:
     """Collect and write one validated transition per output JSONL line."""
-    normalized_seeds = [int(seed) for seed in seeds]
+    normalized_seeds = _strict_int_values(seeds, "seeds")
     normalized_opponents = [str(opponent) for opponent in opponents]
-    normalized_seats = [int(seat) for seat in seats]
-    if not normalized_seeds or any(type(seed) is not int for seed in normalized_seeds):
-        raise ValueError("seeds must contain at least one integer")
+    normalized_seats = _strict_int_values(seats, "seats", allowed={0, 1})
     if not normalized_opponents or any(opponent not in COLLECTOR_OPPONENTS for opponent in normalized_opponents):
         raise ValueError(f"opponents must be drawn from {COLLECTOR_OPPONENTS}")
-    if not normalized_seats or any(seat not in (0, 1) for seat in normalized_seats):
-        raise ValueError("seats must contain 0 and/or 1")
     if type(steps) is not int or steps < 2:
         raise ValueError("steps must be at least 2 to produce a transition")
     if not isinstance(source_policy_identity, str) or not source_policy_identity:
@@ -118,31 +127,60 @@ def collect(
         steps=steps,
         source_policy_identity=source_policy_identity,
     )
-    lines: list[str] = []
-    with tempfile.TemporaryDirectory(prefix="kagriculture-trajectory-") as temporary_directory:
-        replay_directory = Path(temporary_directory)
-        for seed in normalized_seeds:
-            for opponent in normalized_opponents:
-                for candidate_player in normalized_seats:
-                    replay_path = replay_directory / f"seed-{seed}-{opponent}-seat-{candidate_player}.json"
-                    replay = _run_game_isolated(
-                        opponent=opponent,
-                        seed=seed,
-                        steps=steps,
-                        candidate_player=candidate_player,
-                        replay_path=replay_path,
-                    )
-                    transitions = transitions_from_replay(
-                        replay, candidate_player=candidate_player, requested_seed=seed,
-                    )
-                    lines.extend(transition.to_json() for transition in transitions)
-
-    destination.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
     manifest_path = destination.with_suffix(".manifest.json")
-    manifest_path.write_text(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
+    trajectory_temp = None
+    manifest_temp = None
+    trajectory_temp_path: Path | None = None
+    manifest_temp_path: Path | None = None
+    try:
+        trajectory_temp = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=destination.parent,
+            prefix=f".{destination.name}.", suffix=".tmp", delete=False,
+        )
+        trajectory_temp_path = Path(trajectory_temp.name)
+        manifest_temp = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=destination.parent,
+            prefix=f".{manifest_path.name}.", suffix=".tmp", delete=False,
+        )
+        manifest_temp_path = Path(manifest_temp.name)
+        with trajectory_temp, manifest_temp:
+            with tempfile.TemporaryDirectory(prefix="kagriculture-trajectory-") as temporary_directory:
+                replay_directory = Path(temporary_directory)
+                for seed in normalized_seeds:
+                    for opponent in normalized_opponents:
+                        for candidate_player in normalized_seats:
+                            replay_path = replay_directory / f"seed-{seed}-{opponent}-seat-{candidate_player}.json"
+                            replay = _run_game_isolated(
+                                opponent=opponent,
+                                seed=seed,
+                                steps=steps,
+                                candidate_player=candidate_player,
+                                replay_path=replay_path,
+                            )
+                            transitions = transitions_from_replay(
+                                replay, candidate_player=candidate_player, requested_seed=seed,
+                            )
+                            for transition in transitions:
+                                trajectory_temp.write(transition.to_json() + "\n")
+            manifest_temp.write(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+            )
+            trajectory_temp.flush()
+            manifest_temp.flush()
+            os.fsync(trajectory_temp.fileno())
+            os.fsync(manifest_temp.fileno())
+        os.replace(trajectory_temp_path, destination)
+        trajectory_temp_path = None
+        os.replace(manifest_temp_path, manifest_path)
+        manifest_temp_path = None
+    finally:
+        if trajectory_temp is not None:
+            trajectory_temp.close()
+        if manifest_temp is not None:
+            manifest_temp.close()
+        for temporary_path in (trajectory_temp_path, manifest_temp_path):
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
     return manifest
 
 

@@ -1,5 +1,6 @@
 import json
 import math
+from dataclasses import FrozenInstanceError
 
 import pytest
 
@@ -63,6 +64,7 @@ def test_candidate_observations_do_not_gain_opponent_private_state(tmp_path):
 
     for transition in transitions:
         assert "opponent_secret" not in transition.observation["private"]
+        assert "opponent_secret" not in transition.next_observation["private"]
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
@@ -93,6 +95,22 @@ def test_requested_seed_mismatch_is_rejected(tmp_path):
     assert error.value.details == {"requested_seed": 18, "replay_seed": 17}
 
 
+@pytest.mark.parametrize("bad_seed", [True, "17", 17.0, None])
+def test_collect_rejects_non_integer_seed_types_before_coercion(tmp_path, bad_seed):
+    from scripts.collect_trajectories import collect
+
+    with pytest.raises(ValueError, match="seeds"):
+        collect(seeds=[bad_seed], opponents=["pass"], seats=[0], steps=4, output=tmp_path / "bad.jsonl")
+
+
+@pytest.mark.parametrize("bad_seat", [True, "0", 0.0, None, 2])
+def test_collect_rejects_non_integer_or_invalid_seat_types_before_coercion(tmp_path, bad_seat):
+    from scripts.collect_trajectories import collect
+
+    with pytest.raises(ValueError, match="seats"):
+        collect(seeds=[0], opponents=["pass"], seats=[bad_seat], steps=4, output=tmp_path / "bad.jsonl")
+
+
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
 def test_transition_serialization_is_deterministic_and_json_compatible(tmp_path):
     from kagriculture_agent.trajectory import transitions_from_replay
@@ -105,6 +123,19 @@ def test_transition_serialization_is_deterministic_and_json_compatible(tmp_path)
     assert first == second
     assert json.loads(first) == transition.to_dict()
     json.dumps(transition.to_dict(), allow_nan=False, sort_keys=True, separators=(",", ":"))
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_transition_is_frozen_and_normalizes_safety_flags_to_json_list(tmp_path):
+    from kagriculture_agent.trajectory import transitions_from_replay
+
+    transition = transitions_from_replay(_run_replay(tmp_path, steps=4), candidate_player=0)[0]
+
+    assert transition.safety_flags == ()
+    assert isinstance(transition.safety_flags, tuple)
+    with pytest.raises(FrozenInstanceError):
+        transition.reward = 1.0
+    assert transition.to_dict()["safety_flags"] == []
 
 
 def test_local_runner_exposes_current_opponent_and_candidate_seat():
@@ -132,6 +163,20 @@ def test_collector_runs_all_supported_opponents_in_isolated_processes(tmp_path):
     assert all(json.loads(line)["observation"]["player"] == 0 for line in lines)
     assert sum(json.loads(line)["done"] for line in lines) == 4
     assert manifest["opponents"] == ["pass", "random", "starter", "current"]
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_collector_current_opponent_supports_candidate_seat_one(tmp_path):
+    from scripts import collect_trajectories
+
+    output = tmp_path / "current-seat-one.jsonl"
+    collect_trajectories.collect(
+        seeds=[0], opponents=["current"], seats=[1], steps=4, output=output,
+    )
+
+    lines = output.read_text().splitlines()
+    assert len(lines) == 3
+    assert all(json.loads(line)["observation"]["player"] == 1 for line in lines)
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
