@@ -190,6 +190,45 @@ def test_ppo_update_requires_torch_but_is_import_safe():
     assert "prior_cross_entropy" in metrics
 
 
+def test_ppo_update_measures_target_kl_after_optimizer_step():
+    pytest.importorskip("torch")
+    import torch
+    from scripts.train_policy import PPOConfig, ppo_update
+
+    class OneParameterPolicy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bias = torch.nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, _features):
+            batch = 2
+            worker_act = torch.stack((torch.zeros(10, 2), torch.zeros(10, 2))).clone()
+            worker_act[:, :, 1] = self.bias
+            return {
+                "worker_act_logits": worker_act,
+                "worker_target_logits": torch.zeros(batch, 10, 100),
+                "worker_kind_logits": torch.zeros(batch, 10, 14),
+                "market_item_logits": torch.zeros(batch, 9),
+                "market_quantity_logits": torch.zeros(batch, 8),
+                "value": self.bias.repeat(batch),
+            }
+
+    network = OneParameterPolicy()
+    optimizer = torch.optim.SGD(network.parameters(), lr=20.0)
+
+    metrics = ppo_update(
+        network,
+        optimizer,
+        [_transition(done=False), _transition(done=True, final_bank=2000, opponent_final_bank=0)],
+        config=PPOConfig(target_kl=1e-12, ppo_epochs=3),
+        batch_size=2,
+    )
+
+    assert metrics["updates"] == 1
+    assert metrics["early_stopped"] is True
+    assert metrics["approx_kl"] > 1e-12
+
+
 def test_ppo_update_loads_prior_checkpoint_regularization(tmp_path):
     pytest.importorskip("torch")
     import torch
@@ -212,6 +251,78 @@ def test_ppo_update_loads_prior_checkpoint_regularization(tmp_path):
 
     assert metrics["kl_to_prior"] >= 0.0
     assert metrics["prior_cross_entropy"] > 0.0
+
+
+def test_ppo_rollouts_require_callback_unless_offline_fallback_is_explicit():
+    from scripts.train_policy import PPOConfig, run_ppo_training
+
+    with pytest.raises(ValueError, match="rollout_fn.*offline_ppo_fallback"):
+        run_ppo_training(
+            network=None,
+            optimizer=None,
+            transitions=[_transition(done=True)],
+            ppo_steps=1,
+            config=PPOConfig(),
+        )
+
+
+def test_ppo_rollouts_call_callback_once_per_step_with_scheduled_match():
+    from scripts.train_policy import OpponentMatch, PPOConfig, run_ppo_training
+
+    calls = []
+
+    class Pool:
+        def schedule(self, *, count, seed):
+            calls.append(("schedule", count, seed))
+            return [
+                OpponentMatch("current", 0),
+                OpponentMatch("checkpoint", 1, "ckpt-b"),
+                OpponentMatch("mixed", 0),
+            ]
+
+    def rollout_fn(*, step, opponent, seat, checkpoint, rollout_steps):
+        calls.append(("rollout", step, opponent, seat, checkpoint, rollout_steps))
+        return [_transition(done=True, final_bank=1000 + step, opponent_final_bank=900)]
+
+    metrics = run_ppo_training(
+        network=None,
+        optimizer=None,
+        transitions=[],
+        ppo_steps=3,
+        config=PPOConfig(rollout_steps=5),
+        opponent_pool=Pool(),
+        rollout_fn=rollout_fn,
+        seed=23,
+        update_fn=lambda **kwargs: {"updates": 1, "early_stopped": False},
+    )
+
+    assert calls == [
+        ("schedule", 3, 23),
+        ("rollout", 0, "current", 0, None, 5),
+        ("rollout", 1, "checkpoint", 1, "ckpt-b", 5),
+        ("rollout", 2, "mixed", 0, None, 5),
+    ]
+    assert metrics["ppo_updates"] == 3
+    assert metrics["rollout_count"] == 3
+
+
+def test_ppo_offline_fallback_is_explicit_and_reuses_collected_rollout():
+    from scripts.train_policy import PPOConfig, run_ppo_training
+
+    calls = []
+    metrics = run_ppo_training(
+        network=None,
+        optimizer=None,
+        transitions=[_transition(done=False), _transition(done=True)],
+        ppo_steps=2,
+        config=PPOConfig(rollout_steps=1),
+        offline_ppo_fallback=True,
+        update_fn=lambda transitions, **kwargs: calls.append(list(transitions)) or {"updates": 1, "early_stopped": False},
+    )
+
+    assert len(calls) == 2
+    assert all(len(call) == 1 for call in calls)
+    assert metrics["ppo_updates"] == 2
 
 
 def test_opponent_pool_probabilities_and_checkpoint_sampling_are_deterministic():

@@ -601,20 +601,89 @@ def ppo_update(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            with th.no_grad():
+                post_outputs = network(mini_features)
+                post_log_probs, _post_entropy = _select_outputs(post_outputs, mini)
+                log_ratio = post_log_probs - old_log
+                post_step_kl = ((log_ratio.exp() - 1.0) - log_ratio).mean()
             metrics.update({
                 "updates": int(metrics["updates"]) + 1,
                 "policy_loss": float(policy_loss.detach()),
                 "value_loss": float(value_loss.detach()),
                 "entropy": float(entropy.detach()),
-                "approx_kl": float(approx),
+                "approx_kl": float(post_step_kl.detach()),
                 "kl_to_prior": float(kl_to_prior.detach()),
                 "prior_cross_entropy": float(prior_ce.detach()),
                 "loss": float(loss.detach()),
             })
-            if float(approx) > config.target_kl:
+            if float(post_step_kl) > config.target_kl:
                 metrics["early_stopped"] = True
                 return metrics
     return metrics
+
+
+def run_ppo_training(
+    *, network: Any, optimizer: Any, transitions: Sequence[dict[str, Any]],
+    ppo_steps: int, config: PPOConfig, batch_size: int | None = None,
+    seed: int = 0, prior_checkpoint: str | Path | None = None,
+    opponent_pool: Any | None = None, rollout_fn: Any | None = None,
+    offline_ppo_fallback: bool = False, update_fn: Any | None = None,
+) -> dict[str, Any]:
+    """Run PPO with fresh scheduled league rollouts or explicit offline fallback."""
+    steps = max(0, int(ppo_steps))
+    if steps == 0:
+        return {"ppo_updates": 0, "rollout_count": 0, "early_stopped": False, "last_metrics": None}
+    updater = update_fn or ppo_update
+    if rollout_fn is None and not offline_ppo_fallback:
+        raise ValueError("rollout_fn is required for PPO unless offline_ppo_fallback is explicitly selected")
+    pool = opponent_pool or OpponentPool()
+    schedule = pool.schedule(count=steps, seed=seed) if rollout_fn is not None else []
+    total_updates = 0
+    rollout_count = 0
+    last_metrics: dict[str, Any] | None = None
+    offline_rows = list(transitions)
+    if offline_ppo_fallback and not offline_rows:
+        raise ValueError("offline_ppo_fallback requires collected transitions")
+    for step in range(steps):
+        if rollout_fn is None:
+            rollout = offline_rows[:config.rollout_steps]
+        else:
+            match = schedule[step]
+            rollout = rollout_fn(
+                step=step,
+                opponent=match.opponent,
+                seat=match.seat,
+                checkpoint=match.checkpoint,
+                rollout_steps=config.rollout_steps,
+            )
+            rollout_count += 1
+        if not isinstance(rollout, Sequence) or isinstance(rollout, (str, bytes)):
+            raise ValueError("rollout_fn must return a sequence of transitions")
+        if not rollout:
+            raise ValueError("PPO rollout produced no transitions")
+        last_metrics = updater(
+            network=network,
+            optimizer=optimizer,
+            transitions=list(rollout),
+            config=config,
+            batch_size=batch_size,
+            seed=int(seed) + step,
+            prior_checkpoint=prior_checkpoint,
+        )
+        total_updates += int(last_metrics.get("updates", 0))
+        if last_metrics.get("early_stopped"):
+            return {
+                "ppo_updates": total_updates,
+                "rollout_count": rollout_count,
+                "early_stopped": True,
+                "last_metrics": last_metrics,
+            }
+    return {
+        "ppo_updates": total_updates,
+        "rollout_count": rollout_count,
+        "early_stopped": False,
+        "last_metrics": last_metrics,
+    }
 
 
 def _checkpoint_metadata(transition_count: int, config: PPOConfig | None = None) -> dict[str, Any]:
@@ -631,7 +700,8 @@ def _checkpoint_metadata(transition_count: int, config: PPOConfig | None = None)
 def train_behavior_clone(
     *, input_path: str | Path, output_path: str | Path, steps: int,
     batch_size: int, seed: int = 0, ppo_steps: int = 0,
-    prior_checkpoint: str | Path | None = None,
+    prior_checkpoint: str | Path | None = None, rollout_fn: Any | None = None,
+    opponent_pool: Any | None = None, offline_ppo_fallback: bool = False,
 ) -> dict[str, Any]:
     """Run complete behavior-cloning epochs, optional PPO, and checkpoint."""
     th = require_torch()
@@ -683,23 +753,25 @@ def train_behavior_clone(
     ppo_metrics = None
     if ppo_steps:
         config = PPOConfig()
-        for step in range(max(0, int(ppo_steps))):
-            rollout = transitions[:config.rollout_steps]
-            ppo_metrics = ppo_update(
-                network,
-                optimizer,
-                rollout,
-                config=config,
-                batch_size=batch_size,
-                seed=int(seed) + step,
-                prior_checkpoint=prior_checkpoint,
-            )
-            if ppo_metrics.get("early_stopped"):
-                break
+        ppo_metrics = run_ppo_training(
+            network=network,
+            optimizer=optimizer,
+            transitions=transitions,
+            ppo_steps=int(ppo_steps),
+            config=config,
+            batch_size=batch_size,
+            seed=int(seed),
+            prior_checkpoint=prior_checkpoint,
+            opponent_pool=opponent_pool,
+            rollout_fn=rollout_fn,
+            offline_ppo_fallback=offline_ppo_fallback,
+        )
+        if isinstance(ppo_metrics.get("last_metrics"), dict):
+            ppo_metrics = {**ppo_metrics, **ppo_metrics["last_metrics"]}
     metadata = _checkpoint_metadata(len(transitions))
     metadata["behavior_clone_epochs"] = epochs
     metadata["behavior_clone_updates"] = bc_updates
-    metadata["ppo_updates"] = 0 if ppo_metrics is None else ppo_metrics["updates"]
+    metadata["ppo_updates"] = 0 if ppo_metrics is None else ppo_metrics["ppo_updates"]
     metadata["ppo_metrics"] = ppo_metrics
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -726,6 +798,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ppo-steps", type=int, default=0)
     parser.add_argument("--prior-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--offline-ppo-fallback",
+        action="store_true",
+        help="reuse collected input transitions for PPO instead of requiring a fresh rollout callback",
+    )
     return parser
 
 
@@ -740,8 +817,9 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             ppo_steps=args.ppo_steps,
             prior_checkpoint=args.prior_checkpoint,
+            offline_ppo_fallback=args.offline_ppo_fallback,
         )
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
     print(json.dumps(metadata, sort_keys=True, separators=(",", ":")))
