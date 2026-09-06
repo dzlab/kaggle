@@ -204,7 +204,7 @@ def _finite_float(value: Any, name: str) -> float:
 
 
 def normalize_advantages(advantages: Sequence[float], epsilon: float = 1e-8) -> list[float]:
-    values = [float(value) for value in advantages]
+    values = [_finite_float(value, "advantages") for value in advantages]
     if not values:
         return []
     mean = sum(values) / len(values)
@@ -221,16 +221,20 @@ def generalized_advantage_estimate(
 ) -> tuple[list[float], list[float]]:
     if not (len(rewards) == len(values) == len(dones)):
         raise ValueError("rewards, values, and dones must have the same length")
+    gamma = _finite_float(gamma, "gamma")
+    gae_lambda = _finite_float(gae_lambda, "gae_lambda")
+    rewards = [_finite_float(reward, "rewards") for reward in rewards]
+    values = [_finite_float(value, "values") for value in values]
     advantages = [0.0 for _ in rewards]
     next_advantage = 0.0
     next_value = 0.0
     for index in range(len(rewards) - 1, -1, -1):
         nonterminal = 0.0 if dones[index] else 1.0
-        delta = float(rewards[index]) + gamma * next_value * nonterminal - float(values[index])
+        delta = rewards[index] + gamma * next_value * nonterminal - values[index]
         next_advantage = delta + gamma * gae_lambda * nonterminal * next_advantage
         advantages[index] = next_advantage
-        next_value = float(values[index])
-    returns = [advantage + float(value) for advantage, value in zip(advantages, values)]
+        next_value = values[index]
+    returns = [advantage + value for advantage, value in zip(advantages, values)]
     return advantages, returns
 
 
@@ -287,7 +291,9 @@ def approximate_kl(new_log_probs: Sequence[float], old_log_probs: Sequence[float
         raise ValueError("new_log_probs and old_log_probs must have the same length")
     if not new_log_probs:
         return 0.0
-    return sum(float(old) - float(new) for new, old in zip(new_log_probs, old_log_probs)) / len(new_log_probs)
+    new_values = [_finite_float(value, "new_log_probs") for value in new_log_probs]
+    old_values = [_finite_float(value, "old_log_probs") for value in old_log_probs]
+    return sum(old - new for new, old in zip(new_values, old_values)) / len(new_values)
 
 
 def _read_transitions(path: str | Path) -> list[dict[str, Any]]:
@@ -687,11 +693,19 @@ def run_ppo_training(
     seed: int = 0, prior_checkpoint: str | Path | None = None,
     opponent_pool: Any | None = None, rollout_fn: Any | None = None,
     offline_ppo_fallback: bool = False, update_fn: Any | None = None,
+    promotion_match_fn: Any | None = None,
+    candidate_checkpoint: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run PPO with fresh scheduled league rollouts or explicit offline fallback."""
     steps = max(0, int(ppo_steps))
     if steps == 0:
-        return {"ppo_updates": 0, "rollout_count": 0, "early_stopped": False, "last_metrics": None}
+        return {
+            "ppo_updates": 0,
+            "rollout_count": 0,
+            "early_stopped": False,
+            "last_metrics": None,
+            "promotion": None,
+        }
     updater = update_fn or ppo_update
     if rollout_fn is None and not offline_ppo_fallback:
         raise ValueError("rollout_fn is required for PPO unless offline_ppo_fallback is explicitly selected")
@@ -736,12 +750,22 @@ def run_ppo_training(
                 "rollout_count": rollout_count,
                 "early_stopped": True,
                 "last_metrics": last_metrics,
+                "promotion": None,
             }
+    promotion = None
+    if promotion_match_fn is not None:
+        if candidate_checkpoint is None:
+            raise ValueError("candidate_checkpoint is required when promotion_match_fn is provided")
+        promotion = maybe_promote_checkpoint(
+            match_fn=promotion_match_fn,
+            candidate_checkpoint=candidate_checkpoint,
+        )
     return {
         "ppo_updates": total_updates,
         "rollout_count": rollout_count,
         "early_stopped": False,
         "last_metrics": last_metrics,
+        "promotion": promotion,
     }
 
 
@@ -765,10 +789,20 @@ def _candidate_won(result: Any) -> bool:
         return result
     if isinstance(result, dict):
         if "candidate_win" in result:
-            return bool(result["candidate_win"])
+            if type(result["candidate_win"]) is bool:
+                return result["candidate_win"]
+            raise ValueError("promotion match result candidate_win must be boolean")
         if "winner" in result:
-            return str(result["winner"]).lower() in {"candidate", "learned", "policy", "agent"}
-    return False
+            winner = result["winner"]
+            if not isinstance(winner, str):
+                raise ValueError("promotion match result winner must be a string")
+            normalized = winner.lower()
+            if normalized in {"candidate", "learned", "policy", "agent"}:
+                return True
+            if normalized in {"opponent", "best", "baseline"}:
+                return False
+            raise ValueError("promotion match result winner must be candidate or opponent")
+    raise ValueError("promotion match result must be boolean or contain candidate_win/winner")
 
 
 def run_promotion_match(
@@ -779,7 +813,10 @@ def run_promotion_match(
         raise ValueError(f"promotion match must run exactly {PROMOTION_MATCH_SIZE} games")
     wins = 0
     for index in range(PROMOTION_MATCH_SIZE):
-        wins += int(_candidate_won(match_fn(index)))
+        try:
+            wins += int(_candidate_won(match_fn(index)))
+        except ValueError as exc:
+            raise ValueError(f"promotion match result {index} is malformed: {exc}") from exc
     return {
         "games": PROMOTION_MATCH_SIZE,
         "wins": wins,
@@ -787,11 +824,17 @@ def run_promotion_match(
     }
 
 
+def maybe_promote_checkpoint(*, match_fn: Any, candidate_checkpoint: str | Path) -> dict[str, Any]:
+    result = run_promotion_match(match_fn)
+    return {"candidate_checkpoint": str(candidate_checkpoint), **result}
+
+
 def train_behavior_clone(
     *, input_path: str | Path, output_path: str | Path, steps: int,
     batch_size: int, seed: int = 0, ppo_steps: int = 0,
     prior_checkpoint: str | Path | None = None, rollout_fn: Any | None = None,
     opponent_pool: Any | None = None, offline_ppo_fallback: bool = False,
+    promotion_match_fn: Any | None = None,
 ) -> dict[str, Any]:
     """Run complete behavior-cloning epochs, optional PPO, and checkpoint."""
     th = require_torch()
@@ -855,6 +898,8 @@ def train_behavior_clone(
             opponent_pool=opponent_pool,
             rollout_fn=rollout_fn,
             offline_ppo_fallback=offline_ppo_fallback,
+            promotion_match_fn=promotion_match_fn,
+            candidate_checkpoint=output_path,
         )
         if isinstance(ppo_metrics.get("last_metrics"), dict):
             ppo_metrics = {**ppo_metrics, **ppo_metrics["last_metrics"]}
@@ -890,10 +935,13 @@ def _nonnegative_int(value: str) -> int:
 
 
 def _cli_training_options(args: argparse.Namespace) -> dict[str, Any]:
-    # The standalone CLI only has collected trajectory input. Fresh self-play
-    # rollout callbacks remain available through train_behavior_clone().
+    if args.ppo_steps > 0 and not args.offline_ppo_fallback:
+        raise ValueError(
+            "--ppo-steps requires --offline-ppo-fallback in the standalone CLI; "
+            "fresh league rollouts are available through the rollout_fn API"
+        )
     return {
-        "offline_ppo_fallback": bool(args.offline_ppo_fallback or args.ppo_steps > 0),
+        "offline_ppo_fallback": bool(args.offline_ppo_fallback),
     }
 
 
@@ -916,8 +964,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    options = _cli_training_options(args)
     try:
+        options = _cli_training_options(args)
         metadata = train_behavior_clone(
             input_path=args.input_path,
             output_path=args.output_path,
@@ -928,7 +976,7 @@ def main(argv: list[str] | None = None) -> int:
             prior_checkpoint=args.prior_checkpoint,
             offline_ppo_fallback=options["offline_ppo_fallback"],
         )
-    except (RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
     print(json.dumps(metadata, sort_keys=True, separators=(",", ":")))

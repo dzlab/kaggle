@@ -101,6 +101,14 @@ def test_advantage_normalization_returns_zero_mean_unit_variance():
     assert normalize_advantages([5.0, 5.0]) == [0.0, 0.0]
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+def test_advantage_normalization_rejects_nonfinite_values(bad):
+    from scripts.train_policy import normalize_advantages
+
+    with pytest.raises(ValueError, match="finite"):
+        normalize_advantages([1.0, bad])
+
+
 def test_ppo_ratio_clipping_limits_objective():
     from scripts.train_policy import clipped_policy_terms
 
@@ -169,6 +177,26 @@ def test_generalized_advantage_estimate_uses_terminal_rewards_and_dones():
     assert returns[-1] == pytest.approx(math.tanh(0.3))
     assert advantages[-1] == pytest.approx(math.tanh(0.3) - 0.2)
     assert len(advantages) == len(returns) == 2
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"rewards": [float("nan")], "values": [0.0], "dones": [True]},
+    {"rewards": [0.0], "values": [float("inf")], "dones": [True]},
+    {"rewards": [0.0], "values": [0.0], "dones": [True], "gamma": float("nan")},
+    {"rewards": [0.0], "values": [0.0], "dones": [True], "gae_lambda": float("inf")},
+])
+def test_generalized_advantage_estimate_rejects_nonfinite_inputs(kwargs):
+    from scripts.train_policy import generalized_advantage_estimate
+
+    with pytest.raises(ValueError, match="finite"):
+        generalized_advantage_estimate(**kwargs)
+
+
+def test_approximate_kl_rejects_nonfinite_inputs():
+    from scripts.train_policy import approximate_kl
+
+    with pytest.raises(ValueError, match="finite"):
+        approximate_kl([0.0], [float("nan")])
 
 
 def test_rollout_batch_uses_terminal_bank_reward_and_normalized_advantages():
@@ -446,7 +474,7 @@ def test_ppo_offline_fallback_is_explicit_and_reuses_collected_rollout():
     assert metrics["ppo_updates"] == 2
 
 
-def test_cli_ppo_steps_use_collected_input_as_offline_rollout_source():
+def test_cli_ppo_steps_require_explicit_offline_fallback_for_replay_reuse():
     from scripts.train_policy import _cli_training_options, _parser
 
     args = _parser().parse_args([
@@ -455,7 +483,16 @@ def test_cli_ppo_steps_use_collected_input_as_offline_rollout_source():
         "--ppo-steps", "2",
     ])
 
-    assert _cli_training_options(args)["offline_ppo_fallback"] is True
+    with pytest.raises(ValueError, match="--offline-ppo-fallback"):
+        _cli_training_options(args)
+
+    explicit = _parser().parse_args([
+        "--input", "transitions.jsonl",
+        "--output", "policy.pt",
+        "--ppo-steps", "2",
+        "--offline-ppo-fallback",
+    ])
+    assert _cli_training_options(explicit)["offline_ppo_fallback"] is True
 
 
 def test_promotion_match_runs_exactly_fixed_gate_and_counts_wins():
@@ -478,6 +515,76 @@ def test_promotion_match_rejects_wrong_match_size():
 
     with pytest.raises(ValueError, match="exactly 100"):
         run_promotion_match(lambda index: {"winner": "candidate"}, match_size=99)
+
+
+@pytest.mark.parametrize("result", [
+    None,
+    "candidate",
+    {"winner": "tie"},
+    {"winner": None},
+    {"candidate_win": "yes"},
+    {"candidate_win": 1},
+    {"candidate_win": None},
+    {"other": "candidate"},
+])
+def test_promotion_match_rejects_malformed_or_nonbinary_results(result):
+    from scripts.train_policy import run_promotion_match
+
+    def match_fn(_index):
+        return result
+
+    with pytest.raises(ValueError, match="promotion match result"):
+        run_promotion_match(match_fn)
+
+
+def test_checkpoint_promotion_runner_uses_fixed_match_before_promoting():
+    from scripts.train_policy import maybe_promote_checkpoint
+
+    calls = []
+
+    def match_fn(index):
+        calls.append(index)
+        return {"candidate_win": index < 71}
+
+    result = maybe_promote_checkpoint(match_fn=match_fn, candidate_checkpoint="candidate.pt")
+
+    assert calls == list(range(100))
+    assert result == {
+        "candidate_checkpoint": "candidate.pt",
+        "games": 100,
+        "wins": 71,
+        "promoted": True,
+    }
+
+
+def test_cli_main_reports_oserror_without_traceback(monkeypatch, capsys):
+    from scripts import train_policy
+
+    def fail(**_kwargs):
+        raise OSError("cannot write checkpoint")
+
+    monkeypatch.setattr(train_policy, "train_behavior_clone", fail)
+
+    assert train_policy.main([
+        "--input", "missing.jsonl",
+        "--output", "policy.pt",
+    ]) == 2
+    captured = capsys.readouterr()
+    assert captured.err.strip() == "cannot write checkpoint"
+    assert "Traceback" not in captured.err
+
+
+def test_cli_main_reports_ambiguous_ppo_mode_without_traceback(capsys):
+    from scripts import train_policy
+
+    assert train_policy.main([
+        "--input", "transitions.jsonl",
+        "--output", "policy.pt",
+        "--ppo-steps", "1",
+    ]) == 2
+    captured = capsys.readouterr()
+    assert "--offline-ppo-fallback" in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_opponent_pool_probabilities_and_checkpoint_sampling_are_deterministic():
