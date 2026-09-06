@@ -95,12 +95,30 @@ def test_transition_serialization_is_deterministic_and_json_compatible(tmp_path)
 
 
 def test_local_runner_exposes_current_opponent_and_candidate_seat():
-    from scripts.run_local import _parser
+    from scripts.run_local import OPPONENTS, _parser
 
-    args = _parser().parse_args(["--opponent", "current", "--seat", "1", "--steps", "1"])
+    args = _parser().parse_args(["--opponent", "pass", "--seat", "1", "--steps", "1"])
 
-    assert args.opponent == "current"
+    assert OPPONENTS == ("pass", "random", "starter")
+    assert args.opponent == "pass"
     assert args.candidate_player == 1
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_collector_runs_all_supported_opponents_in_isolated_processes(tmp_path):
+    from scripts import collect_trajectories
+
+    output = tmp_path / "all-opponents.jsonl"
+    manifest = collect_trajectories.collect(
+        seeds=[0], opponents=["pass", "random", "starter", "current"],
+        seats=[0], steps=4, output=output,
+    )
+
+    lines = output.read_text().splitlines()
+    assert len(lines) == 4 * 3
+    assert all(json.loads(line)["observation"]["player"] == 0 for line in lines)
+    assert sum(json.loads(line)["done"] for line in lines) == 4
+    assert manifest["opponents"] == ["pass", "random", "starter", "current"]
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")

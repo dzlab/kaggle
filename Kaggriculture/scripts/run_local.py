@@ -18,7 +18,7 @@ from kagriculture_agent.constants import CROPS
 from main import agent
 
 
-OPPONENTS = ("pass", "random", "starter", "current")
+OPPONENTS = ("pass", "random", "starter")
 
 
 def _deterministic_random_agent(seed: int):
@@ -65,6 +65,21 @@ def _ordered_agents(opponent_agent: Any, candidate_player: int) -> list[Any]:
     return [agent, opponent_agent] if candidate_player == 0 else [opponent_agent, agent]
 
 
+def _current_opponent_agent(configuration: Any = None):
+    """Return a fresh, evaluator-sanitized current policy callable."""
+    policy = candidate_policy("current")
+    # Reuse the evaluator's action sanitizer so self-play cannot terminate the
+    # engine with a policy action that is legal in shape but not in state.
+    from scripts.evaluate import _sanitize_action
+
+    def current_opponent(observation: dict[str, Any]) -> dict[str, Any]:
+        action = policy(observation)
+        fallback = {"farmer": ["PASS"], "hands": [], "market": []}
+        return _sanitize_action(action, observation, fallback, configuration)
+
+    return current_opponent
+
+
 def run_episode(
     *,
     opponent: str,
@@ -72,6 +87,8 @@ def run_episode(
     steps: int = 720,
     replay_path: str | Path,
     candidate_player: int = 0,
+    opponent_agent: Any | None = None,
+    current_opponent: bool = False,
     debug: bool = False,
 ) -> Any:
     """Run one local game and save its JSON replay."""
@@ -81,6 +98,8 @@ def run_episode(
         raise ValueError("steps must be positive")
     if type(candidate_player) is not int or candidate_player not in (0, 1):
         raise ValueError("candidate_player must be 0 or 1")
+    if current_opponent and opponent != "pass":
+        raise ValueError("current_opponent requires opponent pass")
 
     try:
         from kaggle_environments import make
@@ -94,12 +113,13 @@ def run_episode(
         configuration={"episodeSteps": steps, "seed": seed},
         debug=debug,
     )
-    if opponent == "random":
-        opponent_agent = _deterministic_random_agent(seed)
-    elif opponent == "current":
-        opponent_agent = candidate_policy("current")
-    else:
-        opponent_agent = opponent
+    if current_opponent:
+        opponent_agent = _current_opponent_agent(env.configuration)
+    elif opponent_agent is None:
+        if opponent == "random":
+            opponent_agent = _deterministic_random_agent(seed)
+        else:
+            opponent_agent = opponent
     env.run(_ordered_agents(opponent_agent, candidate_player))
 
     replay = Path(replay_path)
@@ -117,12 +137,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", type=_positive_int, default=720, dest="steps")
     parser.add_argument("--replay", type=Path, default=None, dest="replay_path")
     parser.add_argument("--seat", type=int, choices=(0, 1), default=0, dest="candidate_player")
+    parser.add_argument(
+        "--current-opponent", action="store_true",
+        help="use a fresh current Policy callable as the opponent",
+    )
     parser.add_argument("--debug", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.current_opponent and args.opponent != "pass":
+        _parser().error("--current-opponent requires --opponent pass")
     replay_path = args.replay_path or PROJECT_ROOT / "replays" / f"seed-{args.seed}-{args.opponent}.json"
     env = run_episode(
         opponent=args.opponent,
@@ -130,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
         steps=args.steps,
         replay_path=replay_path,
         candidate_player=args.candidate_player,
+        current_opponent=args.current_opponent,
         debug=args.debug,
     )
     result = env.toJSON()

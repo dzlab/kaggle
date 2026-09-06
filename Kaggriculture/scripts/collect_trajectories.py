@@ -21,7 +21,8 @@ from kagriculture_agent.constants import ENGINE_VERSION
 from kagriculture_agent.features import FEATURE_SCHEMA_VERSION
 from kagriculture_agent.trajectory import TRANSITION_SCHEMA_VERSION, Transition, transitions_from_replay
 
-OPPONENTS = ("current", "random", "starter")
+COLLECTOR_OPPONENTS = ("pass", "random", "starter", "current")
+OPPONENTS = COLLECTOR_OPPONENTS
 
 
 def _positive_int(value: str) -> int:
@@ -38,15 +39,18 @@ def _run_game_isolated(
     *, opponent: str, seed: int, steps: int, candidate_player: int, replay_path: Path,
 ) -> dict[str, Any]:
     """Run one game in a fresh interpreter and return its JSON replay."""
+    engine_opponent = "pass" if opponent == "current" else opponent
     command = [
         sys.executable,
         str(RUN_LOCAL),
-        "--opponent", opponent,
+        "--opponent", engine_opponent,
         "--seed", str(seed),
         "--steps", str(steps),
         "--seat", str(candidate_player),
         "--replay", str(replay_path),
     ]
+    if opponent == "current":
+        command.append("--current-opponent")
     completed = subprocess.run(
         command,
         cwd=PROJECT_ROOT,
@@ -96,8 +100,8 @@ def collect(
     normalized_seats = [int(seat) for seat in seats]
     if not normalized_seeds or any(type(seed) is not int for seed in normalized_seeds):
         raise ValueError("seeds must contain at least one integer")
-    if not normalized_opponents or any(opponent not in OPPONENTS for opponent in normalized_opponents):
-        raise ValueError(f"opponents must be drawn from {OPPONENTS}")
+    if not normalized_opponents or any(opponent not in COLLECTOR_OPPONENTS for opponent in normalized_opponents):
+        raise ValueError(f"opponents must be drawn from {COLLECTOR_OPPONENTS}")
     if not normalized_seats or any(seat not in (0, 1) for seat in normalized_seats):
         raise ValueError("seats must contain 0 and/or 1")
     if type(steps) is not int or steps < 2:
@@ -145,7 +149,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seeds", type=_positive_int, default=100)
     parser.add_argument("--start-seed", type=int, default=0)
     parser.add_argument("--steps", type=_positive_int, default=720)
-    parser.add_argument("--opponents", nargs="+", choices=OPPONENTS, default=list(OPPONENTS))
+    parser.add_argument("--opponents", nargs="+", choices=COLLECTOR_OPPONENTS, default=list(COLLECTOR_OPPONENTS))
     parser.add_argument("--seats", nargs="+", type=int, choices=(0, 1), default=[0, 1])
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-policy-identity", default="current")
