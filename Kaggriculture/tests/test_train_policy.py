@@ -781,6 +781,42 @@ def test_ppo_promotion_publishes_current_metadata_to_output_and_best(tmp_path):
     }
 
 
+def test_ppo_registry_only_promotion_persists_loadable_best(tmp_path):
+    from scripts.train_policy import PPOConfig, run_ppo_training
+
+    output = tmp_path / "policy.pt"
+    registry = {"best": None, "candidates": []}
+
+    def save_candidate(path, *, ppo_metrics):
+        Path(path).write_text(json.dumps({
+            "metadata": {"ppo_updates": ppo_metrics["ppo_updates"]},
+            "model_state_dict": {"weights": [1, 2, 3]},
+        }), encoding="utf-8")
+        return path
+
+    metrics = run_ppo_training(
+        network=None,
+        optimizer=None,
+        transitions=[_transition(done=True)],
+        ppo_steps=1,
+        config=PPOConfig(),
+        offline_ppo_fallback=True,
+        update_fn=lambda **_kwargs: {"updates": 5, "early_stopped": False},
+        promotion_match_fn=lambda index, **_kwargs: {"candidate_win": index < 71},
+        candidate_checkpoint=output,
+        checkpoint_registry=registry,
+        save_candidate_fn=save_candidate,
+    )
+
+    registry_best = Path(registry["best"])
+    assert metrics["promotion"]["promoted"] is True
+    assert registry_best != output
+    assert registry_best != Path(metrics["promotion"]["candidate_checkpoint"])
+    assert registry_best.exists()
+    assert json.loads(registry_best.read_text(encoding="utf-8"))["metadata"]["ppo_updates"] == 5
+    assert json.loads(output.read_text(encoding="utf-8"))["metadata"]["ppo_updates"] == 5
+
+
 def test_cli_main_reports_oserror_without_traceback(monkeypatch, capsys):
     from scripts import train_policy
 

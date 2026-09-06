@@ -774,6 +774,10 @@ def run_ppo_training(
         def save_temp_candidate(path: str | Path) -> str:
             return _save_candidate(save_candidate_fn, path, ppo_metrics=summary)
 
+        registry_best_checkpoint = (
+            _registry_best_checkpoint_path(final_candidate, checkpoint_registry)
+            if checkpoint_registry is not None and best_checkpoint_path is None else None
+        )
         promotion = maybe_promote_checkpoint(
             match_fn=promotion_match_fn,
             candidate_checkpoint=candidate_for_match,
@@ -781,6 +785,7 @@ def run_ppo_training(
             save_candidate_fn=save_temp_candidate,
             cleanup_candidate_fn=cleanup_candidate_fn,
             best_checkpoint_path=best_checkpoint_path,
+            promoted_checkpoint_path=registry_best_checkpoint,
         )
         if promotion["promoted"]:
             try:
@@ -873,6 +878,14 @@ def _temporary_candidate_path(final_path: str | Path) -> Path:
     return path.with_name(f".{path.name}.promotion-candidate.tmp")
 
 
+def _registry_best_checkpoint_path(final_path: str | Path, registry: dict[str, Any], best_key: str = "best") -> Path:
+    current_best = registry.get(best_key)
+    if current_best:
+        return Path(current_best)
+    path = Path(final_path)
+    return path.with_name(f".{path.name}.registry-best.pt")
+
+
 def _save_candidate(save_candidate_fn: Any, path: str | Path, *, ppo_metrics: dict[str, Any] | None) -> str:
     if save_candidate_fn is None:
         return str(path)
@@ -885,12 +898,26 @@ def _save_candidate(save_candidate_fn: Any, path: str | Path, *, ppo_metrics: di
     return str(save_candidate_fn(path))
 
 
+def _promoted_checkpoint_path(
+    saved_candidate: str,
+    *,
+    best_checkpoint_path: str | Path | None,
+    promoted_checkpoint_path: str | Path | None,
+) -> str:
+    if best_checkpoint_path is not None:
+        return _persist_best_checkpoint(saved_candidate, best_checkpoint_path)
+    if promoted_checkpoint_path is not None:
+        return _persist_best_checkpoint(saved_candidate, promoted_checkpoint_path)
+    return saved_candidate
+
+
 def maybe_promote_checkpoint(
     *, match_fn: Any, candidate_checkpoint: str | Path,
     registry: dict[str, Any] | None = None,
     save_candidate_fn: Any | None = None,
     cleanup_candidate_fn: Any | None = None,
     best_checkpoint_path: str | Path | None = None,
+    promoted_checkpoint_path: str | Path | None = None,
     best_key: str = "best",
 ) -> dict[str, Any]:
     """Register a candidate, run the fixed promotion match, and update best only on promotion."""
@@ -922,9 +949,10 @@ def maybe_promote_checkpoint(
         raise
     if result["promoted"]:
         entry["status"] = "promoted"
-        registry[best_key] = (
-            _persist_best_checkpoint(saved_candidate, best_checkpoint_path)
-            if best_checkpoint_path is not None else saved_candidate
+        registry[best_key] = _promoted_checkpoint_path(
+            saved_candidate,
+            best_checkpoint_path=best_checkpoint_path,
+            promoted_checkpoint_path=promoted_checkpoint_path,
         )
     else:
         entry["status"] = "rejected"
