@@ -13,11 +13,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from kagriculture_agent.candidates import candidate_policy
 from kagriculture_agent.constants import CROPS
 from main import agent
 
 
-OPPONENTS = ("pass", "random", "starter")
+OPPONENTS = ("pass", "random", "starter", "current")
 
 
 def _deterministic_random_agent(seed: int):
@@ -58,12 +59,19 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def _ordered_agents(opponent_agent: Any, candidate_player: int) -> list[Any]:
+    if type(candidate_player) is not int or candidate_player not in (0, 1):
+        raise ValueError("candidate_player must be 0 or 1")
+    return [agent, opponent_agent] if candidate_player == 0 else [opponent_agent, agent]
+
+
 def run_episode(
     *,
     opponent: str,
     seed: int,
     steps: int = 720,
     replay_path: str | Path,
+    candidate_player: int = 0,
     debug: bool = False,
 ) -> Any:
     """Run one local game and save its JSON replay."""
@@ -71,6 +79,8 @@ def run_episode(
         raise ValueError(f"unsupported opponent: {opponent}")
     if steps < 1:
         raise ValueError("steps must be positive")
+    if type(candidate_player) is not int or candidate_player not in (0, 1):
+        raise ValueError("candidate_player must be 0 or 1")
 
     try:
         from kaggle_environments import make
@@ -84,8 +94,13 @@ def run_episode(
         configuration={"episodeSteps": steps, "seed": seed},
         debug=debug,
     )
-    opponent_agent = _deterministic_random_agent(seed) if opponent == "random" else opponent
-    env.run([agent, opponent_agent])
+    if opponent == "random":
+        opponent_agent = _deterministic_random_agent(seed)
+    elif opponent == "current":
+        opponent_agent = candidate_policy("current")
+    else:
+        opponent_agent = opponent
+    env.run(_ordered_agents(opponent_agent, candidate_player))
 
     replay = Path(replay_path)
     replay.parent.mkdir(parents=True, exist_ok=True)
@@ -101,6 +116,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps", type=_positive_int, default=720, dest="steps")
     parser.add_argument("--replay", type=Path, default=None, dest="replay_path")
+    parser.add_argument("--seat", type=int, choices=(0, 1), default=0, dest="candidate_player")
     parser.add_argument("--debug", action="store_true")
     return parser
 
@@ -113,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         steps=args.steps,
         replay_path=replay_path,
+        candidate_player=args.candidate_player,
         debug=args.debug,
     )
     result = env.toJSON()
