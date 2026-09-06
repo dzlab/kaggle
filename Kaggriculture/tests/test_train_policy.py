@@ -541,20 +541,75 @@ def test_checkpoint_promotion_runner_uses_fixed_match_before_promoting():
     from scripts.train_policy import maybe_promote_checkpoint
 
     calls = []
+    registry = {"best": "previous.pt", "candidates": []}
 
-    def match_fn(index):
-        calls.append(index)
+    def match_fn(index, *, candidate_checkpoint, best_checkpoint, registry_entry):
+        calls.append((index, candidate_checkpoint, best_checkpoint, registry_entry))
         return {"candidate_win": index < 71}
 
-    result = maybe_promote_checkpoint(match_fn=match_fn, candidate_checkpoint="candidate.pt")
+    result = maybe_promote_checkpoint(
+        match_fn=match_fn,
+        candidate_checkpoint="candidate.pt",
+        registry=registry,
+    )
 
-    assert calls == list(range(100))
+    assert [call[0] for call in calls] == list(range(100))
+    assert {call[1] for call in calls} == {"candidate.pt"}
+    assert {call[2] for call in calls} == {"previous.pt"}
+    assert all(call[3]["path"] == "candidate.pt" and call[3]["status"] == "candidate" for call in calls)
     assert result == {
         "candidate_checkpoint": "candidate.pt",
         "games": 100,
         "wins": 71,
         "promoted": True,
     }
+    assert registry["best"] == "candidate.pt"
+    assert registry["candidates"] == [{"path": "candidate.pt", "status": "promoted"}]
+
+
+def test_checkpoint_promotion_retains_best_and_cleans_candidate_on_rejection():
+    from scripts.train_policy import maybe_promote_checkpoint
+
+    registry = {"best": "previous.pt", "candidates": []}
+    cleaned = []
+
+    def match_fn(index, **_kwargs):
+        return {"candidate_win": index < 70}
+
+    result = maybe_promote_checkpoint(
+        match_fn=match_fn,
+        candidate_checkpoint="candidate.pt",
+        registry=registry,
+        cleanup_candidate_fn=cleaned.append,
+    )
+
+    assert result["promoted"] is False
+    assert result["wins"] == 70
+    assert registry["best"] == "previous.pt"
+    assert registry["candidates"] == [{"path": "candidate.pt", "status": "rejected"}]
+    assert cleaned == ["candidate.pt"]
+
+
+def test_checkpoint_promotion_cleans_candidate_and_retains_best_on_match_error():
+    from scripts.train_policy import maybe_promote_checkpoint
+
+    registry = {"best": "previous.pt", "candidates": []}
+    cleaned = []
+
+    def match_fn(_index, **_kwargs):
+        return {"winner": "draw"}
+
+    with pytest.raises(ValueError, match="promotion match result"):
+        maybe_promote_checkpoint(
+            match_fn=match_fn,
+            candidate_checkpoint="candidate.pt",
+            registry=registry,
+            cleanup_candidate_fn=cleaned.append,
+        )
+
+    assert registry["best"] == "previous.pt"
+    assert registry["candidates"] == [{"path": "candidate.pt", "status": "error"}]
+    assert cleaned == ["candidate.pt"]
 
 
 def test_cli_main_reports_oserror_without_traceback(monkeypatch, capsys):

@@ -824,9 +824,51 @@ def run_promotion_match(
     }
 
 
-def maybe_promote_checkpoint(*, match_fn: Any, candidate_checkpoint: str | Path) -> dict[str, Any]:
-    result = run_promotion_match(match_fn)
-    return {"candidate_checkpoint": str(candidate_checkpoint), **result}
+def maybe_promote_checkpoint(
+    *, match_fn: Any, candidate_checkpoint: str | Path,
+    registry: dict[str, Any] | None = None,
+    save_candidate_fn: Any | None = None,
+    cleanup_candidate_fn: Any | None = None,
+    best_key: str = "best",
+) -> dict[str, Any]:
+    """Register a candidate, run the fixed promotion match, and update best only on promotion."""
+    registry = registry if registry is not None else {best_key: None, "candidates": []}
+    previous_best = registry.get(best_key)
+    saved_candidate = (
+        str(save_candidate_fn(candidate_checkpoint))
+        if save_candidate_fn is not None else str(candidate_checkpoint)
+    )
+    entry = {"path": saved_candidate, "status": "candidate"}
+    candidates = registry.setdefault("candidates", [])
+    if not isinstance(candidates, list):
+        raise ValueError("checkpoint registry candidates must be a list")
+    candidates.append(entry)
+
+    def candidate_match(index: int) -> Any:
+        return match_fn(
+            index,
+            candidate_checkpoint=saved_candidate,
+            best_checkpoint=previous_best,
+            registry_entry=dict(entry),
+        )
+
+    try:
+        result = run_promotion_match(candidate_match)
+    except Exception:
+        entry["status"] = "error"
+        registry[best_key] = previous_best
+        if cleanup_candidate_fn is not None:
+            cleanup_candidate_fn(saved_candidate)
+        raise
+    if result["promoted"]:
+        entry["status"] = "promoted"
+        registry[best_key] = saved_candidate
+    else:
+        entry["status"] = "rejected"
+        registry[best_key] = previous_best
+        if cleanup_candidate_fn is not None:
+            cleanup_candidate_fn(saved_candidate)
+    return {"candidate_checkpoint": saved_candidate, **result}
 
 
 def train_behavior_clone(
