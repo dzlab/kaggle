@@ -1,0 +1,350 @@
+"""Train compact Kaggriculture policies with behavior cloning and PPO helpers."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+import sys
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from kagriculture_agent.constants import ENGINE_VERSION
+from kagriculture_agent.features import FEATURE_SCHEMA_VERSION, extract_features
+from kagriculture_agent.model import ACTION_VOCAB, MODEL_VERSION, CompactPolicyNet, require_torch, set_training_seed
+
+
+@dataclass(frozen=True)
+class PPOConfig:
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    clip_epsilon: float = 0.20
+    value_coef: float = 0.50
+    entropy_coef: float = 0.01
+    target_kl: float = 0.03
+    rollout_steps: int = 64
+    kl_coef: float = 0.10
+    prior_ce_coef: float = 0.01
+
+    def __post_init__(self) -> None:
+        for name in ("gamma", "gae_lambda", "clip_epsilon", "value_coef", "entropy_coef", "target_kl"):
+            value = getattr(self, name)
+            if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+        if not 0.0 < self.gamma <= 1.0:
+            raise ValueError("gamma must be in (0, 1]; gamma=1.0 is for explicit experiments only")
+        if not 0.0 <= self.gae_lambda <= 1.0:
+            raise ValueError("gae_lambda must be in [0, 1]")
+        if self.rollout_steps < 1:
+            raise ValueError("rollout_steps must be positive")
+
+
+@dataclass(frozen=True)
+class OpponentMatch:
+    opponent: str
+    seat: int
+    checkpoint: str | None = None
+
+
+class OpponentPool:
+    """Deterministic league sampler for self-play PPO rollouts."""
+
+    probabilities = {
+        "current": 0.40,
+        "mixed": 0.15,
+        "random": 0.10,
+        "starter": 0.10,
+        "checkpoint": 0.25,
+    }
+
+    def __init__(self, previous_checkpoints: Sequence[str | Path] = ()) -> None:
+        self.checkpoint_candidates = tuple(str(path) for path in previous_checkpoints[-5:])
+        total = sum(self.probabilities.values())
+        if abs(total - 1.0) > 1e-12:
+            raise ValueError("opponent pool probabilities must sum to one")
+
+    def sample(self, index: int) -> OpponentMatch:
+        rng = random.Random(int(index))
+        draw = rng.random()
+        cumulative = 0.0
+        selected = "checkpoint"
+        for opponent, probability in self.probabilities.items():
+            cumulative += probability
+            if draw <= cumulative:
+                selected = opponent
+                break
+        checkpoint = None
+        if selected == "checkpoint":
+            if self.checkpoint_candidates:
+                checkpoint = self.checkpoint_candidates[rng.randrange(len(self.checkpoint_candidates))]
+            else:
+                selected = "current"
+        return OpponentMatch(opponent=selected, seat=int(index) % 2, checkpoint=checkpoint)
+
+
+def should_promote(*, wins: int, games: int, threshold: float = 0.70) -> bool:
+    return games > 0 and (wins / games) > threshold
+
+
+def terminal_bank_margin_reward(final_bank: Any, opponent_final_bank: Any) -> float:
+    try:
+        final = float(final_bank)
+        opponent = float(opponent_final_bank)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if not math.isfinite(final) or not math.isfinite(opponent):
+        return 0.0
+    return math.tanh((final - opponent) / 1000.0)
+
+
+def normalize_advantages(advantages: Sequence[float], epsilon: float = 1e-8) -> list[float]:
+    values = [float(value) for value in advantages]
+    if not values:
+        return []
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / len(values)
+    std = math.sqrt(variance)
+    if std <= epsilon:
+        return [0.0 for _value in values]
+    return [(value - mean) / std for value in values]
+
+
+def generalized_advantage_estimate(
+    *, rewards: Sequence[float], values: Sequence[float], dones: Sequence[bool],
+    gamma: float = PPOConfig.gamma, gae_lambda: float = PPOConfig.gae_lambda,
+) -> tuple[list[float], list[float]]:
+    if not (len(rewards) == len(values) == len(dones)):
+        raise ValueError("rewards, values, and dones must have the same length")
+    advantages = [0.0 for _ in rewards]
+    next_advantage = 0.0
+    next_value = 0.0
+    for index in range(len(rewards) - 1, -1, -1):
+        nonterminal = 0.0 if dones[index] else 1.0
+        delta = float(rewards[index]) + gamma * next_value * nonterminal - float(values[index])
+        next_advantage = delta + gamma * gae_lambda * nonterminal * next_advantage
+        advantages[index] = next_advantage
+        next_value = float(values[index])
+    returns = [advantage + float(value) for advantage, value in zip(advantages, values)]
+    return advantages, returns
+
+
+def clipped_policy_terms(
+    *, new_log_probs: Sequence[float], old_log_probs: Sequence[float],
+    advantages: Sequence[float], clip_epsilon: float = PPOConfig.clip_epsilon,
+) -> dict[str, list[float] | float]:
+    if not (len(new_log_probs) == len(old_log_probs) == len(advantages)):
+        raise ValueError("new_log_probs, old_log_probs, and advantages must have the same length")
+    ratios = [math.exp(float(new) - float(old)) for new, old in zip(new_log_probs, old_log_probs)]
+    low = 1.0 - clip_epsilon
+    high = 1.0 + clip_epsilon
+    clipped = [min(high, max(low, ratio)) for ratio in ratios]
+    objectives = [
+        min(ratio * float(advantage), clipped_ratio * float(advantage))
+        for ratio, clipped_ratio, advantage in zip(ratios, clipped, advantages)
+    ]
+    loss = -sum(objectives) / len(objectives) if objectives else 0.0
+    return {"ratios": ratios, "clipped_ratios": clipped, "loss": loss}
+
+
+def clipped_value_loss(
+    *, values: Sequence[float], old_values: Sequence[float], returns: Sequence[float],
+    clip_epsilon: float = PPOConfig.clip_epsilon,
+) -> float:
+    if not (len(values) == len(old_values) == len(returns)):
+        raise ValueError("values, old_values, and returns must have the same length")
+    losses = []
+    for value, old, target in zip(values, old_values, returns):
+        clipped = float(old) + min(clip_epsilon, max(-clip_epsilon, float(value) - float(old)))
+        losses.append(max((float(value) - float(target)) ** 2, (clipped - float(target)) ** 2))
+    return sum(losses) / len(losses) if losses else 0.0
+
+
+def ppo_total_loss(
+    *, policy_loss: float, value_loss: float, entropy: float, kl_to_prior: float,
+    cross_entropy_to_prior: float, config: PPOConfig,
+) -> float:
+    """Combine PPO clipped losses with previous-checkpoint regularization."""
+    return (
+        float(policy_loss)
+        + config.value_coef * float(value_loss)
+        - config.entropy_coef * float(entropy)
+        + config.kl_coef * float(kl_to_prior)
+        + config.prior_ce_coef * float(cross_entropy_to_prior)
+    )
+
+
+def approximate_kl(new_log_probs: Sequence[float], old_log_probs: Sequence[float]) -> float:
+    if len(new_log_probs) != len(old_log_probs):
+        raise ValueError("new_log_probs and old_log_probs must have the same length")
+    if not new_log_probs:
+        return 0.0
+    return sum(float(old) - float(new) for new, old in zip(new_log_probs, old_log_probs)) / len(new_log_probs)
+
+
+def _read_transitions(path: str | Path) -> list[dict[str, Any]]:
+    transitions: list[dict[str, Any]] = []
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSON transition at line {line_number}") from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"transition at line {line_number} must be an object")
+            transitions.append(row)
+    if not transitions:
+        raise ValueError("at least one transition is required")
+    return transitions
+
+
+def _command_kind(command: Any) -> str:
+    if not isinstance(command, Sequence) or isinstance(command, (str, bytes)) or not command:
+        return "PASS"
+    name = str(command[0]).upper()
+    if name in {"NORTH", "SOUTH", "EAST", "WEST"}:
+        return "MOVE"
+    return name if name in ACTION_VOCAB["worker_kinds"] else "PASS"
+
+
+def _worker_labels(action: dict[str, Any]) -> tuple[list[int], list[int], list[int]]:
+    commands = [action.get("farmer", ["PASS"])]
+    hands = action.get("hands", [])
+    if isinstance(hands, Sequence) and not isinstance(hands, (str, bytes)):
+        commands.extend(hands)
+    commands = (commands + [["PASS"]] * 10)[:10]
+    kind_lookup = {kind: index for index, kind in enumerate(ACTION_VOCAB["worker_kinds"])}
+    act_labels: list[int] = []
+    target_labels: list[int] = []
+    kind_labels: list[int] = []
+    for command in commands:
+        kind = _command_kind(command)
+        act_labels.append(0 if kind == "PASS" else 1)
+        target_labels.append(0)
+        kind_labels.append(kind_lookup.get(kind, 0))
+    return act_labels, target_labels, kind_labels
+
+
+def _market_labels(action: dict[str, Any]) -> tuple[int, int]:
+    market = action.get("market", [])
+    if not isinstance(market, Sequence) or isinstance(market, (str, bytes)) or not market:
+        return 0, 0
+    first = market[0]
+    if not isinstance(first, Sequence) or isinstance(first, (str, bytes)) or len(first) < 2:
+        return 0, 0
+    item_lookup = {item: index for index, item in enumerate(ACTION_VOCAB["market_items"])}
+    quantity_lookup = {quantity: index for index, quantity in enumerate(ACTION_VOCAB["market_quantities"])}
+    item = str(first[1]).upper()
+    try:
+        quantity = int(first[2]) if len(first) > 2 else 1
+    except (TypeError, ValueError, OverflowError):
+        quantity = 0
+    quantity = min(ACTION_VOCAB["market_quantities"], key=lambda candidate: abs(candidate - quantity))
+    return item_lookup.get(item, 0), quantity_lookup.get(quantity, 0)
+
+
+def _checkpoint_metadata(transition_count: int, config: PPOConfig | None = None) -> dict[str, Any]:
+    return {
+        "model_version": MODEL_VERSION,
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "action_vocab": {key: list(value) for key, value in ACTION_VOCAB.items()},
+        "engine_version": ENGINE_VERSION,
+        "transition_count": int(transition_count),
+        "ppo_config": asdict(config or PPOConfig()),
+    }
+
+
+def train_behavior_clone(
+    *, input_path: str | Path, output_path: str | Path, steps: int,
+    batch_size: int, seed: int = 0,
+) -> dict[str, Any]:
+    """Run deterministic smoke behavior cloning and write a PyTorch checkpoint."""
+    th = require_torch()
+    set_training_seed(seed)
+    transitions = _read_transitions(input_path)
+    features = [extract_features(transition.get("observation", {})) for transition in transitions]
+    actions = [transition.get("action", {}) if isinstance(transition.get("action"), dict) else {} for transition in transitions]
+    network = CompactPolicyNet()
+    optimizer = th.optim.AdamW(network.parameters(), lr=1e-3)
+    generator = th.Generator().manual_seed(int(seed))
+    batch_size = max(1, int(batch_size))
+    steps = max(1, int(steps))
+    for _step in range(steps):
+        permutation = th.randperm(len(features), generator=generator)[:min(batch_size, len(features))].tolist()
+        batch_features = [features[index] for index in permutation]
+        batch_actions = [actions[index] for index in permutation]
+        outputs = network(batch_features)
+        act, target, kind = zip(*(_worker_labels(action) for action in batch_actions))
+        market_items, market_quantities = zip(*(_market_labels(action) for action in batch_actions))
+        act_target = th.tensor(act, dtype=th.long)
+        target_target = th.tensor(target, dtype=th.long)
+        kind_target = th.tensor(kind, dtype=th.long)
+        item_target = th.tensor(market_items, dtype=th.long)
+        quantity_target = th.tensor(market_quantities, dtype=th.long)
+        loss = (
+            th.nn.functional.cross_entropy(outputs["worker_act_logits"].reshape(-1, 2), act_target.reshape(-1))
+            + th.nn.functional.cross_entropy(outputs["worker_target_logits"].reshape(-1, 100), target_target.reshape(-1))
+            + th.nn.functional.cross_entropy(
+                outputs["worker_kind_logits"].reshape(-1, len(ACTION_VOCAB["worker_kinds"])),
+                kind_target.reshape(-1),
+            )
+            + th.nn.functional.cross_entropy(outputs["market_item_logits"], item_target)
+            + th.nn.functional.cross_entropy(outputs["market_quantity_logits"], quantity_target)
+        )
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    metadata = _checkpoint_metadata(len(transitions))
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    th.save({"metadata": metadata, "model_state_dict": network.state_dict()}, destination)
+    return metadata
+
+
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, required=True, dest="input_path")
+    parser.add_argument("--output", type=Path, required=True, dest="output_path")
+    parser.add_argument("--steps", type=_positive_int, default=1)
+    parser.add_argument("--batch-size", type=_positive_int, default=32)
+    parser.add_argument("--seed", type=int, default=0)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        metadata = train_behavior_clone(
+            input_path=args.input_path,
+            output_path=args.output_path,
+            steps=args.steps,
+            batch_size=args.batch_size,
+            seed=args.seed,
+        )
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(metadata, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
