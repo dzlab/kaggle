@@ -8,6 +8,7 @@ from typing import Any
 
 from .constants import ANIMALS, CROPS, LAND_PRICES, PRODUCTS, max_market_orders, season_days, shed_capacity as DEFAULT_SHED_CAPACITY
 from .economics import feed_reserve, market_price, market_regime
+from .learned_policy import LearnedPolicy, compile_proposal
 from .memory import PolicyMemory, market_order_allowed
 from .observation import is_shed_adjacent, parse_observation as _parse_observation, shed_access_tiles
 from .planner import (
@@ -993,11 +994,13 @@ def _assignment_valid(state: Any, assignment: WorkerAssignment) -> bool:
 class Policy:
     """Stateful deterministic policy with reset-safe episode memory."""
 
-    def __init__(self, strategy: str = "current", *, opponent_signals: bool = False) -> None:
+    def __init__(self, strategy: str = "current", *, opponent_signals: bool = False,
+                 learned_model: str | None = None) -> None:
         if strategy != "auto":
             get_strategy(strategy)
         self.strategy_name = strategy
         self.opponent_signals = bool(opponent_signals)
+        self.learned_policy = LearnedPolicy(learned_model)
         self.memory = PolicyMemory()
 
     def _carried_assignments(self, state: Mapping[str, Any]) -> list[WorkerAssignment]:
@@ -1214,6 +1217,21 @@ class Policy:
             assignments = self._replan(state, regime, macro, protected, strategy_spec)
         else:
             assignments = self.memory.assignments
+        learned_action = None
+        if self.learned_policy.model_path is not None:
+            try:
+                from .features import extract_features
+
+                proposal = self.learned_policy.propose(state, extract_features(state))
+                self.memory.diagnostics["learned_model_status"] = self.learned_policy.diagnostics.get("status")
+                if self.learned_policy.diagnostics.get("status") == "ok":
+                    learned_action = compile_proposal(state, proposal, self.memory, strategy_spec)
+                    assignments = self.memory.assignments
+            except Exception as exc:
+                # Feature extraction and compilation are part of the optional
+                # path; deterministic play must survive every model failure.
+                self.memory.diagnostics["learned_model_status"] = "incompatible_model"
+                self.memory.diagnostics["learned_model_error"] = type(exc).__name__
         by_worker = {assignment.worker_index: assignment for assignment in assignments}
         terminal_cleanup = (
             _whole(_get(state, "day")) >= season_days - 1
@@ -1226,6 +1244,21 @@ class Policy:
                     state, worker["index"], None, worker["position"], force=True,
                 )
                 commands[worker["index"]] = _unit_command(drop or PASS)
+        elif learned_action is not None:
+            by_worker = {assignment.worker_index: assignment for assignment in assignments}
+            commands = {
+                worker["index"]: learned_action["farmer"] if worker["index"] == 0
+                else (learned_action["hands"][worker["index"] - 1]
+                      if worker["index"] - 1 < len(learned_action["hands"]) else [PASS])
+                for worker in workers
+            }
+            for worker in workers:
+                drop = _drop_carried_goods(
+                    state, worker["index"],
+                    _get(by_worker.get(worker["index"]), "task"), worker["position"],
+                )
+                if drop is not None:
+                    commands[worker["index"]] = _unit_command(drop)
         else:
             commands = {worker["index"]: worker_action(worker["index"], state, by_worker.get(worker["index"])) for worker in workers}
             for worker in workers:
@@ -1252,11 +1285,14 @@ class Policy:
         final_liquidation_window = (
             _whole(_get(state, "hour")) >= _terminal_liquidation_hour(strategy_spec)
         )
-        market = (
-            build_market_orders(state, market_plan, strategy_spec)
-            if not terminal_cleanup or (final_liquidation_window and not _has_carried_goods(state))
-            else []
-        )
+        if learned_action is not None:
+            market = learned_action["market"] if not terminal_cleanup else []
+        else:
+            market = (
+                build_market_orders(state, market_plan, strategy_spec)
+                if not terminal_cleanup or (final_liquidation_window and not _has_carried_goods(state))
+                else []
+            )
         market = self._basic_need_guard(state, market, assignments, strategy_spec)
         market = self._filter_market_direction(state, market, strategy_spec)
         market = _remove_pickup_sale_conflicts(market, commands)

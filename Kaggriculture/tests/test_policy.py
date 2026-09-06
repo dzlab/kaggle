@@ -18,6 +18,17 @@ def test_policy_defaults_to_current_strategy():
     assert Policy().strategy_name == "current"
 
 
+def test_policy_with_missing_learned_model_uses_full_deterministic_fallback(tmp_path):
+    state = observation()
+
+    deterministic = policy_module.Policy().act(deepcopy(state))
+    learned = policy_module.Policy(learned_model=str(tmp_path / "missing-model.json"))
+    learned_action = learned.act(deepcopy(state))
+
+    assert learned_action == deterministic
+    assert learned.memory.diagnostics["learned_model_status"] == "missing_model"
+
+
 def test_unknown_strategy_is_rejected():
     from kagriculture_agent.policy import Policy
 
