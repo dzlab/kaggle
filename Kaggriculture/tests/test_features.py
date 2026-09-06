@@ -113,6 +113,20 @@ def test_outlier_numeric_inputs_are_clamped_to_documented_unit_bound():
     assert all(-1.0 <= value <= 1.0 for value in values)
 
 
+def test_huge_worker_coordinates_return_finite_fixed_shape_features():
+    state = sample_state()
+    state["farm"]["workers"] = [{
+        "index": 0,
+        "position": {"x": 10**1000, "y": -(10**1000)},
+    }]
+
+    features = extract_features(state)
+
+    assert len(features.worker_tokens) == 10
+    assert all(-1.0 <= value <= 1.0 and value == value
+               for token in features.worker_tokens for value in token)
+
+
 def test_market_tokens_reflect_current_and_sequential_quotes():
     low = sample_state()
     high = sample_state()

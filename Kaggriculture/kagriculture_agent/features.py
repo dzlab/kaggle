@@ -251,7 +251,7 @@ def _worker_token(worker: Any, state: Mapping[str, Any], day: float) -> tuple[fl
     raw_distance = (abs(target.x - position.x) + abs(target.y - position.y)) if target else 0
     distance = 1.0 if raw_distance >= 18 else raw_distance / 18.0
     deadline = _number(_get(task, "deadline", day + season_days), day + season_days)
-    return (_nonnegative_unit(position.x / 9.0), _nonnegative_unit(position.y / 9.0), float(role == "FARMER"), float(role != "FARMER"),
+    return (_nonnegative_ratio(position.x, 9.0), _nonnegative_ratio(position.y, 9.0), float(role == "FARMER"), float(role != "FARMER"),
             *tuple(float(item in held_names) for item in PRODUCTS),
             _nonnegative_ratio(_number(_get(worker, "index", 0)), MAX_WORKERS),
             *_one_hot(str(_get(task, "kind", "IDLE")), _TASK_KINDS), _nonnegative_unit(distance),
