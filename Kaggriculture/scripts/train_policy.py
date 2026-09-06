@@ -21,6 +21,7 @@ from kagriculture_agent.features import FEATURE_SCHEMA_VERSION, extract_features
 from kagriculture_agent.model import ACTION_VOCAB, MODEL_VERSION, CompactPolicyNet, require_torch, set_training_seed
 
 PROMOTION_MATCH_SIZE = 100
+LOG_RATIO_CLAMP = 20.0
 _DIRECTION_DELTAS = {
     "NORTH": (0, -1),
     "SOUTH": (0, 1),
@@ -46,14 +47,27 @@ class PPOConfig:
     ppo_epochs: int = 1
 
     def __post_init__(self) -> None:
-        for name in ("gamma", "gae_lambda", "clip_epsilon", "value_coef", "entropy_coef", "target_kl"):
+        for name in (
+            "gamma", "gae_lambda", "clip_epsilon", "value_coef", "entropy_coef",
+            "target_kl", "rollout_steps", "kl_coef", "prior_ce_coef", "ppo_epochs",
+        ):
             value = getattr(self, name)
-            if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
                 raise ValueError(f"{name} must be finite")
+        for name in ("rollout_steps", "ppo_epochs"):
+            if type(getattr(self, name)) is not int:
+                raise ValueError(f"{name} must be an integer")
         if not 0.0 < self.gamma <= 1.0:
             raise ValueError("gamma must be in (0, 1]; gamma=1.0 is for explicit experiments only")
         if not 0.0 <= self.gae_lambda <= 1.0:
             raise ValueError("gae_lambda must be in [0, 1]")
+        if self.clip_epsilon <= 0.0:
+            raise ValueError("clip_epsilon must be positive")
+        for name in ("value_coef", "entropy_coef", "kl_coef", "prior_ce_coef"):
+            if getattr(self, name) < 0.0:
+                raise ValueError(f"{name} must be nonnegative")
+        if self.target_kl <= 0.0:
+            raise ValueError("target_kl must be positive")
         if self.rollout_steps < 1 or self.ppo_epochs < 1:
             raise ValueError("rollout_steps and ppo_epochs must be positive")
 
@@ -179,6 +193,16 @@ def terminal_bank_margin_reward(final_bank: Any, opponent_final_bank: Any) -> fl
     return math.tanh((final - opponent) / 1000.0)
 
 
+def _finite_float(value: Any, name: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be finite") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
 def normalize_advantages(advantages: Sequence[float], epsilon: float = 1e-8) -> list[float]:
     values = [float(value) for value in advantages]
     if not values:
@@ -216,12 +240,15 @@ def clipped_policy_terms(
 ) -> dict[str, list[float] | float]:
     if not (len(new_log_probs) == len(old_log_probs) == len(advantages)):
         raise ValueError("new_log_probs, old_log_probs, and advantages must have the same length")
-    ratios = [math.exp(float(new) - float(old)) for new, old in zip(new_log_probs, old_log_probs)]
+    ratios = [
+        math.exp(max(-LOG_RATIO_CLAMP, min(LOG_RATIO_CLAMP, _finite_float(new, "new_log_probs") - _finite_float(old, "old_log_probs"))))
+        for new, old in zip(new_log_probs, old_log_probs)
+    ]
     low = 1.0 - clip_epsilon
     high = 1.0 + clip_epsilon
     clipped = [min(high, max(low, ratio)) for ratio in ratios]
     objectives = [
-        min(ratio * float(advantage), clipped_ratio * float(advantage))
+        min(ratio * _finite_float(advantage, "advantages"), clipped_ratio * _finite_float(advantage, "advantages"))
         for ratio, clipped_ratio, advantage in zip(ratios, clipped, advantages)
     ]
     loss = -sum(objectives) / len(objectives) if objectives else 0.0
@@ -507,18 +534,46 @@ def _distribution_regularization(outputs: dict[str, Any], prior_outputs: dict[st
     return sum(kl_terms) / len(kl_terms), sum(ce_terms) / len(ce_terms)
 
 
+def validate_prior_checkpoint_metadata(metadata: Any) -> None:
+    if not isinstance(metadata, dict):
+        raise ValueError("prior checkpoint metadata must be an object")
+    expected = {
+        "model_version": MODEL_VERSION,
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "engine_version": ENGINE_VERSION,
+    }
+    for field, value in expected.items():
+        if metadata.get(field) != value:
+            raise ValueError(f"prior checkpoint {field} mismatch")
+    expected_vocab = {key: list(value) for key, value in ACTION_VOCAB.items()}
+    if metadata.get("action_vocab") != expected_vocab:
+        raise ValueError("prior checkpoint action_vocab mismatch")
+
+
 def _load_prior_network(prior_checkpoint: str | Path | None) -> Any:
     if prior_checkpoint is None:
         return None
     th = require_torch()
     prior = CompactPolicyNet()
     checkpoint = th.load(prior_checkpoint, map_location="cpu")
+    if not isinstance(checkpoint, dict) or "metadata" not in checkpoint:
+        raise ValueError("prior checkpoint metadata is required")
+    validate_prior_checkpoint_metadata(checkpoint["metadata"])
+    if "model_state_dict" not in checkpoint:
+        raise ValueError("prior checkpoint model_state_dict is required")
     state = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
     prior.load_state_dict(state)
     prior.eval()
     for parameter in prior.parameters():
         parameter.requires_grad_(False)
     return prior
+
+
+def _ensure_finite_outputs(outputs: dict[str, Any]) -> None:
+    th = require_torch()
+    for name, tensor in outputs.items():
+        if not th.isfinite(tensor).all().item():
+            raise ValueError(f"{name} must contain only finite values")
 
 
 def ppo_update(
@@ -535,6 +590,7 @@ def ppo_update(
     bootstrap = build_rollout_batch(rows, config=config)
     with th.no_grad():
         old_outputs = network(features)
+        _ensure_finite_outputs(old_outputs)
         old_log_probs, _old_entropy = _select_outputs(old_outputs, bootstrap)
     rollout = build_rollout_batch(
         rows, config=config,
@@ -574,12 +630,14 @@ def ppo_update(
                 market_quantities=[rollout.market_quantities[index] for index in indices],
             )
             outputs = network(mini_features)
+            _ensure_finite_outputs(outputs)
             log_probs, entropy = _select_outputs(outputs, mini)
             old_log = th.tensor(mini.old_log_probs, dtype=th.float32)
             advantages = th.tensor(mini.advantages, dtype=th.float32)
             returns = th.tensor(mini.returns, dtype=th.float32)
             old_values = th.tensor(mini.values, dtype=th.float32)
-            ratio = (log_probs - old_log).exp()
+            log_ratio = th.clamp(log_probs - old_log, -LOG_RATIO_CLAMP, LOG_RATIO_CLAMP)
+            ratio = log_ratio.exp()
             policy_loss = -th.minimum(
                 ratio * advantages,
                 th.clamp(ratio, 1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon) * advantages,
@@ -603,9 +661,10 @@ def ppo_update(
             optimizer.step()
             with th.no_grad():
                 post_outputs = network(mini_features)
+                _ensure_finite_outputs(post_outputs)
                 post_log_probs, _post_entropy = _select_outputs(post_outputs, mini)
-                log_ratio = post_log_probs - old_log
-                post_step_kl = ((log_ratio.exp() - 1.0) - log_ratio).mean()
+                post_log_ratio = th.clamp(post_log_probs - old_log, -LOG_RATIO_CLAMP, LOG_RATIO_CLAMP)
+                post_step_kl = ((post_log_ratio.exp() - 1.0) - post_log_ratio).mean()
             metrics.update({
                 "updates": int(metrics["updates"]) + 1,
                 "policy_loss": float(policy_loss.detach()),
@@ -694,6 +753,37 @@ def _checkpoint_metadata(transition_count: int, config: PPOConfig | None = None)
         "engine_version": ENGINE_VERSION,
         "transition_count": int(transition_count),
         "ppo_config": asdict(config or PPOConfig()),
+    }
+
+
+def checkpoint_metadata(transition_count: int, config: PPOConfig | None = None) -> dict[str, Any]:
+    return _checkpoint_metadata(transition_count, config)
+
+
+def _candidate_won(result: Any) -> bool:
+    if isinstance(result, bool):
+        return result
+    if isinstance(result, dict):
+        if "candidate_win" in result:
+            return bool(result["candidate_win"])
+        if "winner" in result:
+            return str(result["winner"]).lower() in {"candidate", "learned", "policy", "agent"}
+    return False
+
+
+def run_promotion_match(
+    match_fn: Any, *, match_size: int = PROMOTION_MATCH_SIZE,
+) -> dict[str, int | bool]:
+    """Run the fixed promotion match and apply the strict >70% win gate."""
+    if match_size != PROMOTION_MATCH_SIZE:
+        raise ValueError(f"promotion match must run exactly {PROMOTION_MATCH_SIZE} games")
+    wins = 0
+    for index in range(PROMOTION_MATCH_SIZE):
+        wins += int(_candidate_won(match_fn(index)))
+    return {
+        "games": PROMOTION_MATCH_SIZE,
+        "wins": wins,
+        "promoted": should_promote(wins=wins, games=PROMOTION_MATCH_SIZE),
     }
 
 
@@ -789,6 +879,24 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def _nonnegative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer") from exc
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer")
+    return number
+
+
+def _cli_training_options(args: argparse.Namespace) -> dict[str, Any]:
+    # The standalone CLI only has collected trajectory input. Fresh self-play
+    # rollout callbacks remain available through train_behavior_clone().
+    return {
+        "offline_ppo_fallback": bool(args.offline_ppo_fallback or args.ppo_steps > 0),
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True, dest="input_path")
@@ -796,7 +904,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", type=_positive_int, default=1)
     parser.add_argument("--batch-size", type=_positive_int, default=32)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--ppo-steps", type=int, default=0)
+    parser.add_argument("--ppo-steps", type=_nonnegative_int, default=0)
     parser.add_argument("--prior-checkpoint", type=Path, default=None)
     parser.add_argument(
         "--offline-ppo-fallback",
@@ -808,6 +916,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    options = _cli_training_options(args)
     try:
         metadata = train_behavior_clone(
             input_path=args.input_path,
@@ -817,7 +926,7 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             ppo_steps=args.ppo_steps,
             prior_checkpoint=args.prior_checkpoint,
-            offline_ppo_fallback=args.offline_ppo_fallback,
+            offline_ppo_fallback=options["offline_ppo_fallback"],
         )
     except (RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

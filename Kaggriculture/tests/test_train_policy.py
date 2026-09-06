@@ -51,6 +51,38 @@ def test_default_ppo_config_matches_plan_values():
     assert PPOConfig(gamma=1.0).gamma == 1.0
 
 
+@pytest.mark.parametrize("field,value", [
+    ("gamma", 0.0),
+    ("gamma", 1.1),
+    ("gae_lambda", -0.1),
+    ("gae_lambda", 1.1),
+    ("clip_epsilon", 0.0),
+    ("value_coef", -0.1),
+    ("entropy_coef", -0.1),
+    ("target_kl", 0.0),
+    ("rollout_steps", 0),
+    ("kl_coef", -0.1),
+    ("prior_ce_coef", -0.1),
+    ("ppo_epochs", 0),
+])
+def test_ppo_config_validates_every_field_range(field, value):
+    from scripts.train_policy import PPOConfig
+
+    with pytest.raises(ValueError, match=field):
+        PPOConfig(**{field: value})
+
+
+def test_parser_rejects_negative_ppo_steps():
+    from scripts.train_policy import _parser
+
+    with pytest.raises(SystemExit):
+        _parser().parse_args([
+            "--input", "transitions.jsonl",
+            "--output", "policy.pt",
+            "--ppo-steps", "-1",
+        ])
+
+
 def test_terminal_bank_margin_reward_is_normalized():
     from scripts.train_policy import terminal_bank_margin_reward
 
@@ -82,6 +114,28 @@ def test_ppo_ratio_clipping_limits_objective():
     assert terms["ratios"] == pytest.approx([1.5, 0.5])
     assert terms["clipped_ratios"] == pytest.approx([1.2, 0.8])
     assert terms["loss"] == pytest.approx(-(1.2 - 0.8) / 2)
+
+
+def test_ppo_ratio_clipping_clamps_extreme_log_ratios_and_rejects_nonfinite():
+    from scripts.train_policy import LOG_RATIO_CLAMP, clipped_policy_terms
+
+    terms = clipped_policy_terms(
+        new_log_probs=[1000.0, -1000.0],
+        old_log_probs=[0.0, 0.0],
+        advantages=[1.0, -1.0],
+        clip_epsilon=0.2,
+    )
+
+    assert all(math.isfinite(value) for value in terms["ratios"])
+    assert terms["ratios"] == pytest.approx([math.exp(LOG_RATIO_CLAMP), math.exp(-LOG_RATIO_CLAMP)])
+    assert terms["clipped_ratios"] == pytest.approx([1.2, 0.8])
+
+    with pytest.raises(ValueError, match="finite"):
+        clipped_policy_terms(
+            new_log_probs=[float("nan")],
+            old_log_probs=[0.0],
+            advantages=[1.0],
+        )
 
 
 def test_ppo_total_loss_includes_value_entropy_kl_and_prior_ce_terms():
@@ -229,6 +283,38 @@ def test_ppo_update_measures_target_kl_after_optimizer_step():
     assert metrics["approx_kl"] > 1e-12
 
 
+def test_ppo_update_rejects_nonfinite_logits_before_optimizer_step():
+    pytest.importorskip("torch")
+    import torch
+    from scripts.train_policy import PPOConfig, ppo_update
+
+    class BadPolicy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bias = torch.nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, _features):
+            return {
+                "worker_act_logits": torch.full((2, 10, 2), float("nan")) + self.bias,
+                "worker_target_logits": torch.zeros(2, 10, 100),
+                "worker_kind_logits": torch.zeros(2, 10, 14),
+                "market_item_logits": torch.zeros(2, 9),
+                "market_quantity_logits": torch.zeros(2, 8),
+                "value": torch.zeros(2) + self.bias,
+            }
+
+    network = BadPolicy()
+    optimizer = torch.optim.SGD(network.parameters(), lr=1.0)
+
+    with pytest.raises(ValueError, match="finite"):
+        ppo_update(
+            network,
+            optimizer,
+            [_transition(done=False), _transition(done=True)],
+            config=PPOConfig(),
+        )
+
+
 def test_ppo_update_loads_prior_checkpoint_regularization(tmp_path):
     pytest.importorskip("torch")
     import torch
@@ -237,7 +323,9 @@ def test_ppo_update_loads_prior_checkpoint_regularization(tmp_path):
 
     prior = CompactPolicyNet()
     prior_path = tmp_path / "prior.pt"
-    torch.save({"model_state_dict": prior.state_dict()}, prior_path)
+    from scripts.train_policy import checkpoint_metadata
+
+    torch.save({"metadata": checkpoint_metadata(transition_count=2), "model_state_dict": prior.state_dict()}, prior_path)
     network = CompactPolicyNet()
     optimizer = torch.optim.AdamW(network.parameters(), lr=1e-3)
 
@@ -251,6 +339,39 @@ def test_ppo_update_loads_prior_checkpoint_regularization(tmp_path):
 
     assert metrics["kl_to_prior"] >= 0.0
     assert metrics["prior_cross_entropy"] > 0.0
+
+
+def test_prior_checkpoint_metadata_validation_accepts_current_schema():
+    from scripts.train_policy import checkpoint_metadata, validate_prior_checkpoint_metadata
+
+    metadata = checkpoint_metadata(transition_count=2)
+
+    assert validate_prior_checkpoint_metadata(metadata) is None
+
+
+@pytest.mark.parametrize("field,value", [
+    ("model_version", "old"),
+    ("feature_schema_version", -1),
+    ("engine_version", "0.0.0"),
+])
+def test_prior_checkpoint_metadata_validation_rejects_incompatible_versions(field, value):
+    from scripts.train_policy import checkpoint_metadata, validate_prior_checkpoint_metadata
+
+    metadata = checkpoint_metadata(transition_count=2)
+    metadata[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        validate_prior_checkpoint_metadata(metadata)
+
+
+def test_prior_checkpoint_metadata_validation_rejects_action_vocab_mismatch():
+    from scripts.train_policy import checkpoint_metadata, validate_prior_checkpoint_metadata
+
+    metadata = checkpoint_metadata(transition_count=2)
+    metadata["action_vocab"]["worker_kinds"] = ["PASS"]
+
+    with pytest.raises(ValueError, match="action_vocab"):
+        validate_prior_checkpoint_metadata(metadata)
 
 
 def test_ppo_rollouts_require_callback_unless_offline_fallback_is_explicit():
@@ -323,6 +444,40 @@ def test_ppo_offline_fallback_is_explicit_and_reuses_collected_rollout():
     assert len(calls) == 2
     assert all(len(call) == 1 for call in calls)
     assert metrics["ppo_updates"] == 2
+
+
+def test_cli_ppo_steps_use_collected_input_as_offline_rollout_source():
+    from scripts.train_policy import _cli_training_options, _parser
+
+    args = _parser().parse_args([
+        "--input", "transitions.jsonl",
+        "--output", "policy.pt",
+        "--ppo-steps", "2",
+    ])
+
+    assert _cli_training_options(args)["offline_ppo_fallback"] is True
+
+
+def test_promotion_match_runs_exactly_fixed_gate_and_counts_wins():
+    from scripts.train_policy import PROMOTION_MATCH_SIZE, run_promotion_match
+
+    calls = []
+
+    def match_fn(index):
+        calls.append(index)
+        return {"winner": "candidate" if index < 71 else "opponent"}
+
+    result = run_promotion_match(match_fn)
+
+    assert calls == list(range(PROMOTION_MATCH_SIZE))
+    assert result == {"games": 100, "wins": 71, "promoted": True}
+
+
+def test_promotion_match_rejects_wrong_match_size():
+    from scripts.train_policy import run_promotion_match
+
+    with pytest.raises(ValueError, match="exactly 100"):
+        run_promotion_match(lambda index: {"winner": "candidate"}, match_size=99)
 
 
 def test_opponent_pool_probabilities_and_checkpoint_sampling_are_deterministic():
