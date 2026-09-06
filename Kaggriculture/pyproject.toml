@@ -11,6 +11,12 @@ dependencies = [
     "kaggle-environments==1.32.7; python_version >= '3.11'",
 ]
 
+[project.optional-dependencies]
+training = [
+    "numpy>=2,<3",
+    "torch>=2,<3",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8,<10",
