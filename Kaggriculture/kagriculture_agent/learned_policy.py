@@ -9,9 +9,8 @@ deterministic policy's legality checks.
 from __future__ import annotations
 
 import json
+import multiprocessing
 import pickle
-import queue
-import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import isfinite
@@ -68,25 +67,47 @@ def _empty() -> PolicyProposal:
     return _EMPTY_PROPOSAL
 
 
-def _run_with_timeout(function: Any, timeout: float) -> tuple[bool, Any]:
-    """Run untrusted model code without allowing it to block the agent."""
-    result: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
-
-    def run() -> None:
+def _process_entry(connection: Any, function: Any) -> None:
+    """Execute model code in an isolated child and return only serializable data."""
+    try:
+        connection.send((True, function()))
+    except BaseException as exc:  # model code must not escape the entrypoint
         try:
-            result.put((True, function()))
-        except BaseException as exc:  # model code must not escape the entrypoint
-            result.put((False, exc))
+            connection.send((False, type(exc).__name__))
+        except BaseException:
+            pass
+    finally:
+        connection.close()
 
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
-    thread.join(max(0.0, timeout))
-    if thread.is_alive():
+
+def _run_with_timeout(function: Any, timeout: float) -> tuple[bool, Any]:
+    """Run model code in a killable process so timed-out code cannot continue."""
+    try:
+        context = multiprocessing.get_context("fork")
+    except ValueError:
+        context = multiprocessing.get_context()
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(target=_process_entry, args=(sender, function))
+    process.daemon = True
+    try:
+        process.start()
+    except BaseException as exc:
+        receiver.close()
+        sender.close()
+        return False, exc
+    sender.close()
+    process.join(max(0.0, timeout))
+    if process.is_alive():
+        process.terminate()
+        process.join(0.5)
+        receiver.close()
         return False, TimeoutError("learned model timed out")
     try:
-        return result.get_nowait()
-    except queue.Empty:
-        return False, RuntimeError("learned model returned no result")
+        return receiver.recv() if receiver.poll() else (False, RuntimeError("learned model returned no result"))
+    except (EOFError, OSError, TypeError):
+        return False, RuntimeError("learned model returned an unreadable result")
+    finally:
+        receiver.close()
 
 
 def _coerce_worker(raw: Any) -> WorkerProposal | None:
@@ -193,7 +214,9 @@ class LearnedPolicy:
             ok, loaded = _run_with_timeout(self._load, self.timeout_seconds)
             if not ok:
                 status = "slow_model" if isinstance(loaded, TimeoutError) else (
-                    "missing_model" if isinstance(loaded, FileNotFoundError) else "load_error"
+                    "missing_model"
+                    if isinstance(loaded, FileNotFoundError) or loaded == "FileNotFoundError"
+                    else "load_error"
                 )
                 self.diagnostics = {"status": status, "error": type(loaded).__name__}
                 return _empty()
@@ -310,6 +333,45 @@ def _proposal_is_usable(state: Any, worker_index: int, kind: str, item: str | No
     return True
 
 
+def _strategy_allows(state: Any, kind: str, item: str | None, strategy: Any,
+                     crop_count: int, animal_count: int) -> bool:
+    if strategy is None:
+        return True
+    crops = {str(value).upper() for value in (_get(strategy, "crops", ()) or ())}
+    animals = {str(value).upper() for value in (_get(strategy, "animals", ()) or ())}
+    if kind == "PLANT" and item not in crops:
+        return False
+    if kind == "ANIMAL" and item not in animals:
+        return False
+    if kind == "PLACE" and item in ANIMALS and item not in animals:
+        return False
+    try:
+        if kind == "PLANT" and crop_count >= max(0, int(_get(strategy, "max_crop_units", 0))):
+            return False
+        if kind in {"ANIMAL", "PLACE"} and item in ANIMALS and animal_count >= max(0, int(_get(strategy, "max_animal_units", 0))):
+            return False
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return True
+
+
+def _proposal_sort_key(candidate: WorkerProposal) -> tuple[Any, ...]:
+    target = normalize_position(candidate.target)
+    return (
+        -_number(candidate.score), candidate.kind,
+        target.y if target is not None else float("inf"),
+        target.x if target is not None else float("inf"),
+        candidate.item or "",
+    )
+
+
+def _existing_counts(state: Any) -> tuple[int, int]:
+    from .policy import _existing_animal_units, _iter_tiles, _crop
+
+    crops = sum(1 for _, tile in _iter_tiles(state) if _crop(tile) is not None)
+    return crops, _existing_animal_units(state)
+
+
 def _carried_assignment(state: Any, memory: PolicyMemory, worker_index: int) -> WorkerAssignment | None:
     # Importing these private helpers here avoids a policy/learned-policy
     # import cycle while sharing the exact existing legality rules.
@@ -327,20 +389,20 @@ def _carried_assignment(state: Any, memory: PolicyMemory, worker_index: int) -> 
     return None
 
 
-def _fallback_assignments(state: Any, memory: PolicyMemory) -> list[WorkerAssignment]:
+def _fallback_assignments(state: Any, memory: PolicyMemory, strategy: Any = None) -> list[WorkerAssignment]:
     from .planner import assign_tasks, build_daily_plan
     from .policy import _assignment_valid
 
     valid = [assignment for assignment in memory.assignments if _assignment_valid(state, assignment)]
     if valid:
         return valid
-    return assign_tasks(build_daily_plan(state, memory), _get(state, "workers", ()), state)
+    return assign_tasks(build_daily_plan(state, memory, strategy), _get(state, "workers", ()), state, strategy)
 
 
 def _route_positions(start: Position | None, target: Position | None, board_size: int) -> list[Position]:
     if start is None or target is None:
         return []
-    positions = [start]
+    positions: list[Position] = []
     current = start
     for move in route_to(start, target, board_size):
         current = Position(
@@ -359,7 +421,8 @@ def compile_proposal(state: Any, proposal: PolicyProposal, memory: PolicyMemory,
     board_size = _board_size(state)
     worker_records = _worker_records(state)
     known = {record["index"]: record for record in worker_records}
-    selected: dict[int, WorkerProposal] = {}
+    candidates_by_worker: dict[int, list[WorkerProposal]] = {}
+    existing_crops, existing_animals = _existing_counts(state)
     for candidate in proposal.workers if isinstance(proposal, PolicyProposal) else ():
         if candidate.worker_index not in known or candidate.kind not in _VALID_KINDS:
             continue
@@ -370,12 +433,26 @@ def compile_proposal(state: Any, proposal: PolicyProposal, memory: PolicyMemory,
             continue
         if not _proposal_is_usable(state, candidate.worker_index, candidate.kind, candidate.item):
             continue
-        score = _number(candidate.score)
-        current = selected.get(candidate.worker_index)
-        if current is None or (-score, candidate.worker_index) < (-_number(current.score), candidate.worker_index):
-            selected[candidate.worker_index] = candidate
+        if not _strategy_allows(state, candidate.kind, candidate.item, strategy,
+                                existing_crops, existing_animals):
+            continue
+        candidates_by_worker.setdefault(candidate.worker_index, []).append(candidate)
 
-    assignments = _fallback_assignments(state, memory)
+    selected: dict[int, WorkerProposal] = {}
+    crop_count, animal_count = existing_crops, existing_animals
+    for worker_index in sorted(candidates_by_worker):
+        candidate = min(candidates_by_worker[worker_index], key=_proposal_sort_key)
+        if candidate.kind == "PLANT":
+            if strategy is not None and crop_count >= int(_get(strategy, "max_crop_units", 0)):
+                continue
+            crop_count += 1
+        if candidate.kind in {"ANIMAL", "PLACE"} and candidate.item in ANIMALS:
+            if strategy is not None and animal_count >= int(_get(strategy, "max_animal_units", 0)):
+                continue
+            animal_count += 1
+        selected[worker_index] = candidate
+
+    assignments = _fallback_assignments(state, memory, strategy)
     by_worker = {int(policy_get(assignment, "worker_index", -1)): assignment for assignment in assignments}
     for worker_index in sorted(known):
         carried = _carried_assignment(state, memory, worker_index)

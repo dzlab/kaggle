@@ -1,4 +1,5 @@
 from copy import deepcopy
+from kagriculture_agent.learned_policy import PolicyProposal, WorkerProposal
 
 import kagriculture_agent.policy as policy_module
 import pytest
@@ -27,6 +28,54 @@ def test_policy_with_missing_learned_model_uses_full_deterministic_fallback(tmp_
 
     assert learned_action == deterministic
     assert learned.memory.diagnostics["learned_model_status"] == "missing_model"
+
+
+def test_failed_learned_inference_discards_stale_assignments_and_replans(monkeypatch):
+    state = observation()
+    state["farms"][0]["tiles"][0][2] = {
+        "kind": "PLANT", "crop": "WHEAT", "watered_today": False,
+    }
+    policy = policy_module.Policy(learned_model="injected")
+    proposals = iter([
+        PolicyProposal((WorkerProposal(0, "WATER", Position(2, 0), None, 9),), (), 1, "v1"),
+        None,
+    ])
+    def propose(_state, _features):
+        proposal = next(proposals)
+        if proposal is None:
+            policy.learned_policy.diagnostics = {"status": "inference_error"}
+            return PolicyProposal((), (), 0, "none")
+        policy.learned_policy.diagnostics = {"status": "ok"}
+        return proposal
+    monkeypatch.setattr(policy.learned_policy, "propose", propose)
+    replans = []
+    original_replan = policy._replan
+    def record_replan(*args, **kwargs):
+        replans.append(True)
+        return original_replan(*args, **kwargs)
+    monkeypatch.setattr(policy, "_replan", record_replan)
+
+    policy.act(deepcopy(state))
+    policy.act(deepcopy(state))
+
+    assert len(replans) >= 2
+    assert policy.memory.diagnostics["learned_active"] is False
+
+
+def test_worker_only_learned_proposal_keeps_deterministic_seed_market_intent(monkeypatch):
+    state = observation(seeds={}, hands=[])
+    policy = policy_module.Policy(learned_model="injected")
+    monkeypatch.setattr(
+        policy.learned_policy, "propose",
+        lambda _state, _features: (
+            policy.learned_policy.diagnostics.update(status="ok")
+            or PolicyProposal((WorkerProposal(0, "WATER", Position(0, 0), None, 1),), (), 1, "v1")
+        ),
+    )
+
+    action = policy.act(state)
+
+    assert ["BUY_SEED", "WHEAT"] in [order[:2] for order in action["market"]]
 
 
 def test_unknown_strategy_is_rejected():

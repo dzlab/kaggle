@@ -1218,20 +1218,33 @@ class Policy:
         else:
             assignments = self.memory.assignments
         learned_action = None
+        learned_proposal = None
+        learned_was_active = bool(self.memory.diagnostics.get("learned_active"))
         if self.learned_policy.model_path is not None:
             try:
                 from .features import extract_features
 
                 proposal = self.learned_policy.propose(state, extract_features(state))
-                self.memory.diagnostics["learned_model_status"] = self.learned_policy.diagnostics.get("status")
-                if self.learned_policy.diagnostics.get("status") == "ok":
+                learned_status = self.learned_policy.diagnostics.get("status")
+                self.memory.diagnostics["learned_model_status"] = learned_status
+                if learned_status == "ok":
+                    learned_proposal = proposal
                     learned_action = compile_proposal(state, proposal, self.memory, strategy_spec)
                     assignments = self.memory.assignments
+                    self.memory.diagnostics["learned_active"] = True
+                elif learned_was_active:
+                    self.memory.assignments = []
+                    assignments = self._replan(state, regime, macro, (), strategy_spec)
+                    self.memory.diagnostics["learned_active"] = False
             except Exception as exc:
                 # Feature extraction and compilation are part of the optional
                 # path; deterministic play must survive every model failure.
                 self.memory.diagnostics["learned_model_status"] = "incompatible_model"
                 self.memory.diagnostics["learned_model_error"] = type(exc).__name__
+                if learned_was_active:
+                    self.memory.assignments = []
+                    assignments = self._replan(state, regime, macro, (), strategy_spec)
+                    self.memory.diagnostics["learned_active"] = False
         by_worker = {assignment.worker_index: assignment for assignment in assignments}
         terminal_cleanup = (
             _whole(_get(state, "day")) >= season_days - 1
@@ -1286,7 +1299,13 @@ class Policy:
             _whole(_get(state, "hour")) >= _terminal_liquidation_hour(strategy_spec)
         )
         if learned_action is not None:
-            market = learned_action["market"] if not terminal_cleanup else []
+            # The model contributes intents; deterministic planning remains
+            # responsible for feed, seed, and other safety-critical orders.
+            market_plan.extend(learned_proposal.market_orders)
+            market = (
+                build_market_orders(state, market_plan, strategy_spec)
+                if not terminal_cleanup else []
+            )
         else:
             market = (
                 build_market_orders(state, market_plan, strategy_spec)
