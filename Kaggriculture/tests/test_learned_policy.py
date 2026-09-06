@@ -1,5 +1,7 @@
 from dataclasses import FrozenInstanceError
 import json
+import os
+import signal
 import time
 
 import pytest
@@ -10,6 +12,7 @@ from kagriculture_agent.learned_policy import (
     WorkerProposal,
     compile_proposal,
 )
+import kagriculture_agent.learned_policy as learned_policy_module
 from kagriculture_agent.memory import PolicyMemory
 from kagriculture_agent.strategy import StrategySpec
 from kagriculture_agent.types import Position, Task, WorkerAssignment
@@ -68,6 +71,17 @@ class SlowModel:
         return {"workers": []}
 
 
+class SigtermIgnoringModel:
+    def __init__(self, pid_path):
+        self.pid_path = pid_path
+
+    def __call__(self, state, features):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        self.pid_path.write_text(str(os.getpid()))
+        time.sleep(0.5)
+        return {"workers": []}
+
+
 def test_slow_model_is_terminated_at_process_boundary():
     policy = LearnedPolicy(SlowModel(), timeout_seconds=0.03)
 
@@ -78,6 +92,29 @@ def test_slow_model_is_terminated_at_process_boundary():
     assert proposal == PolicyProposal((), (), 0.0, "none")
     assert policy.diagnostics["status"] == "slow_model"
     assert elapsed < 0.4
+
+
+def test_sigterm_ignoring_model_has_no_orphan_after_hard_cleanup(tmp_path):
+    pid_path = tmp_path / "child.pid"
+    policy = LearnedPolicy(SigtermIgnoringModel(pid_path), timeout_seconds=0.03)
+
+    proposal = policy.propose({}, object())
+
+    assert proposal == PolicyProposal((), (), 0.0, "none")
+    assert policy.diagnostics["status"] == "slow_model"
+    child_pid = int(pid_path.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+
+def test_non_json_model_artifact_is_rejected_without_pickle_loading(tmp_path):
+    path = tmp_path / "binary.model"
+    path.write_bytes(b"\x80\x04}\x94.")
+
+    policy = LearnedPolicy(path)
+
+    assert policy.propose({}, object()) == PolicyProposal((), (), 0.0, "none")
+    assert policy.diagnostics["status"] == "load_error"
 
 
 @pytest.mark.parametrize("model_contents", [b"not a model", b"{\"workers\": ["])
@@ -184,6 +221,33 @@ def test_compile_rejects_strategy_disallowed_items_and_capacity_overages():
 
     assert action["farmer"] == ["PASS"]
     assert action["hands"] == [["PASS"]]
+
+
+def test_melon_strategy_rejects_carrot_fertilization(monkeypatch):
+    current = state(inventories=[{"FERTILIZER": 1}])
+    current["tiles"][0][1] = {"kind": "PLANT", "crop": "CARROT", "fertilized": False}
+    strategy = StrategySpec("melon", ("WHEAT", "MELON"), ("COW", "SHEEP"), 80, 9, 12)
+    monkeypatch.setattr(learned_policy_module, "_fallback_assignments", lambda *_args: [])
+    proposal = PolicyProposal((WorkerProposal(0, "FERTILIZE", Position(1, 0), "CARROT", 1),), (), 1, "v1")
+
+    action = compile_proposal(current, proposal, PolicyMemory(), strategy)
+
+    assert action["farmer"] == ["PASS"]
+
+
+def test_melon_strategy_counts_only_allowed_crops_against_capacity(monkeypatch):
+    current = state()
+    current["tiles"][0][0] = {"kind": "PLANT", "crop": "CARROT"}
+    current["private"]["seeds"] = {"MELON": 1}
+    strategy = StrategySpec("one-melon", ("MELON",), (), 1, 0, 0)
+    monkeypatch.setattr(learned_policy_module, "_fallback_assignments", lambda *_args: [])
+    proposal = PolicyProposal((WorkerProposal(0, "PLANT", Position(1, 0), "MELON", 1),), (), 1, "v1")
+    memory = PolicyMemory()
+
+    action = compile_proposal(current, proposal, memory, strategy)
+
+    assert action["farmer"] == ["EAST"]
+    assert memory.assignments[0].task.item == "MELON"
 
 
 def test_compile_preserves_carried_delivery_assignment():

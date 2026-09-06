@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import multiprocessing
-import pickle
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import isfinite
@@ -100,6 +99,12 @@ def _run_with_timeout(function: Any, timeout: float) -> tuple[bool, Any]:
     if process.is_alive():
         process.terminate()
         process.join(0.5)
+        if process.is_alive():
+            process.kill()
+            process.join(0.5)
+        if process.is_alive():
+            receiver.close()
+            return False, RuntimeError("learned model process did not terminate")
         receiver.close()
         return False, TimeoutError("learned model timed out")
     try:
@@ -190,10 +195,10 @@ class LearnedPolicy:
             return self.model_path
         path = Path(self.model_path)
         raw = path.read_bytes()
-        try:
-            return json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return pickle.loads(raw)
+        value = json.loads(raw.decode("utf-8"))
+        if not isinstance(value, Mapping):
+            raise TypeError("learned model must be a JSON object")
+        return value
 
     def _invoke(self, model: Any, state: Any, features: Any) -> Any:
         if isinstance(model, Mapping) and ("workers" in model or "market_orders" in model or "market" in model):
@@ -333,17 +338,14 @@ def _proposal_is_usable(state: Any, worker_index: int, kind: str, item: str | No
     return True
 
 
-def _strategy_allows(state: Any, kind: str, item: str | None, strategy: Any,
+def _strategy_allows(state: Any, kind: str, item: str | None, target: Position | None, strategy: Any,
                      crop_count: int, animal_count: int) -> bool:
     if strategy is None:
         return True
-    crops = {str(value).upper() for value in (_get(strategy, "crops", ()) or ())}
-    animals = {str(value).upper() for value in (_get(strategy, "animals", ()) or ())}
-    if kind == "PLANT" and item not in crops:
-        return False
-    if kind == "ANIMAL" and item not in animals:
-        return False
-    if kind == "PLACE" and item in ANIMALS and item not in animals:
+    from .planner import _task_allowed, normalize_planner_state
+
+    task = Task(kind, target, 0, None, 0.0, item=item)
+    if not _task_allowed(task, strategy, normalize_planner_state(state)):
         return False
     try:
         if kind == "PLANT" and crop_count >= max(0, int(_get(strategy, "max_crop_units", 0))):
@@ -365,10 +367,12 @@ def _proposal_sort_key(candidate: WorkerProposal) -> tuple[Any, ...]:
     )
 
 
-def _existing_counts(state: Any) -> tuple[int, int]:
+def _existing_counts(state: Any, strategy: Any = None) -> tuple[int, int]:
     from .policy import _existing_animal_units, _iter_tiles, _crop
 
-    crops = sum(1 for _, tile in _iter_tiles(state) if _crop(tile) is not None)
+    allowed = set(_get(strategy, "crops", ()) or ()) if strategy is not None else set(CROPS)
+    allowed = {str(value).upper() for value in allowed}
+    crops = sum(1 for _, tile in _iter_tiles(state) if _crop(tile) in allowed)
     return crops, _existing_animal_units(state)
 
 
@@ -422,7 +426,7 @@ def compile_proposal(state: Any, proposal: PolicyProposal, memory: PolicyMemory,
     worker_records = _worker_records(state)
     known = {record["index"]: record for record in worker_records}
     candidates_by_worker: dict[int, list[WorkerProposal]] = {}
-    existing_crops, existing_animals = _existing_counts(state)
+    existing_crops, existing_animals = _existing_counts(state, strategy)
     for candidate in proposal.workers if isinstance(proposal, PolicyProposal) else ():
         if candidate.worker_index not in known or candidate.kind not in _VALID_KINDS:
             continue
@@ -433,7 +437,7 @@ def compile_proposal(state: Any, proposal: PolicyProposal, memory: PolicyMemory,
             continue
         if not _proposal_is_usable(state, candidate.worker_index, candidate.kind, candidate.item):
             continue
-        if not _strategy_allows(state, candidate.kind, candidate.item, strategy,
+        if not _strategy_allows(state, candidate.kind, candidate.item, target, strategy,
                                 existing_crops, existing_animals):
             continue
         candidates_by_worker.setdefault(candidate.worker_index, []).append(candidate)
