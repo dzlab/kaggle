@@ -1,5 +1,6 @@
 import json
 import math
+from pathlib import Path
 
 import pytest
 
@@ -610,6 +611,88 @@ def test_checkpoint_promotion_cleans_candidate_and_retains_best_on_match_error()
     assert registry["best"] == "previous.pt"
     assert registry["candidates"] == [{"path": "candidate.pt", "status": "error"}]
     assert cleaned == ["candidate.pt"]
+
+
+def test_ppo_promotion_callback_reads_saved_candidate_and_persists_best_on_acceptance(tmp_path):
+    from scripts.train_policy import PPOConfig, run_ppo_training
+
+    candidate = tmp_path / "candidate.pt"
+    best = tmp_path / "best.pt"
+    best.write_text("previous-best", encoding="utf-8")
+    registry = {"best": str(best), "candidates": []}
+    seen = []
+
+    def save_candidate(path):
+        Path = type(path)
+        target = Path(path)
+        target.write_text("candidate-after-ppo", encoding="utf-8")
+        return target
+
+    def match_fn(index, *, candidate_checkpoint, best_checkpoint, registry_entry):
+        seen.append((
+            index,
+            Path(candidate_checkpoint).read_text(encoding="utf-8"),
+            Path(best_checkpoint).read_text(encoding="utf-8"),
+            registry_entry["status"],
+        ))
+        return {"candidate_win": index < 71}
+
+    metrics = run_ppo_training(
+        network=None,
+        optimizer=None,
+        transitions=[_transition(done=True)],
+        ppo_steps=1,
+        config=PPOConfig(),
+        offline_ppo_fallback=True,
+        update_fn=lambda **_kwargs: {"updates": 1, "early_stopped": False},
+        promotion_match_fn=match_fn,
+        candidate_checkpoint=candidate,
+        best_checkpoint_path=best,
+        checkpoint_registry=registry,
+        save_candidate_fn=save_candidate,
+    )
+
+    assert len(seen) == 100
+    assert {item[1] for item in seen} == {"candidate-after-ppo"}
+    assert {item[2] for item in seen} == {"previous-best"}
+    assert {item[3] for item in seen} == {"candidate"}
+    assert metrics["promotion"]["promoted"] is True
+    assert best.read_text(encoding="utf-8") == "candidate-after-ppo"
+    assert registry["best"] == str(best)
+
+
+def test_ppo_promotion_retains_durable_best_and_cleans_candidate_on_rejection(tmp_path):
+    from scripts.train_policy import PPOConfig, run_ppo_training
+
+    candidate = tmp_path / "candidate.pt"
+    best = tmp_path / "best.pt"
+    best.write_text("previous-best", encoding="utf-8")
+    registry = {"best": str(best), "candidates": []}
+
+    def save_candidate(path):
+        path.write_text("candidate-after-ppo", encoding="utf-8")
+        return path
+
+    metrics = run_ppo_training(
+        network=None,
+        optimizer=None,
+        transitions=[_transition(done=True)],
+        ppo_steps=1,
+        config=PPOConfig(),
+        offline_ppo_fallback=True,
+        update_fn=lambda **_kwargs: {"updates": 1, "early_stopped": False},
+        promotion_match_fn=lambda index, **_kwargs: {"candidate_win": index < 70},
+        candidate_checkpoint=candidate,
+        best_checkpoint_path=best,
+        checkpoint_registry=registry,
+        save_candidate_fn=save_candidate,
+    )
+
+    assert metrics["promotion"]["promoted"] is False
+    assert best.read_text(encoding="utf-8") == "previous-best"
+    assert not candidate.exists()
+    assert registry["best"] == str(best)
+    assert registry["candidates"] == [{"path": str(candidate), "status": "rejected"}]
 
 
 def test_cli_main_reports_oserror_without_traceback(monkeypatch, capsys):

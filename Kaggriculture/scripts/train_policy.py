@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import random
+import shutil
 import sys
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
@@ -695,6 +696,10 @@ def run_ppo_training(
     offline_ppo_fallback: bool = False, update_fn: Any | None = None,
     promotion_match_fn: Any | None = None,
     candidate_checkpoint: str | Path | None = None,
+    best_checkpoint_path: str | Path | None = None,
+    checkpoint_registry: dict[str, Any] | None = None,
+    save_candidate_fn: Any | None = None,
+    cleanup_candidate_fn: Any | None = None,
 ) -> dict[str, Any]:
     """Run PPO with fresh scheduled league rollouts or explicit offline fallback."""
     steps = max(0, int(ppo_steps))
@@ -759,6 +764,10 @@ def run_ppo_training(
         promotion = maybe_promote_checkpoint(
             match_fn=promotion_match_fn,
             candidate_checkpoint=candidate_checkpoint,
+            registry=checkpoint_registry,
+            save_candidate_fn=save_candidate_fn,
+            cleanup_candidate_fn=cleanup_candidate_fn,
+            best_checkpoint_path=best_checkpoint_path,
         )
     return {
         "ppo_updates": total_updates,
@@ -824,20 +833,40 @@ def run_promotion_match(
     }
 
 
+def _cleanup_checkpoint(path: str | Path) -> None:
+    try:
+        Path(path).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _persist_best_checkpoint(candidate: str | Path, best: str | Path) -> str:
+    candidate_path = Path(candidate)
+    best_path = Path(best)
+    if not candidate_path.exists():
+        raise OSError(f"candidate checkpoint does not exist: {candidate_path}")
+    best_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(candidate_path, best_path)
+    return str(best_path)
+
+
 def maybe_promote_checkpoint(
     *, match_fn: Any, candidate_checkpoint: str | Path,
     registry: dict[str, Any] | None = None,
     save_candidate_fn: Any | None = None,
     cleanup_candidate_fn: Any | None = None,
+    best_checkpoint_path: str | Path | None = None,
     best_key: str = "best",
 ) -> dict[str, Any]:
     """Register a candidate, run the fixed promotion match, and update best only on promotion."""
     registry = registry if registry is not None else {best_key: None, "candidates": []}
-    previous_best = registry.get(best_key)
+    previous_best = str(best_checkpoint_path) if best_checkpoint_path is not None else registry.get(best_key)
     saved_candidate = (
         str(save_candidate_fn(candidate_checkpoint))
         if save_candidate_fn is not None else str(candidate_checkpoint)
     )
+    if best_checkpoint_path is not None and not Path(saved_candidate).exists():
+        raise OSError(f"candidate checkpoint does not exist: {saved_candidate}")
     entry = {"path": saved_candidate, "status": "candidate"}
     candidates = registry.setdefault("candidates", [])
     if not isinstance(candidates, list):
@@ -857,17 +886,18 @@ def maybe_promote_checkpoint(
     except Exception:
         entry["status"] = "error"
         registry[best_key] = previous_best
-        if cleanup_candidate_fn is not None:
-            cleanup_candidate_fn(saved_candidate)
+        (cleanup_candidate_fn or _cleanup_checkpoint)(saved_candidate)
         raise
     if result["promoted"]:
         entry["status"] = "promoted"
-        registry[best_key] = saved_candidate
+        registry[best_key] = (
+            _persist_best_checkpoint(saved_candidate, best_checkpoint_path)
+            if best_checkpoint_path is not None else saved_candidate
+        )
     else:
         entry["status"] = "rejected"
         registry[best_key] = previous_best
-        if cleanup_candidate_fn is not None:
-            cleanup_candidate_fn(saved_candidate)
+        (cleanup_candidate_fn or _cleanup_checkpoint)(saved_candidate)
     return {"candidate_checkpoint": saved_candidate, **result}
 
 
@@ -877,6 +907,8 @@ def train_behavior_clone(
     prior_checkpoint: str | Path | None = None, rollout_fn: Any | None = None,
     opponent_pool: Any | None = None, offline_ppo_fallback: bool = False,
     promotion_match_fn: Any | None = None,
+    best_checkpoint_path: str | Path | None = None,
+    checkpoint_registry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run complete behavior-cloning epochs, optional PPO, and checkpoint."""
     th = require_torch()
@@ -925,6 +957,21 @@ def train_behavior_clone(
             loss.backward()
             optimizer.step()
             bc_updates += 1
+    metadata = _checkpoint_metadata(len(transitions))
+    metadata["behavior_clone_epochs"] = epochs
+    metadata["behavior_clone_updates"] = bc_updates
+    metadata["ppo_updates"] = 0
+    metadata["ppo_metrics"] = None
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    th.save({"metadata": metadata, "model_state_dict": network.state_dict()}, destination)
+
+    def save_current_candidate(path: str | Path) -> str:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        th.save({"metadata": metadata, "model_state_dict": network.state_dict()}, target)
+        return str(target)
+
     ppo_metrics = None
     if ppo_steps:
         config = PPOConfig()
@@ -942,16 +989,14 @@ def train_behavior_clone(
             offline_ppo_fallback=offline_ppo_fallback,
             promotion_match_fn=promotion_match_fn,
             candidate_checkpoint=output_path,
+            best_checkpoint_path=best_checkpoint_path,
+            checkpoint_registry=checkpoint_registry,
+            save_candidate_fn=save_current_candidate,
         )
         if isinstance(ppo_metrics.get("last_metrics"), dict):
             ppo_metrics = {**ppo_metrics, **ppo_metrics["last_metrics"]}
-    metadata = _checkpoint_metadata(len(transitions))
-    metadata["behavior_clone_epochs"] = epochs
-    metadata["behavior_clone_updates"] = bc_updates
     metadata["ppo_updates"] = 0 if ppo_metrics is None else ppo_metrics["ppo_updates"]
     metadata["ppo_metrics"] = ppo_metrics
-    destination = Path(output_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
     th.save({"metadata": metadata, "model_state_dict": network.state_dict()}, destination)
     return metadata
 
@@ -996,6 +1041,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ppo-steps", type=_nonnegative_int, default=0)
     parser.add_argument("--prior-checkpoint", type=Path, default=None)
+    parser.add_argument("--best-checkpoint", type=Path, default=None)
     parser.add_argument(
         "--offline-ppo-fallback",
         action="store_true",
@@ -1017,6 +1063,7 @@ def main(argv: list[str] | None = None) -> int:
             ppo_steps=args.ppo_steps,
             prior_checkpoint=args.prior_checkpoint,
             offline_ppo_fallback=options["offline_ppo_fallback"],
+            best_checkpoint_path=args.best_checkpoint,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
