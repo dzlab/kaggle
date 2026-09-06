@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import math
 import random
@@ -758,24 +759,35 @@ def run_ppo_training(
                 "promotion": None,
             }
     promotion = None
-    if promotion_match_fn is not None:
-        if candidate_checkpoint is None:
-            raise ValueError("candidate_checkpoint is required when promotion_match_fn is provided")
-        promotion = maybe_promote_checkpoint(
-            match_fn=promotion_match_fn,
-            candidate_checkpoint=candidate_checkpoint,
-            registry=checkpoint_registry,
-            save_candidate_fn=save_candidate_fn,
-            cleanup_candidate_fn=cleanup_candidate_fn,
-            best_checkpoint_path=best_checkpoint_path,
-        )
-    return {
+    summary = {
         "ppo_updates": total_updates,
         "rollout_count": rollout_count,
         "early_stopped": False,
         "last_metrics": last_metrics,
-        "promotion": promotion,
     }
+    if promotion_match_fn is not None:
+        if candidate_checkpoint is None:
+            raise ValueError("candidate_checkpoint is required when promotion_match_fn is provided")
+        final_candidate = Path(candidate_checkpoint)
+        candidate_for_match = _temporary_candidate_path(final_candidate)
+
+        def save_temp_candidate(path: str | Path) -> str:
+            return _save_candidate(save_candidate_fn, path, ppo_metrics=summary)
+
+        promotion = maybe_promote_checkpoint(
+            match_fn=promotion_match_fn,
+            candidate_checkpoint=candidate_for_match,
+            registry=checkpoint_registry,
+            save_candidate_fn=save_temp_candidate,
+            cleanup_candidate_fn=cleanup_candidate_fn,
+            best_checkpoint_path=best_checkpoint_path,
+        )
+        if promotion["promoted"]:
+            try:
+                _persist_best_checkpoint(candidate_for_match, final_candidate)
+            finally:
+                _cleanup_checkpoint(candidate_for_match)
+    return {**summary, "promotion": promotion}
 
 
 def _checkpoint_metadata(transition_count: int, config: PPOConfig | None = None) -> dict[str, Any]:
@@ -846,8 +858,31 @@ def _persist_best_checkpoint(candidate: str | Path, best: str | Path) -> str:
     if not candidate_path.exists():
         raise OSError(f"candidate checkpoint does not exist: {candidate_path}")
     best_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(candidate_path, best_path)
+    temporary_path = best_path.with_name(f".{best_path.name}.publish.tmp")
+    try:
+        shutil.copyfile(candidate_path, temporary_path)
+        temporary_path.replace(best_path)
+    except Exception:
+        _cleanup_checkpoint(temporary_path)
+        raise
     return str(best_path)
+
+
+def _temporary_candidate_path(final_path: str | Path) -> Path:
+    path = Path(final_path)
+    return path.with_name(f".{path.name}.promotion-candidate.tmp")
+
+
+def _save_candidate(save_candidate_fn: Any, path: str | Path, *, ppo_metrics: dict[str, Any] | None) -> str:
+    if save_candidate_fn is None:
+        return str(path)
+    try:
+        signature = inspect.signature(save_candidate_fn)
+    except (TypeError, ValueError):
+        return str(save_candidate_fn(path))
+    if "ppo_metrics" in signature.parameters:
+        return str(save_candidate_fn(path, ppo_metrics=ppo_metrics))
+    return str(save_candidate_fn(path))
 
 
 def maybe_promote_checkpoint(
@@ -861,10 +896,7 @@ def maybe_promote_checkpoint(
     """Register a candidate, run the fixed promotion match, and update best only on promotion."""
     registry = registry if registry is not None else {best_key: None, "candidates": []}
     previous_best = str(best_checkpoint_path) if best_checkpoint_path is not None else registry.get(best_key)
-    saved_candidate = (
-        str(save_candidate_fn(candidate_checkpoint))
-        if save_candidate_fn is not None else str(candidate_checkpoint)
-    )
+    saved_candidate = _save_candidate(save_candidate_fn, candidate_checkpoint, ppo_metrics=None)
     if best_checkpoint_path is not None and not Path(saved_candidate).exists():
         raise OSError(f"candidate checkpoint does not exist: {saved_candidate}")
     entry = {"path": saved_candidate, "status": "candidate"}
@@ -966,10 +998,14 @@ def train_behavior_clone(
     destination.parent.mkdir(parents=True, exist_ok=True)
     th.save({"metadata": metadata, "model_state_dict": network.state_dict()}, destination)
 
-    def save_current_candidate(path: str | Path) -> str:
+    def save_current_candidate(path: str | Path, *, ppo_metrics: dict[str, Any] | None = None) -> str:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        th.save({"metadata": metadata, "model_state_dict": network.state_dict()}, target)
+        candidate_metadata = dict(metadata)
+        if ppo_metrics is not None:
+            candidate_metadata["ppo_updates"] = ppo_metrics["ppo_updates"]
+            candidate_metadata["ppo_metrics"] = ppo_metrics
+        th.save({"metadata": candidate_metadata, "model_state_dict": network.state_dict()}, target)
         return str(target)
 
     ppo_metrics = None

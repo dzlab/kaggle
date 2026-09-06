@@ -692,7 +692,93 @@ def test_ppo_promotion_retains_durable_best_and_cleans_candidate_on_rejection(tm
     assert best.read_text(encoding="utf-8") == "previous-best"
     assert not candidate.exists()
     assert registry["best"] == str(best)
-    assert registry["candidates"] == [{"path": str(candidate), "status": "rejected"}]
+    assert registry["candidates"][0]["path"] != str(candidate)
+    assert registry["candidates"][0]["status"] == "rejected"
+    assert not Path(registry["candidates"][0]["path"]).exists()
+
+
+def test_ppo_promotion_uses_temp_candidate_and_preserves_output_on_match_error(tmp_path):
+    from scripts.train_policy import PPOConfig, run_ppo_training
+
+    output = tmp_path / "policy.pt"
+    output.write_text("existing-output", encoding="utf-8")
+    best = tmp_path / "best.pt"
+    best.write_text("previous-best", encoding="utf-8")
+    saved = []
+
+    def save_candidate(path, *, ppo_metrics):
+        candidate_path = Path(path)
+        saved.append((candidate_path, ppo_metrics["ppo_updates"]))
+        candidate_path.write_text("candidate-after-ppo", encoding="utf-8")
+        return candidate_path
+
+    def match_fn(_index, *, candidate_checkpoint, **_kwargs):
+        assert Path(candidate_checkpoint) != output
+        assert Path(candidate_checkpoint).parent == output.parent
+        assert Path(candidate_checkpoint).read_text(encoding="utf-8") == "candidate-after-ppo"
+        raise ValueError("promotion match result forced failure")
+
+    with pytest.raises(ValueError, match="forced failure"):
+        run_ppo_training(
+            network=None,
+            optimizer=None,
+            transitions=[_transition(done=True)],
+            ppo_steps=1,
+            config=PPOConfig(),
+            offline_ppo_fallback=True,
+            update_fn=lambda **_kwargs: {"updates": 3, "early_stopped": False, "loss": 1.5},
+            promotion_match_fn=match_fn,
+            candidate_checkpoint=output,
+            best_checkpoint_path=best,
+            save_candidate_fn=save_candidate,
+        )
+
+    assert output.read_text(encoding="utf-8") == "existing-output"
+    assert best.read_text(encoding="utf-8") == "previous-best"
+    assert saved and saved[0][0] != output
+    assert saved[0][1] == 3
+    assert not saved[0][0].exists()
+
+
+def test_ppo_promotion_publishes_current_metadata_to_output_and_best(tmp_path):
+    from scripts.train_policy import PPOConfig, run_ppo_training
+
+    output = tmp_path / "policy.pt"
+    best = tmp_path / "best.pt"
+    best.write_text("previous-best", encoding="utf-8")
+
+    def save_candidate(path, *, ppo_metrics):
+        Path(path).write_text(json.dumps({
+            "metadata": {
+                "ppo_updates": ppo_metrics["ppo_updates"],
+                "last_loss": ppo_metrics["last_metrics"]["loss"],
+            }
+        }), encoding="utf-8")
+        return path
+
+    metrics = run_ppo_training(
+        network=None,
+        optimizer=None,
+        transitions=[_transition(done=True)],
+        ppo_steps=1,
+        config=PPOConfig(),
+        offline_ppo_fallback=True,
+        update_fn=lambda **_kwargs: {"updates": 4, "early_stopped": False, "loss": 2.25},
+        promotion_match_fn=lambda index, **_kwargs: {"candidate_win": index < 71},
+        candidate_checkpoint=output,
+        best_checkpoint_path=best,
+        save_candidate_fn=save_candidate,
+    )
+
+    assert metrics["promotion"]["promoted"] is True
+    assert json.loads(output.read_text(encoding="utf-8"))["metadata"] == {
+        "ppo_updates": 4,
+        "last_loss": 2.25,
+    }
+    assert json.loads(best.read_text(encoding="utf-8"))["metadata"] == {
+        "ppo_updates": 4,
+        "last_loss": 2.25,
+    }
 
 
 def test_cli_main_reports_oserror_without_traceback(monkeypatch, capsys):
