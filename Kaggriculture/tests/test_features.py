@@ -75,6 +75,44 @@ def test_private_state_does_not_leak_opponent_private_state():
     assert extract_features(state) == baseline
 
 
+def test_worker_permutations_have_identical_features_after_stable_sorting():
+    state = sample_state()
+    workers = [
+        {"index": 3, "role": "WORKER", "position": {"x": 3, "y": 3}},
+        {"index": 1, "role": "FARMER", "position": {"x": 1, "y": 1}},
+        {"index": 1, "role": "WORKER", "position": {"x": 2, "y": 2}},
+    ]
+    state["farm"]["workers"] = workers
+    permuted = deepcopy(state)
+    permuted["farm"]["workers"] = [workers[2], workers[0], workers[1]]
+
+    assert extract_features(state) == extract_features(permuted)
+
+
+def test_outlier_numeric_inputs_are_clamped_to_documented_unit_bound():
+    state = sample_state()
+    state.update({"day": 10**100, "hour": 10**100, "cash": 10**100, "production": -10**100})
+    state["farm"]["tiles"][0][0] = {
+        "kind": "WHEAT", "age": 10**100, "yield_units": 10**100,
+        "task": {"deadline": -10**100},
+    }
+    state["farm"]["workers"] = [{
+        "index": 10**100, "position": {"x": 10**100, "y": -10**100},
+        "task": {"target": {"x": 10**100, "y": 10**100}, "deadline": -10**100},
+    }]
+    state["market"]["prices"]["WHEAT"] = 10**100
+    state["market"]["inventory"]["WHEAT"] = -10**100
+    state["private"]["shed"]["WHEAT"] = 10**100
+
+    features = extract_features(state)
+    values = [value for group in (
+        features.tile_tokens, features.worker_tokens, features.market_tokens,
+        (features.global_tokens,),
+    ) for token in group for value in token]
+    assert values
+    assert all(-1.0 <= value <= 1.0 for value in values)
+
+
 def test_market_tokens_reflect_current_and_sequential_quotes():
     low = sample_state()
     high = sample_state()
@@ -89,15 +127,38 @@ def test_market_tokens_reflect_current_and_sequential_quotes():
     assert high_token[10] == 1000 / MARKET_I0
 
 
-@pytest.mark.parametrize("malformed", [None, [], {"farm": {"tiles": "bad"}}, {"private": []}])
+def test_raw_engine_observation_uses_selected_farm_only():
+    selected = sample_state()
+    opponent = sample_state()
+    raw = {
+        "player": 0,
+        "day": selected["day"], "hour": selected["hour"],
+        "farms": [selected["farm"], opponent["farm"]],
+        "private": selected["private"], "market": selected["market"],
+        "town": selected["town"],
+    }
+    baseline = extract_features(raw)
+    raw["farms"][1]["private"] = {"shed": {"WHEAT": 10**100}, "secret": "opponent"}
+    raw["private"] = {"shed": {"WHEAT": 7}, "secret": "selected"}
+
+    assert extract_features(raw) == baseline
+
+
+@pytest.mark.parametrize("malformed", [
+    None, [],
+    {"farm": {"tiles": "bad", "workers": {"bad": object()}}},
+    {"private": [], "market": {"prices": [], "inventory": object()}, "town": {"demand": object()}},
+])
 def test_malformed_observations_return_finite_fixed_empty_features(malformed):
     features = extract_features(malformed)
 
     assert len(features.tile_tokens) == 100
     assert len(features.worker_tokens) == 10
     assert len(features.market_tokens) == len(PRODUCTS)
-    assert all(value == value and abs(value) != float("inf")
-               for token in features.tile_tokens for value in token)
+    for group in (features.tile_tokens, features.worker_tokens, features.market_tokens,
+                  (features.global_tokens,)):
+        assert all(value == value and abs(value) != float("inf")
+                   for token in group for value in token)
 
 
 def test_schema_mismatch_is_rejected():

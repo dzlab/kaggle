@@ -29,6 +29,11 @@ from .strategy import market_sale_quotes, select_strategy
 from .types import Position
 
 FEATURE_SCHEMA_VERSION = 1
+# Every emitted numeric feature is clamped to this closed interval.  Ratios
+# use their natural denominator before clamping; one-hot and boolean fields
+# already lie in the same interval.
+FEATURE_VALUE_MIN = -1.0
+FEATURE_VALUE_MAX = 1.0
 BOARD_SIZE = 10
 MAX_WORKERS = 10
 _TASK_KINDS = ("IDLE", "MOVE", "WATER", "FERTILIZE", "HARVEST", "PLANT", "FEED", "CARE", "SELL", "BUILD", "DIG", "WEED")
@@ -47,6 +52,28 @@ def _number(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError, OverflowError):
         return default
     return result if isfinite(result) else default
+
+
+def _unit(value: Any) -> float:
+    """Return a finite numeric feature in the documented [-1, 1] range."""
+    value = _number(value)
+    return max(FEATURE_VALUE_MIN, min(FEATURE_VALUE_MAX, value))
+
+
+def _nonnegative_unit(value: Any) -> float:
+    return _unit(max(0.0, _number(value)))
+
+
+def _nonnegative_ratio(value: Any, denominator: float) -> float:
+    """Clamp a nonnegative ratio before division, including huge integers."""
+    try:
+        if value <= 0:
+            return 0.0
+        if value >= denominator:
+            return FEATURE_VALUE_MAX
+        return _nonnegative_unit(value / denominator)
+    except (TypeError, OverflowError, ValueError):
+        return 0.0
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -110,7 +137,27 @@ def _task(worker: Any, state: Mapping[str, Any]) -> Mapping[str, Any]:
 def _workers(state: Mapping[str, Any]) -> list[Any]:
     farm = _mapping(state.get("farm"))
     workers = state.get("workers", farm.get("workers", []))
-    return list(workers) if isinstance(workers, Sequence) and not isinstance(workers, (str, bytes)) else []
+    if not isinstance(workers, Sequence) or isinstance(workers, (str, bytes)):
+        return []
+    records = list(workers)
+    return sorted(records, key=lambda worker: (
+        _number(_get(worker, "index", 0)),
+        (_position(_get(worker, "position", worker)) or Position(0, 0)).y,
+        (_position(_get(worker, "position", worker)) or Position(0, 0)).x,
+        str(_get(worker, "role", "WORKER")).upper(),
+        str(_get(_get(worker, "task", _get(worker, "current_task", {})), "kind", "IDLE")).upper(),
+        repr(_stable_value(worker)),
+    ))
+
+
+def _stable_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return tuple(sorted((str(key), _stable_value(item)) for key, item in value.items()))
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return tuple(_stable_value(item) for item in value)
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    return type(value).__name__
 
 
 def _market_value(state: Mapping[str, Any], key: str, item: str, default: float) -> float:
@@ -183,15 +230,15 @@ def _tile_token(position: Position, tile: Any, day: float) -> tuple[float, ...]:
         expected = float(crop_data.get("max_yield", 0))
     deadline = _number(_get(_get(tile, "task", {}), "deadline", day + season_days), day + season_days)
     needs = _mapping(_get(tile, "needs", {}))
-    return (position.x / 9.0, position.y / 9.0, locked, empty, *_one_hot(crop, tuple(CROPS)),
-            age / season_days, age / max(1.0, float(crop_data.get("first_yield_day", season_days))),
-            age / max(1.0, float(crop_data.get("max_yield_day", season_days))),
+    return (_nonnegative_ratio(position.x, 9.0), _nonnegative_ratio(position.y, 9.0), locked, empty, *_one_hot(crop, tuple(CROPS)),
+            _nonnegative_ratio(age, season_days), _nonnegative_ratio(age, max(1.0, float(crop_data.get("first_yield_day", season_days)))),
+            _nonnegative_ratio(age, max(1.0, float(crop_data.get("max_yield_day", season_days)))),
             float(bool(_get(tile, "watered", _get(tile, "water", False)))),
             float(bool(_get(tile, "fertilized", _get(tile, "fertilizer", False)))),
             *_one_hot(structure, ("COOP", "PASTURE")), *_one_hot(animal, tuple(ANIMALS)),
             float(bool(_get(tile, "needs_feed", needs.get("feed", False)))),
-            float(bool(_get(tile, "needs_care", needs.get("care", False)))), expected / 100.0,
-            max(-1.0, min(1.0, (deadline - day) / season_days)))
+            float(bool(_get(tile, "needs_care", needs.get("care", False)))), _nonnegative_ratio(expected, 100.0),
+            _unit((deadline - day) / season_days))
 
 
 def _worker_token(worker: Any, state: Mapping[str, Any], day: float) -> tuple[float, ...]:
@@ -201,13 +248,14 @@ def _worker_token(worker: Any, state: Mapping[str, Any], day: float) -> tuple[fl
     held_names = set(held) if isinstance(held, Sequence) and not isinstance(held, (str, bytes)) else set(held) if isinstance(held, Mapping) else set()
     task = _task(worker, state)
     target = _position(_get(task, "target", _get(task, "position")))
-    distance = ((abs(target.x - position.x) + abs(target.y - position.y)) / 18.0) if target else 0.0
+    raw_distance = (abs(target.x - position.x) + abs(target.y - position.y)) if target else 0
+    distance = 1.0 if raw_distance >= 18 else raw_distance / 18.0
     deadline = _number(_get(task, "deadline", day + season_days), day + season_days)
-    return (position.x / 9.0, position.y / 9.0, float(role == "FARMER"), float(role != "FARMER"),
+    return (_nonnegative_unit(position.x / 9.0), _nonnegative_unit(position.y / 9.0), float(role == "FARMER"), float(role != "FARMER"),
             *tuple(float(item in held_names) for item in PRODUCTS),
-            _number(_get(worker, "index", 0)) / MAX_WORKERS,
-            *_one_hot(str(_get(task, "kind", "IDLE")), _TASK_KINDS), distance,
-            max(-1.0, min(1.0, (deadline - day) / season_days)))
+            _nonnegative_ratio(_number(_get(worker, "index", 0)), MAX_WORKERS),
+            *_one_hot(str(_get(task, "kind", "IDLE")), _TASK_KINDS), _nonnegative_unit(distance),
+            _unit((deadline - day) / season_days))
 
 
 def _empty_worker_token() -> tuple[float, ...]:
@@ -221,8 +269,10 @@ def _market_token(item: str, state: Mapping[str, Any]) -> tuple[float, ...]:
     demand = _mapping(state.get("town"))
     demand_values = demand.get("demand", demand.get("demands", demand.get("requested_items", ())))
     demand_names = {str(value).upper() for value in demand_values} if isinstance(demand_values, Sequence) and not isinstance(demand_values, str) else {str(demand_values).upper()}
-    return (*_one_hot(item, tuple(PRODUCTS)), quote / 100.0, (inventory - MARKET_I0) / MARKET_I0,
-            (post[0] if post else quote) / 100.0, float(item in demand_names), float(quote <= PRICE_FLOOR))
+    return (*_one_hot(item, tuple(PRODUCTS)), _nonnegative_ratio(quote, 100.0),
+            _unit((inventory - MARKET_I0) / MARKET_I0),
+            _nonnegative_ratio(post[0] if post else quote, 100.0),
+            float(item in demand_names), float(quote <= PRICE_FLOOR))
 
 
 def _global_token(state: Mapping[str, Any], day: float, hour: float, worker_count: int) -> tuple[float, ...]:
@@ -234,8 +284,8 @@ def _global_token(state: Mapping[str, Any], day: float, hour: float, worker_coun
     strategy_name = str(state.get("strategy", _mapping(state.get("private")).get("strategy", ""))).lower()
     if strategy_name not in _STRATEGIES:
         strategy_name = select_strategy(state).name
-    return (day / season_days, hour / 24.0, max(0.0, _number(state.get("cash", farm.get("money", 0)))) / 10000.0,
-            min(1.0, used / shed_capacity), max(0.0, _number(shed.get("WHEAT", 0))) / 100.0,
-            max(0.0, (MAX_WORKERS - worker_count) / MAX_WORKERS), min(1.0, unlocked / 100.0),
-            max(0.0, production) / 100.0, max(0.0, (season_days - day) / season_days),
+    return (_nonnegative_ratio(day, season_days), _nonnegative_ratio(min(24.0, hour), 24.0), _nonnegative_ratio(max(0.0, _number(state.get("cash", farm.get("money", 0)))), 10000.0),
+            _nonnegative_ratio(used, shed_capacity), _nonnegative_ratio(max(0.0, _number(shed.get("WHEAT", 0))), 100.0),
+            _nonnegative_ratio(MAX_WORKERS - worker_count, MAX_WORKERS), _nonnegative_ratio(unlocked, 100.0),
+            _nonnegative_ratio(max(0.0, production), 100.0), _nonnegative_ratio(season_days - day, season_days),
             *_one_hot(strategy_name, _STRATEGIES))
