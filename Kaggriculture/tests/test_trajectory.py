@@ -122,6 +122,22 @@ def test_collector_runs_all_supported_opponents_in_isolated_processes(tmp_path):
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_collector_emits_default_length_trajectory_and_manifest(tmp_path):
+    from scripts import collect_trajectories
+
+    output = tmp_path / "default-length.jsonl"
+    manifest = collect_trajectories.collect(
+        seeds=[17], opponents=["pass"], seats=[0], steps=720, output=output,
+    )
+
+    lines = output.read_text().splitlines()
+    assert len(lines) == 719
+    assert json.loads(lines[-1])["done"] is True
+    assert output.with_suffix(".manifest.json").exists()
+    assert manifest["steps"] == 720
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
 def test_collector_writes_valid_transition_lines_and_manifest(tmp_path, monkeypatch):
     from scripts import collect_trajectories
 

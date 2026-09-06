@@ -8,6 +8,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
+from unittest.mock import patch
 
 TRANSITION_SCHEMA_VERSION = 1
 
@@ -83,14 +84,19 @@ def _validated_player_states(
     info = _mapping(replay.get("info"))
     expected_seed = info.get("seed") if type(info.get("seed")) is int else None
     try:
-        valid = _valid_replay(
-            replay,
-            own_states,
-            other_states,
-            configuration,
-            expected_seed=expected_seed,
-            candidate_player=candidate_player,
-        )
+        # Trajectory data may retain terminal goods for later analysis. Keep
+        # every evaluator structural, action-schema, and transition-effect
+        # check, but do not apply the evaluator's selection-only full-season
+        # liquidation gate to collection.
+        with patch("scripts.evaluate._requires_full_liquidation", return_value=False):
+            valid = _valid_replay(
+                replay,
+                own_states,
+                other_states,
+                configuration,
+                expected_seed=expected_seed,
+                candidate_player=candidate_player,
+            )
     except Exception as exc:
         raise _failure(
             "replay validation raised an exception",
