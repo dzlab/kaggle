@@ -20,6 +20,17 @@ from kagriculture_agent.constants import ENGINE_VERSION
 from kagriculture_agent.features import FEATURE_SCHEMA_VERSION, extract_features
 from kagriculture_agent.model import ACTION_VOCAB, MODEL_VERSION, CompactPolicyNet, require_torch, set_training_seed
 
+PROMOTION_MATCH_SIZE = 100
+_DIRECTION_DELTAS = {
+    "NORTH": (0, -1),
+    "SOUTH": (0, 1),
+    "EAST": (1, 0),
+    "WEST": (-1, 0),
+}
+_CURRENT_TILE_KINDS = {
+    "WATER", "HARVEST", "FERTILIZE", "FEED", "CARE", "DROP", "SELL", "DIG", "WEED",
+}
+
 
 @dataclass(frozen=True)
 class PPOConfig:
@@ -32,6 +43,7 @@ class PPOConfig:
     rollout_steps: int = 64
     kl_coef: float = 0.10
     prior_ce_coef: float = 0.01
+    ppo_epochs: int = 1
 
     def __post_init__(self) -> None:
         for name in ("gamma", "gae_lambda", "clip_epsilon", "value_coef", "entropy_coef", "target_kl"):
@@ -42,8 +54,8 @@ class PPOConfig:
             raise ValueError("gamma must be in (0, 1]; gamma=1.0 is for explicit experiments only")
         if not 0.0 <= self.gae_lambda <= 1.0:
             raise ValueError("gae_lambda must be in [0, 1]")
-        if self.rollout_steps < 1:
-            raise ValueError("rollout_steps must be positive")
+        if self.rollout_steps < 1 or self.ppo_epochs < 1:
+            raise ValueError("rollout_steps and ppo_epochs must be positive")
 
 
 @dataclass(frozen=True)
@@ -51,6 +63,27 @@ class OpponentMatch:
     opponent: str
     seat: int
     checkpoint: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkerLabels:
+    act: list[int]
+    target: list[int]
+    kind: list[int]
+
+
+@dataclass(frozen=True)
+class RolloutBatch:
+    transitions: list[dict[str, Any]]
+    rewards: list[float]
+    dones: list[bool]
+    values: list[float]
+    old_log_probs: list[float]
+    advantages: list[float]
+    returns: list[float]
+    worker: WorkerLabels
+    market_items: list[int]
+    market_quantities: list[int]
 
 
 class OpponentPool:
@@ -88,9 +121,51 @@ class OpponentPool:
                 selected = "current"
         return OpponentMatch(opponent=selected, seat=int(index) % 2, checkpoint=checkpoint)
 
+    def schedule(self, *, count: int, seed: int = 0) -> list[OpponentMatch]:
+        """Return a deterministic stratified schedule with alternating seats."""
+        if count < 1:
+            raise ValueError("count must be positive")
+        counts = {
+            opponent: int(count * probability)
+            for opponent, probability in self.probabilities.items()
+        }
+        missing = count - sum(counts.values())
+        remainders = sorted(
+            (
+                (count * probability - counts[opponent], opponent)
+                for opponent, probability in self.probabilities.items()
+            ),
+            reverse=True,
+        )
+        for _fraction, opponent in remainders[:missing]:
+            counts[opponent] += 1
+        matches: list[OpponentMatch] = []
+        for opponent in self.probabilities:
+            if opponent != "checkpoint":
+                matches.extend(OpponentMatch(opponent=opponent, seat=0) for _ in range(counts[opponent]))
+        if self.checkpoint_candidates:
+            matches.extend(
+                OpponentMatch(
+                    opponent="checkpoint", seat=0,
+                    checkpoint=self.checkpoint_candidates[index % len(self.checkpoint_candidates)],
+                )
+                for index in range(counts["checkpoint"])
+            )
+        else:
+            matches.extend(OpponentMatch(opponent="current", seat=0) for _ in range(counts["checkpoint"]))
+        random.Random(int(seed)).shuffle(matches)
+        return [
+            OpponentMatch(match.opponent, index % 2, match.checkpoint)
+            for index, match in enumerate(matches)
+        ]
 
-def should_promote(*, wins: int, games: int, threshold: float = 0.70) -> bool:
-    return games > 0 and (wins / games) > threshold
+
+def should_promote(
+    *, wins: int, games: int, threshold: float = 0.70,
+    match_size: int = PROMOTION_MATCH_SIZE,
+) -> bool:
+    """Promote only after the fixed 100-game match exceeds 70% wins."""
+    return games == match_size and games > 0 and (wins / games) > threshold
 
 
 def terminal_bank_margin_reward(final_bank: Any, opponent_final_bank: Any) -> float:
@@ -206,6 +281,17 @@ def _read_transitions(path: str | Path) -> list[dict[str, Any]]:
     return transitions
 
 
+def epoch_minibatches(*, count: int, batch_size: int, seed: int, epoch: int) -> list[list[int]]:
+    """Return a deterministic complete epoch partition over all transition indices."""
+    if count < 1:
+        raise ValueError("count must be positive")
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    indices = list(range(count))
+    random.Random((int(seed) << 16) + int(epoch)).shuffle(indices)
+    return [indices[start:start + batch_size] for start in range(0, count, batch_size)]
+
+
 def _command_kind(command: Any) -> str:
     if not isinstance(command, Sequence) or isinstance(command, (str, bytes)) or not command:
         return "PASS"
@@ -215,22 +301,84 @@ def _command_kind(command: Any) -> str:
     return name if name in ACTION_VOCAB["worker_kinds"] else "PASS"
 
 
-def _worker_labels(action: dict[str, Any]) -> tuple[list[int], list[int], list[int]]:
+def _selected_farm(observation: dict[str, Any]) -> dict[str, Any]:
+    farm = observation.get("farm")
+    if isinstance(farm, dict):
+        return farm
+    farms = observation.get("farms")
+    if isinstance(farms, Sequence) and not isinstance(farms, (str, bytes)):
+        try:
+            player = int(observation.get("player", 0))
+        except (TypeError, ValueError, OverflowError):
+            player = 0
+        if 0 <= player < len(farms) and isinstance(farms[player], dict):
+            return farms[player]
+    return {}
+
+
+def _worker_positions(observation: dict[str, Any]) -> list[tuple[int, int]]:
+    workers = _selected_farm(observation).get("workers", [])
+    if not isinstance(workers, Sequence) or isinstance(workers, (str, bytes)):
+        workers = []
+    positions: list[tuple[int, int]] = []
+    for worker in list(workers)[:10]:
+        raw = worker.get("position", worker) if isinstance(worker, dict) else worker
+        if isinstance(raw, dict):
+            x_value, y_value = raw.get("x", 0), raw.get("y", 0)
+        elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)) and len(raw) >= 2:
+            x_value, y_value = raw[0], raw[1]
+        else:
+            x_value, y_value = 0, 0
+        try:
+            x, y = int(x_value), int(y_value)
+        except (TypeError, ValueError, OverflowError):
+            x, y = 0, 0
+        positions.append((max(0, min(9, x)), max(0, min(9, y))))
+    positions.extend([(0, 0)] * (10 - len(positions)))
+    return positions[:10]
+
+
+def _target_index(command: Any, position: tuple[int, int]) -> int:
+    x, y = position
+    if isinstance(command, Sequence) and not isinstance(command, (str, bytes)) and command:
+        name = str(command[0]).upper()
+        if name in _DIRECTION_DELTAS:
+            dx, dy = _DIRECTION_DELTAS[name]
+            x = max(0, min(9, x + dx))
+            y = max(0, min(9, y + dy))
+        elif name not in _CURRENT_TILE_KINDS and len(command) >= 3:
+            raw = command[2]
+            if isinstance(raw, dict) and "x" in raw and "y" in raw:
+                try:
+                    x = max(0, min(9, int(raw["x"])))
+                    y = max(0, min(9, int(raw["y"])))
+                except (TypeError, ValueError, OverflowError):
+                    pass
+    return y * 10 + x
+
+
+def worker_labels(action: dict[str, Any], observation: dict[str, Any] | None = None) -> WorkerLabels:
     commands = [action.get("farmer", ["PASS"])]
     hands = action.get("hands", [])
     if isinstance(hands, Sequence) and not isinstance(hands, (str, bytes)):
         commands.extend(hands)
     commands = (commands + [["PASS"]] * 10)[:10]
+    positions = _worker_positions(observation or {})
     kind_lookup = {kind: index for index, kind in enumerate(ACTION_VOCAB["worker_kinds"])}
     act_labels: list[int] = []
     target_labels: list[int] = []
     kind_labels: list[int] = []
-    for command in commands:
+    for command, position in zip(commands, positions):
         kind = _command_kind(command)
         act_labels.append(0 if kind == "PASS" else 1)
-        target_labels.append(0)
+        target_labels.append(_target_index(command, position))
         kind_labels.append(kind_lookup.get(kind, 0))
-    return act_labels, target_labels, kind_labels
+    return WorkerLabels(act_labels, target_labels, kind_labels)
+
+
+def _worker_labels(action: dict[str, Any], observation: dict[str, Any] | None = None) -> tuple[list[int], list[int], list[int]]:
+    labels = worker_labels(action, observation)
+    return labels.act, labels.target, labels.kind
 
 
 def _market_labels(action: dict[str, Any]) -> tuple[int, int]:
@@ -251,6 +399,224 @@ def _market_labels(action: dict[str, Any]) -> tuple[int, int]:
     return item_lookup.get(item, 0), quantity_lookup.get(quantity, 0)
 
 
+def build_rollout_batch(
+    transitions: Sequence[dict[str, Any]], *, config: PPOConfig,
+    value_estimates: Sequence[float] | None = None,
+    old_log_probs: Sequence[float] | None = None,
+) -> RolloutBatch:
+    rows = list(transitions)
+    if not rows:
+        raise ValueError("rollout batch requires at least one transition")
+    values = [0.0 for _ in rows] if value_estimates is None else [float(value) for value in value_estimates]
+    old = [0.0 for _ in rows] if old_log_probs is None else [float(value) for value in old_log_probs]
+    if len(values) != len(rows) or len(old) != len(rows):
+        raise ValueError("value_estimates and old_log_probs must match transition count")
+    rewards: list[float] = []
+    dones: list[bool] = []
+    worker_act: list[list[int]] = []
+    worker_target: list[list[int]] = []
+    worker_kind: list[list[int]] = []
+    market_items: list[int] = []
+    market_quantities: list[int] = []
+    for transition in rows:
+        done = bool(transition.get("done"))
+        dones.append(done)
+        rewards.append(
+            terminal_bank_margin_reward(
+                transition.get("final_bank"), transition.get("opponent_final_bank"),
+            )
+            if done else 0.0
+        )
+        action = transition.get("action", {})
+        if not isinstance(action, dict):
+            action = {}
+        observation = transition.get("observation", {})
+        if not isinstance(observation, dict):
+            observation = {}
+        labels = worker_labels(action, observation)
+        worker_act.append(labels.act)
+        worker_target.append(labels.target)
+        worker_kind.append(labels.kind)
+        item, quantity = _market_labels(action)
+        market_items.append(item)
+        market_quantities.append(quantity)
+    advantages, returns = generalized_advantage_estimate(
+        rewards=rewards, values=values, dones=dones,
+        gamma=config.gamma, gae_lambda=config.gae_lambda,
+    )
+    return RolloutBatch(
+        transitions=rows,
+        rewards=rewards,
+        dones=dones,
+        values=values,
+        old_log_probs=old,
+        advantages=normalize_advantages(advantages),
+        returns=returns,
+        worker=WorkerLabels(worker_act, worker_target, worker_kind),
+        market_items=market_items,
+        market_quantities=market_quantities,
+    )
+
+
+def _select_outputs(outputs: dict[str, Any], batch: RolloutBatch) -> tuple[Any, Any]:
+    th = require_torch()
+    worker_act = th.tensor(batch.worker.act, dtype=th.long)
+    worker_target = th.tensor(batch.worker.target, dtype=th.long)
+    worker_kind = th.tensor(batch.worker.kind, dtype=th.long)
+    market_items = th.tensor(batch.market_items, dtype=th.long)
+    market_quantities = th.tensor(batch.market_quantities, dtype=th.long)
+    act_log = outputs["worker_act_logits"].log_softmax(dim=-1)
+    target_log = outputs["worker_target_logits"].log_softmax(dim=-1)
+    kind_log = outputs["worker_kind_logits"].log_softmax(dim=-1)
+    item_log = outputs["market_item_logits"].log_softmax(dim=-1)
+    quantity_log = outputs["market_quantity_logits"].log_softmax(dim=-1)
+    log_probs = (
+        act_log.gather(-1, worker_act.unsqueeze(-1)).squeeze(-1).sum(dim=1)
+        + target_log.gather(-1, worker_target.unsqueeze(-1)).squeeze(-1).sum(dim=1)
+        + kind_log.gather(-1, worker_kind.unsqueeze(-1)).squeeze(-1).sum(dim=1)
+        + item_log.gather(-1, market_items.unsqueeze(-1)).squeeze(-1)
+        + quantity_log.gather(-1, market_quantities.unsqueeze(-1)).squeeze(-1)
+    )
+    entropy = (
+        -(act_log.exp() * act_log).sum(dim=-1).sum(dim=1)
+        - (target_log.exp() * target_log).sum(dim=-1).sum(dim=1)
+        - (kind_log.exp() * kind_log).sum(dim=-1).sum(dim=1)
+        - (item_log.exp() * item_log).sum(dim=-1)
+        - (quantity_log.exp() * quantity_log).sum(dim=-1)
+    ).mean()
+    return log_probs, entropy
+
+
+def _distribution_regularization(outputs: dict[str, Any], prior_outputs: dict[str, Any] | None) -> tuple[Any, Any]:
+    th = require_torch()
+    zero = outputs["value"].sum() * 0.0
+    if prior_outputs is None:
+        return zero, zero
+    kl_terms = []
+    ce_terms = []
+    for name in (
+        "worker_act_logits", "worker_target_logits", "worker_kind_logits",
+        "market_item_logits", "market_quantity_logits",
+    ):
+        log_probs = outputs[name].log_softmax(dim=-1)
+        with th.no_grad():
+            prior_log_probs = prior_outputs[name].log_softmax(dim=-1)
+            prior_probs = prior_log_probs.exp()
+        kl_terms.append((prior_probs * (prior_log_probs - log_probs)).sum(dim=-1).mean())
+        ce_terms.append(-(prior_probs * log_probs).sum(dim=-1).mean())
+    return sum(kl_terms) / len(kl_terms), sum(ce_terms) / len(ce_terms)
+
+
+def _load_prior_network(prior_checkpoint: str | Path | None) -> Any:
+    if prior_checkpoint is None:
+        return None
+    th = require_torch()
+    prior = CompactPolicyNet()
+    checkpoint = th.load(prior_checkpoint, map_location="cpu")
+    state = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    prior.load_state_dict(state)
+    prior.eval()
+    for parameter in prior.parameters():
+        parameter.requires_grad_(False)
+    return prior
+
+
+def ppo_update(
+    network: Any, optimizer: Any, transitions: Sequence[dict[str, Any]], *,
+    config: PPOConfig, batch_size: int | None = None, seed: int = 0,
+    prior_checkpoint: str | Path | None = None,
+) -> dict[str, float | int | bool]:
+    """Run clipped PPO updates over one rollout batch."""
+    th = require_torch()
+    rows = list(transitions)
+    if not rows:
+        raise ValueError("ppo_update requires at least one transition")
+    features = [extract_features(row.get("observation", {})) for row in rows]
+    bootstrap = build_rollout_batch(rows, config=config)
+    with th.no_grad():
+        old_outputs = network(features)
+        old_log_probs, _old_entropy = _select_outputs(old_outputs, bootstrap)
+    rollout = build_rollout_batch(
+        rows, config=config,
+        value_estimates=old_outputs["value"].detach().tolist(),
+        old_log_probs=old_log_probs.detach().tolist(),
+    )
+    prior = _load_prior_network(prior_checkpoint)
+    metrics: dict[str, float | int | bool] = {
+        "updates": 0,
+        "early_stopped": False,
+        "policy_loss": 0.0,
+        "value_loss": 0.0,
+        "entropy": 0.0,
+        "approx_kl": 0.0,
+        "kl_to_prior": 0.0,
+        "prior_cross_entropy": 0.0,
+        "loss": 0.0,
+    }
+    size = max(1, int(batch_size or len(rows)))
+    for epoch in range(config.ppo_epochs):
+        for indices in epoch_minibatches(count=len(rows), batch_size=size, seed=seed, epoch=epoch):
+            mini_features = [features[index] for index in indices]
+            mini = RolloutBatch(
+                transitions=[rollout.transitions[index] for index in indices],
+                rewards=[rollout.rewards[index] for index in indices],
+                dones=[rollout.dones[index] for index in indices],
+                values=[rollout.values[index] for index in indices],
+                old_log_probs=[rollout.old_log_probs[index] for index in indices],
+                advantages=[rollout.advantages[index] for index in indices],
+                returns=[rollout.returns[index] for index in indices],
+                worker=WorkerLabels(
+                    [rollout.worker.act[index] for index in indices],
+                    [rollout.worker.target[index] for index in indices],
+                    [rollout.worker.kind[index] for index in indices],
+                ),
+                market_items=[rollout.market_items[index] for index in indices],
+                market_quantities=[rollout.market_quantities[index] for index in indices],
+            )
+            outputs = network(mini_features)
+            log_probs, entropy = _select_outputs(outputs, mini)
+            old_log = th.tensor(mini.old_log_probs, dtype=th.float32)
+            advantages = th.tensor(mini.advantages, dtype=th.float32)
+            returns = th.tensor(mini.returns, dtype=th.float32)
+            old_values = th.tensor(mini.values, dtype=th.float32)
+            ratio = (log_probs - old_log).exp()
+            policy_loss = -th.minimum(
+                ratio * advantages,
+                th.clamp(ratio, 1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon) * advantages,
+            ).mean()
+            clipped_values = old_values + th.clamp(
+                outputs["value"] - old_values, -config.clip_epsilon, config.clip_epsilon,
+            )
+            value_loss = th.maximum((outputs["value"] - returns) ** 2, (clipped_values - returns) ** 2).mean()
+            prior_outputs = prior(mini_features) if prior is not None else None
+            kl_to_prior, prior_ce = _distribution_regularization(outputs, prior_outputs)
+            loss = (
+                policy_loss
+                + config.value_coef * value_loss
+                - config.entropy_coef * entropy
+                + config.kl_coef * kl_to_prior
+                + config.prior_ce_coef * prior_ce
+            )
+            approx = (old_log - log_probs).mean().detach()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            metrics.update({
+                "updates": int(metrics["updates"]) + 1,
+                "policy_loss": float(policy_loss.detach()),
+                "value_loss": float(value_loss.detach()),
+                "entropy": float(entropy.detach()),
+                "approx_kl": float(approx),
+                "kl_to_prior": float(kl_to_prior.detach()),
+                "prior_cross_entropy": float(prior_ce.detach()),
+                "loss": float(loss.detach()),
+            })
+            if float(approx) > config.target_kl:
+                metrics["early_stopped"] = True
+                return metrics
+    return metrics
+
+
 def _checkpoint_metadata(transition_count: int, config: PPOConfig | None = None) -> dict[str, Any]:
     return {
         "model_version": MODEL_VERSION,
@@ -264,9 +630,10 @@ def _checkpoint_metadata(transition_count: int, config: PPOConfig | None = None)
 
 def train_behavior_clone(
     *, input_path: str | Path, output_path: str | Path, steps: int,
-    batch_size: int, seed: int = 0,
+    batch_size: int, seed: int = 0, ppo_steps: int = 0,
+    prior_checkpoint: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Run deterministic smoke behavior cloning and write a PyTorch checkpoint."""
+    """Run complete behavior-cloning epochs, optional PPO, and checkpoint."""
     th = require_torch()
     set_training_seed(seed)
     transitions = _read_transitions(input_path)
@@ -274,35 +641,66 @@ def train_behavior_clone(
     actions = [transition.get("action", {}) if isinstance(transition.get("action"), dict) else {} for transition in transitions]
     network = CompactPolicyNet()
     optimizer = th.optim.AdamW(network.parameters(), lr=1e-3)
-    generator = th.Generator().manual_seed(int(seed))
     batch_size = max(1, int(batch_size))
-    steps = max(1, int(steps))
-    for _step in range(steps):
-        permutation = th.randperm(len(features), generator=generator)[:min(batch_size, len(features))].tolist()
-        batch_features = [features[index] for index in permutation]
-        batch_actions = [actions[index] for index in permutation]
-        outputs = network(batch_features)
-        act, target, kind = zip(*(_worker_labels(action) for action in batch_actions))
-        market_items, market_quantities = zip(*(_market_labels(action) for action in batch_actions))
-        act_target = th.tensor(act, dtype=th.long)
-        target_target = th.tensor(target, dtype=th.long)
-        kind_target = th.tensor(kind, dtype=th.long)
-        item_target = th.tensor(market_items, dtype=th.long)
-        quantity_target = th.tensor(market_quantities, dtype=th.long)
-        loss = (
-            th.nn.functional.cross_entropy(outputs["worker_act_logits"].reshape(-1, 2), act_target.reshape(-1))
-            + th.nn.functional.cross_entropy(outputs["worker_target_logits"].reshape(-1, 100), target_target.reshape(-1))
-            + th.nn.functional.cross_entropy(
-                outputs["worker_kind_logits"].reshape(-1, len(ACTION_VOCAB["worker_kinds"])),
-                kind_target.reshape(-1),
+    epochs = max(1, int(steps))
+    bc_updates = 0
+    for epoch in range(epochs):
+        for permutation in epoch_minibatches(
+            count=len(features), batch_size=batch_size, seed=int(seed), epoch=epoch,
+        ):
+            batch_features = [features[index] for index in permutation]
+            batch_actions = [actions[index] for index in permutation]
+            batch_observations = [
+                transitions[index].get("observation", {})
+                if isinstance(transitions[index].get("observation", {}), dict) else {}
+                for index in permutation
+            ]
+            outputs = network(batch_features)
+            labels = [
+                worker_labels(action, observation)
+                for action, observation in zip(batch_actions, batch_observations)
+            ]
+            act_target = th.tensor([label.act for label in labels], dtype=th.long)
+            target_target = th.tensor([label.target for label in labels], dtype=th.long)
+            kind_target = th.tensor([label.kind for label in labels], dtype=th.long)
+            market_items, market_quantities = zip(*(_market_labels(action) for action in batch_actions))
+            item_target = th.tensor(market_items, dtype=th.long)
+            quantity_target = th.tensor(market_quantities, dtype=th.long)
+            loss = (
+                th.nn.functional.cross_entropy(outputs["worker_act_logits"].reshape(-1, 2), act_target.reshape(-1))
+                + th.nn.functional.cross_entropy(outputs["worker_target_logits"].reshape(-1, 100), target_target.reshape(-1))
+                + th.nn.functional.cross_entropy(
+                    outputs["worker_kind_logits"].reshape(-1, len(ACTION_VOCAB["worker_kinds"])),
+                    kind_target.reshape(-1),
+                )
+                + th.nn.functional.cross_entropy(outputs["market_item_logits"], item_target)
+                + th.nn.functional.cross_entropy(outputs["market_quantity_logits"], quantity_target)
             )
-            + th.nn.functional.cross_entropy(outputs["market_item_logits"], item_target)
-            + th.nn.functional.cross_entropy(outputs["market_quantity_logits"], quantity_target)
-        )
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            bc_updates += 1
+    ppo_metrics = None
+    if ppo_steps:
+        config = PPOConfig()
+        for step in range(max(0, int(ppo_steps))):
+            rollout = transitions[:config.rollout_steps]
+            ppo_metrics = ppo_update(
+                network,
+                optimizer,
+                rollout,
+                config=config,
+                batch_size=batch_size,
+                seed=int(seed) + step,
+                prior_checkpoint=prior_checkpoint,
+            )
+            if ppo_metrics.get("early_stopped"):
+                break
     metadata = _checkpoint_metadata(len(transitions))
+    metadata["behavior_clone_epochs"] = epochs
+    metadata["behavior_clone_updates"] = bc_updates
+    metadata["ppo_updates"] = 0 if ppo_metrics is None else ppo_metrics["updates"]
+    metadata["ppo_metrics"] = ppo_metrics
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     th.save({"metadata": metadata, "model_state_dict": network.state_dict()}, destination)
@@ -326,6 +724,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", type=_positive_int, default=1)
     parser.add_argument("--batch-size", type=_positive_int, default=32)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--ppo-steps", type=int, default=0)
+    parser.add_argument("--prior-checkpoint", type=Path, default=None)
     return parser
 
 
@@ -338,6 +738,8 @@ def main(argv: list[str] | None = None) -> int:
             steps=args.steps,
             batch_size=args.batch_size,
             seed=args.seed,
+            ppo_steps=args.ppo_steps,
+            prior_checkpoint=args.prior_checkpoint,
         )
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)

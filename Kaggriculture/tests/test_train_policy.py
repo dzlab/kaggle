@@ -7,7 +7,10 @@ from kagriculture_agent.constants import ENGINE_VERSION
 from kagriculture_agent.features import FEATURE_SCHEMA_VERSION
 
 
-def _transition(final_bank=1200, opponent_final_bank=900, reward=0.0, done=False):
+def _transition(
+    final_bank=1200, opponent_final_bank=900, reward=0.0, done=False,
+    farmer=None, hands=None,
+):
     return {
         "observation": {
             "day": 1,
@@ -19,7 +22,11 @@ def _transition(final_bank=1200, opponent_final_bank=900, reward=0.0, done=False
             },
             "private": {"shed": {"WHEAT": 4}},
         },
-        "action": {"farmer": ["EAST"], "hands": [], "market": [["BUY_SEED", "WHEAT", 1]]},
+        "action": {
+            "farmer": farmer or ["EAST"],
+            "hands": [] if hands is None else hands,
+            "market": [["BUY_SEED", "WHEAT", 1]],
+        },
         "next_observation": {},
         "done": done,
         "reward": reward,
@@ -110,6 +117,103 @@ def test_generalized_advantage_estimate_uses_terminal_rewards_and_dones():
     assert len(advantages) == len(returns) == 2
 
 
+def test_rollout_batch_uses_terminal_bank_reward_and_normalized_advantages():
+    from scripts.train_policy import PPOConfig, build_rollout_batch
+
+    transitions = [
+        _transition(done=False, reward=99.0),
+        _transition(done=True, final_bank=1200, opponent_final_bank=900),
+    ]
+
+    batch = build_rollout_batch(
+        transitions,
+        config=PPOConfig(),
+        value_estimates=[0.1, 0.2],
+        old_log_probs=[-0.3, -0.4],
+    )
+
+    assert batch.rewards == [0.0, pytest.approx(math.tanh(0.3))]
+    assert batch.returns[-1] == pytest.approx(math.tanh(0.3))
+    assert sum(batch.advantages) == pytest.approx(0.0)
+    assert math.sqrt(sum(value * value for value in batch.advantages) / len(batch.advantages)) == pytest.approx(1.0)
+    assert batch.old_log_probs == [-0.3, -0.4]
+
+
+def test_worker_target_labels_derive_from_action_and_observation_positions():
+    from scripts.train_policy import worker_labels
+
+    state = _transition(farmer=["EAST"])["observation"]
+    state["farm"]["workers"] = [
+        {"index": 0, "role": "FARMER", "position": {"x": 0, "y": 0}},
+        {"index": 1, "role": "WORKER", "position": {"x": 5, "y": 5}},
+    ]
+
+    labels = worker_labels({"farmer": ["EAST"], "hands": [["WATER"]]}, state)
+
+    assert labels.target[0] == 1
+    assert labels.target[1] == 55
+    assert labels.target[:2] != [0, 0]
+
+
+def test_behavior_clone_epoch_minibatches_cover_all_transitions_once_per_epoch():
+    from scripts.train_policy import epoch_minibatches
+
+    batches = epoch_minibatches(count=5, batch_size=2, seed=7, epoch=0)
+
+    assert sorted(index for batch in batches for index in batch) == [0, 1, 2, 3, 4]
+    assert all(1 <= len(batch) <= 2 for batch in batches)
+    assert batches == epoch_minibatches(count=5, batch_size=2, seed=7, epoch=0)
+    assert batches != epoch_minibatches(count=5, batch_size=2, seed=7, epoch=1)
+
+
+def test_ppo_update_requires_torch_but_is_import_safe():
+    from scripts.train_policy import PPOConfig, ppo_update
+
+    pytest.importorskip("torch")
+    from kagriculture_agent.model import CompactPolicyNet
+
+    torch = pytest.importorskip("torch")
+    network = CompactPolicyNet()
+    optimizer = torch.optim.AdamW(network.parameters(), lr=1e-3)
+    metrics = ppo_update(
+        network,
+        optimizer,
+        [_transition(done=False), _transition(done=True)],
+        config=PPOConfig(target_kl=100.0),
+    )
+
+    assert metrics["updates"] >= 1
+    assert "policy_loss" in metrics
+    assert "value_loss" in metrics
+    assert "entropy" in metrics
+    assert "kl_to_prior" in metrics
+    assert "prior_cross_entropy" in metrics
+
+
+def test_ppo_update_loads_prior_checkpoint_regularization(tmp_path):
+    pytest.importorskip("torch")
+    import torch
+    from kagriculture_agent.model import CompactPolicyNet
+    from scripts.train_policy import PPOConfig, ppo_update
+
+    prior = CompactPolicyNet()
+    prior_path = tmp_path / "prior.pt"
+    torch.save({"model_state_dict": prior.state_dict()}, prior_path)
+    network = CompactPolicyNet()
+    optimizer = torch.optim.AdamW(network.parameters(), lr=1e-3)
+
+    metrics = ppo_update(
+        network,
+        optimizer,
+        [_transition(done=False), _transition(done=True)],
+        config=PPOConfig(target_kl=100.0),
+        prior_checkpoint=prior_path,
+    )
+
+    assert metrics["kl_to_prior"] >= 0.0
+    assert metrics["prior_cross_entropy"] > 0.0
+
+
 def test_opponent_pool_probabilities_and_checkpoint_sampling_are_deterministic():
     from scripts.train_policy import OpponentPool
 
@@ -131,11 +235,38 @@ def test_opponent_pool_probabilities_and_checkpoint_sampling_are_deterministic()
     assert {match.seat for match in first[:2]} == {0, 1}
 
 
-def test_promotion_requires_strictly_more_than_seventy_percent():
-    from scripts.train_policy import should_promote
+def test_opponent_pool_schedule_uses_requested_probabilities_and_uniform_checkpoints():
+    from collections import Counter
 
-    assert should_promote(wins=71, games=100)
-    assert not should_promote(wins=70, games=100)
+    from scripts.train_policy import OpponentPool
+
+    pool = OpponentPool(previous_checkpoints=[f"ckpt-{index}" for index in range(7)])
+    schedule = pool.schedule(count=100, seed=11)
+    opponent_counts = Counter(match.opponent for match in schedule)
+    checkpoint_counts = Counter(match.checkpoint for match in schedule if match.checkpoint)
+
+    assert opponent_counts == {
+        "current": 40,
+        "mixed": 15,
+        "random": 10,
+        "starter": 10,
+        "checkpoint": 25,
+    }
+    assert set(checkpoint_counts) == set(pool.checkpoint_candidates)
+    assert set(checkpoint_counts.values()) == {5}
+    assert [match.seat for match in schedule[:8]] == [0, 1, 0, 1, 0, 1, 0, 1]
+    assert schedule == pool.schedule(count=100, seed=11)
+
+
+def test_promotion_requires_strictly_more_than_seventy_percent():
+    from scripts.train_policy import PROMOTION_MATCH_SIZE, should_promote
+
+    assert PROMOTION_MATCH_SIZE == 100
+    assert should_promote(wins=71, games=PROMOTION_MATCH_SIZE)
+    assert not should_promote(wins=70, games=PROMOTION_MATCH_SIZE)
+    assert not should_promote(wins=1, games=1)
+    assert not should_promote(wins=72, games=99)
+    assert not should_promote(wins=72, games=101)
     assert not should_promote(wins=0, games=0)
 
 
@@ -162,3 +293,6 @@ def test_behavior_cloning_smoke_writes_checkpoint_metadata(tmp_path):
     assert metadata["engine_version"] == ENGINE_VERSION
     assert "action_vocab" in metadata
     assert metadata["transition_count"] == 2
+    assert metadata["behavior_clone_epochs"] == 1
+    assert metadata["behavior_clone_updates"] == 1
+    assert metadata["ppo_updates"] == 0
