@@ -102,6 +102,7 @@ def test_rollout_metrics_report_required_units():
                 "workers": 4,
                 "environment_steps_per_minute": 100_000.0,
                 "policy_inference_ms_per_turn": 9.99,
+                "policy_inference_p95_ms": 9.99,
             },
             True,
         ),
@@ -110,6 +111,7 @@ def test_rollout_metrics_report_required_units():
                 "workers": 4,
                 "environment_steps_per_minute": 99_999.0,
                 "policy_inference_ms_per_turn": 1.0,
+                "policy_inference_p95_ms": 1.0,
             },
             False,
         ),
@@ -117,7 +119,8 @@ def test_rollout_metrics_report_required_units():
             {
                 "workers": 4,
                 "environment_steps_per_minute": 150_000.0,
-                "policy_inference_ms_per_turn": 10.0,
+                "policy_inference_ms_per_turn": 1.0,
+                "policy_inference_p95_ms": 10.0,
             },
             False,
         ),
@@ -126,6 +129,7 @@ def test_rollout_metrics_report_required_units():
                 "workers": 2,
                 "environment_steps_per_minute": 150_000.0,
                 "policy_inference_ms_per_turn": 1.0,
+                "policy_inference_p95_ms": 1.0,
             },
             False,
         ),
@@ -195,8 +199,9 @@ def test_json_report_includes_gate_status(tmp_path):
 
     assert report["gate"]["real_engine_kept"] is True
     assert report["gate"]["throughput_steps_per_minute_threshold"] == 100_000
-    assert report["gate"]["inference_ms_per_turn_threshold"] == 10.0
+    assert report["gate"]["inference_p95_ms_threshold"] == 10.0
     assert [result["workers"] for result in report["results"]] == [1, 4]
+    assert report["results"][1]["policy_inference_ms_per_turn"] == pytest.approx(2.0)
     json.dumps(report, allow_nan=False, sort_keys=True)
 
 

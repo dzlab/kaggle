@@ -22,7 +22,7 @@ from kagriculture_agent.policy import Policy
 from scripts.collect_trajectories import DEFAULT_GAME_TIMEOUT_SECONDS, _run_game_isolated
 
 MIN_REAL_ENGINE_STEPS_PER_MINUTE = 100_000
-MAX_POLICY_INFERENCE_MS_PER_TURN = 10.0
+MAX_POLICY_INFERENCE_P95_MS = 10.0
 DEFAULT_OPPONENT = "current"
 
 
@@ -166,7 +166,7 @@ def real_engine_gate_passed(results: Sequence[Mapping[str, Any]]) -> bool:
             continue
         return (
             float(result.get("environment_steps_per_minute", 0.0)) >= MIN_REAL_ENGINE_STEPS_PER_MINUTE
-            and float(result.get("policy_inference_ms_per_turn", float("inf"))) < MAX_POLICY_INFERENCE_MS_PER_TURN
+            and float(result.get("policy_inference_p95_ms", float("inf"))) < MAX_POLICY_INFERENCE_P95_MS
         )
     return False
 
@@ -301,7 +301,7 @@ def run_benchmark(
             "gate": {
                 "four_worker_result_present": any(result.get("workers") == 4 for result in results),
                 "throughput_steps_per_minute_threshold": MIN_REAL_ENGINE_STEPS_PER_MINUTE,
-                "inference_ms_per_turn_threshold": MAX_POLICY_INFERENCE_MS_PER_TURN,
+                "inference_p95_ms_threshold": MAX_POLICY_INFERENCE_P95_MS,
                 "real_engine_kept": keep_real_engine,
                 "simulator_required": not keep_real_engine,
             },
