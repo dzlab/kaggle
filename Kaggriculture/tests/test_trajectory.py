@@ -1,5 +1,6 @@
 import json
 import math
+import subprocess
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -111,6 +112,51 @@ def test_collect_rejects_non_integer_or_invalid_seat_types_before_coercion(tmp_p
         collect(seeds=[0], opponents=["pass"], seats=[bad_seat], steps=4, output=tmp_path / "bad.jsonl")
 
 
+@pytest.mark.parametrize("bad_opponent", [True, 1, 0.0, None, b"pass"])
+def test_collect_rejects_non_string_opponents_before_coercion(tmp_path, bad_opponent):
+    from scripts.collect_trajectories import collect
+
+    with pytest.raises(ValueError, match="opponents"):
+        collect(seeds=[0], opponents=[bad_opponent], seats=[0], steps=4, output=tmp_path / "bad.jsonl")
+
+
+def test_isolated_game_timeout_becomes_diagnostic_runtime_error(monkeypatch, tmp_path):
+    from scripts import collect_trajectories
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(kwargs.get("args", args[0] if args else "run_local.py"), 0.25)
+
+    monkeypatch.setattr(collect_trajectories.subprocess, "run", timeout)
+
+    with pytest.raises(RuntimeError, match="timed out.*opponent=pass.*seed=3.*seat=1"):
+        collect_trajectories._run_game_isolated(
+            opponent="pass", seed=3, steps=4, candidate_player=1,
+            replay_path=tmp_path / "replay.json", timeout=0.25,
+        )
+
+
+def test_collection_timeout_cleans_temp_files_and_preserves_existing_pair(tmp_path, monkeypatch):
+    from scripts import collect_trajectories
+
+    output = tmp_path / "timeout.jsonl"
+    manifest_path = output.with_suffix(".manifest.json")
+    output.write_text("old-transition\n")
+    manifest_path.write_text("old-manifest\n")
+
+    def fail(*, opponent, seed, steps, candidate_player, replay_path, timeout):
+        raise RuntimeError("timed out: opponent=pass seed=0 seat=0")
+
+    monkeypatch.setattr(collect_trajectories, "_run_game_isolated", fail)
+    with pytest.raises(RuntimeError, match="timed out"):
+        collect_trajectories.collect(
+            seeds=[0], opponents=["pass"], seats=[0], steps=4, output=output,
+        )
+
+    assert output.read_text() == "old-transition\n"
+    assert manifest_path.read_text() == "old-manifest\n"
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
 def test_transition_serialization_is_deterministic_and_json_compatible(tmp_path):
     from kagriculture_agent.trajectory import transitions_from_replay
@@ -199,7 +245,7 @@ def test_collector_emits_default_length_trajectory_and_manifest(tmp_path):
 def test_collector_writes_valid_transition_lines_and_manifest(tmp_path, monkeypatch):
     from scripts import collect_trajectories
 
-    def fake_isolated_game(*, opponent, seed, steps, candidate_player, replay_path):
+    def fake_isolated_game(*, opponent, seed, steps, candidate_player, replay_path, timeout):
         run_episode(
             opponent="pass", seed=seed, steps=4,
             candidate_player=candidate_player, replay_path=replay_path,
@@ -229,7 +275,7 @@ def test_collector_writes_valid_transition_lines_and_manifest(tmp_path, monkeypa
 def test_collector_rejects_replay_relabelled_with_a_different_seed(tmp_path, monkeypatch):
     from scripts import collect_trajectories
 
-    def fake_isolated_game(*, opponent, seed, steps, candidate_player, replay_path):
+    def fake_isolated_game(*, opponent, seed, steps, candidate_player, replay_path, timeout):
         replay = _run_replay(tmp_path, steps=4)
         replay["info"]["seed"] = seed + 1
         return replay
