@@ -2,6 +2,76 @@ import json
 
 import pytest
 
+try:
+    from kaggle_environments import make
+except ModuleNotFoundError:
+    make = None
+
+
+def _simulator_parity_agent(obs):
+    step = obs.get("step", 0)
+    player = obs.get("player", 0)
+    farm = obs["farms"][player]
+    private = obs["private"]
+    hands = farm.get("hands", [])
+    farmer_action = ["PASS"]
+    hand_actions = [["PASS"] for _ in hands]
+    market = []
+
+    if step == 0:
+        market = [
+            ["HIRE"],
+            ["BUY_LAND"],
+            ["BUY_SEED", "WHEAT", 2],
+            ["BUY_PRODUCT", "WHEAT", 2],
+            ["BUY_ANIMAL", "GOOSE", 1],
+            ["SELL", "WHEAT", 1],
+        ]
+    elif step == 1:
+        farmer_action = ["PLANT", "WHEAT"]
+        hand_actions = [["PLANT", "WHEAT"] for _ in hands]
+    elif step == 2:
+        farmer_action = ["WATER"]
+        hand_actions = [["EAST"] for _ in hands]
+    elif step == 3:
+        hand_actions = [["PLACE", "WHEAT", 1] for _ in hands]
+    elif step == 23:
+        farmer_action = ["PASS"]
+    elif step == 24:
+        assert hands == []
+        market = [["SELL", "WHEAT", private["shed"].get("WHEAT", 0)]]
+    elif step == 49:
+        farmer_action = ["HARVEST"]
+
+    return {"farmer": farmer_action, "hands": hand_actions, "market": market}
+
+
+def _public_parity_snapshot(player_state):
+    observation = player_state["observation"]
+    return {
+        "step": observation.get("step"),
+        "day": observation["day"],
+        "hour": observation["hour"],
+        "farms": observation["farms"],
+        "market": observation["market"],
+        "town": observation["town"],
+        "status": player_state["status"],
+        "reward": player_state["reward"],
+    }
+
+
+def _private_parity_snapshot(player_state):
+    observation = player_state["observation"]
+    farm = observation["farms"][observation["player"]]
+    return {
+        "private": observation["private"],
+        "cash": farm["money"],
+        "farmer": farm["farmer"],
+        "hands": farm["hands"],
+        "status": player_state["status"],
+        "reward": player_state["reward"],
+    }
+
 
 def test_rollout_metrics_report_required_units():
     from scripts.benchmark_rollouts import summarize_run
@@ -137,3 +207,48 @@ def test_parser_rejects_non_positive_or_duplicate_counts(argv):
     parser = _parser()
     with pytest.raises(SystemExit):
         parser.parse_args(argv)
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_simulator_replays_recorded_actions_with_real_engine_parity_for_required_seeds():
+    from kagriculture_agent.simulator import (
+        REQUIRED_PARITY_SEEDS,
+        KaggricultureSimulator,
+        recorded_actions_from_replay,
+        simulator_parity_status,
+    )
+
+    mismatches = []
+    for seed in REQUIRED_PARITY_SEEDS:
+        configuration = {"episodeSteps": 72, "seed": seed, "weedSpawnChance": 0.2}
+        real_env = make("kaggriculture", configuration=configuration)
+        real_env.run([_simulator_parity_agent, _simulator_parity_agent])
+        real_replay = real_env.toJSON()
+
+        simulator = KaggricultureSimulator(configuration=configuration, seed=seed)
+        simulated_replay = simulator.replay(recorded_actions_from_replay(real_replay))
+
+        assert simulated_replay["configuration"] == real_replay["configuration"]
+        assert simulated_replay["info"]["seed"] == real_replay["info"]["seed"] == seed
+        assert simulated_replay["statuses"] == real_replay["statuses"] == ["DONE", "DONE"]
+        assert simulated_replay["rewards"] == real_replay["rewards"]
+
+        for step, (real_turn, simulated_turn) in enumerate(zip(real_replay["steps"], simulated_replay["steps"])):
+            for player in (0, 1):
+                if _public_parity_snapshot(simulated_turn[player]) != _public_parity_snapshot(real_turn[player]):
+                    mismatches.append((seed, step, player, "public"))
+                if _private_parity_snapshot(simulated_turn[player]) != _private_parity_snapshot(real_turn[player]):
+                    mismatches.append((seed, step, player, "private"))
+
+    assert mismatches == []
+    assert simulator_parity_status({seed: True for seed in REQUIRED_PARITY_SEEDS})["promotion_ready"] is True
+
+
+def test_simulator_readiness_gate_requires_all_ten_passing_parity_seeds():
+    from kagriculture_agent.simulator import REQUIRED_PARITY_SEEDS, simulator_parity_status
+
+    assert simulator_parity_status({seed: True for seed in REQUIRED_PARITY_SEEDS[:-1]})["promotion_ready"] is False
+    assert simulator_parity_status({seed: True for seed in REQUIRED_PARITY_SEEDS[:-1]})["missing_seeds"] == [9]
+    failed_results = {seed: True for seed in REQUIRED_PARITY_SEEDS[:-1]}
+    failed_results[9] = False
+    assert simulator_parity_status(failed_results)["promotion_ready"] is False
