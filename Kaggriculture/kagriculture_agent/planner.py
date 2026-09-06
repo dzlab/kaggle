@@ -733,6 +733,22 @@ def _has_basic_need_deadline(state: Any, day: int | None = None,
     )
 
 
+def due_basic_need_tasks(state: Any, day: int | None = None,
+                         strategy: StrategySpec | None = None) -> list[Task]:
+    """Return due WATER/FEED tasks from the current normalized observation."""
+    raw_state = _mapping(state)
+    if "farm" not in raw_state and "farms" in raw_state:
+        state = parse_observation(state)
+    normalized = normalize_planner_state(state)
+    current_day = _day(normalized, EpisodeMemory()) if day is None else day
+    return [
+        task for task in build_daily_plan(normalized, EpisodeMemory(), strategy)
+        if task.kind in {"WATER", "FEED"}
+        and task.deadline is not None
+        and task.deadline <= current_day
+    ]
+
+
 def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
                                 strategy: StrategySpec | None = None) -> dict[str, Any]:
     """Choose a live portfolio and executable macro intents from observations.

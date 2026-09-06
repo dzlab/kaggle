@@ -8,9 +8,10 @@ from typing import Any
 
 from .constants import ANIMALS, CROPS, LAND_PRICES, PRODUCTS, max_market_orders, season_days, shed_capacity as DEFAULT_SHED_CAPACITY
 from .economics import feed_reserve, market_price, market_regime
-from .memory import PolicyMemory
+from .memory import PolicyMemory, market_order_allowed
 from .observation import is_shed_adjacent, parse_observation as _parse_observation, shed_access_tiles
 from .planner import (
+    _feed_purchase_needed,
     _fits_same_day_deadline,
     _feed_animal_counts,
     _is_live_owned_placed_animal,
@@ -18,6 +19,7 @@ from .planner import (
     assign_tasks,
     build_autonomous_macro_plan,
     build_daily_plan,
+    due_basic_need_tasks,
     normalize_planner_state,
 )
 from .routing import is_locked_tile, normalize_position, next_move
@@ -864,6 +866,19 @@ def _remove_pickup_sale_conflicts(market: Sequence[Sequence[Any]], commands: Map
     )]
 
 
+def _market_order_direction(order: Any) -> tuple[str, str] | None:
+    if not isinstance(order, Sequence) or isinstance(order, (str, bytes)) or len(order) < 2:
+        return None
+    try:
+        kind = str(order[0]).strip().upper()
+        item = str(order[1]).strip().upper()
+    except Exception:
+        return None
+    if kind not in {"BUY_PRODUCT", "SELL"} or not item:
+        return None
+    return item, kind
+
+
 def worker_action(worker_index: int, state: Any, assignment: WorkerAssignment | Task | None) -> list[Any]:
     """Emit one safe command for a worker, falling back to ``PASS``."""
     if assignment is None:
@@ -990,6 +1005,10 @@ class Policy:
         protected = []
         for assignment in self.memory.assignments:
             kind = str(_get(assignment.task, "kind", "")).upper()
+            if kind == "WATER":
+                if _assignment_valid(state, assignment):
+                    protected.append(assignment)
+                continue
             if kind not in {"FEED", "FERTILIZE", "ANIMAL", "PLACE"}:
                 continue
             required = _required_worker_item(assignment.task, state)
@@ -1052,6 +1071,115 @@ class Policy:
         if kind == "FEED":
             return kind, target
         return kind, target, str(_get(task, "item", "") or "").upper()
+
+    def _basic_need_guard(self, state: Mapping[str, Any], market: Sequence[Sequence[Any]],
+                          assignments: Sequence[WorkerAssignment],
+                          strategy: StrategySpec | None) -> list[list[Any]]:
+        """Preserve feed solvency and due basic-need assignments."""
+        normalized = _state_for_planner(state)
+        day = _whole(_get(normalized, "day"))
+        live_counts = _animals(normalized)
+        reserve_wheat = strategy.reserve_wheat if strategy is not None and live_counts else 0
+        wheat_price = _buy_product_quote("WHEAT", normalized)
+        due_tasks = due_basic_need_tasks(normalized, day, strategy)
+        due_assignments_valid = all(
+            any(
+                self._task_identity(assignment.task) == self._task_identity(task)
+                and _assignment_valid(normalized, assignment)
+                for assignment in assignments
+            )
+            for task in due_tasks
+        )
+        accepted: list[list[Any]] = []
+        purchase_intents: list[list[Any]] = []
+        sale_proceeds = sum(
+            _sale_proceeds(str(order[1]).upper(), _whole(order[2]), normalized)
+            for order in market
+            if self._market_order_kind(order) == "SELL"
+            and len(order) >= 3
+        )
+        required_wheat = 0
+        due_guard_blocked = bool(due_tasks) and not due_assignments_valid
+        guard_blocked = due_guard_blocked
+        for raw_order in market:
+            order = list(raw_order)
+            kind = self._market_order_kind(order)
+            if kind in {"BUY_PRODUCT", "BUY_SEED", "BUY_ANIMAL", "BUY_LAND", "HIRE"}:
+                candidate_intents = [*purchase_intents, order]
+                projected_counts = dict(live_counts)
+                for intent in candidate_intents:
+                    if self._market_order_kind(intent) != "BUY_ANIMAL" or len(intent) < 3:
+                        continue
+                    item = str(intent[1]).upper()
+                    projected_counts[item] = projected_counts.get(item, 0) + _whole(intent[2])
+                needed, cash_after = _feed_purchase_needed(
+                    normalized, day, projected_counts, candidate_intents,
+                    _cash(normalized) + sale_proceeds, wheat_price, reserve_wheat,
+                )
+                required_wheat = max(required_wheat, needed)
+                item = str(order[1]).upper() if len(order) >= 2 else ""
+                discretionary = (
+                    kind in {"BUY_LAND", "BUY_ANIMAL", "HIRE", "BUY_SEED"}
+                    or (kind == "BUY_PRODUCT" and item != "WHEAT")
+                )
+                # A wheat order is itself the basic-need purchase and remains
+                # available even when an already-due FEED task has no slot.
+                if discretionary and (due_guard_blocked or cash_after < 0):
+                    guard_blocked = True
+                    continue
+                purchase_intents.append(order)
+            accepted.append(order)
+        if not purchase_intents:
+            required_wheat, cash_after = _feed_purchase_needed(
+                normalized, day, live_counts, [], _cash(normalized) + sale_proceeds,
+                wheat_price, reserve_wheat,
+            )
+            guard_blocked = guard_blocked or cash_after < 0
+        self.memory.diagnostics["reserved_wheat"] = int(required_wheat)
+        self.memory.diagnostics["basic_need_guard"] = "blocked" if guard_blocked else "pass"
+        return accepted
+
+    @staticmethod
+    def _market_order_kind(order: Any) -> str:
+        if not isinstance(order, Sequence) or isinstance(order, (str, bytes)) or not order:
+            return ""
+        try:
+            return str(order[0]).strip().upper()
+        except Exception:
+            return ""
+
+    def _filter_market_direction(self, state: Mapping[str, Any], market: Sequence[Sequence[Any]],
+                                 strategy: StrategySpec | None) -> list[list[Any]]:
+        day = _whole(_get(state, "day"))
+        hour = _whole(_get(state, "hour"))
+        turn = day * 24 + hour
+        terminal = day >= season_days - 1 and hour >= _terminal_liquidation_hour(strategy)
+        filtered = []
+        current_directions: dict[str, str] = {}
+        for order in market:
+            direction = _market_order_direction(order)
+            if direction is not None and not market_order_allowed(
+                self.memory, item=direction[0], direction=direction[1],
+                turn=turn, terminal=terminal,
+            ):
+                continue
+            if direction is not None and not terminal:
+                item, order_direction = direction
+                if (item in current_directions
+                        and current_directions[item] != order_direction):
+                    continue
+                current_directions[item] = order_direction
+            filtered.append(list(order))
+        return filtered
+
+    def _record_market_direction(self, state: Mapping[str, Any], market: Sequence[Sequence[Any]]) -> None:
+        turn = _whole(_get(state, "day")) * 24 + _whole(_get(state, "hour"))
+        for order in market:
+            direction = _market_order_direction(order)
+            if direction is None:
+                continue
+            item, kind = direction
+            self.memory.market_history.setdefault(item, []).append((turn, kind))
 
     def act(self, obs: Any) -> dict[str, Any]:
         state = parse_observation(obs)
@@ -1129,7 +1257,10 @@ class Policy:
             if not terminal_cleanup or (final_liquidation_window and not _has_carried_goods(state))
             else []
         )
+        market = self._basic_need_guard(state, market, assignments, strategy_spec)
+        market = self._filter_market_direction(state, market, strategy_spec)
         market = _remove_pickup_sale_conflicts(market, commands)
+        self._record_market_direction(state, market)
         self.memory.sell_batches = [order for order in market if order[0] == "SELL"]
         return {"farmer": farmer, "hands": hands, "market": market}
 

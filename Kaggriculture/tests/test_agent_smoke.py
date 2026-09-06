@@ -38,6 +38,22 @@ def test_candidate_policy_factory_rejects_unknown_name():
 
     with pytest.raises(ValueError, match="unsupported candidate"):
         candidate_policy("unknown")
+
+
+def test_candidate_policy_memory_does_not_carry_market_direction_across_episodes():
+    from kagriculture_agent.memory import market_order_allowed
+
+    policy = __import__("kagriculture_agent.policy", fromlist=["Policy"]).Policy()
+    policy.memory.market_history["MELON"] = [(8, "SELL")]
+
+    assert not market_order_allowed(
+        policy.memory, item="MELON", direction="BUY_PRODUCT", turn=9,
+    )
+    policy.memory.reset(reason="episode_start")
+
+    assert market_order_allowed(
+        policy.memory, item="MELON", direction="BUY_PRODUCT", turn=0,
+    )
 UNIT_NO_ARGUMENTS = {
     "NORTH", "SOUTH", "EAST", "WEST", "PASS", "DROP", "WATER", "HARVEST",
     "FERTILIZE", "BUILD_COOP", "BUILD_PASTURE", "FEED", "COLLECT_FERTILIZER",

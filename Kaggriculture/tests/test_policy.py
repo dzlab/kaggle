@@ -2087,6 +2087,102 @@ def test_policy_memory_reset_clears_selected_strategy():
     assert memory.selected_strategy is None
 
 
+def test_market_order_direction_memory_allows_repeats_and_terminal_liquidation():
+    from kagriculture_agent.memory import market_order_allowed
+
+    memory = policy_module.PolicyMemory()
+
+    assert market_order_allowed(memory, item=" wheat ", direction="buy_product", turn=1)
+    memory.market_history["WHEAT"] = [(1, "BUY_PRODUCT")]
+    assert market_order_allowed(memory, item="WHEAT", direction="BUY_PRODUCT", turn=2)
+    assert not market_order_allowed(memory, item="WHEAT", direction="SELL", turn=3)
+    assert market_order_allowed(memory, item="WHEAT", direction="SELL", turn=4)
+    assert market_order_allowed(
+        memory, item="WHEAT", direction="SELL", turn=3, terminal=True,
+    )
+
+
+def test_market_order_direction_memory_resets_between_episodes():
+    from kagriculture_agent.memory import market_order_allowed
+
+    memory = policy_module.PolicyMemory(market_history={"MELON": [(5, "SELL")]})
+
+    assert not market_order_allowed(memory, item="melon", direction="BUY_PRODUCT", turn=6)
+    memory.reset(reason="episode_start")
+
+    assert market_order_allowed(memory, item="melon", direction="BUY_PRODUCT", turn=0)
+    assert memory.market_history == {}
+
+
+def test_policy_rejects_second_opposite_market_direction_in_same_act(monkeypatch):
+    def fake_market_orders(state, plan, strategy=None):
+        return [["BUY_PRODUCT", "MELON", 1], ["SELL", "MELON", 1]]
+
+    monkeypatch.setattr(policy_module, "build_market_orders", fake_market_orders)
+
+    action = policy_module.Policy().act(observation(day=4, hour=1, shed={"MELON": 1}))
+
+    assert action["market"] == [["BUY_PRODUCT", "MELON", 1]]
+
+
+def _live_animal_solvency_observation(*, wheat: int, money: int = 1_200) -> dict:
+    board = [[None for _ in range(5)] for _ in range(5)]
+    board[0][0] = {
+        "kind": "COOP", "animal": {"species": "GOOSE", "fed_today": True,
+                                      "cared_today": True},
+    }
+    shed = {"CARROT": 99} if not wheat else {"WHEAT": wheat, "CARROT": 99 - wheat}
+    obs = observation(
+        day=4, hour=4, hands=[], tiles=board, shed=shed, seeds={},
+        inventories=[[]], money=money,
+    )
+    obs["market"] = {"prices": {"WHEAT": 50, "CARROT": 1}, "inventory": {}}
+    obs["market_intents"] = [["BUY_LAND"], ["HIRE"], ["BUY_ANIMAL", "GOOSE", 1]]
+    return obs
+
+
+def test_policy_basic_need_guard_omits_discretionary_purchases_without_wheat():
+    policy = policy_module.Policy(strategy="premium")
+
+    action = policy.act(_live_animal_solvency_observation(wheat=0))
+
+    assert not {order[0] for order in action["market"]} & {"BUY_LAND", "HIRE", "BUY_ANIMAL"}
+    assert policy.memory.diagnostics["reserved_wheat"] > 0
+    assert policy.memory.diagnostics["basic_need_guard"] == "blocked"
+
+
+def test_policy_basic_need_guard_keeps_purchase_when_wheat_is_sufficient():
+    policy = policy_module.Policy(strategy="premium")
+
+    action = policy.act(_live_animal_solvency_observation(wheat=50))
+
+    assert "BUY_LAND" in {order[0] for order in action["market"]}
+    assert policy.memory.diagnostics["reserved_wheat"] == 0
+    assert policy.memory.diagnostics["basic_need_guard"] == "pass"
+
+
+def test_policy_replanning_preserves_overdue_watering_assignment():
+    board = [[None for _ in range(5)] for _ in range(5)]
+    board[0][1] = {"kind": "PLANT", "crop": "WHEAT", "needs_water": True}
+    obs = observation(day=4, hour=2, hands=[], tiles=board, shed={}, seeds={}, inventories=[[]])
+    obs["market"]["prices"] = {"WHEAT": 10, "MELON": 250}
+    policy = policy_module.Policy()
+    assignment = WorkerAssignment(0, Task("WATER", Position(1, 0), 100, 4, 1))
+    policy.memory.assignments = [assignment]
+    policy.memory.last_day = 4
+    policy.memory.last_hour = 1
+    policy.memory.market_regime = {"WHEAT": "old"}
+
+    policy.act(obs)
+
+    assert any(
+        current.worker_index == 0
+        and current.task.kind == "WATER"
+        and current.task.target == Position(1, 0)
+        for current in policy.memory.assignments
+    )
+
+
 def test_opponent_signal_requires_three_consistent_observations():
     from kagriculture_agent.strategy import OpponentMarketSignal
 
