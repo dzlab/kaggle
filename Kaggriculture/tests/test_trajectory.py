@@ -81,6 +81,19 @@ def test_malformed_replay_raises_structured_value_error(tmp_path):
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_requested_seed_mismatch_is_rejected(tmp_path):
+    from kagriculture_agent.trajectory import ReplayValidationError, transitions_from_replay
+
+    replay = _run_replay(tmp_path, steps=4)
+
+    with pytest.raises(ReplayValidationError) as error:
+        transitions_from_replay(replay, candidate_player=0, requested_seed=18)
+
+    assert error.value.code == "seed_mismatch"
+    assert error.value.details == {"requested_seed": 18, "replay_seed": 17}
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
 def test_transition_serialization_is_deterministic_and_json_compatible(tmp_path):
     from kagriculture_agent.trajectory import transitions_from_replay
 
@@ -165,3 +178,24 @@ def test_collector_writes_valid_transition_lines_and_manifest(tmp_path, monkeypa
     assert manifest["transition_schema_version"] == 1
     assert manifest["source_policy_identity"] == "current"
     assert json.loads(output.with_suffix(".manifest.json").read_text()) == manifest
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_collector_rejects_replay_relabelled_with_a_different_seed(tmp_path, monkeypatch):
+    from scripts import collect_trajectories
+
+    def fake_isolated_game(*, opponent, seed, steps, candidate_player, replay_path):
+        replay = _run_replay(tmp_path, steps=4)
+        replay["info"]["seed"] = seed + 1
+        return replay
+
+    monkeypatch.setattr(collect_trajectories, "_run_game_isolated", fake_isolated_game)
+    output = tmp_path / "mismatched.jsonl"
+
+    with pytest.raises(ValueError, match="seed_mismatch"):
+        collect_trajectories.collect(
+            seeds=[17], opponents=["pass"], seats=[0], steps=4, output=output,
+        )
+
+    assert not output.exists()
+    assert not output.with_suffix(".manifest.json").exists()

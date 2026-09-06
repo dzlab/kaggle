@@ -132,7 +132,9 @@ def collect(
                         candidate_player=candidate_player,
                         replay_path=replay_path,
                     )
-                    transitions = transitions_from_replay(replay, candidate_player=candidate_player)
+                    transitions = transitions_from_replay(
+                        replay, candidate_player=candidate_player, requested_seed=seed,
+                    )
                     lines.extend(transition.to_json() for transition in transitions)
 
     destination.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")

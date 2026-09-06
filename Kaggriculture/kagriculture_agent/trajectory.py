@@ -62,7 +62,7 @@ def _failure(message: str, **details: Any) -> ReplayValidationError:
 
 
 def _validated_player_states(
-    replay: Mapping[str, Any], candidate_player: int,
+    replay: Mapping[str, Any], candidate_player: int, requested_seed: int | None,
 ) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]], Mapping[str, Any]]:
     if type(candidate_player) is not int or candidate_player not in (0, 1):
         raise ReplayValidationError(
@@ -82,7 +82,24 @@ def _validated_player_states(
     other_states = _player_states(replay, 1 - candidate_player)
     configuration = _mapping(replay.get("configuration"))
     info = _mapping(replay.get("info"))
-    expected_seed = info.get("seed") if type(info.get("seed")) is int else None
+    replay_seed = info.get("seed")
+    if requested_seed is not None:
+        if type(requested_seed) is not int:
+            raise ReplayValidationError(
+                "invalid_requested_seed",
+                "requested_seed must be an integer",
+                requested_seed=requested_seed,
+            )
+        if replay_seed != requested_seed:
+            raise ReplayValidationError(
+                "seed_mismatch",
+                "replay seed does not match requested seed",
+                requested_seed=requested_seed,
+                replay_seed=replay_seed,
+            )
+    expected_seed = requested_seed if requested_seed is not None else (
+        replay_seed if type(replay_seed) is int else None
+    )
     try:
         # Trajectory data may retain terminal goods for later analysis. Keep
         # every evaluator structural, action-schema, and transition-effect
@@ -130,7 +147,10 @@ def _validated_player_states(
     return own_states, other_states, configuration
 
 
-def transitions_from_replay(replay: Mapping[str, Any], candidate_player: int = 0) -> list[Transition]:
+def transitions_from_replay(
+    replay: Mapping[str, Any], candidate_player: int = 0, requested_seed: int | None = None,
+    *, expected_seed: int | None = None,
+) -> list[Transition]:
     """Convert a validated engine replay into candidate-player transitions.
 
     Kaggle stores the action chosen from state ``n`` on the state record at
@@ -139,7 +159,18 @@ def transitions_from_replay(replay: Mapping[str, Any], candidate_player: int = 0
     """
     if not isinstance(replay, Mapping):
         raise _failure("replay must be a JSON object", reason="invalid_replay_type")
-    own_states, other_states, _configuration = _validated_player_states(replay, candidate_player)
+    if requested_seed is not None and expected_seed is not None and requested_seed != expected_seed:
+        raise ReplayValidationError(
+            "conflicting_requested_seed",
+            "requested_seed and expected_seed must match",
+            requested_seed=requested_seed,
+            expected_seed=expected_seed,
+        )
+    if requested_seed is None:
+        requested_seed = expected_seed
+    own_states, other_states, _configuration = _validated_player_states(
+        replay, candidate_player, requested_seed,
+    )
 
     from scripts.evaluate import _final_bank
 
