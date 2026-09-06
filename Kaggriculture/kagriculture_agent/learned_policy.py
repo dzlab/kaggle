@@ -343,6 +343,12 @@ def _strategy_allows(state: Any, kind: str, item: str | None, target: Position |
     if strategy is None:
         return True
     from .planner import _task_allowed, normalize_planner_state
+    if kind == "FERTILIZE" and item is None:
+        from .policy import _crop
+
+        item = _crop(_tile_at(state, target)) if target is not None else None
+        if item is None:
+            return False
 
     task = Task(kind, target, 0, None, 0.0, item=item)
     if not _task_allowed(task, strategy, normalize_planner_state(state)):
@@ -469,7 +475,12 @@ def compile_proposal(state: Any, proposal: PolicyProposal, memory: PolicyMemory,
         target = normalize_position(candidate.target) or known[worker_index]["position"]
         if target is None:
             continue
-        task = Task(candidate.kind, target, int(max(0, _number(candidate.score))), None, max(0.0, _number(candidate.score)), item=candidate.item)
+        task_item = candidate.item
+        if candidate.kind == "FERTILIZE" and task_item is None:
+            from .policy import _crop
+
+            task_item = _crop(_tile_at(state, target))
+        task = Task(candidate.kind, target, int(max(0, _number(candidate.score))), None, max(0.0, _number(candidate.score)), item=task_item)
         by_worker[worker_index] = WorkerAssignment(
             worker_index, task, _route_positions(known[worker_index]["position"], target, board_size),
         )

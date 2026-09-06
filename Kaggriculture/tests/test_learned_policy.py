@@ -235,6 +235,32 @@ def test_melon_strategy_rejects_carrot_fertilization(monkeypatch):
     assert action["farmer"] == ["PASS"]
 
 
+def test_melon_strategy_rejects_itemless_carrot_fertilization(monkeypatch):
+    current = state(inventories=[{"FERTILIZER": 1}])
+    current["tiles"][0][1] = {"kind": "PLANT", "crop": "CARROT", "fertilized": False}
+    strategy = StrategySpec("melon", ("WHEAT", "MELON"), ("COW", "SHEEP"), 80, 9, 12)
+    monkeypatch.setattr(learned_policy_module, "_fallback_assignments", lambda *_args: [])
+    proposal = PolicyProposal((WorkerProposal(0, "FERTILIZE", Position(1, 0), None, 1),), (), 1, "v1")
+
+    action = compile_proposal(current, proposal, PolicyMemory(), strategy)
+
+    assert action["farmer"] == ["PASS"]
+
+
+def test_melon_strategy_keeps_itemless_melon_fertilization_eligible(monkeypatch):
+    current = state(inventories=[{"FERTILIZER": 1}])
+    current["tiles"][0][1] = {"kind": "PLANT", "crop": "MELON", "fertilized": False}
+    strategy = StrategySpec("melon", ("WHEAT", "MELON"), ("COW", "SHEEP"), 80, 9, 12)
+    monkeypatch.setattr(learned_policy_module, "_fallback_assignments", lambda *_args: [])
+    proposal = PolicyProposal((WorkerProposal(0, "FERTILIZE", Position(1, 0), None, 1),), (), 1, "v1")
+    memory = PolicyMemory()
+
+    action = compile_proposal(current, proposal, memory, strategy)
+
+    assert action["farmer"] == ["EAST"]
+    assert memory.assignments[0].task.item == "MELON"
+
+
 def test_melon_strategy_counts_only_allowed_crops_against_capacity(monkeypatch):
     current = state()
     current["tiles"][0][0] = {"kind": "PLANT", "crop": "CARROT"}
