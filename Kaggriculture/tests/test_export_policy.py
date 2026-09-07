@@ -35,14 +35,14 @@ def _artifact():
     weights = {}
     for name, shape in runtime.artifact_tensor_shapes().items():
         if len(shape) == 1:
-            weights[name] = {"shape": list(shape), "values": [0.0] * shape[0]}
+            weights[name] = {"shape": list(shape), "values": [((index % 9) - 4) * 0.001 for index in range(shape[0])]}
         else:
-            weights[name] = {"shape": list(shape), "scales": [1.0] * shape[0], "values": [[0] * shape[1] for _ in range(shape[0])]}
-    # Keep the latency fixture representative: every runtime path must execute
-    # the real dependency-free graph rather than an all-zero fast path.
-    weights["tile_projection.weight"]["values"][0][0] = 1
-    weights["worker_projection.weight"]["values"][0][0] = -1
-    weights["value_head.bias"]["values"][0] = 0.5
+            weights[name] = {
+                "shape": list(shape),
+                "scales": [0.01] * shape[0],
+                "values": [[((row * 13 + column * 7) % 255) - 127 for column in range(shape[1])]
+                           for row in range(shape[0])],
+            }
     artifact = {
         "format_version": 1,
         "model_version": "learned_v1",
