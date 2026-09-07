@@ -8,6 +8,10 @@ from kagriculture_agent.features import extract_features
 from kagriculture_agent.learned_policy import LearnedPolicy, load_exported_policy
 
 
+def pytest_configure(config):
+    config.addinivalue_line("markers", "performance: execute the 1000-state runtime gate")
+
+
 class _FakeTensor:
     def __init__(self, values, shape):
         self._values = values
@@ -34,6 +38,11 @@ def _artifact():
             weights[name] = {"shape": list(shape), "values": [0.0] * shape[0]}
         else:
             weights[name] = {"shape": list(shape), "scales": [1.0] * shape[0], "values": [[0] * shape[1] for _ in range(shape[0])]}
+    # Keep the latency fixture representative: every runtime path must execute
+    # the real dependency-free graph rather than an all-zero fast path.
+    weights["tile_projection.weight"]["values"][0][0] = 1
+    weights["worker_projection.weight"]["values"][0][0] = -1
+    weights["value_head.bias"]["values"][0] = 0.5
     artifact = {
         "format_version": 1,
         "model_version": "learned_v1",
@@ -193,6 +202,75 @@ def test_artifact_builder_regression_plumbs_validated_vocab_without_torch():
     assert len(artifact["checksum"]) == 64
 
 
+def test_build_artifact_validates_action_vocab_independently():
+    from scripts.export_policy import build_artifact
+    from kagriculture_agent.learned_policy import artifact_tensor_shapes
+
+    state = {}
+    for name, shape in artifact_tensor_shapes().items():
+        values = [0.0] * shape[0] if len(shape) == 1 else [[0.0] * shape[1] for _ in range(shape[0])]
+        state[name] = _FakeTensor(values, shape)
+    with pytest.raises(ValueError, match="action_vocab"):
+        build_artifact(state, {})
+
+
+def test_artifact_writer_rejects_symlink_destination_and_writes_atomically(tmp_path):
+    from scripts.export_policy import write_artifact
+
+    target = tmp_path / "target.json"
+    target.write_text("old", encoding="utf-8")
+    link = tmp_path / "artifact.json"
+    link.symlink_to(target)
+    with pytest.raises(ValueError, match="symlink"):
+        write_artifact(_artifact(), link)
+    assert target.read_text(encoding="utf-8") == "old"
+
+    destination = tmp_path / "new.json"
+    write_artifact(_artifact(), destination)
+    assert json.loads(destination.read_text(encoding="utf-8"))["format_version"] == 1
+    assert not list(tmp_path.glob(".new.json.*.tmp"))
+
+
+def test_checkpoint_loader_requires_weights_only_support():
+    from scripts.export_policy import _load_checkpoint_safely
+
+    class UnsafeTorch:
+        @staticmethod
+        def load(path, map_location=None):
+            return {}
+
+    with pytest.raises(RuntimeError, match="weights_only"):
+        _load_checkpoint_safely(UnsafeTorch, "checkpoint.pt")
+
+    calls = {}
+
+    class SafeTorch:
+        @staticmethod
+        def load(path, map_location=None, weights_only=False):
+            calls["weights_only"] = weights_only
+            return {}
+
+    assert _load_checkpoint_safely(SafeTorch, "checkpoint.pt") == {}
+    assert calls["weights_only"] is True
+
+
+def test_runtime_gelu_matches_torch_exact_default():
+    from kagriculture_agent.learned_policy import _gelu
+
+    assert _gelu(1.0) == pytest.approx(0.8413447460685429, abs=1e-12)
+    assert _gelu(-1.0) == pytest.approx(-0.15865525393145707, abs=1e-12)
+
+
+def test_export_cli_returns_clean_nonzero_error_without_traceback(tmp_path, capsys):
+    from scripts.export_policy import main
+
+    assert main([str(tmp_path / "missing.pt"), str(tmp_path / "policy.json")]) == 2
+    captured = capsys.readouterr()
+    assert "export failed:" in captured.err
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.performance
 def test_dependency_free_fixture_inference_is_fast_enough(tmp_path):
     path = tmp_path / "policy.json"
     path.write_text(json.dumps(_artifact()), encoding="utf-8")

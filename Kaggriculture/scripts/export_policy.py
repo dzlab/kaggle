@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import math
+import os
 import struct
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -103,6 +106,13 @@ def _strict_equal(actual: Any, expected: Any) -> bool:
     return actual == expected
 
 
+def validate_action_vocab(action_vocab: Any) -> dict[str, list[Any]]:
+    expected_vocab = {key: list(value) for key, value in ACTION_VOCAB.items()}
+    if not _strict_equal(action_vocab, expected_vocab):
+        raise ValueError("checkpoint action_vocab mismatch")
+    return expected_vocab
+
+
 def validate_checkpoint_metadata(metadata: Any) -> dict[str, list[Any]]:
     if not isinstance(metadata, dict):
         raise ValueError("checkpoint metadata is required")
@@ -116,10 +126,7 @@ def validate_checkpoint_metadata(metadata: Any) -> dict[str, list[Any]]:
     hidden_width = metadata.get("hidden_width", HIDDEN_WIDTH)
     if type(hidden_width) is not int or hidden_width != HIDDEN_WIDTH:
         raise ValueError(f"checkpoint hidden_width mismatch: expected {HIDDEN_WIDTH}, got {hidden_width!r}")
-    expected_vocab = {key: list(value) for key, value in ACTION_VOCAB.items()}
-    if not _strict_equal(metadata.get("action_vocab"), expected_vocab):
-        raise ValueError("checkpoint action_vocab mismatch")
-    return expected_vocab
+    return validate_action_vocab(metadata.get("action_vocab"))
 
 
 def validate_checkpoint_state_dict(state: Any) -> None:
@@ -140,6 +147,7 @@ def validate_checkpoint_state_dict(state: Any) -> None:
 def build_artifact(state: dict[str, Any], action_vocab: dict[str, list[Any]]) -> dict[str, Any]:
     """Build the serialized artifact after checkpoint validation."""
     validate_checkpoint_state_dict(state)
+    validated_vocab = validate_action_vocab(action_vocab)
     shapes = artifact_tensor_shapes()
     artifact: dict[str, Any] = {
         "format_version": FORMAT_VERSION,
@@ -148,11 +156,50 @@ def build_artifact(state: dict[str, Any], action_vocab: dict[str, list[Any]]) ->
         "engine_version": ENGINE_VERSION,
         "hidden_width": HIDDEN_WIDTH,
         "quantization": QUANTIZATION,
-        "action_vocab": action_vocab,
+        "action_vocab": validated_vocab,
         "weights": {name: _tensor_to_artifact(name, state[name], shapes[name]) for name in expected_tensor_names()},
     }
     artifact["checksum"] = artifact_checksum(artifact)
     return artifact
+
+
+def _load_checkpoint_safely(torch: Any, checkpoint_path: str | Path) -> Any:
+    """Load tensor-only checkpoints; never fall back to arbitrary pickle."""
+    try:
+        parameters = inspect.signature(torch.load).parameters
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("cannot verify that this PyTorch version supports safe checkpoint loading") from exc
+    if "weights_only" not in parameters:
+        raise RuntimeError("PyTorch version lacks safe weights_only checkpoint loading; upgrade PyTorch")
+    try:
+        return torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except TypeError as exc:
+        raise RuntimeError("PyTorch safe weights_only checkpoint loading is unavailable") from exc
+
+
+def write_artifact(artifact: dict[str, Any], artifact_path: str | Path) -> None:
+    """Atomically publish an artifact without following an existing symlink."""
+    destination = Path(artifact_path)
+    if destination.is_symlink():
+        raise ValueError(f"refusing to overwrite symlink destination: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_name: str | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp",
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(_canonical_bytes(artifact) + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, destination)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
 
 
 def export_checkpoint(checkpoint_path: str | Path, artifact_path: str | Path) -> dict[str, Any]:
@@ -161,16 +208,14 @@ def export_checkpoint(checkpoint_path: str | Path, artifact_path: str | Path) ->
         import torch
     except ModuleNotFoundError as exc:
         raise RuntimeError("PyTorch is required to export a checkpoint; install the training extra") from exc
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint = _load_checkpoint_safely(torch, checkpoint_path)
     if not isinstance(checkpoint, dict):
         raise ValueError("checkpoint must be an object")
     metadata = checkpoint.get("metadata")
     expected_vocab = validate_checkpoint_metadata(metadata)
     state = checkpoint.get("model_state_dict")
     artifact = build_artifact(state, expected_vocab)
-    destination = Path(artifact_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(_canonical_bytes(artifact) + b"\n")
+    write_artifact(artifact, artifact_path)
     return artifact
 
 
@@ -181,8 +226,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         export_checkpoint(args.checkpoint, args.artifact)
-    except (OSError, RuntimeError, ValueError, TypeError) as exc:
-        parser.error(str(exc))
+    except Exception as exc:
+        print(f"export failed: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 

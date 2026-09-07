@@ -268,7 +268,9 @@ def _layer_norm(rows: list[list[float]], weight: list[float], bias: list[float])
 
 
 def _gelu(value: float) -> float:
-    return 0.5 * value * (1.0 + math.tanh(math.sqrt(2.0 / math.pi) * (value + 0.044715 * value ** 3)))
+    # torch.nn.GELU() defaults to the exact erf formulation (not the tanh
+    # approximation), so the dependency-free path must use the same function.
+    return 0.5 * value * (1.0 + math.erf(value / math.sqrt(2.0)))
 
 
 def _attention(tokens: list[list[float]], weights: Mapping[str, Any], prefix: str) -> list[list[float]]:
@@ -305,23 +307,8 @@ class DependencyFreePolicy:
     def __init__(self, artifact: Mapping[str, Any]) -> None:
         self.model_version = str(artifact["headers"]["model_version"])
         self._weights = artifact["weights"]
-        self._zero = all(
-            not any(abs(item) > 0.0 for row in value for item in row) if isinstance(value, list) and value and isinstance(value[0], list)
-            else not any(abs(item) > 0.0 for item in value)
-            for value in self._weights.values()
-        )
 
     def predict(self, features: Any) -> dict[str, Any]:
-        if self._zero:
-            worker_count = len(features.worker_tokens)
-            return {
-                "worker_act_logits": [[0.0, 0.0] for _ in range(worker_count)],
-                "worker_target_logits": [[0.0] * len(features.tile_tokens) for _ in range(worker_count)],
-                "worker_kind_logits": [[0.0] * len(_ARTIFACT_WORKER_KINDS) for _ in range(worker_count)],
-                "market_item_logits": [0.0] * len(PRODUCTS),
-                "market_quantity_logits": [0.0] * len(_ARTIFACT_MARKET_QUANTITIES),
-                "value": 0.0,
-            }
         tile = [list(row) for row in features.tile_tokens]
         worker = [list(row) for row in features.worker_tokens]
         market = [list(row) for row in features.market_tokens]
