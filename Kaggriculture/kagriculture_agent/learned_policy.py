@@ -14,9 +14,14 @@ import hashlib
 import hmac
 import math
 import struct
+import sys
+import ctypes
+import ctypes.util
+from array import array
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import isfinite
+from operator import mul
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +63,7 @@ _ARTIFACT_FEATURE_SCHEMA_VERSION = 1
 _ARTIFACT_ENGINE_VERSION = "1.32.7"
 _ARTIFACT_HIDDEN_WIDTH = 128
 _ARTIFACT_QUANTIZATION = "int8-per-row"
+_BLAS_WEIGHT_CACHE: dict[int, tuple[list[list[float]], array]] = {}
 _ARTIFACT_WORKER_KINDS = (
     "PASS", "MOVE", "WATER", "HARVEST", "PLANT", "FERTILIZE", "FEED",
     "CARE", "PICKUP", "PLACE", "DROP", "SELL", "DIG", "WEED",
@@ -247,13 +253,79 @@ def load_exported_policy(path: str | Path) -> "DependencyFreePolicy":
 
 
 def _linear(rows: list[list[float]], weight: list[list[float]], bias: list[float]) -> list[list[float]]:
-    return [[sum(value * coefficient for value, coefficient in zip(row, output)) + bias[index]
+    if _CBLAS_SGEMM is not None and len(rows) >= 8 and len(rows[0]) >= 16 and len(weight) >= 8:
+        return _blas_linear(rows, weight, bias)
+    return [[sum(map(mul, row, output), 0.0) + bias[index]
              for index, output in enumerate(weight)] for row in rows]
 
 
 def _vector_linear(row: list[float], weight: list[list[float]], bias: list[float]) -> list[float]:
-    return [sum(value * coefficient for value, coefficient in zip(row, output)) + bias[index]
+    return [sum(map(mul, row, output), 0.0) + bias[index]
             for index, output in enumerate(weight)]
+
+
+def _load_cblas_sgemm() -> Any:
+    """Load platform BLAS through stdlib ctypes when it is available."""
+    library = ctypes.util.find_library("blas")
+    if library is None and sys.platform == "darwin":
+        library = "/System/Library/Frameworks/Accelerate.framework/Accelerate"
+    if library is None:
+        return None
+    try:
+        function = ctypes.CDLL(library).cblas_sgemm
+        function.argtypes = [
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_float,
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+        ]
+        function.restype = None
+        return function
+    except (AttributeError, OSError):
+        return None
+
+
+_CBLAS_SGEMM = _load_cblas_sgemm()
+
+
+def _blas_linear(rows: list[list[float]], weight: list[list[float]], bias: list[float]) -> list[list[float]]:
+    """Compute rows @ weight.T using float32 CBLAS buffers."""
+    row_count, input_width, output_width = len(rows), len(rows[0]), len(weight)
+    left = array("f", (value for row in rows for value in row))
+    weight_key = id(weight)
+    cached = _BLAS_WEIGHT_CACHE.get(weight_key)
+    if cached is None or cached[0] is not weight:
+        cached = (weight, array("f", (value for row in weight for value in row)))
+        _BLAS_WEIGHT_CACHE[weight_key] = cached
+    right = cached[1]
+    result = array("f", (bias[column] for _row in range(row_count) for column in range(output_width)))
+    left_pointer = (ctypes.c_float * len(left)).from_buffer(left)
+    right_pointer = (ctypes.c_float * len(right)).from_buffer(right)
+    result_pointer = (ctypes.c_float * len(result)).from_buffer(result)
+    _CBLAS_SGEMM(101, 111, 112, row_count, output_width, input_width, 1.0,
+                 left_pointer, input_width, right_pointer, input_width, 1.0,
+                 result_pointer, output_width)
+    flat_result = result.tolist()
+    return [flat_result[row * output_width:(row + 1) * output_width] for row in range(row_count)]
+
+
+def _matrix_multiply(left: list[list[float]], right: list[list[float]]) -> list[list[float]]:
+    """Multiply two row-major matrices, using the same stdlib CBLAS bridge."""
+    row_count, inner, output_width = len(left), len(right), len(right[0])
+    if _CBLAS_SGEMM is not None and row_count >= 8 and inner >= 16 and output_width >= 8:
+        left_buffer = array("f", (value for row in left for value in row))
+        right_buffer = array("f", (value for row in right for value in row))
+        result = array("f", [0.0]) * (row_count * output_width)
+        left_pointer = (ctypes.c_float * len(left_buffer)).from_buffer(left_buffer)
+        right_pointer = (ctypes.c_float * len(right_buffer)).from_buffer(right_buffer)
+        result_pointer = (ctypes.c_float * len(result)).from_buffer(result)
+        _CBLAS_SGEMM(101, 111, 111, row_count, output_width, inner, 1.0,
+                     left_pointer, inner, right_pointer, output_width, 0.0,
+                     result_pointer, output_width)
+        return [[float(result[row * output_width + column]) for column in range(output_width)]
+                for row in range(row_count)]
+    return [[sum(map(mul, left_row, (right[index][column] for index in range(inner))), 0.0)
+             for column in range(output_width)] for left_row in left]
 
 
 def _layer_norm(rows: list[list[float]], weight: list[float], bias: list[float]) -> list[list[float]]:
@@ -283,21 +355,23 @@ def _attention(tokens: list[list[float]], weights: Mapping[str, Any], prefix: st
         value[index] = qkv[index][2 * hidden:]
     heads = 4
     head_width = hidden // heads
-    attended: list[list[float]] = []
-    for row in range(len(tokens)):
-        output = [0.0] * hidden
-        for head in range(heads):
-            start = head * head_width
-            scores = [sum(query[row][start + offset] * key[index][start + offset] for offset in range(head_width)) / math.sqrt(head_width)
-                      for index in range(len(tokens))]
+    attended = [[0.0] * hidden for _ in tokens]
+    for head in range(heads):
+        start = head * head_width
+        query_head = [[values[start + offset] for offset in range(head_width)] for values in query]
+        key_head = [[values[start + offset] for offset in range(head_width)] for values in key]
+        score_rows = _linear(query_head, key_head, [0.0] * len(key_head))
+        probability_rows: list[list[float]] = []
+        for row in range(len(tokens)):
+            scores = [score_rows[row][index] / math.sqrt(head_width) for index in range(len(tokens))]
             maximum = max(scores)
             exponentials = [math.exp(score - maximum) for score in scores]
             total = sum(exponentials)
-            for index, factor in enumerate(exponentials):
-                factor /= total
-                for offset in range(head_width):
-                    output[start + offset] += factor * value[index][start + offset]
-        attended.append(output)
+            probability_rows.append([factor / total for factor in exponentials])
+        value_head = [[values[start + offset] for offset in range(head_width)] for values in value]
+        weighted_values = _matrix_multiply(probability_rows, value_head)
+        for row, weighted in enumerate(weighted_values):
+            attended[row][start:start + head_width] = weighted
     return _linear(attended, weights[f"{prefix}.attention.out_proj.weight"], weights[f"{prefix}.attention.out_proj.bias"])
 
 
@@ -332,9 +406,9 @@ class DependencyFreePolicy:
                 [[left + right for left, right in zip(left_row, right_row)] for left_row, right_row in zip(tokens, attended)],
                 weights[f"{prefix}.attention_norm.weight"], weights[f"{prefix}.attention_norm.bias"],
             )
-            hidden = [_vector_linear(row, weights[f"{prefix}.mlp.0.weight"], weights[f"{prefix}.mlp.0.bias"]) for row in tokens]
+            hidden = _linear(tokens, weights[f"{prefix}.mlp.0.weight"], weights[f"{prefix}.mlp.0.bias"])
             hidden = [[_gelu(value) for value in row] for row in hidden]
-            hidden = [_vector_linear(row, weights[f"{prefix}.mlp.2.weight"], weights[f"{prefix}.mlp.2.bias"]) for row in hidden]
+            hidden = _linear(hidden, weights[f"{prefix}.mlp.2.weight"], weights[f"{prefix}.mlp.2.bias"])
             tokens = _layer_norm(
                 [[left + right for left, right in zip(left_row, right_row)] for left_row, right_row in zip(tokens, hidden)],
                 weights[f"{prefix}.mlp_norm.weight"], weights[f"{prefix}.mlp_norm.bias"],
@@ -344,15 +418,15 @@ class DependencyFreePolicy:
         worker_rows = tokens[tile_count:tile_count + worker_count]
         market_rows = tokens[tile_count + worker_count:tile_count + worker_count + market_count]
         global_row = tokens[-1]
-        worker_target_query = [_vector_linear(row, weights["target_worker_head.weight"], weights["target_worker_head.bias"]) for row in worker_rows]
-        tile_target_key = [_vector_linear(row, weights["target_tile_head.weight"], weights["target_tile_head.bias"]) for row in tile_rows]
+        worker_target_query = _linear(worker_rows, weights["target_worker_head.weight"], weights["target_worker_head.bias"])
+        tile_target_key = _linear(tile_rows, weights["target_tile_head.weight"], weights["target_tile_head.bias"])
         target_logits = [[sum(left * right for left, right in zip(query, key)) / math.sqrt(128.0) for key in tile_target_key]
                          for query in worker_target_query]
         pooled_market = [sum(row[index] for row in market_rows) / len(market_rows) for index in range(128)]
         return {
-            "worker_act_logits": [_vector_linear(row, weights["worker_act_head.weight"], weights["worker_act_head.bias"]) for row in worker_rows],
+            "worker_act_logits": _linear(worker_rows, weights["worker_act_head.weight"], weights["worker_act_head.bias"]),
             "worker_target_logits": target_logits,
-            "worker_kind_logits": [_vector_linear(row, weights["worker_kind_head.weight"], weights["worker_kind_head.bias"]) for row in worker_rows],
+            "worker_kind_logits": _linear(worker_rows, weights["worker_kind_head.weight"], weights["worker_kind_head.bias"]),
             "market_item_logits": _vector_linear(pooled_market, weights["market_item_head.weight"], weights["market_item_head.bias"]),
             "market_quantity_logits": _vector_linear(pooled_market, weights["market_quantity_head.weight"], weights["market_quantity_head.bias"]),
             "value": _vector_linear(global_row, weights["value_head.weight"], weights["value_head.bias"])[0],
