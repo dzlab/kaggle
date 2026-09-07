@@ -92,6 +92,30 @@ def test_rollout_metrics_report_required_units():
     assert result["environment_steps_per_minute"] == pytest.approx(7200.0)
     assert result["policy_inference_ms_per_turn"] == pytest.approx(26.5)
     assert result["policy_inference_p95_ms"] == pytest.approx(100.0)
+    assert result["policy_inference_valid_samples"] == 4
+    assert result["policy_inference_latency_valid"] is True
+    assert result["benchmark_valid"] is True
+
+
+@pytest.mark.parametrize("latencies", [[], [float("nan")], [float("inf"), float("-inf")]])
+def test_rollout_metrics_mark_missing_or_non_finite_latency_samples_invalid(latencies):
+    from scripts.benchmark_rollouts import summarize_run, real_engine_gate_passed
+
+    result = summarize_run(
+        worker_count=4,
+        game_count=2,
+        environment_steps=4000,
+        rollout_seconds=1.0,
+        inference_latencies_ms=latencies,
+    )
+
+    assert result["policy_inference_valid_samples"] == 0
+    assert result["policy_inference_invalid_samples"] == len(latencies)
+    assert result["policy_inference_latency_valid"] is False
+    assert result["policy_inference_ms_per_turn"] is None
+    assert result["policy_inference_p95_ms"] is None
+    assert result["benchmark_valid"] is False
+    assert real_engine_gate_passed([result]) is False
 
 
 @pytest.mark.parametrize(
@@ -148,7 +172,13 @@ def test_benchmark_uses_real_collector_runner_and_alternates_seats(tmp_path):
 
     def fake_runner(*, opponent, seed, steps, candidate_player, replay_path, timeout):
         calls.append((opponent, seed, steps, candidate_player, replay_path, timeout))
-        return {"steps": [{"observation": {"player": candidate_player}}, {"observation": {"player": candidate_player}}]}
+        return {
+            "steps": [
+                [{"observation": {"player": candidate_player}, "status": "ACTIVE"}, {"status": "ACTIVE"}],
+                [{"observation": {"player": candidate_player}, "status": "DONE"}, {"status": "DONE"}],
+            ],
+            "statuses": ["DONE", "DONE"],
+        }
 
     result = benchmark_rollouts.benchmark_worker_count(
         games=3,
@@ -170,6 +200,150 @@ def test_benchmark_uses_real_collector_runner_and_alternates_seats(tmp_path):
     assert all(call[5] == benchmark_rollouts.DEFAULT_GAME_TIMEOUT_SECONDS for call in calls)
     assert result["environment_steps"] == 3
     assert result["policy_inference_ms_per_turn"] == pytest.approx(1.0)
+    assert result["successful_games"] == 3
+    assert result["failed_games"] == 0
+
+
+def test_benchmark_counts_only_successful_terminal_games_for_throughput(tmp_path):
+    from scripts import benchmark_rollouts
+
+    def fake_runner(*, opponent, seed, steps, candidate_player, replay_path, timeout):
+        if seed == 8:
+            return {
+                "steps": [
+                    [{"status": "ACTIVE"}, {"status": "ACTIVE"}],
+                    [{"status": "ERROR"}, {"status": "DONE"}],
+                ],
+                "statuses": ["ERROR", "DONE"],
+                "info": {},
+            }
+        return {
+            "steps": [
+                [{"status": "ACTIVE"}, {"status": "ACTIVE"}],
+                [{"status": "DONE"}, {"status": "DONE"}],
+                [{"status": "DONE"}, {"status": "DONE"}],
+            ],
+            "statuses": ["DONE", "DONE"],
+            "info": {},
+        }
+
+    result = benchmark_rollouts.benchmark_worker_count(
+        games=3,
+        steps=20,
+        worker_count=4,
+        start_seed=7,
+        output_dir=tmp_path,
+        game_runner=fake_runner,
+        latency_sampler=lambda replays, policy_factory=None, clock=None: [1.0],
+        clock=benchmark_rollouts.SequenceClock([10.0, 11.0]),
+    )
+
+    assert result["successful_games"] == 2
+    assert result["failed_games"] == 1
+    assert result["environment_steps"] == 4
+    assert result["games_per_hour"] == pytest.approx(7200.0)
+    assert result["benchmark_valid"] is False
+    assert result["failure_counts"] == {"ERROR": 1}
+    assert benchmark_rollouts.real_engine_gate_passed([result]) is False
+
+
+def test_benchmark_records_runner_failures_without_counting_steps(tmp_path):
+    from scripts import benchmark_rollouts
+
+    def fake_runner(*, opponent, seed, steps, candidate_player, replay_path, timeout):
+        if seed == 8:
+            raise RuntimeError("boom")
+        return {
+            "steps": [
+                [{"status": "ACTIVE"}, {"status": "ACTIVE"}],
+                [{"status": "DONE"}, {"status": "DONE"}],
+            ],
+            "statuses": ["DONE", "DONE"],
+            "info": {},
+        }
+
+    result = benchmark_rollouts.benchmark_worker_count(
+        games=2,
+        steps=20,
+        worker_count=4,
+        start_seed=7,
+        output_dir=tmp_path,
+        game_runner=fake_runner,
+        latency_sampler=lambda replays, policy_factory=None, clock=None: [1.0],
+        clock=benchmark_rollouts.SequenceClock([10.0, 11.0]),
+    )
+
+    assert result["successful_games"] == 1
+    assert result["failed_games"] == 1
+    assert result["environment_steps"] == 1
+    assert result["failure_counts"] == {"RUNNER_ERROR": 1}
+    assert result["benchmark_valid"] is False
+    assert benchmark_rollouts.real_engine_gate_passed([result]) is False
+
+
+@pytest.mark.parametrize("bad_replay", [None, [], {"steps": []}])
+def test_benchmark_classifies_malformed_runner_results_as_failed_games(tmp_path, bad_replay):
+    from scripts import benchmark_rollouts
+
+    def fake_runner(*, opponent, seed, steps, candidate_player, replay_path, timeout):
+        return bad_replay
+
+    result = benchmark_rollouts.benchmark_worker_count(
+        games=1,
+        steps=20,
+        worker_count=4,
+        output_dir=tmp_path,
+        game_runner=fake_runner,
+        latency_sampler=lambda replays, policy_factory=None, clock=None: [1.0],
+        clock=benchmark_rollouts.SequenceClock([10.0, 11.0]),
+    )
+
+    assert result["successful_games"] == 0
+    assert result["failed_games"] == 1
+    assert result["environment_steps"] == 0
+    assert result["failure_counts"] == {"RUNNER_ERROR": 1}
+    assert result["benchmark_valid"] is False
+    assert benchmark_rollouts.real_engine_gate_passed([result]) is False
+
+
+@pytest.mark.parametrize(
+    "replay,reason",
+    [
+        ({"steps": [[{"status": "DONE"}, {"status": "DONE"}]], "statuses": []}, "NON_TERMINAL"),
+        ({"steps": [[{"status": "DONE"}, {"status": "DONE"}]], "statuses": "DONE"}, "NON_TERMINAL"),
+        (
+            {
+                "steps": [
+                    [{"status": "ACTIVE"}, {"status": "ACTIVE"}],
+                    [{"status": "ACTIVE"}, {"status": "ACTIVE"}],
+                ],
+                "statuses": ["DONE", "DONE"],
+            },
+            "NON_TERMINAL",
+        ),
+    ],
+)
+def test_benchmark_requires_valid_terminal_statuses_for_successful_games(tmp_path, replay, reason):
+    from scripts import benchmark_rollouts
+
+    def fake_runner(*, opponent, seed, steps, candidate_player, replay_path, timeout):
+        return replay
+
+    result = benchmark_rollouts.benchmark_worker_count(
+        games=1,
+        steps=20,
+        worker_count=4,
+        output_dir=tmp_path,
+        game_runner=fake_runner,
+        latency_sampler=lambda replays, policy_factory=None, clock=None: [1.0],
+        clock=benchmark_rollouts.SequenceClock([10.0, 11.0]),
+    )
+
+    assert result["successful_games"] == 0
+    assert result["failed_games"] == 1
+    assert result["failure_counts"] == {reason: 1}
+    assert result["benchmark_valid"] is False
+    assert benchmark_rollouts.real_engine_gate_passed([result]) is False
 
 
 def test_json_report_includes_gate_status(tmp_path):
@@ -257,3 +431,41 @@ def test_simulator_readiness_gate_requires_all_ten_passing_parity_seeds():
     failed_results = {seed: True for seed in REQUIRED_PARITY_SEEDS[:-1]}
     failed_results[9] = False
     assert simulator_parity_status(failed_results)["promotion_ready"] is False
+
+
+@pytest.mark.parametrize("invalid_result", ["false", 0, 1])
+def test_simulator_readiness_gate_rejects_non_boolean_parity_results(invalid_result):
+    from kagriculture_agent.simulator import REQUIRED_PARITY_SEEDS, simulator_parity_status
+
+    seed_results = {seed: True for seed in REQUIRED_PARITY_SEEDS}
+    seed_results[0] = invalid_result
+
+    status = simulator_parity_status(seed_results)
+
+    assert status["promotion_ready"] is False
+    assert status["invalid_seeds"] == [0]
+    assert status["missing_seeds"] == []
+    assert 0 not in status["passed_seeds"]
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+@pytest.mark.parametrize("bad_action", ["bad", RuntimeError("boom")])
+def test_simulator_replay_preserves_public_step_malformed_action_status_parity(bad_action):
+    from kagriculture_agent.simulator import KaggricultureSimulator
+
+    configuration = {"episodeSteps": 4, "seed": 0}
+    valid_action = {"farmer": ["PASS"], "hands": [], "market": []}
+    real_env = make("kaggriculture", configuration=configuration, debug=True)
+    real_env.step([bad_action, valid_action])
+    real_replay = real_env.toJSON()
+
+    simulator = KaggricultureSimulator(configuration=configuration, seed=0, debug=True)
+    simulated_replay = simulator.replay([[bad_action, valid_action]])
+
+    assert simulated_replay["statuses"] == real_replay["statuses"]
+    assert [state["status"] for state in simulated_replay["steps"][-1]] == [
+        state["status"] for state in real_replay["steps"][-1]
+    ]
+    assert [state.get("action") for state in simulated_replay["steps"][-1]] == [
+        state.get("action") for state in real_replay["steps"][-1]
+    ]

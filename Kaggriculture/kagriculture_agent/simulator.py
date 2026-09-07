@@ -50,7 +50,7 @@ class KaggricultureSimulator:
     def done(self) -> bool:
         return bool(self._env.done)
 
-    def replay(self, action_sequence: Sequence[Sequence[Mapping[str, Any]]]) -> dict[str, Any]:
+    def replay(self, action_sequence: Sequence[Sequence[Any]]) -> dict[str, Any]:
         """Replay one two-player action list per environment transition.
 
         Actions must already be selected from a prior observation.  This method
@@ -65,7 +65,7 @@ class KaggricultureSimulator:
             actions = _normalize_turn_actions(turn_actions)
             if self._env.done:
                 raise ValueError("action_sequence contains actions after the environment is done")
-            _step_recorded_actions(self._env, actions)
+            self._env.step(actions)
         return self._env.toJSON()
 
 
@@ -84,30 +84,39 @@ def recorded_actions_from_replay(replay: Mapping[str, Any]) -> list[list[dict[st
 
 def simulator_parity_status(seed_results: Mapping[int, bool]) -> dict[str, Any]:
     """Return the promotion-readiness status for required simulator parity seeds."""
-    normalized = {seed: bool(passed) for seed, passed in seed_results.items() if type(seed) is int}
     required = set(REQUIRED_PARITY_SEEDS)
+    normalized = {
+        seed: passed
+        for seed, passed in seed_results.items()
+        if type(seed) is int and seed in required and type(passed) is bool
+    }
+    invalid = {
+        seed
+        for seed, passed in seed_results.items()
+        if type(seed) is int and seed in required and type(passed) is not bool
+    }
     passed = {seed for seed, result in normalized.items() if result}
     failed = {seed for seed, result in normalized.items() if seed in required and not result}
-    missing = required - set(normalized)
+    present = {seed for seed in seed_results if type(seed) is int and seed in required}
+    missing = required - present
     return {
         "engine_version": str(ENGINE_VERSION),
         "required_seeds": list(REQUIRED_PARITY_SEEDS),
         "passed_seeds": sorted(seed for seed in passed if seed in required),
         "failed_seeds": sorted(failed),
+        "invalid_seeds": sorted(invalid),
         "missing_seeds": sorted(missing),
-        "promotion_ready": not failed and not missing and required <= passed,
+        "promotion_ready": not failed and not invalid and not missing and required <= passed,
     }
 
 
-def _normalize_turn_actions(turn_actions: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def _normalize_turn_actions(turn_actions: Sequence[Any]) -> list[Any]:
     if isinstance(turn_actions, (str, bytes)) or not isinstance(turn_actions, Sequence):
         raise ValueError("each turn must contain one action per player")
     actions = [copy.deepcopy(action) for action in turn_actions]
     if len(actions) != 2:
         raise ValueError("Kaggriculture replay requires exactly two player actions per turn")
-    if any(not isinstance(action, Mapping) for action in actions):
-        raise ValueError("player actions must be mappings")
-    return [dict(action) for action in actions]
+    return actions
 
 
 def _state_action(state: Any) -> dict[str, Any]:
@@ -115,21 +124,3 @@ def _state_action(state: Any) -> dict[str, Any]:
     if not isinstance(action, Mapping):
         raise ValueError("replay player state is missing an action object")
     return copy.deepcopy(dict(action))
-
-
-def _step_recorded_actions(env: Any, actions: Sequence[Mapping[str, Any]]) -> None:
-    from kaggle_environments.utils import structify
-
-    action_state = [
-        {**env.state[index], "action": copy.deepcopy(action)}
-        for index, action in enumerate(actions)
-    ]
-    previous_done = env.done
-    env.state = structify(env.interpreter(structify(action_state), env))
-    env.state[0].observation.step = 0 if previous_done else len(env.steps)
-    if env.state[0].observation.step >= env.configuration.episodeSteps - 1:
-        for player_state in env.state:
-            if player_state.status in ("ACTIVE", "INACTIVE"):
-                player_state.status = "DONE"
-    env.steps.append(env.state)
-    env.logs.append([])

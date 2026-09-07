@@ -135,6 +135,9 @@ def summarize_run(
     environment_steps: int,
     rollout_seconds: float,
     inference_latencies_ms: Sequence[float],
+    successful_games: int | None = None,
+    failed_games: int = 0,
+    failure_counts: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     if worker_count < 1:
         raise ValueError("worker_count must be positive")
@@ -144,19 +147,46 @@ def summarize_run(
         raise ValueError("environment_steps must be non-negative")
     if not math.isfinite(rollout_seconds) or rollout_seconds <= 0:
         raise ValueError("rollout_seconds must be positive and finite")
-    latencies = [float(value) for value in inference_latencies_ms if math.isfinite(float(value))]
-    mean_latency = sum(latencies) / len(latencies) if latencies else 0.0
+    if successful_games is None:
+        successful_games = game_count
+    if successful_games < 0 or failed_games < 0:
+        raise ValueError("game counts must be non-negative")
+    if successful_games + failed_games > game_count:
+        raise ValueError("successful and failed games cannot exceed game_count")
+    latencies: list[float] = []
+    invalid_latency_samples = 0
+    for value in inference_latencies_ms:
+        try:
+            latency = float(value)
+        except (TypeError, ValueError):
+            invalid_latency_samples += 1
+            continue
+        if math.isfinite(latency):
+            latencies.append(latency)
+        else:
+            invalid_latency_samples += 1
+    latency_valid = bool(latencies)
+    mean_latency = sum(latencies) / len(latencies) if latencies else None
+    p95_latency = _percentile(latencies, 95.0) if latencies else None
     steps_per_second = environment_steps / rollout_seconds
+    benchmark_valid = successful_games == game_count and failed_games == 0 and latency_valid
     return {
         "workers": int(worker_count),
         "games": int(game_count),
+        "successful_games": int(successful_games),
+        "failed_games": int(failed_games),
+        "failure_counts": dict(failure_counts or {}),
         "environment_steps": int(environment_steps),
         "rollout_seconds": float(rollout_seconds),
-        "games_per_hour": float(game_count / rollout_seconds * 3600.0),
+        "games_per_hour": float(successful_games / rollout_seconds * 3600.0),
         "environment_steps_per_second": float(steps_per_second),
         "environment_steps_per_minute": float(steps_per_second * 60.0),
-        "policy_inference_ms_per_turn": float(mean_latency),
-        "policy_inference_p95_ms": float(_percentile(latencies, 95.0)),
+        "policy_inference_ms_per_turn": float(mean_latency) if mean_latency is not None else None,
+        "policy_inference_p95_ms": float(p95_latency) if p95_latency is not None else None,
+        "policy_inference_valid_samples": len(latencies),
+        "policy_inference_invalid_samples": invalid_latency_samples,
+        "policy_inference_latency_valid": latency_valid,
+        "benchmark_valid": benchmark_valid,
     }
 
 
@@ -164,58 +194,129 @@ def real_engine_gate_passed(results: Sequence[Mapping[str, Any]]) -> bool:
     for result in results:
         if result.get("workers") != 4:
             continue
+        if "benchmark_valid" in result and result.get("benchmark_valid") is not True:
+            return False
+        try:
+            failed_games = int(result.get("failed_games", 0))
+        except (TypeError, ValueError):
+            return False
+        if failed_games > 0:
+            return False
+        throughput = _finite_result_number(result.get("environment_steps_per_minute"))
+        p95_latency = _finite_result_number(result.get("policy_inference_p95_ms"))
+        if throughput is None or p95_latency is None:
+            return False
         return (
-            float(result.get("environment_steps_per_minute", 0.0)) >= MIN_REAL_ENGINE_STEPS_PER_MINUTE
-            and float(result.get("policy_inference_p95_ms", float("inf"))) < MAX_POLICY_INFERENCE_P95_MS
+            throughput >= MIN_REAL_ENGINE_STEPS_PER_MINUTE
+            and p95_latency < MAX_POLICY_INFERENCE_P95_MS
         )
     return False
 
 
-def _game_job(args: tuple[str, int, int, int, str, float]) -> tuple[dict[str, Any], int]:
+def _finite_result_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _game_job(args: tuple[str, int, int, int, str, float]) -> tuple[dict[str, Any] | None, int, str | None]:
     opponent, seed, steps, candidate_player, replay_path, timeout = args
-    replay = _run_game_isolated(
-        opponent=opponent,
-        seed=seed,
-        steps=steps,
-        candidate_player=candidate_player,
-        replay_path=Path(replay_path),
-        timeout=timeout,
-    )
+    try:
+        replay = _run_game_isolated(
+            opponent=opponent,
+            seed=seed,
+            steps=steps,
+            candidate_player=candidate_player,
+            replay_path=Path(replay_path),
+            timeout=timeout,
+        )
+    except Exception:
+        return None, 0, "RUNNER_ERROR"
+    if not isinstance(replay, Mapping):
+        return None, 0, "RUNNER_ERROR"
     if isinstance(replay.get("info"), dict):
         replay["info"]["candidate_player"] = candidate_player
     step_records = replay.get("steps", ())
     environment_steps = max(0, len(step_records) - 1) if isinstance(step_records, Sequence) else 0
-    return replay, environment_steps
+    return replay, environment_steps, None
 
 
 def _run_jobs(
     jobs: Sequence[tuple[str, int, int, int, str, float]],
     worker_count: int,
     game_runner: Callable[..., Mapping[str, Any]] | None,
-) -> list[tuple[Mapping[str, Any], int]]:
+) -> list[tuple[Mapping[str, Any] | None, int, str | None]]:
     if game_runner is not None:
         results = []
         for opponent, seed, steps, candidate_player, replay_path, timeout in jobs:
-            replay = game_runner(
-                opponent=opponent,
-                seed=seed,
-                steps=steps,
-                candidate_player=candidate_player,
-                replay_path=Path(replay_path),
-                timeout=timeout,
-            )
+            try:
+                replay = game_runner(
+                    opponent=opponent,
+                    seed=seed,
+                    steps=steps,
+                    candidate_player=candidate_player,
+                    replay_path=Path(replay_path),
+                    timeout=timeout,
+                )
+            except Exception:
+                results.append((None, 0, "RUNNER_ERROR"))
+                continue
+            if not isinstance(replay, Mapping):
+                results.append((None, 0, "RUNNER_ERROR"))
+                continue
             if isinstance(replay.get("info"), dict):
                 replay["info"]["candidate_player"] = candidate_player
             elif isinstance(replay, dict):
                 replay["info"] = {"candidate_player": candidate_player}
             step_records = replay.get("steps", ()) if isinstance(replay, Mapping) else ()
             environment_steps = max(0, len(step_records) - 1) if isinstance(step_records, Sequence) else 0
-            results.append((replay, environment_steps))
+            results.append((replay, environment_steps, None))
         return results
     if worker_count == 1:
         return [_game_job(job) for job in jobs]
     with ProcessPoolExecutor(max_workers=worker_count) as executor:
         return list(executor.map(_game_job, jobs))
+
+
+def _terminal_failure_reason(replay: Mapping[str, Any] | None, runner_failure: str | None) -> str | None:
+    if runner_failure is not None:
+        return runner_failure
+    if not isinstance(replay, Mapping):
+        return "RUNNER_ERROR"
+    steps = replay.get("steps")
+    if not _valid_steps_shape(steps):
+        return "RUNNER_ERROR"
+    statuses = replay.get("statuses")
+    if not isinstance(statuses, Sequence) or isinstance(statuses, (str, bytes)) or len(statuses) != 2:
+        return "NON_TERMINAL"
+    status_values = [str(status) for status in statuses]
+    for bad_status in ("ERROR", "INVALID", "TIMEOUT"):
+        if bad_status in status_values:
+            return bad_status
+    if any(status != "DONE" for status in status_values):
+        return "NON_TERMINAL"
+    for turn in steps:
+        for player_state in turn:
+            status = player_state.get("status")
+            if status in ("ERROR", "INVALID", "TIMEOUT"):
+                return str(status)
+    final_statuses = [str(player_state.get("status")) for player_state in steps[-1]]
+    if final_statuses != ["DONE", "DONE"]:
+        return "NON_TERMINAL"
+    return None
+
+
+def _valid_steps_shape(steps: Any) -> bool:
+    if not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)) or not steps:
+        return False
+    for turn in steps:
+        if not isinstance(turn, Sequence) or isinstance(turn, (str, bytes)) or len(turn) != 2:
+            return False
+        if any(not isinstance(player_state, Mapping) for player_state in turn):
+            return False
+    return True
 
 
 def benchmark_worker_count(
@@ -248,12 +349,25 @@ def benchmark_worker_count(
     start = clock()
     game_results = _run_jobs(jobs, worker_count, game_runner)
     rollout_seconds = clock() - start
-    replays = [result[0] for result in game_results]
-    environment_steps = sum(result[1] for result in game_results)
-    latencies = list(latency_sampler(replays))
+    failure_counts: dict[str, int] = {}
+    successful_replays: list[Mapping[str, Any]] = []
+    environment_steps = 0
+    for replay, replay_steps, runner_failure in game_results:
+        failure_reason = _terminal_failure_reason(replay, runner_failure)
+        if failure_reason is not None:
+            failure_counts[failure_reason] = failure_counts.get(failure_reason, 0) + 1
+            continue
+        if replay is not None:
+            successful_replays.append(replay)
+        environment_steps += replay_steps
+    failed_games = sum(failure_counts.values())
+    latencies = list(latency_sampler(successful_replays))
     return summarize_run(
         worker_count=worker_count,
         game_count=games,
+        successful_games=len(successful_replays),
+        failed_games=failed_games,
+        failure_counts=failure_counts,
         environment_steps=environment_steps,
         rollout_seconds=rollout_seconds,
         inference_latencies_ms=latencies,
