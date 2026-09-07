@@ -1,4 +1,6 @@
 import builtins
+import hashlib
+import importlib
 import importlib.util
 import json
 import math
@@ -20,6 +22,50 @@ PRODUCTS = {"WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON", "EGG", "MILK", "
 ANIMALS = {"GOOSE", "COW", "SHEEP"}
 
 
+def _artifact_checksum(value):
+    payload = {key: item for key, item in value.items() if key != "checksum"}
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _valid_learned_artifact():
+    from kagriculture_agent import learned_policy as runtime
+
+    weights = {}
+    for name, shape in runtime.artifact_tensor_shapes().items():
+        if len(shape) == 1:
+            weights[name] = {"shape": list(shape), "values": [0.0] * shape[0]}
+        else:
+            weights[name] = {
+                "shape": list(shape),
+                "scales": [1.0] * shape[0],
+                "values": [[0] * shape[1] for _row in range(shape[0])],
+            }
+    artifact = {
+        "format_version": 1,
+        "model_version": "learned_v1",
+        "feature_schema_version": 1,
+        "engine_version": "1.32.7",
+        "hidden_width": 128,
+        "quantization": "int8-per-row",
+        "action_vocab": {
+            "worker_kinds": list(runtime._ARTIFACT_WORKER_KINDS),
+            "market_items": sorted(runtime.PRODUCTS),
+            "market_quantities": list(runtime._ARTIFACT_MARKET_QUANTITIES),
+        },
+        "weights": weights,
+    }
+    artifact["checksum"] = _artifact_checksum(artifact)
+    return artifact
+
+
+def _reload_candidates_after_env():
+    import kagriculture_agent.candidates as candidates
+
+    return importlib.reload(candidates)
+
+
 @pytest.mark.parametrize("name", ["current", "melon", "premium", "mixed"])
 def test_candidate_policy_factory_returns_named_policy(name):
     from kagriculture_agent.candidates import CANDIDATES, candidate_policy
@@ -38,6 +84,62 @@ def test_candidate_policy_factory_rejects_unknown_name():
 
     with pytest.raises(ValueError, match="unsupported candidate"):
         candidate_policy("unknown")
+
+
+def test_learned_v1_is_hidden_and_rejected_without_valid_artifact(monkeypatch, tmp_path):
+    with monkeypatch.context() as local:
+        local.setenv("KAGRICULTURE_LEARNED_V1_ARTIFACT", str(tmp_path / "missing.json"))
+        candidates = _reload_candidates_after_env()
+
+        assert candidates.CANDIDATES == ("current", "melon", "premium", "mixed")
+        with pytest.raises(ValueError, match="learned_v1 artifact does not exist"):
+            candidates.candidate_policy("learned_v1")
+
+    _reload_candidates_after_env()
+
+
+def test_learned_v1_registers_only_with_valid_artifact(monkeypatch, tmp_path):
+    artifact_path = tmp_path / "learned_v1.json"
+    artifact_path.write_text(json.dumps(_valid_learned_artifact()), encoding="utf-8")
+    with monkeypatch.context() as local:
+        local.setenv("KAGRICULTURE_LEARNED_V1_ARTIFACT", str(artifact_path))
+        candidates = _reload_candidates_after_env()
+        action = candidates.candidate_policy("learned_v1")({"step": 0})
+
+        assert candidates.CANDIDATES == ("current", "melon", "premium", "mixed", "learned_v1")
+        assert set(action) == {"farmer", "hands", "market"}
+        assert action == {"farmer": ["PASS"], "hands": [], "market": []}
+
+    _reload_candidates_after_env()
+
+
+def test_candidate_and_evaluator_import_without_training_dependencies(monkeypatch):
+    original_import = builtins.__import__
+
+    def block_training_dependencies(name, *args, **kwargs):
+        if name.split(".", 1)[0] in {"torch", "numpy"}:
+            raise ModuleNotFoundError(name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", block_training_dependencies)
+    import kagriculture_agent.candidates as candidates
+    import scripts.evaluate as evaluate
+
+    candidates = importlib.reload(candidates)
+    evaluate = importlib.reload(evaluate)
+
+    assert "current" in candidates.CANDIDATES
+    assert callable(evaluate.build_manifest)
+
+
+def test_policy_with_corrupt_learned_artifact_falls_back_to_exact_action_schema(tmp_path):
+    from kagriculture_agent.policy import Policy
+
+    artifact_path = tmp_path / "broken.json"
+    artifact_path.write_text("{", encoding="utf-8")
+    action = Policy(strategy="current", learned_model=str(artifact_path)).act({"step": 0})
+
+    assert action == {"farmer": ["PASS"], "hands": [], "market": []}
 
 
 def test_candidate_policy_memory_does_not_carry_market_direction_across_episodes():

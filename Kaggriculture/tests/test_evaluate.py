@@ -1,5 +1,7 @@
 import json
 import io
+import hashlib
+import importlib
 import subprocess
 import sys
 from pathlib import Path
@@ -35,6 +37,52 @@ def _engine_envelope(replay, seed=1, *, legacy_compact_fixture=True):
         "specification": {"action": {}, "agents": [2], "configuration": {}},
     })
     return replay
+
+
+def _artifact_checksum(value):
+    payload = {key: item for key, item in value.items() if key != "checksum"}
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _valid_learned_artifact():
+    from kagriculture_agent import learned_policy as runtime
+
+    weights = {}
+    for name, shape in runtime.artifact_tensor_shapes().items():
+        if len(shape) == 1:
+            weights[name] = {"shape": list(shape), "values": [0.0] * shape[0]}
+        else:
+            weights[name] = {
+                "shape": list(shape),
+                "scales": [1.0] * shape[0],
+                "values": [[0] * shape[1] for _row in range(shape[0])],
+            }
+    artifact = {
+        "format_version": 1,
+        "model_version": "learned_v1",
+        "feature_schema_version": 1,
+        "engine_version": "1.32.7",
+        "hidden_width": 128,
+        "quantization": "int8-per-row",
+        "action_vocab": {
+            "worker_kinds": list(runtime._ARTIFACT_WORKER_KINDS),
+            "market_items": sorted(runtime.PRODUCTS),
+            "market_quantities": list(runtime._ARTIFACT_MARKET_QUANTITIES),
+        },
+        "weights": weights,
+    }
+    artifact["checksum"] = _artifact_checksum(artifact)
+    return artifact
+
+
+def _reload_candidate_modules():
+    import kagriculture_agent.candidates as candidates
+    import scripts.evaluate as evaluate
+
+    importlib.reload(candidates)
+    return importlib.reload(evaluate)
 
 
 def _strict_two_turn_replay():
@@ -176,7 +224,7 @@ def test_cli_rejects_overlapping_development_and_holdout_seeds():
         ])
 
 
-def test_build_manifest_is_schema_v2_json_compatible_and_normalized():
+def test_build_manifest_is_schema_v3_json_compatible_and_normalized():
     from scripts.evaluate import build_manifest
 
     manifest = build_manifest(
@@ -186,17 +234,89 @@ def test_build_manifest_is_schema_v2_json_compatible_and_normalized():
     )
 
     assert manifest == {
-        "schema_version": 2,
+        "schema_version": 3,
         "engine_version": "1.32.7",
         "steps": 720,
         "seeds": [3],
         "seats": [0, 1],
         "opponents": ["pass"],
         "candidates": ["current"],
+        "candidate_models": {
+            "current": {
+                "model_identity": "deterministic:current",
+                "artifact_sha256": None,
+                "feature_schema_version": 1,
+                "engine_version": "1.32.7",
+            },
+        },
         "python_version": ".".join(map(str, sys.version_info[:3])),
         "command": ["scripts/evaluate.py", "--output", "<report>"],
     }
     json.dumps(manifest, allow_nan=False)
+
+
+def test_build_manifest_includes_learned_v1_artifact_metadata(monkeypatch, tmp_path):
+    artifact_path = tmp_path / "learned_v1.json"
+    artifact_path.write_text(json.dumps(_valid_learned_artifact()), encoding="utf-8")
+    with monkeypatch.context() as local:
+        local.setenv("KAGRICULTURE_LEARNED_V1_ARTIFACT", str(artifact_path))
+        evaluate = _reload_candidate_modules()
+        manifest = evaluate.build_manifest(
+            candidates=["current", "learned_v1"], opponents=["pass"], seeds=[3],
+            steps=720, seats=[0, 1], command=["scripts/evaluate.py"],
+        )
+
+        assert manifest["candidates"] == ["current", "learned_v1"]
+        assert manifest["candidate_models"]["learned_v1"] == {
+            "model_identity": "learned_v1",
+            "artifact_sha256": hashlib.sha256(artifact_path.read_bytes()).hexdigest(),
+            "feature_schema_version": 1,
+            "engine_version": "1.32.7",
+        }
+        assert manifest["candidate_models"]["current"]["artifact_sha256"] is None
+
+    _reload_candidate_modules()
+
+
+def test_run_matrix_uses_identical_matrix_for_current_and_learned_candidate(monkeypatch, tmp_path):
+    artifact_path = tmp_path / "learned_v1.json"
+    artifact_path.write_text(json.dumps(_valid_learned_artifact()), encoding="utf-8")
+    captured = []
+
+    def fake_run_game(**kwargs):
+        captured.append(kwargs)
+        candidate = kwargs["candidate"]
+        return {
+            **_complete_worker_record(),
+            "candidate": candidate,
+            "variant": candidate,
+            "opponent": kwargs["opponent"],
+            "seed": kwargs["seed"],
+            "seat": kwargs["seat"],
+        }
+
+    with monkeypatch.context() as local:
+        local.setenv("KAGRICULTURE_LEARNED_V1_ARTIFACT", str(artifact_path))
+        evaluate = _reload_candidate_modules()
+        local.setattr(evaluate, "run_game", fake_run_game)
+
+        evaluate.run_matrix(
+            candidates=["current", "learned_v1"], opponents=["pass", "random"],
+            seeds=[1, 2], steps=96, seats=[0, 1],
+        )
+
+    matrices = {}
+    for request in captured:
+        matrices.setdefault(request["candidate"], []).append(
+            (request["opponent"], request["seed"], request["seat"])
+        )
+    assert matrices["current"] == matrices["learned_v1"]
+    assert matrices["current"] == [
+        (opponent, seed, seat)
+        for opponent in ("pass", "random") for seed in (1, 2) for seat in (0, 1)
+    ]
+
+    _reload_candidate_modules()
 
 
 def test_cli_preserves_legacy_variants_as_a_separate_selection_mode():
@@ -1554,7 +1674,7 @@ def test_holdout_report_controls_selection_and_exposes_holdout_decisions():
     ]
     assert document["promotion_decisions"]["challenger"]["holdout"]["status"] == "discard"
     assert document["metadata"]["holdout"]["selected_candidate"] == "baseline"
-    assert document["metadata"]["manifest"]["schema_version"] == 2
+    assert document["metadata"]["manifest"]["schema_version"] == 3
     json.dumps(document, allow_nan=False)
 
 

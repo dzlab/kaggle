@@ -37,7 +37,7 @@ from kagriculture_agent.constants import (  # noqa: E402
     season_days,
     shed_capacity,
 )
-from kagriculture_agent.candidates import CANDIDATES, candidate_policy  # noqa: E402
+from kagriculture_agent.candidates import CANDIDATES, candidate_metadata, candidate_policy  # noqa: E402
 from kagriculture_agent.economics import market_price  # noqa: E402
 from kagriculture_agent.observation import is_shed_adjacent  # noqa: E402
 from kagriculture_agent.planner import _has_basic_need_deadline  # noqa: E402
@@ -83,6 +83,19 @@ _STRICT_NUMERIC_FIELDS = frozenset({
 })
 _STRICT_QUANTITY_MAPPING_FIELDS = frozenset({"inventory", "prices", "shed", "seeds"})
 _BASELINE_CONVENTION = "the first configured candidate is the baseline for promotion decisions"
+
+
+def _manifest_candidate_metadata(candidate: str) -> dict[str, Any]:
+    """Return model metadata without rejecting report-only historical names."""
+    try:
+        return candidate_metadata(candidate)
+    except ValueError:
+        return {
+            "model_identity": f"unregistered:{candidate}",
+            "artifact_sha256": None,
+            "feature_schema_version": None,
+            "engine_version": str(ENGINE_VERSION),
+        }
 
 
 def _positive_int(value: str) -> int:
@@ -3384,13 +3397,17 @@ def build_manifest(*, candidates: Sequence[str], opponents: Sequence[str], seeds
                    steps: int, seats: Sequence[int], command: Sequence[str] | None = None) -> dict[str, Any]:
     """Return the JSON-compatible, versioned reproducibility manifest."""
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "engine_version": str(ENGINE_VERSION),
         "steps": int(steps),
         "seeds": [int(seed) for seed in seeds],
         "seats": [int(seat) for seat in seats],
         "opponents": [str(opponent) for opponent in opponents],
         "candidates": [str(candidate) for candidate in candidates],
+        "candidate_models": {
+            str(candidate): _manifest_candidate_metadata(str(candidate))
+            for candidate in candidates
+        },
         "python_version": ".".join(map(str, sys.version_info[:3])),
         "command": _normalized_command(command),
     }
