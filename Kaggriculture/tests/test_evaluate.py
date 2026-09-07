@@ -278,6 +278,47 @@ def test_build_manifest_includes_learned_v1_artifact_metadata(monkeypatch, tmp_p
     _reload_candidate_modules()
 
 
+def test_build_manifest_names_legacy_and_stable_mixed_paths_separately():
+    from scripts.evaluate import build_manifest
+
+    common = {
+        "candidates": ["mixed"], "opponents": ["pass"], "seeds": [3],
+        "steps": 720, "seats": [0, 1], "command": ["scripts/evaluate.py"],
+    }
+    legacy = build_manifest(**common, selection_path="legacy_variant")
+    stable = build_manifest(**common, selection_path="candidate")
+
+    assert legacy["candidate_models"]["mixed"]["model_identity"] == "legacy_variant:mixed"
+    assert stable["candidate_models"]["mixed"]["model_identity"] == "deterministic:mixed"
+    assert legacy != stable
+    assert legacy == build_manifest(**common, selection_path="legacy_variant")
+    assert stable == build_manifest(**common, selection_path="candidate")
+
+
+def test_result_manifest_uses_actual_legacy_or_candidate_selection_path():
+    from scripts.evaluate import build_result_document
+
+    common = {"opponents": ["pass"], "min_valid_games": 1}
+    legacy = build_result_document(
+        config={**common, "variants": ["mixed"]}, records=[]
+    )
+    stable = build_result_document(
+        config={**common, "candidates": ["mixed"]}, records=[]
+    )
+
+    legacy_manifest = legacy["metadata"]["manifest"]
+    stable_manifest = stable["metadata"]["manifest"]
+    assert legacy_manifest["candidate_models"]["mixed"]["model_identity"] == "legacy_variant:mixed"
+    assert stable_manifest["candidate_models"]["mixed"]["model_identity"] == "deterministic:mixed"
+    assert legacy_manifest != stable_manifest
+    assert legacy_manifest == build_result_document(
+        config={**common, "variants": ["mixed"]}, records=[]
+    )["metadata"]["manifest"]
+    assert stable_manifest == build_result_document(
+        config={**common, "candidates": ["mixed"]}, records=[]
+    )["metadata"]["manifest"]
+
+
 def test_run_matrix_uses_identical_matrix_for_current_and_learned_candidate(monkeypatch, tmp_path):
     artifact_path = tmp_path / "learned_v1.json"
     artifact_path.write_text(json.dumps(_valid_learned_artifact()), encoding="utf-8")

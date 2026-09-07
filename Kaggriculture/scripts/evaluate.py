@@ -85,8 +85,17 @@ _STRICT_QUANTITY_MAPPING_FIELDS = frozenset({"inventory", "prices", "shed", "see
 _BASELINE_CONVENTION = "the first configured candidate is the baseline for promotion decisions"
 
 
-def _manifest_candidate_metadata(candidate: str) -> dict[str, Any]:
+def _manifest_candidate_metadata(candidate: str, *, selection_path: str = "candidate") -> dict[str, Any]:
     """Return model metadata without rejecting report-only historical names."""
+    if selection_path == "legacy_variant":
+        return {
+            "model_identity": f"legacy_variant:{candidate}",
+            "artifact_sha256": None,
+            "feature_schema_version": None,
+            "engine_version": str(ENGINE_VERSION),
+        }
+    if selection_path != "candidate":
+        raise ValueError(f"unsupported manifest selection path: {selection_path}")
     try:
         return candidate_metadata(candidate)
     except ValueError:
@@ -3405,7 +3414,9 @@ def build_manifest(*, candidates: Sequence[str], opponents: Sequence[str], seeds
         "opponents": [str(opponent) for opponent in opponents],
         "candidates": [str(candidate) for candidate in candidates],
         "candidate_models": {
-            str(candidate): _manifest_candidate_metadata(str(candidate))
+            str(candidate): _manifest_candidate_metadata(
+                str(candidate), selection_path=selection_path,
+            )
             for candidate in candidates
         },
         "python_version": ".".join(map(str, sys.version_info[:3])),
@@ -3469,7 +3480,9 @@ def _select_paired_candidate(candidates: Sequence[str], summaries: Mapping[str, 
 def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mapping[str, Any]], command: Sequence[str] | None = None,
                           ablation_records: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
                           ablation_configs: Mapping[str, Mapping[str, bool]] | None = None,
-                          holdout_records: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+                          holdout_records: Sequence[Mapping[str, Any]] | None = None,
+                          baseline_records: Sequence[Mapping[str, Any]] | None = None,
+                          holdout_baseline_records: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
     variants = _resolve_candidates(
         config.get("variants"), config.get("candidates"), allow_unknown=True,
     )
@@ -3488,6 +3501,7 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
     manifest = build_manifest(
         candidates=variants, opponents=opponents, seeds=seed_values,
         steps=config.get("steps", 720), seats=seats, command=command,
+        selection_path="candidate" if config.get("candidates") is not None else "legacy_variant",
     )
     holdout_document = None
     development_selected_default = _select_default(
@@ -3522,6 +3536,7 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
         holdout_manifest = build_manifest(
             candidates=variants, opponents=opponents, seeds=holdout_seed_values,
             steps=config.get("steps", 720), seats=seats, command=command,
+            selection_path="candidate" if config.get("candidates") is not None else "legacy_variant",
         )
         holdout_document = {
             "manifest": holdout_manifest,
