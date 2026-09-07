@@ -5,5 +5,12 @@ __pycache__/
 reports/
 replays/
 
+# Training data/checkpoints are not submission runtime inputs.  Only an
+# explicitly selected exported artifact may be packaged.
+trajectories/
+checkpoints/
+artifacts/*
+!artifacts/learned_v1.json
+
 # Local setuptools build metadata.
 *.egg-info/

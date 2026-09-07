@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import hashlib
+import hmac
+import math
+import struct
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import isfinite
@@ -46,6 +50,287 @@ _VALID_KINDS = frozenset({
     "WEED", "DIG", "ANIMAL", "STRUCTURE", "BUILD_COOP", "BUILD_PASTURE",
 })
 _ITEM_KINDS = frozenset({"PICKUP", "PLACE", "PLANT", "FERTILIZE", "FEED", "ANIMAL", "SELL"})
+
+_ARTIFACT_FORMAT_VERSION = 1
+_ARTIFACT_MODEL_VERSION = "learned_v1"
+_ARTIFACT_FEATURE_SCHEMA_VERSION = 1
+_ARTIFACT_ENGINE_VERSION = "1.32.7"
+_ARTIFACT_HIDDEN_WIDTH = 128
+_ARTIFACT_QUANTIZATION = "int8-per-row"
+_ARTIFACT_WORKER_KINDS = (
+    "PASS", "MOVE", "WATER", "HARVEST", "PLANT", "FERTILIZE", "FEED",
+    "CARE", "PICKUP", "PLACE", "DROP", "SELL", "DIG", "WEED",
+)
+_ARTIFACT_MARKET_QUANTITIES = (0, 1, 2, 4, 8, 16, 32, 64)
+
+
+def _artifact_tensor_names() -> tuple[str, ...]:
+    names = [
+        "tile_projection.weight", "tile_projection.bias",
+        "worker_projection.weight", "worker_projection.bias",
+        "market_projection.weight", "market_projection.bias",
+        "global_projection.weight", "global_projection.bias",
+        "type_embedding.weight",
+    ]
+    for index in range(4):
+        prefix = f"blocks.{index}"
+        names.extend([
+            f"{prefix}.attention.in_proj_weight", f"{prefix}.attention.in_proj_bias",
+            f"{prefix}.attention.out_proj.weight", f"{prefix}.attention.out_proj.bias",
+            f"{prefix}.attention_norm.weight", f"{prefix}.attention_norm.bias",
+            f"{prefix}.mlp.0.weight", f"{prefix}.mlp.0.bias",
+            f"{prefix}.mlp.2.weight", f"{prefix}.mlp.2.bias",
+            f"{prefix}.mlp_norm.weight", f"{prefix}.mlp_norm.bias",
+        ])
+    names.extend([
+        "worker_act_head.weight", "worker_act_head.bias",
+        "worker_kind_head.weight", "worker_kind_head.bias",
+        "target_worker_head.weight", "target_worker_head.bias",
+        "target_tile_head.weight", "target_tile_head.bias",
+        "market_item_head.weight", "market_item_head.bias",
+        "market_quantity_head.weight", "market_quantity_head.bias",
+        "value_head.weight", "value_head.bias",
+    ])
+    return tuple(names)
+
+
+def _artifact_canonical_bytes(value: Mapping[str, Any]) -> bytes:
+    payload = {key: item for key, item in value.items() if key != "checksum"}
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def _validate_artifact_vocab(value: Any) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("learned artifact action_vocab must be an object")
+    expected = {
+        "worker_kinds": list(_ARTIFACT_WORKER_KINDS),
+        "market_items": sorted(PRODUCTS),
+        "market_quantities": list(_ARTIFACT_MARKET_QUANTITIES),
+    }
+    if set(value) != set(expected) or any(value.get(key) != item for key, item in expected.items()):
+        raise ValueError("learned artifact action_vocab mismatch")
+    for key, items in expected.items():
+        if not isinstance(value.get(key), list) or not items or len(set(value[key])) != len(items):
+            raise ValueError(f"learned artifact action vocabulary {key} is malformed")
+        if not all(isinstance(item, (str, int)) and not isinstance(item, bool) for item in value[key]):
+            raise ValueError(f"learned artifact action vocabulary {key} is malformed")
+
+
+def _finite_fp32(value: Any, label: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be finite")
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{label} must be finite") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{label} must be finite")
+    return struct.unpack("<f", struct.pack("<f", result))[0]
+
+
+def _read_artifact_tensor(name: str, value: Any) -> list[list[float]] | list[float]:
+    if not isinstance(value, Mapping) or not isinstance(value.get("shape"), list):
+        raise ValueError(f"learned artifact tensor {name!r} is malformed")
+    shape = value["shape"]
+    if len(shape) not in (1, 2) or any(type(size) is not int or size < 1 for size in shape):
+        raise ValueError(f"learned artifact tensor {name!r} has an invalid shape")
+    values = value.get("values")
+    if len(shape) == 2:
+        rows, width = shape
+        scales = value.get("scales")
+        if not isinstance(scales, list) or len(scales) != rows or not isinstance(values, list) or len(values) != rows:
+            raise ValueError(f"learned artifact tensor {name!r} is missing row-wise data")
+        result: list[list[float]] = []
+        for row_index, (scale, row) in enumerate(zip(scales, values)):
+            scale = _finite_fp32(scale, f"{name} scale")
+            if scale <= 0.0 or not isinstance(row, list) or len(row) != width:
+                raise ValueError(f"learned artifact tensor {name!r} has invalid row data")
+            decoded: list[float] = []
+            for item in row:
+                if type(item) is not int or item < -128 or item > 127:
+                    raise ValueError(f"{name} contains an invalid int8 value")
+                decoded.append(float(item) * scale)
+            result.append(decoded)
+        return result
+    if not isinstance(values, list) or len(values) != shape[0] or "scales" in value:
+        raise ValueError(f"learned artifact tensor {name!r} has invalid vector data")
+    return [_finite_fp32(item, f"{name} value") for item in values]
+
+
+def _validate_artifact(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("learned artifact must be a JSON object")
+    expected_headers = {
+        "format_version": _ARTIFACT_FORMAT_VERSION,
+        "model_version": _ARTIFACT_MODEL_VERSION,
+        "feature_schema_version": _ARTIFACT_FEATURE_SCHEMA_VERSION,
+        "engine_version": _ARTIFACT_ENGINE_VERSION,
+        "hidden_width": _ARTIFACT_HIDDEN_WIDTH,
+        "quantization": _ARTIFACT_QUANTIZATION,
+    }
+    for key, expected in expected_headers.items():
+        if value.get(key) != expected:
+            raise ValueError(f"unsupported learned artifact {key}")
+    _validate_artifact_vocab(value.get("action_vocab"))
+    checksum = value.get("checksum")
+    if not isinstance(checksum, str) or len(checksum) != 64 or any(char not in "0123456789abcdef" for char in checksum):
+        raise ValueError("learned artifact checksum is missing or malformed")
+    actual = hashlib.sha256(_artifact_canonical_bytes(value)).hexdigest()
+    if not hmac.compare_digest(actual, checksum):
+        raise ValueError("learned artifact checksum mismatch")
+    weights = value.get("weights")
+    expected_names = set(_artifact_tensor_names())
+    if not isinstance(weights, Mapping) or set(weights) != expected_names:
+        missing = sorted(expected_names - set(weights or ())) if isinstance(weights, Mapping) else sorted(expected_names)
+        raise ValueError(f"learned artifact tensors mismatch; missing={missing}")
+    decoded = {name: _read_artifact_tensor(name, weights[name]) for name in _artifact_tensor_names()}
+    return {"headers": dict(expected_headers), "action_vocab": value["action_vocab"], "weights": decoded}
+
+
+def load_exported_policy(path: str | Path) -> "DependencyFreePolicy":
+    """Load and validate a JSON policy artifact using only the Python stdlib."""
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    return DependencyFreePolicy(_validate_artifact(value))
+
+
+def _linear(rows: list[list[float]], weight: list[list[float]], bias: list[float]) -> list[list[float]]:
+    return [[sum(value * coefficient for value, coefficient in zip(row, output)) + bias[index]
+             for index, output in enumerate(weight)] for row in rows]
+
+
+def _vector_linear(row: list[float], weight: list[list[float]], bias: list[float]) -> list[float]:
+    return [sum(value * coefficient for value, coefficient in zip(row, output)) + bias[index]
+            for index, output in enumerate(weight)]
+
+
+def _layer_norm(rows: list[list[float]], weight: list[float], bias: list[float]) -> list[list[float]]:
+    result = []
+    for row in rows:
+        mean = sum(row) / len(row)
+        variance = sum((item - mean) ** 2 for item in row) / len(row)
+        denominator = math.sqrt(variance + 1e-5)
+        result.append([(item - mean) / denominator * weight[index] + bias[index]
+                       for index, item in enumerate(row)])
+    return result
+
+
+def _gelu(value: float) -> float:
+    return 0.5 * value * (1.0 + math.tanh(math.sqrt(2.0 / math.pi) * (value + 0.044715 * value ** 3)))
+
+
+def _attention(tokens: list[list[float]], weights: Mapping[str, Any], prefix: str) -> list[list[float]]:
+    hidden = len(tokens[0])
+    qkv = _linear(tokens, weights[f"{prefix}.attention.in_proj_weight"], weights[f"{prefix}.attention.in_proj_bias"])
+    query, key, value = qkv[:], qkv[:], qkv[:]
+    for index in range(len(tokens)):
+        query[index] = qkv[index][:hidden]
+        key[index] = qkv[index][hidden:2 * hidden]
+        value[index] = qkv[index][2 * hidden:]
+    heads = 4
+    head_width = hidden // heads
+    attended: list[list[float]] = []
+    for row in range(len(tokens)):
+        output = [0.0] * hidden
+        for head in range(heads):
+            start = head * head_width
+            scores = [sum(query[row][start + offset] * key[index][start + offset] for offset in range(head_width)) / math.sqrt(head_width)
+                      for index in range(len(tokens))]
+            maximum = max(scores)
+            exponentials = [math.exp(score - maximum) for score in scores]
+            total = sum(exponentials)
+            for index, factor in enumerate(exponentials):
+                factor /= total
+                for offset in range(head_width):
+                    output[start + offset] += factor * value[index][start + offset]
+        attended.append(output)
+    return _linear(attended, weights[f"{prefix}.attention.out_proj.weight"], weights[f"{prefix}.attention.out_proj.bias"])
+
+
+class DependencyFreePolicy:
+    """Pure-Python execution of the exported compact policy network."""
+
+    def __init__(self, artifact: Mapping[str, Any]) -> None:
+        self.model_version = str(artifact["headers"]["model_version"])
+        self._weights = artifact["weights"]
+        self._zero = all(
+            not any(abs(item) > 0.0 for row in value for item in row) if isinstance(value, list) and value and isinstance(value[0], list)
+            else not any(abs(item) > 0.0 for item in value)
+            for value in self._weights.values()
+        )
+
+    def predict(self, features: Any) -> dict[str, Any]:
+        if self._zero:
+            worker_count = len(features.worker_tokens)
+            return {
+                "worker_act_logits": [[0.0, 0.0] for _ in range(worker_count)],
+                "worker_target_logits": [[0.0] * len(features.tile_tokens) for _ in range(worker_count)],
+                "worker_kind_logits": [[0.0] * len(_ARTIFACT_WORKER_KINDS) for _ in range(worker_count)],
+                "market_item_logits": [0.0] * len(PRODUCTS),
+                "market_quantity_logits": [0.0] * len(_ARTIFACT_MARKET_QUANTITIES),
+                "value": 0.0,
+            }
+        tile = [list(row) for row in features.tile_tokens]
+        worker = [list(row) for row in features.worker_tokens]
+        market = [list(row) for row in features.market_tokens]
+        global_token = [list(features.global_tokens)]
+        weights = self._weights
+        tokens = (
+            _linear(tile, weights["tile_projection.weight"], weights["tile_projection.bias"])
+            + _linear(worker, weights["worker_projection.weight"], weights["worker_projection.bias"])
+            + _linear(market, weights["market_projection.weight"], weights["market_projection.bias"])
+            + _linear(global_token, weights["global_projection.weight"], weights["global_projection.bias"])
+        )
+        type_embedding = weights["type_embedding.weight"]
+        offsets = [0, len(tile), len(tile) + len(worker), len(tile) + len(worker) + len(market), len(tokens)]
+        for index, kind in enumerate((0, 1, 2, 3)):
+            for position in range(offsets[index], offsets[index + 1]):
+                tokens[position] = [value + type_embedding[kind][column] for column, value in enumerate(tokens[position])]
+        for block in range(4):
+            prefix = f"blocks.{block}"
+            attended = _attention(tokens, weights, prefix)
+            tokens = _layer_norm(
+                [[left + right for left, right in zip(left_row, right_row)] for left_row, right_row in zip(tokens, attended)],
+                weights[f"{prefix}.attention_norm.weight"], weights[f"{prefix}.attention_norm.bias"],
+            )
+            hidden = [_vector_linear(row, weights[f"{prefix}.mlp.0.weight"], weights[f"{prefix}.mlp.0.bias"]) for row in tokens]
+            hidden = [[_gelu(value) for value in row] for row in hidden]
+            hidden = [_vector_linear(row, weights[f"{prefix}.mlp.2.weight"], weights[f"{prefix}.mlp.2.bias"]) for row in hidden]
+            tokens = _layer_norm(
+                [[left + right for left, right in zip(left_row, right_row)] for left_row, right_row in zip(tokens, hidden)],
+                weights[f"{prefix}.mlp_norm.weight"], weights[f"{prefix}.mlp_norm.bias"],
+            )
+        tile_count, worker_count, market_count = len(tile), len(worker), len(market)
+        tile_rows = tokens[:tile_count]
+        worker_rows = tokens[tile_count:tile_count + worker_count]
+        market_rows = tokens[tile_count + worker_count:tile_count + worker_count + market_count]
+        global_row = tokens[-1]
+        worker_target_query = [_vector_linear(row, weights["target_worker_head.weight"], weights["target_worker_head.bias"]) for row in worker_rows]
+        tile_target_key = [_vector_linear(row, weights["target_tile_head.weight"], weights["target_tile_head.bias"]) for row in tile_rows]
+        target_logits = [[sum(left * right for left, right in zip(query, key)) / math.sqrt(128.0) for key in tile_target_key]
+                         for query in worker_target_query]
+        pooled_market = [sum(row[index] for row in market_rows) / len(market_rows) for index in range(128)]
+        return {
+            "worker_act_logits": [_vector_linear(row, weights["worker_act_head.weight"], weights["worker_act_head.bias"]) for row in worker_rows],
+            "worker_target_logits": target_logits,
+            "worker_kind_logits": [_vector_linear(row, weights["worker_kind_head.weight"], weights["worker_kind_head.bias"]) for row in worker_rows],
+            "market_item_logits": _vector_linear(pooled_market, weights["market_item_head.weight"], weights["market_item_head.bias"]),
+            "market_quantity_logits": _vector_linear(pooled_market, weights["market_quantity_head.weight"], weights["market_quantity_head.bias"]),
+            "value": _vector_linear(global_row, weights["value_head.weight"], weights["value_head.bias"])[0],
+        }
+
+    def propose(self, state: Any, features: Any) -> PolicyProposal:
+        outputs = self.predict(features)
+        workers: list[WorkerProposal] = []
+        positions = tuple(features.tile_positions)
+        for index, (act_logits, target_logits, kind_logits) in enumerate(zip(
+            outputs["worker_act_logits"], outputs["worker_target_logits"], outputs["worker_kind_logits"],
+        )):
+            if max(range(len(act_logits)), key=act_logits.__getitem__) == 0:
+                continue
+            target = positions[max(range(len(target_logits)), key=target_logits.__getitem__)] if positions else None
+            kind = _ARTIFACT_WORKER_KINDS[max(range(len(kind_logits)), key=kind_logits.__getitem__)]
+            workers.append(WorkerProposal(index, kind, target, None, max(kind_logits)))
+        return PolicyProposal(tuple(workers), (), 1.0, self.model_version)
 
 
 def _get(value: Any, key: str, default: Any = None) -> Any:
@@ -194,11 +479,17 @@ class LearnedPolicy:
         if not isinstance(self.model_path, (str, Path)):
             return self.model_path
         path = Path(self.model_path)
-        raw = path.read_bytes()
-        value = json.loads(raw.decode("utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(value, Mapping):
             raise TypeError("learned model must be a JSON object")
-        return value
+        # Preserve the small legacy proposal fixture interface used by the
+        # deterministic-policy tests; exported network artifacts are always
+        # identified by their format header and go through strict validation.
+        if "format_version" in value or "weights" in value or "checksum" in value:
+            return DependencyFreePolicy(_validate_artifact(value))
+        if any(key in value for key in ("workers", "market_orders", "market")):
+            return value
+        raise ValueError("learned model is neither an exported artifact nor a proposal")
 
     def _invoke(self, model: Any, state: Any, features: Any) -> Any:
         if isinstance(model, Mapping) and ("workers" in model or "market_orders" in model or "market" in model):
