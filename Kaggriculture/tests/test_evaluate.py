@@ -1784,6 +1784,51 @@ def test_no_holdout_report_labels_development_only_default_selection():
     assert document["metadata"]["selected_default_source"] == "development_only"
 
 
+def test_unavailable_learned_candidate_cannot_win_complete_development_and_holdout():
+    from scripts.evaluate import build_result_document
+
+    development = [
+        _metric_record(
+            seat=seat, seed=1, candidate=candidate,
+            outcome="win" if candidate == "learned_v1" else "tie",
+            differential=2 if candidate == "learned_v1" else 1,
+        )
+        for candidate in ("current", "learned_v1")
+        for seat in (0, 1)
+    ]
+    holdout = [
+        _metric_record(
+            seat=seat, seed=100, candidate=candidate,
+            outcome="win" if candidate == "learned_v1" else "tie",
+            differential=2 if candidate == "learned_v1" else 1,
+        )
+        for candidate in ("current", "learned_v1")
+        for seat in (0, 1)
+    ]
+
+    document = build_result_document(
+        config={
+            "candidates": ["current", "learned_v1"],
+            "opponents": ["pass"],
+            "seed_values": [1],
+            "holdout_seed_values": [100],
+            "seats": [0, 1],
+            "min_valid_games": 1,
+        },
+        records=development,
+        holdout_records=holdout,
+    )
+
+    assert document["selected_candidate"] is None
+    assert document["holdout"]["selected_candidate"] is None
+    assert document["promotion_decisions"]["learned_v1"]["reasons"] == [
+        "candidate_unavailable"
+    ]
+    assert document["holdout_promotion_decisions"]["learned_v1"]["reasons"] == [
+        "candidate_unavailable"
+    ]
+
+
 def test_sidecar_sort_uses_candidate_and_canonical_record_tiebreaker(tmp_path):
     from scripts.evaluate import write_result_document
 

@@ -3337,6 +3337,34 @@ def _candidate_records(records: Sequence[Mapping[str, Any]], candidate: str) -> 
     return [record for record in records if _record_candidate(record) == candidate]
 
 
+def _candidate_availability_reason(candidate: str) -> str | None:
+    """Return a fail-closed reason for learned candidates unavailable at runtime.
+
+    Historical synthetic candidate names remain valid for report fixtures, but
+    a learned candidate is only promotable when it is registered and its
+    artifact still validates at the selection boundary.
+    """
+    if candidate != "learned_v1":
+        return None
+    if candidate not in CANDIDATES:
+        return "candidate_unavailable"
+    try:
+        candidate_metadata(candidate)
+    except Exception:
+        return "candidate_unavailable"
+    return None
+
+
+def _apply_candidate_availability_gate(
+    candidate: str, decision: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Mark an unavailable learned candidate as ineligible for selection."""
+    reason = _candidate_availability_reason(candidate)
+    if reason is None:
+        return dict(decision)
+    return {**decision, "status": "discard", "reasons": [reason]}
+
+
 def _candidate_metrics(records: Sequence[Mapping[str, Any]], candidates: Sequence[str],
                       *, min_valid_games: int,
                       expected_matrix: Sequence[tuple[str, int, int]] | None = None,
@@ -3486,6 +3514,10 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
     variants = _resolve_candidates(
         config.get("variants"), config.get("candidates"), allow_unknown=True,
     )
+    unavailable_candidates = tuple(
+        candidate for candidate in variants
+        if _candidate_availability_reason(candidate) is not None
+    )
     opponents = list(config.get("opponents", ()))
     min_valid_games = config.get("min_valid_games", 20)
     if type(min_valid_games) is not int or min_valid_games < 1:
@@ -3497,6 +3529,12 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
         records, variants, min_valid_games=min_valid_games,
         expected_matrix=expected_development_matrix,
     )
+    promotion_decisions = {
+        candidate: _apply_candidate_availability_gate(
+            candidate, promotion_decisions[candidate]
+        )
+        for candidate in variants
+    }
     seed_values = _config_seed_values(config)
     manifest = build_manifest(
         candidates=variants, opponents=opponents, seeds=seed_values,
@@ -3522,16 +3560,24 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
             holdout_records, variants, min_valid_games=min_valid_games,
             expected_matrix=expected_holdout_matrix,
         )
+        holdout_promotion_decisions = {
+            candidate: _apply_candidate_availability_gate(
+                candidate, holdout_promotion_decisions[candidate]
+            )
+            for candidate in variants
+        }
         for candidate in variants:
             promotion_decisions[candidate] = {
                 **promotion_decisions.get(candidate, {}),
                 "holdout": holdout_promotion_decisions.get(candidate),
             }
-        selected_candidate = _select_paired_candidate(
+        selected_candidate = None if unavailable_candidates else _select_paired_candidate(
             variants, holdout_paired_summaries, promotion_decisions,
             holdout_promotion_decisions,
         )
-        selected_default = selected_candidate
+        selected_default = (
+            development_selected_default if unavailable_candidates else selected_candidate
+        )
         selected_default_source = "holdout"
         holdout_manifest = build_manifest(
             candidates=variants, opponents=opponents, seeds=holdout_seed_values,
