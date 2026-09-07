@@ -165,7 +165,7 @@ def summarize_run(
             latencies.append(latency)
         else:
             invalid_latency_samples += 1
-    latency_valid = bool(latencies)
+    latency_valid = bool(latencies) and invalid_latency_samples == 0
     mean_latency = sum(latencies) / len(latencies) if latencies else None
     p95_latency = _percentile(latencies, 95.0) if latencies else None
     steps_per_second = environment_steps / rollout_seconds

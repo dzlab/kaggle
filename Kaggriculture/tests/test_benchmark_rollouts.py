@@ -118,6 +118,26 @@ def test_rollout_metrics_mark_missing_or_non_finite_latency_samples_invalid(late
     assert real_engine_gate_passed([result]) is False
 
 
+def test_rollout_metrics_mark_mixed_invalid_latency_samples_invalid():
+    from scripts.benchmark_rollouts import summarize_run, real_engine_gate_passed
+
+    result = summarize_run(
+        worker_count=4,
+        game_count=2,
+        environment_steps=4000,
+        rollout_seconds=1.0,
+        inference_latencies_ms=[1.0, float("nan")],
+    )
+
+    assert result["policy_inference_valid_samples"] == 1
+    assert result["policy_inference_invalid_samples"] == 1
+    assert result["policy_inference_latency_valid"] is False
+    assert result["policy_inference_ms_per_turn"] == pytest.approx(1.0)
+    assert result["policy_inference_p95_ms"] == pytest.approx(1.0)
+    assert result["benchmark_valid"] is False
+    assert real_engine_gate_passed([result]) is False
+
+
 @pytest.mark.parametrize(
     "result,expected",
     [
