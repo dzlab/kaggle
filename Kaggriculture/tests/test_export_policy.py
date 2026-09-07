@@ -8,21 +8,32 @@ from kagriculture_agent.features import extract_features
 from kagriculture_agent.learned_policy import LearnedPolicy, load_exported_policy
 
 
+class _FakeTensor:
+    def __init__(self, values, shape):
+        self._values = values
+        self.shape = tuple(shape)
+        self.ndim = len(self.shape)
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def tolist(self):
+        return self._values
+
+
 def _artifact():
     from kagriculture_agent import learned_policy as runtime
     from scripts.export_policy import artifact_checksum
 
     weights = {}
-    for name in runtime._artifact_tensor_names():
-        if name.endswith((".bias", "_bias")) or name.endswith(".weight") and ("norm" in name or "embedding" in name):
-            size = 384 if name.endswith("in_proj_bias") else 128
-            if name.endswith(".weight") and "embedding" in name:
-                weights[name] = {"shape": [4, 128], "scales": [1.0] * 4, "values": [[0] * 128 for _ in range(4)]}
-            else:
-                weights[name] = {"shape": [size], "values": [0.0] * size}
+    for name, shape in runtime.artifact_tensor_shapes().items():
+        if len(shape) == 1:
+            weights[name] = {"shape": list(shape), "values": [0.0] * shape[0]}
         else:
-            rows = 384 if name.endswith("in_proj_weight") else 128
-            weights[name] = {"shape": [rows, 128], "scales": [1.0] * rows, "values": [[0] * 128 for _ in range(rows)]}
+            weights[name] = {"shape": list(shape), "scales": [1.0] * shape[0], "values": [[0] * shape[1] for _ in range(shape[0])]}
     artifact = {
         "format_version": 1,
         "model_version": "learned_v1",
@@ -50,6 +61,46 @@ def test_artifact_headers_and_checksum_are_valid(tmp_path):
     broken = _artifact()
     broken["hidden_width"] = 64
     path.write_text(json.dumps(broken), encoding="utf-8")
+    with pytest.raises(ValueError, match="unsupported.*hidden_width"):
+        load_exported_policy(path)
+
+
+def test_checksum_valid_architecture_shape_mismatch_is_rejected(tmp_path):
+    from scripts.export_policy import artifact_checksum
+
+    artifact = _artifact()
+    artifact["weights"]["worker_act_head.weight"]["shape"] = [128, 128]
+    artifact["checksum"] = artifact_checksum(artifact)
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(artifact), encoding="utf-8")
+    with pytest.raises(ValueError, match="shape mismatch"):
+        load_exported_policy(path)
+
+
+@pytest.mark.parametrize("field", ["scales", "values"])
+def test_json_numeric_fields_reject_string_values(tmp_path, field):
+    from scripts.export_policy import artifact_checksum
+
+    artifact = _artifact()
+    if field == "scales":
+        artifact["weights"]["worker_act_head.weight"][field][0] = "1.0"
+    else:
+        artifact["weights"]["worker_act_head.weight"][field][0][0] = "0"
+    artifact["checksum"] = artifact_checksum(artifact)
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(artifact), encoding="utf-8")
+    with pytest.raises(ValueError, match="(JSON number|int8)"):
+        load_exported_policy(path)
+
+
+def test_json_numeric_metadata_rejects_boolean(tmp_path):
+    from scripts.export_policy import artifact_checksum
+
+    artifact = _artifact()
+    artifact["hidden_width"] = True
+    artifact["checksum"] = artifact_checksum(artifact)
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(artifact), encoding="utf-8")
     with pytest.raises(ValueError, match="unsupported.*hidden_width"):
         load_exported_policy(path)
 
@@ -97,6 +148,32 @@ def test_export_requires_torch_with_clear_error(tmp_path):
         pytest.skip("torch is installed; checkpoint export is covered by integration fixtures")
     with pytest.raises((RuntimeError, FileNotFoundError)):
         export_policy.export_checkpoint(tmp_path / "missing.pt", tmp_path / "policy.json")
+
+
+def test_exporter_rejects_hidden_width_metadata_mismatch():
+    from kagriculture_agent.model import ACTION_VOCAB
+    from scripts.export_policy import validate_checkpoint_metadata
+
+    metadata = {
+        "model_version": "learned_v1", "feature_schema_version": 1,
+        "engine_version": "1.32.7", "hidden_width": 64,
+        "action_vocab": {key: list(value) for key, value in ACTION_VOCAB.items()},
+    }
+    with pytest.raises(ValueError, match="hidden_width"):
+        validate_checkpoint_metadata(metadata)
+
+
+def test_exporter_rejects_checkpoint_tensor_shape_mismatch():
+    from scripts.export_policy import validate_checkpoint_state_dict
+    from kagriculture_agent.learned_policy import artifact_tensor_shapes
+
+    state = {
+        name: _FakeTensor([0.0] * (shape[0] if len(shape) == 1 else shape[0] * shape[1]), shape)
+        for name, shape in artifact_tensor_shapes().items()
+    }
+    state["value_head.weight"] = _FakeTensor([0.0] * (128 * 128), (128, 128))
+    with pytest.raises(ValueError, match="value_head.weight.*shape mismatch"):
+        validate_checkpoint_state_dict(state)
 
 
 def test_dependency_free_fixture_inference_is_fast_enough(tmp_path):

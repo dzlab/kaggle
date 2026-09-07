@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from kagriculture_agent.constants import ENGINE_VERSION
 from kagriculture_agent.features import FEATURE_SCHEMA_VERSION
+from kagriculture_agent.learned_policy import artifact_tensor_shapes
 from kagriculture_agent.model import ACTION_VOCAB, HIDDEN_WIDTH, MODEL_VERSION
 
 FORMAT_VERSION = 1
@@ -33,10 +34,15 @@ def artifact_checksum(value: dict[str, Any]) -> str:
 
 
 def _float32(value: Any) -> float:
+    if type(value) not in (int, float):
+        raise ValueError("tensor contains a non-numeric value")
     result = float(value)
     if not math.isfinite(result):
         raise ValueError("tensor contains a non-finite value")
-    return struct.unpack("<f", struct.pack("<f", result))[0]
+    try:
+        return struct.unpack("<f", struct.pack("<f", result))[0]
+    except (OverflowError, struct.error) as exc:
+        raise ValueError("tensor value is outside fp32 range") from exc
 
 
 def quantize_rowwise(values: Any) -> dict[str, Any]:
@@ -70,10 +76,12 @@ def _plain_tensor(values: Any) -> dict[str, Any]:
     return {"shape": [len(flat)], "values": [_float32(item) for item in flat]}
 
 
-def _tensor_to_artifact(name: str, tensor: Any) -> dict[str, Any]:
+def _tensor_to_artifact(name: str, tensor: Any, expected_shape: tuple[int, ...]) -> dict[str, Any]:
     if not hasattr(tensor, "detach"):
         raise ValueError(f"checkpoint tensor {name!r} is not a torch tensor")
     value = tensor.detach().cpu()
+    if tuple(value.shape) != expected_shape:
+        raise ValueError(f"checkpoint tensor {name!r} shape mismatch: expected {expected_shape}, got {tuple(value.shape)}")
     if value.ndim == 2:
         return quantize_rowwise(value)
     if value.ndim == 1:
@@ -82,33 +90,40 @@ def _tensor_to_artifact(name: str, tensor: Any) -> dict[str, Any]:
 
 
 def expected_tensor_names() -> tuple[str, ...]:
-    names = [
-        "tile_projection.weight", "tile_projection.bias",
-        "worker_projection.weight", "worker_projection.bias",
-        "market_projection.weight", "market_projection.bias",
-        "global_projection.weight", "global_projection.bias",
-        "type_embedding.weight",
-    ]
-    for index in range(4):
-        prefix = f"blocks.{index}"
-        names.extend([
-            f"{prefix}.attention.in_proj_weight", f"{prefix}.attention.in_proj_bias",
-            f"{prefix}.attention.out_proj.weight", f"{prefix}.attention.out_proj.bias",
-            f"{prefix}.attention_norm.weight", f"{prefix}.attention_norm.bias",
-            f"{prefix}.mlp.0.weight", f"{prefix}.mlp.0.bias",
-            f"{prefix}.mlp.2.weight", f"{prefix}.mlp.2.bias",
-            f"{prefix}.mlp_norm.weight", f"{prefix}.mlp_norm.bias",
-        ])
-    names.extend([
-        "worker_act_head.weight", "worker_act_head.bias",
-        "worker_kind_head.weight", "worker_kind_head.bias",
-        "target_worker_head.weight", "target_worker_head.bias",
-        "target_tile_head.weight", "target_tile_head.bias",
-        "market_item_head.weight", "market_item_head.bias",
-        "market_quantity_head.weight", "market_quantity_head.bias",
-        "value_head.weight", "value_head.bias",
-    ])
-    return tuple(names)
+    return tuple(artifact_tensor_shapes())
+
+
+def validate_checkpoint_metadata(metadata: Any) -> None:
+    if not isinstance(metadata, dict):
+        raise ValueError("checkpoint metadata is required")
+    for key, expected in (
+        ("model_version", MODEL_VERSION),
+        ("feature_schema_version", FEATURE_SCHEMA_VERSION),
+        ("engine_version", ENGINE_VERSION),
+    ):
+        if metadata.get(key) != expected:
+            raise ValueError(f"checkpoint {key} mismatch")
+    hidden_width = metadata.get("hidden_width", HIDDEN_WIDTH)
+    if type(hidden_width) is not int or hidden_width != HIDDEN_WIDTH:
+        raise ValueError(f"checkpoint hidden_width mismatch: expected {HIDDEN_WIDTH}, got {hidden_width!r}")
+    expected_vocab = {key: list(value) for key, value in ACTION_VOCAB.items()}
+    if metadata.get("action_vocab") != expected_vocab:
+        raise ValueError("checkpoint action_vocab mismatch")
+
+
+def validate_checkpoint_state_dict(state: Any) -> None:
+    if not isinstance(state, dict):
+        raise ValueError("checkpoint model_state_dict is required")
+    expected = set(expected_tensor_names())
+    if set(state) != expected:
+        missing = sorted(expected - set(state))
+        extra = sorted(set(state) - expected)
+        raise ValueError(f"checkpoint tensors mismatch (missing={missing}, extra={extra})")
+    shapes = artifact_tensor_shapes()
+    for name, tensor in state.items():
+        actual_shape = tuple(getattr(tensor, "shape", ()))
+        if actual_shape != shapes[name]:
+            raise ValueError(f"checkpoint tensor {name!r} shape mismatch: expected {shapes[name]}, got {actual_shape}")
 
 
 def export_checkpoint(checkpoint_path: str | Path, artifact_path: str | Path) -> dict[str, Any]:
@@ -118,28 +133,13 @@ def export_checkpoint(checkpoint_path: str | Path, artifact_path: str | Path) ->
     except ModuleNotFoundError as exc:
         raise RuntimeError("PyTorch is required to export a checkpoint; install the training extra") from exc
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("metadata"), dict):
-        raise ValueError("checkpoint metadata is required")
-    metadata = checkpoint["metadata"]
-    for key, expected in (
-        ("model_version", MODEL_VERSION),
-        ("feature_schema_version", FEATURE_SCHEMA_VERSION),
-        ("engine_version", ENGINE_VERSION),
-    ):
-        if metadata.get(key) != expected:
-            raise ValueError(f"checkpoint {key} mismatch")
+    if not isinstance(checkpoint, dict):
+        raise ValueError("checkpoint must be an object")
+    metadata = checkpoint.get("metadata")
+    validate_checkpoint_metadata(metadata)
     state = checkpoint.get("model_state_dict")
-    if not isinstance(state, dict):
-        raise ValueError("checkpoint model_state_dict is required")
-    expected = set(expected_tensor_names())
-    if set(state) != expected:
-        missing = sorted(expected - set(state))
-        extra = sorted(set(state) - expected)
-        raise ValueError(f"checkpoint tensors mismatch (missing={missing}, extra={extra})")
-    vocab = metadata.get("action_vocab")
-    expected_vocab = {key: list(value) for key, value in ACTION_VOCAB.items()}
-    if vocab != expected_vocab:
-        raise ValueError("checkpoint action_vocab mismatch")
+    validate_checkpoint_state_dict(state)
+    shapes = artifact_tensor_shapes()
     artifact: dict[str, Any] = {
         "format_version": FORMAT_VERSION,
         "model_version": MODEL_VERSION,
@@ -148,7 +148,7 @@ def export_checkpoint(checkpoint_path: str | Path, artifact_path: str | Path) ->
         "hidden_width": HIDDEN_WIDTH,
         "quantization": QUANTIZATION,
         "action_vocab": expected_vocab,
-        "weights": {name: _tensor_to_artifact(name, state[name]) for name in expected_tensor_names()},
+        "weights": {name: _tensor_to_artifact(name, state[name], shapes[name]) for name in expected_tensor_names()},
     }
     artifact["checksum"] = artifact_checksum(artifact)
     destination = Path(artifact_path)

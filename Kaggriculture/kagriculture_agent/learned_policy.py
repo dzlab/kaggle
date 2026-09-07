@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .constants import ANIMALS, CROPS, PRODUCTS
+from .features import GLOBAL_TOKEN_SIZE, MARKET_TOKEN_SIZE, TILE_TOKEN_SIZE, WORKER_TOKEN_SIZE
 from .memory import PolicyMemory
 from .routing import is_locked_tile, normalize_position, route_to
 from .types import Position, Task, WorkerAssignment
@@ -94,6 +95,54 @@ def _artifact_tensor_names() -> tuple[str, ...]:
     return tuple(names)
 
 
+def artifact_tensor_shapes() -> dict[str, tuple[int, ...]]:
+    """Return the exact state-dict shapes for CompactPolicyNet."""
+    shapes: dict[str, tuple[int, ...]] = {
+        "tile_projection.weight": (128, TILE_TOKEN_SIZE),
+        "tile_projection.bias": (128,),
+        "worker_projection.weight": (128, WORKER_TOKEN_SIZE),
+        "worker_projection.bias": (128,),
+        "market_projection.weight": (128, MARKET_TOKEN_SIZE),
+        "market_projection.bias": (128,),
+        "global_projection.weight": (128, GLOBAL_TOKEN_SIZE),
+        "global_projection.bias": (128,),
+        "type_embedding.weight": (4, 128),
+    }
+    for index in range(4):
+        prefix = f"blocks.{index}"
+        shapes.update({
+            f"{prefix}.attention.in_proj_weight": (384, 128),
+            f"{prefix}.attention.in_proj_bias": (384,),
+            f"{prefix}.attention.out_proj.weight": (128, 128),
+            f"{prefix}.attention.out_proj.bias": (128,),
+            f"{prefix}.attention_norm.weight": (128,),
+            f"{prefix}.attention_norm.bias": (128,),
+            f"{prefix}.mlp.0.weight": (256, 128),
+            f"{prefix}.mlp.0.bias": (256,),
+            f"{prefix}.mlp.2.weight": (128, 256),
+            f"{prefix}.mlp.2.bias": (128,),
+            f"{prefix}.mlp_norm.weight": (128,),
+            f"{prefix}.mlp_norm.bias": (128,),
+        })
+    shapes.update({
+        "worker_act_head.weight": (2, 128),
+        "worker_act_head.bias": (2,),
+        "worker_kind_head.weight": (len(_ARTIFACT_WORKER_KINDS), 128),
+        "worker_kind_head.bias": (len(_ARTIFACT_WORKER_KINDS),),
+        "target_worker_head.weight": (128, 128),
+        "target_worker_head.bias": (128,),
+        "target_tile_head.weight": (128, 128),
+        "target_tile_head.bias": (128,),
+        "market_item_head.weight": (len(PRODUCTS), 128),
+        "market_item_head.bias": (len(PRODUCTS),),
+        "market_quantity_head.weight": (len(_ARTIFACT_MARKET_QUANTITIES), 128),
+        "market_quantity_head.bias": (len(_ARTIFACT_MARKET_QUANTITIES),),
+        "value_head.weight": (1, 128),
+        "value_head.bias": (1,),
+    })
+    return shapes
+
+
 def _artifact_canonical_bytes(value: Mapping[str, Any]) -> bytes:
     payload = {key: item for key, item in value.items() if key != "checksum"}
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
@@ -112,26 +161,28 @@ def _validate_artifact_vocab(value: Any) -> None:
     for key, items in expected.items():
         if not isinstance(value.get(key), list) or not items or len(set(value[key])) != len(items):
             raise ValueError(f"learned artifact action vocabulary {key} is malformed")
-        if not all(isinstance(item, (str, int)) and not isinstance(item, bool) for item in value[key]):
+        if not all(type(item) is type(expected_item) for item, expected_item in zip(value[key], items)):
             raise ValueError(f"learned artifact action vocabulary {key} is malformed")
 
 
 def _finite_fp32(value: Any, label: str) -> float:
-    if isinstance(value, bool):
-        raise ValueError(f"{label} must be finite")
-    try:
-        result = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{label} must be finite") from exc
+    if type(value) not in (int, float):
+        raise ValueError(f"{label} must be a JSON number")
+    result = float(value)
     if not math.isfinite(result):
         raise ValueError(f"{label} must be finite")
-    return struct.unpack("<f", struct.pack("<f", result))[0]
+    try:
+        return struct.unpack("<f", struct.pack("<f", result))[0]
+    except (OverflowError, struct.error) as exc:
+        raise ValueError(f"{label} is outside fp32 range") from exc
 
 
-def _read_artifact_tensor(name: str, value: Any) -> list[list[float]] | list[float]:
+def _read_artifact_tensor(name: str, value: Any, expected_shape: tuple[int, ...]) -> list[list[float]] | list[float]:
     if not isinstance(value, Mapping) or not isinstance(value.get("shape"), list):
         raise ValueError(f"learned artifact tensor {name!r} is malformed")
     shape = value["shape"]
+    if tuple(shape) != expected_shape:
+        raise ValueError(f"learned artifact tensor {name!r} shape mismatch: expected {expected_shape}, got {shape}")
     if len(shape) not in (1, 2) or any(type(size) is not int or size < 1 for size in shape):
         raise ValueError(f"learned artifact tensor {name!r} has an invalid shape")
     values = value.get("values")
@@ -169,7 +220,8 @@ def _validate_artifact(value: Any) -> dict[str, Any]:
         "quantization": _ARTIFACT_QUANTIZATION,
     }
     for key, expected in expected_headers.items():
-        if value.get(key) != expected:
+        actual = value.get(key)
+        if type(actual) is not type(expected) or actual != expected:
             raise ValueError(f"unsupported learned artifact {key}")
     _validate_artifact_vocab(value.get("action_vocab"))
     checksum = value.get("checksum")
@@ -183,7 +235,8 @@ def _validate_artifact(value: Any) -> dict[str, Any]:
     if not isinstance(weights, Mapping) or set(weights) != expected_names:
         missing = sorted(expected_names - set(weights or ())) if isinstance(weights, Mapping) else sorted(expected_names)
         raise ValueError(f"learned artifact tensors mismatch; missing={missing}")
-    decoded = {name: _read_artifact_tensor(name, weights[name]) for name in _artifact_tensor_names()}
+    shapes = artifact_tensor_shapes()
+    decoded = {name: _read_artifact_tensor(name, weights[name], shapes[name]) for name in _artifact_tensor_names()}
     return {"headers": dict(expected_headers), "action_vocab": value["action_vocab"], "weights": decoded}
 
 
