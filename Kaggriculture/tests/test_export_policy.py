@@ -176,6 +176,23 @@ def test_exporter_rejects_checkpoint_tensor_shape_mismatch():
         validate_checkpoint_state_dict(state)
 
 
+def test_artifact_builder_regression_plumbs_validated_vocab_without_torch():
+    from kagriculture_agent.model import ACTION_VOCAB
+    from kagriculture_agent.learned_policy import artifact_tensor_shapes
+    from scripts.export_policy import build_artifact
+
+    state = {}
+    for name, shape in artifact_tensor_shapes().items():
+        if len(shape) == 1:
+            values = [0.0] * shape[0]
+        else:
+            values = [[0.0] * shape[1] for _ in range(shape[0])]
+        state[name] = _FakeTensor(values, shape)
+    artifact = build_artifact(state, {key: list(value) for key, value in ACTION_VOCAB.items()})
+    assert artifact["action_vocab"]["worker_kinds"][0] == "PASS"
+    assert len(artifact["checksum"]) == 64
+
+
 def test_dependency_free_fixture_inference_is_fast_enough(tmp_path):
     path = tmp_path / "policy.json"
     path.write_text(json.dumps(_artifact()), encoding="utf-8")

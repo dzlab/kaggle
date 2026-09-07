@@ -93,7 +93,17 @@ def expected_tensor_names() -> tuple[str, ...]:
     return tuple(artifact_tensor_shapes())
 
 
-def validate_checkpoint_metadata(metadata: Any) -> None:
+def _strict_equal(actual: Any, expected: Any) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return set(actual) == set(expected) and all(_strict_equal(actual[key], expected[key]) for key in expected)
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(_strict_equal(left, right) for left, right in zip(actual, expected))
+    return actual == expected
+
+
+def validate_checkpoint_metadata(metadata: Any) -> dict[str, list[Any]]:
     if not isinstance(metadata, dict):
         raise ValueError("checkpoint metadata is required")
     for key, expected in (
@@ -101,14 +111,15 @@ def validate_checkpoint_metadata(metadata: Any) -> None:
         ("feature_schema_version", FEATURE_SCHEMA_VERSION),
         ("engine_version", ENGINE_VERSION),
     ):
-        if metadata.get(key) != expected:
+        if not _strict_equal(metadata.get(key), expected):
             raise ValueError(f"checkpoint {key} mismatch")
     hidden_width = metadata.get("hidden_width", HIDDEN_WIDTH)
     if type(hidden_width) is not int or hidden_width != HIDDEN_WIDTH:
         raise ValueError(f"checkpoint hidden_width mismatch: expected {HIDDEN_WIDTH}, got {hidden_width!r}")
     expected_vocab = {key: list(value) for key, value in ACTION_VOCAB.items()}
-    if metadata.get("action_vocab") != expected_vocab:
+    if not _strict_equal(metadata.get("action_vocab"), expected_vocab):
         raise ValueError("checkpoint action_vocab mismatch")
+    return expected_vocab
 
 
 def validate_checkpoint_state_dict(state: Any) -> None:
@@ -126,6 +137,24 @@ def validate_checkpoint_state_dict(state: Any) -> None:
             raise ValueError(f"checkpoint tensor {name!r} shape mismatch: expected {shapes[name]}, got {actual_shape}")
 
 
+def build_artifact(state: dict[str, Any], action_vocab: dict[str, list[Any]]) -> dict[str, Any]:
+    """Build the serialized artifact after checkpoint validation."""
+    validate_checkpoint_state_dict(state)
+    shapes = artifact_tensor_shapes()
+    artifact: dict[str, Any] = {
+        "format_version": FORMAT_VERSION,
+        "model_version": MODEL_VERSION,
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "engine_version": ENGINE_VERSION,
+        "hidden_width": HIDDEN_WIDTH,
+        "quantization": QUANTIZATION,
+        "action_vocab": action_vocab,
+        "weights": {name: _tensor_to_artifact(name, state[name], shapes[name]) for name in expected_tensor_names()},
+    }
+    artifact["checksum"] = artifact_checksum(artifact)
+    return artifact
+
+
 def export_checkpoint(checkpoint_path: str | Path, artifact_path: str | Path) -> dict[str, Any]:
     """Export a torch checkpoint, failing clearly when torch is unavailable."""
     try:
@@ -136,21 +165,9 @@ def export_checkpoint(checkpoint_path: str | Path, artifact_path: str | Path) ->
     if not isinstance(checkpoint, dict):
         raise ValueError("checkpoint must be an object")
     metadata = checkpoint.get("metadata")
-    validate_checkpoint_metadata(metadata)
+    expected_vocab = validate_checkpoint_metadata(metadata)
     state = checkpoint.get("model_state_dict")
-    validate_checkpoint_state_dict(state)
-    shapes = artifact_tensor_shapes()
-    artifact: dict[str, Any] = {
-        "format_version": FORMAT_VERSION,
-        "model_version": MODEL_VERSION,
-        "feature_schema_version": FEATURE_SCHEMA_VERSION,
-        "engine_version": ENGINE_VERSION,
-        "hidden_width": HIDDEN_WIDTH,
-        "quantization": QUANTIZATION,
-        "action_vocab": expected_vocab,
-        "weights": {name: _tensor_to_artifact(name, state[name], shapes[name]) for name in expected_tensor_names()},
-    }
-    artifact["checksum"] = artifact_checksum(artifact)
+    artifact = build_artifact(state, expected_vocab)
     destination = Path(artifact_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(_canonical_bytes(artifact) + b"\n")
