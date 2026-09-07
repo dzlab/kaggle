@@ -1,5 +1,6 @@
 import io
 import runpy
+import shutil
 import subprocess
 import tarfile
 from pathlib import Path
@@ -84,3 +85,41 @@ def test_submission_tarball_can_include_only_the_selected_policy_artifact(tmp_pa
             artifact.parent.rmdir()
         except OSError:
             pass
+
+
+def test_production_archive_contains_only_runtime_and_selected_artifact(tmp_path):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    shutil.copy2(PROJECT_ROOT / "main.py", staging / "main.py")
+    shutil.copytree(
+        PROJECT_ROOT / "kagriculture_agent",
+        staging / "kagriculture_agent",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    model = staging / "models" / "learned_v1.json"
+    model.parent.mkdir()
+    model.write_text("{}\n", encoding="utf-8")
+
+    archive = tmp_path / "production.tar.gz"
+    subprocess.run(
+        ["tar", "--exclude=__pycache__", "-czf", str(archive), "-C", str(staging),
+         "main.py", "kagriculture_agent", "models/learned_v1.json"],
+        check=True,
+        capture_output=True,
+    )
+
+    with tarfile.open(archive, mode="r:gz") as tar:
+        names = set(tar.getnames())
+
+    assert "main.py" in names
+    assert "models/learned_v1.json" in names
+    assert "kagriculture_agent/learned_policy.py" in names
+    assert all(
+        not name.startswith(("tests/", "reports/", "docs/", "scripts/", "replays/", "trajectories/"))
+        for name in names
+    )
+    assert all(
+        token not in name.lower()
+        for name in names
+        for token in ("torch", "numpy", ".pt", ".pth", "checkpoint")
+    )

@@ -100,6 +100,53 @@ passed the promotion gates. With no holdout records, `selected_candidate` is
 backward compatibility, and `selected_default_source` is `development_only`.
 When holdout evidence is present, that source is `holdout`.
 
+### Learned-policy release procedure
+
+Run development and holdout as disjoint development and holdout matrices. The
+development seeds are used for feature, policy, and checkpoint choices; the
+holdout seeds must be supplied explicitly with `--holdout-seeds`, must not
+overlap the development seeds, and must be run only after the candidate and
+configuration are frozen. Keep the same opponents and both seat orders in
+both splits:
+
+```bash
+uv run python scripts/evaluate.py \
+  --seeds 30 --start-seed 0 \
+  --holdout-seeds 100 101 102 103 104 105 106 107 108 109 \
+  --steps 720 --min-valid-games 20 \
+  --opponents pass random starter --seats 0 1 \
+  --candidates current learned_v1 \
+  --max-same-item-churn 0 --max-market-transactions 500 \
+  --min-terminal-cash 100 \
+  --output reports/kagriculture-learned-holdout.json
+```
+
+The report is promotion evidence only when `learned_v1` has exactly one
+complete, valid record for every requested `(opponent, seed, seat)` pair, with
+no missing, duplicate, extra, or malformed records; zero framework failures;
+zero missed basic-needs events; a non-negative fifth-percentile paired bank
+differential; and strictly better seat-balanced win rate and median paired bank
+differential than `current`. A development-only winner is not a promotion:
+without holdout evidence, `selected_candidate` must remain `null` and the
+production default remains deterministic `current`.
+
+Before rollout, record the selected artifact's SHA-256, model version,
+feature-schema version, engine version, exact holdout command, and report
+path. Package only `main.py`, `kagriculture_agent/`, and the selected
+`models/learned_v1.json`; keep checkpoints, training dependencies, scripts,
+tests, reports, and trajectories out of the submission archive. Since the
+current repository has no valid artifact and the learned-inference latency
+gate is unresolved, no learned holdout result or production switch is implied
+by this documentation.
+
+The learned adapter is fail-safe: an absent, corrupt, incompatible, slow, or
+runtime-failing artifact falls back to the deterministic legality-first policy.
+For an operational rollback, submit the previously validated package with
+`_policy = Policy()` (and omit the learned artifact), then rerun the import
+smoke test and the same production packaging exclusions. Keep the promoted
+artifact, manifest, and holdout report archived so the failed rollout remains
+reproducible.
+
 The default report path is `reports/evaluation.json`; each report also gets a
 compact replay-record sidecar beside it. Use `--quick` for a 2-seed, 96-step
 smoke batch, and do not commit generated reports unless a report is explicitly
