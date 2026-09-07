@@ -17,6 +17,7 @@ import struct
 import sys
 import ctypes
 import ctypes.util
+import threading
 from array import array
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -63,7 +64,8 @@ _ARTIFACT_FEATURE_SCHEMA_VERSION = 1
 _ARTIFACT_ENGINE_VERSION = "1.32.7"
 _ARTIFACT_HIDDEN_WIDTH = 128
 _ARTIFACT_QUANTIZATION = "int8-per-row"
-_BLAS_WEIGHT_CACHE: dict[int, tuple[list[list[float]], array]] = {}
+_BLAS_WEIGHT_CACHE: dict[int, tuple[list[list[float]], array, Any]] = {}
+_BLAS_WORKSPACE = threading.local()
 _ARTIFACT_WORKER_KINDS = (
     "PASS", "MOVE", "WATER", "HARVEST", "PLANT", "FERTILIZE", "FEED",
     "CARE", "PICKUP", "PLACE", "DROP", "SELL", "DIG", "WEED",
@@ -295,13 +297,32 @@ def _blas_linear(rows: list[list[float]], weight: list[list[float]], bias: list[
     weight_key = id(weight)
     cached = _BLAS_WEIGHT_CACHE.get(weight_key)
     if cached is None or cached[0] is not weight:
-        cached = (weight, array("f", (value for row in weight for value in row)))
+        right = array("f", (value for row in weight for value in row))
+        cached = (weight, right, (ctypes.c_float * len(right)).from_buffer(right))
         _BLAS_WEIGHT_CACHE[weight_key] = cached
-    right = cached[1]
-    result = array("f", (bias[column] for _row in range(row_count) for column in range(output_width)))
-    left_pointer = (ctypes.c_float * len(left)).from_buffer(left)
-    right_pointer = (ctypes.c_float * len(right)).from_buffer(right)
-    result_pointer = (ctypes.c_float * len(result)).from_buffer(result)
+    right, right_pointer = cached[1], cached[2]
+    workspace = getattr(_BLAS_WORKSPACE, "buffers", {})
+    _BLAS_WORKSPACE.buffers = workspace
+    key = (row_count, input_width, output_width)
+    buffers = workspace.get(key)
+    if buffers is None:
+        left = array("f", [0.0]) * (row_count * input_width)
+        result = array("f", [0.0]) * (row_count * output_width)
+        buffers = (
+            left, result,
+            (ctypes.c_float * len(left)).from_buffer(left),
+            (ctypes.c_float * len(result)).from_buffer(result),
+        )
+        workspace[key] = buffers
+    left, result, left_pointer, result_pointer = buffers
+    offset = 0
+    for row in rows:
+        left[offset:offset + input_width] = array("f", row)
+        offset += input_width
+    offset = 0
+    for _row in range(row_count):
+        result[offset:offset + output_width] = array("f", bias)
+        offset += output_width
     _CBLAS_SGEMM(101, 111, 112, row_count, output_width, input_width, 1.0,
                  left_pointer, input_width, right_pointer, input_width, 1.0,
                  result_pointer, output_width)
@@ -313,12 +334,30 @@ def _matrix_multiply(left: list[list[float]], right: list[list[float]]) -> list[
     """Multiply two row-major matrices, using the same stdlib CBLAS bridge."""
     row_count, inner, output_width = len(left), len(right), len(right[0])
     if _CBLAS_SGEMM is not None and row_count >= 8 and inner >= 16 and output_width >= 8:
-        left_buffer = array("f", (value for row in left for value in row))
-        right_buffer = array("f", (value for row in right for value in row))
-        result = array("f", [0.0]) * (row_count * output_width)
-        left_pointer = (ctypes.c_float * len(left_buffer)).from_buffer(left_buffer)
-        right_pointer = (ctypes.c_float * len(right_buffer)).from_buffer(right_buffer)
-        result_pointer = (ctypes.c_float * len(result)).from_buffer(result)
+        workspace = getattr(_BLAS_WORKSPACE, "buffers", {})
+        _BLAS_WORKSPACE.buffers = workspace
+        key = ("mm", row_count, inner, output_width)
+        buffers = workspace.get(key)
+        if buffers is None:
+            left_buffer = array("f", [0.0]) * (row_count * len(left[0]))
+            right_buffer = array("f", [0.0]) * (inner * output_width)
+            result = array("f", [0.0]) * (row_count * output_width)
+            buffers = (
+                left_buffer, right_buffer, result,
+                (ctypes.c_float * len(left_buffer)).from_buffer(left_buffer),
+                (ctypes.c_float * len(right_buffer)).from_buffer(right_buffer),
+                (ctypes.c_float * len(result)).from_buffer(result),
+            )
+            workspace[key] = buffers
+        left_buffer, right_buffer, result, left_pointer, right_pointer, result_pointer = buffers
+        left_offset = 0
+        for row in left:
+            left_buffer[left_offset:left_offset + len(row)] = array("f", row)
+            left_offset += len(row)
+        right_offset = 0
+        for row in right:
+            right_buffer[right_offset:right_offset + len(row)] = array("f", row)
+            right_offset += len(row)
         _CBLAS_SGEMM(101, 111, 111, row_count, output_width, inner, 1.0,
                      left_pointer, inner, right_pointer, output_width, 0.0,
                      result_pointer, output_width)
@@ -420,8 +459,14 @@ class DependencyFreePolicy:
         global_row = tokens[-1]
         worker_target_query = _linear(worker_rows, weights["target_worker_head.weight"], weights["target_worker_head.bias"])
         tile_target_key = _linear(tile_rows, weights["target_tile_head.weight"], weights["target_tile_head.bias"])
-        target_logits = [[sum(left * right for left, right in zip(query, key)) / math.sqrt(128.0) for key in tile_target_key]
-                         for query in worker_target_query]
+        tile_target_transposed = [
+            [tile_target_key[row][column] for row in range(len(tile_target_key))]
+            for column in range(128)
+        ]
+        target_logits = [
+            [value / math.sqrt(128.0) for value in row]
+            for row in _matrix_multiply(worker_target_query, tile_target_transposed)
+        ]
         pooled_market = [sum(row[index] for row in market_rows) / len(market_rows) for index in range(128)]
         return {
             "worker_act_logits": _linear(worker_rows, weights["worker_act_head.weight"], weights["worker_act_head.bias"]),
