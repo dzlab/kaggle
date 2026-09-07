@@ -3431,7 +3431,8 @@ def _normalized_command(command: Sequence[str] | None) -> list[str]:
 
 
 def build_manifest(*, candidates: Sequence[str], opponents: Sequence[str], seeds: Sequence[int],
-                   steps: int, seats: Sequence[int], command: Sequence[str] | None = None) -> dict[str, Any]:
+                   steps: int, seats: Sequence[int], command: Sequence[str] | None = None,
+                   selection_path: str = "candidate") -> dict[str, Any]:
     """Return the JSON-compatible, versioned reproducibility manifest."""
     return {
         "schema_version": 3,
