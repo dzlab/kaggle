@@ -13,12 +13,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from kagriculture_agent.candidates import candidate_policy
-from kagriculture_agent.constants import CROPS
+from kagriculture_agent.candidates import artifact_candidate_policy, candidate_policy
+from kagriculture_agent.constants import CROPS, ENGINE_VERSION
 from main import agent
 
 
 OPPONENTS = ("pass", "random", "starter")
+
+
+def _validate_engine_version(module: Any) -> None:
+    """Require the Kaggle engine version used to develop this runner."""
+    if getattr(module, "__version__", None) != ENGINE_VERSION:
+        raise RuntimeError(
+            f"run_local requires kaggle-environments=={ENGINE_VERSION}"
+        )
 
 
 def _deterministic_random_agent(seed: int):
@@ -59,10 +67,10 @@ def _positive_int(value: str) -> int:
     return number
 
 
-def _ordered_agents(opponent_agent: Any, candidate_player: int) -> list[Any]:
+def _ordered_agents(opponent_agent: Any, candidate_player: int, candidate: Any = agent) -> list[Any]:
     if type(candidate_player) is not int or candidate_player not in (0, 1):
         raise ValueError("candidate_player must be 0 or 1")
-    return [agent, opponent_agent] if candidate_player == 0 else [opponent_agent, agent]
+    return [candidate, opponent_agent] if candidate_player == 0 else [opponent_agent, candidate]
 
 
 def _current_opponent_agent(configuration: Any = None):
@@ -89,6 +97,9 @@ def run_episode(
     candidate_player: int = 0,
     opponent_agent: Any | None = None,
     current_opponent: bool = False,
+    candidate_artifact: str | Path | None = None,
+    candidate_identity: str | None = None,
+    opponent_artifact: str | Path | None = None,
     debug: bool = False,
 ) -> Any:
     """Run one local game and save its JSON replay."""
@@ -101,12 +112,24 @@ def run_episode(
     if current_opponent and opponent != "pass":
         raise ValueError("current_opponent requires opponent pass")
 
+    if candidate_artifact is not None:
+        candidate = artifact_candidate_policy(candidate_artifact)
+    elif candidate_identity is None:
+        candidate = agent
+    else:
+        candidate = candidate_policy(candidate_identity)
+    opponent_candidate = None
+    if opponent_artifact is not None:
+        opponent_candidate = artifact_candidate_policy(opponent_artifact)
+
     try:
-        from kaggle_environments import make
+        import kaggle_environments
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "kaggle-environments is required to run local games; install the project dependencies first"
         ) from exc
+    _validate_engine_version(kaggle_environments)
+    make = kaggle_environments.make
 
     env = make(
         "kaggriculture",
@@ -120,7 +143,9 @@ def run_episode(
             opponent_agent = _deterministic_random_agent(seed)
         else:
             opponent_agent = opponent
-    env.run(_ordered_agents(opponent_agent, candidate_player))
+    if opponent_candidate is not None:
+        opponent_agent = opponent_candidate
+    env.run(_ordered_agents(opponent_agent, candidate_player, candidate))
 
     replay = Path(replay_path)
     replay.parent.mkdir(parents=True, exist_ok=True)
@@ -137,6 +162,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", type=_positive_int, default=720, dest="steps")
     parser.add_argument("--replay", type=Path, default=None, dest="replay_path")
     parser.add_argument("--seat", type=int, choices=(0, 1), default=0, dest="candidate_player")
+    parser.add_argument("--candidate-artifact", type=Path, default=None)
+    parser.add_argument("--candidate-identity", default=None)
+    parser.add_argument("--opponent-artifact", type=Path, default=None)
     parser.add_argument(
         "--current-opponent", action="store_true",
         help="use a fresh current Policy callable as the opponent",
@@ -156,6 +184,9 @@ def main(argv: list[str] | None = None) -> int:
         steps=args.steps,
         replay_path=replay_path,
         candidate_player=args.candidate_player,
+        candidate_artifact=args.candidate_artifact,
+        candidate_identity=args.candidate_identity,
+        opponent_artifact=args.opponent_artifact,
         current_opponent=args.current_opponent,
         debug=args.debug,
     )

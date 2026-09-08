@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Mapping
+import math
 from typing import Any, TypeAlias
 
 from .types import EpisodeMemory, Position
@@ -39,6 +40,32 @@ def _valid_index(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
+def _finite_integer(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    return None
+
+
+def observation_turn(observation: Any, turns_per_day: int = 24) -> int:
+    """Return a stable turn number from an engine observation."""
+    source: Observation = observation if isinstance(observation, Mapping) else {}
+    step = _finite_integer(source.get("step"))
+    if step is not None:
+        return step
+
+    day = _finite_integer(source.get("day"))
+    hour = _finite_integer(source.get("hour"))
+    turns = _finite_integer(turns_per_day)
+    if (day is None or hour is None or turns is None or
+            day < 0 or hour < 0 or turns < 1):
+        return 0
+    return day * turns + hour
+
+
 def parse_observation(obs: Any) -> dict[str, Any]:
     """Return a stable, player-specific view while tolerating omitted fields."""
     source: Observation = obs if isinstance(obs, Mapping) else {}
@@ -52,6 +79,7 @@ def parse_observation(obs: Any) -> dict[str, Any]:
         "player": player,
         "day": source.get("day"),
         "hour": source.get("hour"),
+        "turn": observation_turn(source),
         "farm": farm,
         "private": _mapping_or_empty(source.get("private")),
         "market": _mapping_or_empty(source.get("market")),

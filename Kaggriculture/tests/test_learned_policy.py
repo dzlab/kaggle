@@ -94,6 +94,32 @@ def test_slow_model_is_terminated_at_process_boundary():
     assert elapsed < 0.4
 
 
+def test_validated_exported_policy_runs_without_per_turn_process_spawn(monkeypatch):
+    import kagriculture_agent.learned_policy as runtime
+
+    policy = LearnedPolicy("fixture")
+    policy._loaded = True
+    policy._model = object.__new__(runtime.DependencyFreePolicy)
+    monkeypatch.setattr(
+        runtime.DependencyFreePolicy,
+        "propose",
+        lambda self, state, features: PolicyProposal((), (), 1.0, "learned_v1"),
+    )
+    monkeypatch.setattr(runtime, "_run_with_timeout", lambda *args: pytest.fail("unexpected process spawn"))
+
+    proposal = policy.propose({}, object())
+
+    assert proposal == PolicyProposal((), (), 1.0, "learned_v1")
+
+
+def test_file_backed_json_model_loads_without_process_spawn(tmp_path):
+    path = tmp_path / "model.json"
+    path.write_text(json.dumps({"workers": [], "market_orders": []}))
+    model = LearnedPolicy(path)._load()
+
+    assert model == {"workers": [], "market_orders": []}
+
+
 def test_sigterm_ignoring_model_has_no_orphan_after_hard_cleanup(tmp_path):
     pid_path = tmp_path / "child.pid"
     policy = LearnedPolicy(SigtermIgnoringModel(pid_path), timeout_seconds=0.03)

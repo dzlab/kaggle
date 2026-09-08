@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
+import importlib.util
 import json
 import math
 import random
@@ -65,12 +67,26 @@ _NORMALIZED_RECORD_FIELDS = frozenset({
     "variant", "opponent", "seed", "seat", "outcome", "final_bank",
     "opponent_final_bank", "bank_differential", "framework_error",
     "shed_overflow", "price_floor_sales", "missed_basic_needs",
+    "submitted_market_order_count", "market_transaction_count", "same_item_market_churn",
+    "same_item_sell_buy_churn", "terminal_cash", "terminal_inventory_value",
 })
 _NORMALIZED_NUMERIC_FIELDS = frozenset({
     "final_bank", "opponent_final_bank", "bank_differential", "shed_overflow",
-    "price_floor_sales", "missed_basic_needs",
+    "price_floor_sales", "missed_basic_needs", "terminal_cash",
+    "terminal_inventory_value", "market_transaction_count",
+    "submitted_market_order_count", "same_item_market_churn",
+    "same_item_sell_buy_churn",
+})
+_NORMALIZED_NONNEGATIVE_INTEGER_FIELDS = frozenset({
+    "market_transaction_count", "submitted_market_order_count",
+    "same_item_market_churn", "same_item_sell_buy_churn",
 })
 _WORKER_OUTCOMES = frozenset({"win", "loss", "tie", "framework_error"})
+FRAMEWORK_REASON_ORDER = (
+    "engine_error", "malformed_replay", "missed_basic_needs", "market_churn",
+    "market_transaction_cap", "terminal_cash_floor", "terminal_inventory_floor",
+    "incomplete_pairing",
+)
 _STRICT_NUMERIC_FIELDS = frozenset({
     "seed", "step", "day", "hour", "money", "hires_today", "yield_units",
     "max_lifespan_step", "consecutive_unwatered", "planted_day",
@@ -115,6 +131,79 @@ def _positive_int(value: str) -> int:
     if number < 1:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return number
+
+
+def framework_error_reasons(record: Mapping[str, Any]) -> list[str]:
+    """Return the supported framework diagnostics in their canonical order."""
+    if not isinstance(record, Mapping):
+        return []
+    reasons = {
+        reason for reason in record.get("framework_error_reasons", ())
+        if reason in FRAMEWORK_REASON_ORDER
+    } if isinstance(record.get("framework_error_reasons", ()), Sequence) \
+        and not isinstance(record.get("framework_error_reasons"), (str, bytes)) else set()
+    if record.get("engine_error"):
+        reasons.add("engine_error")
+    if record.get("malformed_replay"):
+        reasons.add("malformed_replay")
+    if _number(record.get("missed_basic_needs")) is not None and _number(record.get("missed_basic_needs")) > 0:
+        reasons.add("missed_basic_needs")
+    churn = record.get("same_item_market_churn", record.get("same_item_sell_buy_churn", 0))
+    if _number(churn) is not None and _number(churn) > 0:
+        reasons.add("market_churn")
+    for field, reason in (
+        ("market_transaction_cap", "market_transaction_cap"),
+        ("terminal_cash_floor", "terminal_cash_floor"),
+        ("terminal_inventory_floor", "terminal_inventory_floor"),
+        ("incomplete_pairing", "incomplete_pairing"),
+    ):
+        if record.get(field):
+            reasons.add(reason)
+    return [reason for reason in FRAMEWORK_REASON_ORDER if reason in reasons]
+
+
+def _nonnegative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return number
+
+
+def _nonnegative_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative finite number") from exc
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative finite number")
+    return number
+
+
+def _validate_economic_thresholds(*, max_same_item_market_churn: Any = 0,
+                                  max_market_transactions: Any = None,
+                                  min_terminal_cash: Any = 0.0,
+                                  min_terminal_inventory_value: Any = 0.0) -> dict[str, Any]:
+    """Validate and normalize the ordered economic safety-gate thresholds."""
+    if type(max_same_item_market_churn) is not int or max_same_item_market_churn < 0:
+        raise ValueError("max_same_item_market_churn must be a non-negative integer")
+    if max_market_transactions is not None and (
+        type(max_market_transactions) is not int or max_market_transactions < 0
+    ):
+        raise ValueError("max_market_transactions must be a non-negative integer")
+    for name, value in (("min_terminal_cash", min_terminal_cash),
+                        ("min_terminal_inventory_value", min_terminal_inventory_value)):
+        if isinstance(value, bool) or not isinstance(value, Real) \
+                or not math.isfinite(float(value)) or float(value) < 0:
+            raise ValueError(f"{name} must be a non-negative finite number")
+    return {
+        "max_same_item_market_churn": max_same_item_market_churn,
+        "max_market_transactions": max_market_transactions,
+        "min_terminal_cash": float(min_terminal_cash),
+        "min_terminal_inventory_value": float(min_terminal_inventory_value),
+    }
 
 
 def _validate_seed_partition(development_seeds: Sequence[int], holdout_seeds: Sequence[int] | None) -> None:
@@ -186,6 +275,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--min-valid-games", type=_positive_int, default=20,
         help="minimum valid games required for each seat before selection",
     )
+    parser.add_argument(
+        "--baseline-policy", default=None, metavar="MODULE:CALLABLE",
+        help="previous-agent policy reference; run it on the identical matrix",
+    )
+    parser.add_argument(
+        "--baseline-identity", default="previous-agent",
+        help="stable report identity for --baseline-policy",
+    )
+    parser.add_argument(
+        "--churn-window", type=_positive_int, default=2,
+        help="maximum replay-turn distance for same-item buy/sell churn",
+    )
+    parser.add_argument(
+        "--max-same-item-churn", type=_nonnegative_int, default=0,
+        help="maximum same-item buy/sell churn events per game",
+    )
+    parser.add_argument(
+        "--max-market-transactions", type=_nonnegative_int, default=None,
+        help="maximum submitted market order events across the evaluation (quantity does not multiply the count)",
+    )
+    parser.add_argument(
+        "--min-terminal-cash", type=_nonnegative_float, default=0.0,
+        help="minimum terminal cash required in every valid game",
+    )
+    parser.add_argument(
+        "--min-terminal-inventory-value", type=_nonnegative_float, default=0.0,
+        help="minimum terminal inventory value required in every valid game",
+    )
     parser.add_argument("--ablation", action="append", type=parse_ablation, default=[], metavar="COMPONENT=on|off")
     parser.add_argument("--quick", action="store_true", help="use a small default batch suitable for local tests")
     args = parser.parse_args(argv)
@@ -233,12 +350,71 @@ def _average(records: Sequence[Mapping[str, Any]], key: str) -> float:
     return float(mean(values)) if values else 0.0
 
 
+def _market_metrics(states: Sequence[Mapping[str, Any]], *, churn_window: int = 2) -> dict[str, int]:
+    """Count submitted market order events and reversals in a replay.
+
+    The bootstrap state at index zero contains a placeholder action.  Churn is
+    counted when consecutive opposite ``BUY_PRODUCT``/``SELL`` directions for
+    one item occur within ``churn_window`` replay turns.  Seed purchases are
+    intentionally excluded because seeds and harvested products are distinct
+    inventories in the engine.
+    """
+    if type(churn_window) is not int or churn_window < 1:
+        raise ValueError("churn_window must be a positive integer")
+    transaction_count = 0
+    churn_count = 0
+    last_direction: dict[str, tuple[str, int]] = {}
+    for index, state in enumerate(states):
+        if index == 0 and len(states) > 1:
+            continue
+        observation = _mapping(state.get("observation"))
+        raw_step = _number(observation.get("step"))
+        step = int(raw_step) if raw_step is not None else index
+        action = _mapping(state.get("action"))
+        for order in _market_orders(action):
+            if not order or not isinstance(order[0], str):
+                continue
+            # A quantity-bearing order is one submitted market order event.
+            # The quantity remains part of the replay action, but does not
+            # inflate the activity count; replay data cannot prove a fill.
+            transaction_count += 1
+            operation = order[0]
+            if operation not in {"BUY_PRODUCT", "SELL"} or len(order) < 2 or not isinstance(order[1], str):
+                continue
+            item = order[1]
+            direction = "buy" if operation == "BUY_PRODUCT" else "sell"
+            previous = last_direction.get(item)
+            if previous and previous[0] != direction and step - previous[1] <= churn_window:
+                churn_count += 1
+            last_direction[item] = (direction, step)
+    return {
+        # This is the canonical name.  The older market_transaction_count key
+        # remains as an alias for report/fixture compatibility.
+        "submitted_market_order_count": transaction_count,
+        "market_transaction_count": transaction_count,
+        "same_item_market_churn": churn_count,
+        "same_item_sell_buy_churn": churn_count,
+    }
+
+
 def aggregate_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Aggregate game records into the stable per-variant/opponent schema."""
     records = list(records)
     count = len(records)
     valid_records = [record for record in records if not record.get("framework_error")]
     final_banks = [float(record["final_bank"]) for record in valid_records if record.get("final_bank") is not None]
+    terminal_cash = [
+        float(record.get("terminal_cash", record.get("final_bank")))
+        for record in valid_records
+        if record.get("terminal_cash", record.get("final_bank")) is not None
+    ]
+    terminal_inventory_values = [
+        float(record.get("terminal_inventory_value", 0.0) or 0.0)
+        for record in valid_records
+    ]
+    market_transactions = [int(record.get("submitted_market_order_count", record.get("market_transaction_count", 0)) or 0)
+                           for record in records]
+    churn_values = [int(record.get("same_item_market_churn", record.get("same_item_sell_buy_churn", 0)) or 0) for record in records]
     outcomes = {outcome: sum(record.get("outcome") == outcome for record in valid_records)
                 for outcome in ("win", "loss", "tie")}
     return {
@@ -252,6 +428,16 @@ def aggregate_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "mean_final_bank": float(mean(final_banks)) if final_banks else 0.0,
         "median_final_bank": float(median(final_banks)) if final_banks else 0.0,
         "fifth_percentile_final_bank": float(percentile(final_banks, 5)) if final_banks else 0.0,
+        "mean_terminal_cash": float(mean(terminal_cash)) if terminal_cash else 0.0,
+        "median_terminal_cash": float(median(terminal_cash)) if terminal_cash else 0.0,
+        "mean_terminal_inventory_value": float(mean(terminal_inventory_values)) if terminal_inventory_values else 0.0,
+        "median_terminal_inventory_value": float(median(terminal_inventory_values)) if terminal_inventory_values else 0.0,
+        "total_market_transaction_count": sum(market_transactions),
+        "mean_market_transaction_count": float(mean(market_transactions)) if market_transactions else 0.0,
+        "total_submitted_market_order_count": sum(market_transactions),
+        "mean_submitted_market_order_count": float(mean(market_transactions)) if market_transactions else 0.0,
+        "total_same_item_market_churn": sum(churn_values),
+        "max_same_item_market_churn": max(churn_values, default=0),
         "mean_bank_differential": _average(valid_records, "bank_differential"),
         "framework_error_rate": sum(bool(record.get("framework_error")) for record in records) / count if count else 0.0,
         "average_shed_overflow": _average(records, "shed_overflow"),
@@ -364,6 +550,11 @@ def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 
     pair_scores = []
     pair_differentials = []
+    pair_market_transactions = []
+    pair_market_transaction_totals = []
+    pair_churn = []
+    pair_terminal_cash = []
+    pair_terminal_inventory_value = []
     pair_keys = []
     outcome_counts = {"win": 0, "loss": 0, "tie": 0}
     for key, seat_zero, seat_one in pairs:
@@ -372,6 +563,24 @@ def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         pair_differentials.append(
             (_metric_number(seat_zero["bank_differential"]) + _metric_number(seat_one["bank_differential"])) / 2.0
         )
+        seat_market_transactions = [
+            float(seat_zero.get("submitted_market_order_count", seat_zero.get("market_transaction_count", 0)) or 0),
+            float(seat_one.get("submitted_market_order_count", seat_one.get("market_transaction_count", 0)) or 0),
+        ]
+        pair_market_transactions.append(float(mean(seat_market_transactions)))
+        pair_market_transaction_totals.append(sum(seat_market_transactions))
+        pair_churn.append(float(mean(
+            [float(seat_zero.get("same_item_market_churn", seat_zero.get("same_item_sell_buy_churn", 0)) or 0),
+             float(seat_one.get("same_item_market_churn", seat_one.get("same_item_sell_buy_churn", 0)) or 0)]
+        )))
+        pair_terminal_cash.append(float(mean([
+            float(seat_zero.get("terminal_cash", seat_zero.get("final_bank", 0)) or 0),
+            float(seat_one.get("terminal_cash", seat_one.get("final_bank", 0)) or 0),
+        ])))
+        pair_terminal_inventory_value.append(float(mean([
+            float(seat_zero.get("terminal_inventory_value", 0) or 0),
+            float(seat_one.get("terminal_inventory_value", 0) or 0),
+        ])))
         pair_keys.append(key)
         for seat_record in (seat_zero, seat_one):
             outcome_counts[seat_record["outcome"]] += 1
@@ -400,6 +609,26 @@ def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "mean_paired_bank_differential": float(mean(pair_differentials)) if pair_differentials else None,
         "median_paired_bank_differential": float(median(pair_differentials)) if pair_differentials else None,
         "fifth_percentile_bank_differential": percentile(pair_differentials, 5),
+        "total_market_transaction_count": int(sum(pair_market_transaction_totals)),
+        "mean_paired_market_transaction_count": float(mean(pair_market_transactions)) if pair_market_transactions else None,
+        "median_paired_market_transaction_count": float(median(pair_market_transactions)) if pair_market_transactions else None,
+        "total_submitted_market_order_count": int(sum(pair_market_transaction_totals)),
+        "mean_paired_submitted_market_order_count": float(mean(pair_market_transactions)) if pair_market_transactions else None,
+        "median_paired_submitted_market_order_count": float(median(pair_market_transactions)) if pair_market_transactions else None,
+        "max_same_item_market_churn": max(
+            [
+                int(record.get("same_item_market_churn", record.get("same_item_sell_buy_churn", 0)) or 0)
+                for _key, seat_zero, seat_one in pairs
+                for record in (seat_zero, seat_one)
+            ],
+            default=0,
+        ),
+        "mean_paired_same_item_market_churn": float(mean(pair_churn)) if pair_churn else None,
+        "median_paired_same_item_market_churn": float(median(pair_churn)) if pair_churn else None,
+        "mean_paired_terminal_cash": float(mean(pair_terminal_cash)) if pair_terminal_cash else None,
+        "median_paired_terminal_cash": float(median(pair_terminal_cash)) if pair_terminal_cash else None,
+        "mean_paired_terminal_inventory_value": float(mean(pair_terminal_inventory_value)) if pair_terminal_inventory_value else None,
+        "median_paired_terminal_inventory_value": float(median(pair_terminal_inventory_value)) if pair_terminal_inventory_value else None,
         "wilson_win_rate": wilson,
         "bootstrap_seat_balanced_win_rate": bootstrap_win_rate,
         "bootstrap_bank_differential": bootstrap,
@@ -471,7 +700,11 @@ def _matrix_completeness(
 
 def _safety_gate_reasons(records: Sequence[Mapping[str, Any]], summary: Mapping[str, Any], *,
                         min_valid_games: int,
-                        expected_matrix: Sequence[tuple[str, int, int]] | None = None) -> list[str]:
+                        expected_matrix: Sequence[tuple[str, int, int]] | None = None,
+                        max_same_item_market_churn: int = 0,
+                        max_market_transactions: int | None = None,
+                        min_terminal_cash: float = 0.0,
+                        min_terminal_inventory_value: float = 0.0) -> list[str]:
     """Return ordered reasons a candidate is unsafe for promotion or selection.
 
     Reports written from pre-seat evaluator fixtures may not contain a ``seat``
@@ -494,26 +727,102 @@ def _safety_gate_reasons(records: Sequence[Mapping[str, Any]], summary: Mapping[
             matrix_reasons.append("extra_expected_matrix_records")
         if matrix_reasons:
             return matrix_reasons
-    if not any("seat" in record for record in mappings):
-        return []
-    if any(summary["valid_records_by_seat"][str(seat)] < min_valid_games for seat in (0, 1)):
-        return ["insufficient_valid_games"]
-    if summary["missing_seat_pairs"]:
-        return ["missing_seat_pairs"]
-    if summary["duplicate_seat_pairs"]:
-        return ["duplicate_seat_pairs"]
-    if (
-        summary["fifth_percentile_bank_differential"] is None
-        or summary["fifth_percentile_bank_differential"] < 0
-    ):
-        return ["negative_tail"]
+    seat_aware = any("seat" in record for record in mappings)
+    if seat_aware:
+        if any(summary["valid_records_by_seat"][str(seat)] < min_valid_games for seat in (0, 1)):
+            return ["insufficient_valid_games"]
+        if summary["missing_seat_pairs"]:
+            return ["missing_seat_pairs"]
+        if summary["duplicate_seat_pairs"]:
+            return ["duplicate_seat_pairs"]
+        if (
+            summary["fifth_percentile_bank_differential"] is None
+            or summary["fifth_percentile_bank_differential"] < 0
+        ):
+            return ["negative_tail"]
+    economic_summary = summary if seat_aware else aggregate_records(mappings)
+    if economic_summary.get("max_same_item_market_churn", 0) > max_same_item_market_churn:
+        return ["same_item_market_churn"]
+    if max_market_transactions is not None and economic_summary.get("total_market_transaction_count", 0) > max_market_transactions:
+        return ["market_transaction_count"]
+    valid_mappings = [record for record in mappings if not record.get("framework_error")]
+
+    def _terminal_metric(record: Mapping[str, Any], field: str, summary_key: str,
+                         *legacy_fields: str) -> float:
+        for candidate_field in (field, *legacy_fields):
+            if candidate_field in record and record[candidate_field] is not None:
+                return float(record[candidate_field] or 0.0)
+        if field == "terminal_inventory_value" and "seat" not in record:
+            return 0.0
+        # Legacy records may not expose the per-record terminal metric.  Keep
+        # the old aggregate fallback only for that record, while enforcing
+        # present terminal fields independently.
+        return float(economic_summary.get(summary_key, 0.0) or 0.0)
+
+    cash_below_threshold = any(
+        _terminal_metric(record, "terminal_cash", "mean_terminal_cash", "final_bank") < min_terminal_cash
+        for record in valid_mappings
+    )
+    inventory_below_threshold = any(
+        _terminal_metric(record, "terminal_inventory_value", "mean_terminal_inventory_value")
+        < min_terminal_inventory_value
+        for record in valid_mappings
+    )
+    if cash_below_threshold:
+        return ["terminal_cash_below_threshold"]
+    if inventory_below_threshold:
+        return ["terminal_inventory_value_below_threshold"]
     return []
 
 
 def _passes_safety_gates(records: Sequence[Mapping[str, Any]], summary: Mapping[str, Any], *,
-                         min_valid_games: int) -> bool:
+                         min_valid_games: int,
+                         max_same_item_market_churn: int = 0,
+                         max_market_transactions: int | None = None,
+                         min_terminal_cash: float = 0.0,
+                         min_terminal_inventory_value: float = 0.0) -> bool:
     """Return whether a candidate is eligible for default selection."""
-    return not _safety_gate_reasons(records, summary, min_valid_games=min_valid_games)
+    return not _safety_gate_reasons(
+        records, summary, min_valid_games=min_valid_games,
+        max_same_item_market_churn=max_same_item_market_churn,
+        max_market_transactions=max_market_transactions,
+        min_terminal_cash=min_terminal_cash,
+        min_terminal_inventory_value=min_terminal_inventory_value,
+    )
+
+
+def _external_metric_deltas(
+    candidate_records: Sequence[Mapping[str, Any]],
+    baseline_records: Sequence[Mapping[str, Any]],
+) -> dict[str, float] | None:
+    """Compare external-policy metrics on identical opponent/seed/seat keys."""
+    def keyed(records: Sequence[Mapping[str, Any]]) -> dict[tuple[str, Any, int], Mapping[str, Any]] | None:
+        result = {}
+        for record in records:
+            if not _metric_record_is_valid(record):
+                continue
+            key = (str(record.get("opponent")), record.get("seed"), record["seat"])
+            if key in result:
+                return None
+            result[key] = record
+        return result
+
+    candidate = keyed(candidate_records)
+    baseline = keyed(baseline_records)
+    if candidate is None or baseline is None or not candidate or not baseline or set(candidate) != set(baseline):
+        return None
+    fields = {
+        "market_transaction_count": lambda record: float(
+            record.get("submitted_market_order_count", record.get("market_transaction_count", 0)) or 0
+        ),
+        "same_item_market_churn": lambda record: float(record.get("same_item_market_churn", record.get("same_item_sell_buy_churn", 0)) or 0),
+        "terminal_cash": lambda record: float(record.get("terminal_cash", record.get("final_bank", 0)) or 0),
+        "terminal_inventory_value": lambda record: float(record.get("terminal_inventory_value", 0) or 0),
+    }
+    return {
+        field: float(mean([getter(candidate[key]) - getter(baseline[key]) for key in candidate]))
+        for field, getter in fields.items()
+    }
 
 
 def promotion_decision(
@@ -522,6 +831,11 @@ def promotion_decision(
     *,
     min_valid_games: int = 20,
     expected_matrix: Sequence[tuple[str, int, int]] | None = None,
+    max_same_item_market_churn: int = 0,
+    max_market_transactions: int | None = None,
+    min_terminal_cash: float = 0.0,
+    min_terminal_inventory_value: float = 0.0,
+    baseline_policy: str | None = None,
 ) -> dict[str, Any]:
     """Apply ordered safety gates before comparing a candidate with baseline.
 
@@ -531,6 +845,12 @@ def promotion_decision(
     """
     if type(min_valid_games) is not int or min_valid_games < 1:
         raise ValueError("min_valid_games must be a positive integer")
+    _validate_economic_thresholds(
+        max_same_item_market_churn=max_same_item_market_churn,
+        max_market_transactions=max_market_transactions,
+        min_terminal_cash=min_terminal_cash,
+        min_terminal_inventory_value=min_terminal_inventory_value,
+    )
     records = list(records)
     baseline_records = list(baseline_records)
     expected_matrix = _normalize_expected_matrix(expected_matrix)
@@ -540,13 +860,35 @@ def promotion_decision(
     baseline_matrix = _matrix_completeness(baseline_records, expected_matrix)
     reasons = _safety_gate_reasons(
         records, candidate, min_valid_games=min_valid_games, expected_matrix=expected_matrix,
+        max_same_item_market_churn=max_same_item_market_churn,
+        max_market_transactions=max_market_transactions,
+        min_terminal_cash=float(min_terminal_cash),
+        min_terminal_inventory_value=float(min_terminal_inventory_value),
     )
     baseline_safety_reasons = _safety_gate_reasons(
         baseline_records, baseline, min_valid_games=min_valid_games,
         expected_matrix=expected_matrix,
+        max_same_item_market_churn=max_same_item_market_churn,
+        max_market_transactions=max_market_transactions,
+        min_terminal_cash=float(min_terminal_cash),
+        min_terminal_inventory_value=float(min_terminal_inventory_value),
     )
+    paired_metric_deltas = (
+        _external_metric_deltas(records, baseline_records)
+        if baseline_policy is not None and not reasons else None
+    )
+    if not reasons and baseline_policy is not None and paired_metric_deltas is None:
+        reasons.append("baseline_incomplete_pairing")
     if not reasons and baseline_safety_reasons:
-        reasons.append("baseline_not_eligible")
+        baseline_pairing_issues = {
+            "insufficient_valid_games", "missing_seat_pairs", "duplicate_seat_pairs",
+            "missing_expected_matrix_records", "duplicate_expected_matrix_records",
+            "extra_expected_matrix_records",
+        }
+        if baseline_policy and any(reason in baseline_pairing_issues for reason in baseline_safety_reasons):
+            reasons.append("baseline_incomplete_pairing")
+        else:
+            reasons.append("baseline_not_eligible")
     elif not reasons and (
         baseline["seat_balanced_win_rate"] is None
         or baseline["median_paired_bank_differential"] is None
@@ -562,6 +904,7 @@ def promotion_decision(
         "baseline": baseline,
         "matrix_completeness": candidate_matrix,
         "baseline_matrix_completeness": baseline_matrix,
+        "paired_metric_deltas": paired_metric_deltas,
     }
 
 
@@ -1064,6 +1407,56 @@ def _inventory_total(observation: Mapping[str, Any]) -> float:
     )
 
 
+def _terminal_inventory_value(observation: Mapping[str, Any],
+                              configuration: Mapping[str, Any] | None = None) -> float:
+    """Value terminal goods at the terminal market quote or acquisition cost.
+
+    Shed and worker goods use the final observed market prices.  Animals use
+    their purchase cost and seeds use their published seed cost because the
+    engine has no sell quote for either inventory type.
+    """
+    private = _mapping(observation.get("private"))
+    # Keep harvested/product goods and private seeds in separate ledgers.  A
+    # crop name such as WHEAT can occur in both, but the seed inventory is
+    # valued at CROPS[item]["seed"], never at the harvested-product quote.
+    goods: Counter[str] = Counter()
+    for source in (private.get("shed"), private.get("inventories")):
+        if isinstance(source, Mapping):
+            sources = (source,)
+        elif isinstance(source, Sequence) and not isinstance(source, (str, bytes)):
+            sources = tuple(source)
+        else:
+            sources = ()
+        for inventory in sources:
+            if isinstance(inventory, Mapping):
+                for item, raw_quantity in inventory.items():
+                    quantity = _number(raw_quantity)
+                    if isinstance(item, str) and quantity is not None and quantity > 0:
+                        goods[item] += quantity
+    seed_quantities: Counter[str] = Counter()
+    seeds = private.get("seeds")
+    if isinstance(seeds, Mapping):
+        for item, raw_quantity in seeds.items():
+            quantity = _number(raw_quantity)
+            if isinstance(item, str) and item in CROPS and quantity is not None and quantity > 0:
+                seed_quantities[item] += quantity
+    prices = _mapping(_mapping(observation.get("market")).get("prices"))
+    market_inventory = _mapping(_mapping(observation.get("market")).get("inventory"))
+    params = _mapping(_config_value(configuration, "marketParams", {}))
+    value = 0.0
+    for item, quantity in goods.items():
+        price = _number(prices.get(item))
+        if price is None and item in PRODUCTS:
+            price = float(market_price(item, _number(market_inventory.get(item)) or 0.0, params))
+        if price is None and item in ANIMALS:
+            price = float(ANIMALS[item]["cost"])
+        if price is not None:
+            value += quantity * price
+    value += sum(quantity * float(CROPS[item]["seed"])
+                 for item, quantity in seed_quantities.items())
+    return float(value)
+
+
 def _shed_capacity(configuration: Mapping[str, Any] | None = None) -> int:
     raw = _config_value(configuration, "shedCapacity", shed_capacity)
     try:
@@ -1203,7 +1596,8 @@ def _price_floor_sales(state: Mapping[str, Any], observation: Mapping[str, Any] 
 
 
 def _framework_error_record(*, variant: str, opponent: str, seed: int, seat: int = 0,
-                            error: str | None = None) -> dict[str, Any]:
+                            error: str | None = None,
+                            reason: str = "engine_error") -> dict[str, Any]:
     normalized_seat = seat if type(seat) is int and seat in (0, 1) else 0
     record = {
         "candidate": variant,
@@ -1216,9 +1610,16 @@ def _framework_error_record(*, variant: str, opponent: str, seed: int, seat: int
         "opponent_final_bank": None,
         "bank_differential": 0.0,
         "framework_error": True,
+        "framework_error_reasons": [reason] if reason in FRAMEWORK_REASON_ORDER else ["engine_error"],
         "shed_overflow": 0.0,
         "price_floor_sales": 0,
         "missed_basic_needs": 0,
+        "terminal_cash": None,
+        "terminal_inventory_value": None,
+        "submitted_market_order_count": 0,
+        "market_transaction_count": 0,
+        "same_item_market_churn": 0,
+        "same_item_sell_buy_churn": 0,
     }
     if error:
         record["error"] = str(error)[:1000]
@@ -1226,7 +1627,7 @@ def _framework_error_record(*, variant: str, opponent: str, seed: int, seat: int
 
 
 def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, seed: int,
-                   seat: int = 0) -> dict[str, Any]:
+                   seat: int = 0, churn_window: int = 2) -> dict[str, Any]:
     """Extract one game record from the engine replay JSON."""
     if type(seed) is not int:
         return _framework_error_record(
@@ -1239,7 +1640,10 @@ def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, se
             error="seat must be 0 or 1",
         )
     if not isinstance(replay, Mapping):
-        return _framework_error_record(variant=variant, opponent=opponent, seed=seed, seat=seat)
+        return _framework_error_record(
+            variant=variant, opponent=opponent, seed=seed, seat=seat,
+            reason="malformed_replay",
+        )
     own_states = _player_states(replay, seat)
     other_states = _player_states(replay, 1 - seat)
     replay_configuration = _mapping(replay.get("configuration"))
@@ -1262,6 +1666,7 @@ def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, se
     shed_overflow = 0.0
     floor_sales = 0
     missed_needs = 0
+    market_metrics = _market_metrics(own_states, churn_window=churn_window)
     turns_per_day = _number(_config_value(replay_configuration, "turnsPerDay", 24))
     last_hour = int(turns_per_day) - 1 if turns_per_day is not None and int(turns_per_day) >= 1 else 23
     steps = replay.get("steps", ())
@@ -1291,6 +1696,14 @@ def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, se
             )
         if not is_bootstrap:
             missed_needs += _missed_needs_at_boundary(pre, is_boundary, post, state, replay_configuration)
+    diagnostic_record = {
+        "malformed_replay": framework_error or own_bank is None or other_bank is None,
+        "missed_basic_needs": missed_needs,
+        **market_metrics,
+    }
+    reasons = framework_error_reasons(diagnostic_record)
+    if reasons:
+        outcome, differential = "framework_error", 0.0
     return {
         "candidate": variant,
         "variant": variant,
@@ -1301,15 +1714,23 @@ def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, se
         "final_bank": own_bank,
         "opponent_final_bank": other_bank,
         "bank_differential": differential,
-        "framework_error": framework_error,
+        "framework_error": bool(reasons),
+        "framework_error_reasons": reasons,
         "shed_overflow": shed_overflow,
         "price_floor_sales": floor_sales,
         "missed_basic_needs": missed_needs,
+        "terminal_cash": own_bank,
+        "terminal_inventory_value": (
+            _terminal_inventory_value(_mapping(own_states[-1].get("observation")), replay_configuration)
+            if own_states else None
+        ),
+        **market_metrics,
     }
 
 
 def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, seed: int,
-                  seat: int = 0, candidate_player: int | None = None) -> dict[str, Any]:
+                  seat: int = 0, candidate_player: int | None = None,
+                  churn_window: int = 2) -> dict[str, Any]:
     """Extract one replay record, classifying malformed replay data safely."""
     if type(seat) is not int or seat not in (0, 1):
         return _framework_error_record(
@@ -1323,7 +1744,10 @@ def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, see
                 error="candidate_player must be 0 or 1",
             )
         seat = candidate_player
-    return _replay_record(replay, variant=variant, opponent=opponent, seed=seed, seat=seat)
+    return _replay_record(
+        replay, variant=variant, opponent=opponent, seed=seed, seat=seat,
+        churn_window=churn_window,
+    )
 
 
 def _farm_observation(observation: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -3100,16 +3524,52 @@ def _worker_record_error(record: Mapping[str, Any], *, variant: str, opponent: s
         return "worker seat must be the requested integer seat"
     if not isinstance(record["outcome"], str) or record["outcome"] not in _WORKER_OUTCOMES:
         return "worker outcome is unsupported"
+    if "framework_error_reasons" not in record:
+        if isinstance(record, dict):
+            record["framework_error_reasons"] = []
+        reasons = []
+    else:
+        reasons = record["framework_error_reasons"]
+        if type(reasons) is not list:
+            return "worker framework_error_reasons must be a list"
+        if any(reason not in FRAMEWORK_REASON_ORDER for reason in reasons):
+            return "worker framework_error_reasons contains an unknown reason"
+        if len(reasons) != len(set(reasons)):
+            return "worker framework_error_reasons contains duplicate reasons"
+        canonical_reasons = [
+            reason for reason in FRAMEWORK_REASON_ORDER if reason in reasons
+        ]
+        if reasons != canonical_reasons:
+            return "worker framework_error_reasons are not in canonical order"
     if type(record["framework_error"]) is not bool:
         return "worker framework_error must be boolean"
     is_framework_error = record["outcome"] == "framework_error"
+    # Older worker payloads only had the boolean/outcome pair and represented
+    # framework failures with an empty reason list.  Preserve that wire
+    # contract while requiring reasons whenever a non-framework record claims
+    # a diagnostic failure.
+    if record["framework_error"] and not reasons:
+        pass
+    elif record["framework_error"] != bool(reasons):
+        return "worker framework_error disagrees with framework_error_reasons"
     if record["framework_error"] != is_framework_error:
         return "worker framework_error disagrees with outcome"
-    financial_fields = {"final_bank", "opponent_final_bank", "bank_differential"}
+    if record["submitted_market_order_count"] != record["market_transaction_count"]:
+        return "worker submitted market order count disagrees with market transaction count"
+    financial_fields = {
+        "final_bank", "opponent_final_bank", "bank_differential",
+        "terminal_cash", "terminal_inventory_value",
+    }
     malformed_numbers = []
     for field in _NORMALIZED_NUMERIC_FIELDS:
+        if field not in record:
+            continue
         value = record[field]
         if is_framework_error and field in financial_fields and value is None:
+            continue
+        if field in _NORMALIZED_NONNEGATIVE_INTEGER_FIELDS:
+            if type(value) is not int or value < 0:
+                malformed_numbers.append(field)
             continue
         if not _finite_number_or_none(value) or value is None:
             malformed_numbers.append(field)
@@ -3141,23 +3601,68 @@ def _resolve_candidates(variants: Sequence[str] | None,
     return _candidate_list(selected) if candidates is not None else _variant_list(selected)
 
 
+def _load_policy_reference(reference: str) -> Any:
+    """Load a previous agent from ``module:attribute`` or ``file.py:attribute``."""
+    if not isinstance(reference, str) or ":" not in reference:
+        raise ValueError("baseline policy must use module:callable or file.py:callable")
+    module_name, attribute_name = reference.rsplit(":", 1)
+    if not module_name or not attribute_name:
+        raise ValueError("baseline policy must use module:callable or file.py:callable")
+    path = Path(module_name)
+    if path.suffix == ".py" or path.exists():
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        spec = importlib.util.spec_from_file_location("kaggriculture_baseline", path)
+        if spec is None or spec.loader is None:
+            raise ValueError(f"cannot load baseline policy file: {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    else:
+        module = importlib.import_module(module_name)
+    policy = getattr(module, attribute_name, None)
+    if isinstance(policy, type):
+        policy = policy()
+    if hasattr(policy, "act") and callable(policy.act):
+        policy = policy.act
+    if not callable(policy):
+        raise ValueError(f"baseline policy is not callable: {reference}")
+    return policy
+
+
 def run_game(*, variant: str | None = None, candidate: str | None = None,
              opponent: str, seed: int, steps: int, seat: int = 0,
-             ablations: Mapping[str, bool] | None = None) -> dict[str, Any]:
+             ablations: Mapping[str, bool] | None = None,
+             policy_path: str | None = None,
+             policy_identity: str | None = None,
+             churn_window: int = 2) -> dict[str, Any]:
     """Run one seeded game in a fresh worker and return its normalized record."""
-    variant = _resolve_variant(variant, candidate)
+    if policy_path is not None:
+        if variant is not None or candidate is not None:
+            raise ValueError("baseline policy is separate from variant and candidate modes")
+        if not isinstance(policy_identity, str) or not policy_identity:
+            raise ValueError("policy_identity is required with policy_path")
+        variant = policy_identity
+    else:
+        variant = _resolve_variant(variant, candidate)
     if opponent not in OPPONENTS:
         raise ValueError(f"unsupported opponent: {opponent}")
     _validate_game_parameters(seed, steps)
     if type(seat) is not int or seat not in (0, 1):
         raise ValueError("seat must be 0 or 1")
+    if type(churn_window) is not int or churn_window < 1:
+        raise ValueError("churn_window must be a positive integer")
     payload = {
         ("candidate" if candidate is not None else "variant"): variant,
         "opponent": opponent,
         "seed": seed,
         "steps": steps,
         "seat": seat,
+        "churn_window": churn_window,
     }
+    if policy_path is not None:
+        payload.pop("variant")
+        payload["policy_path"] = policy_path
+        payload["policy_identity"] = policy_identity
     if ablations is not None:
         payload["ablations"] = dict(ablations)
     try:
@@ -3195,6 +3700,8 @@ def run_game(*, variant: str | None = None, candidate: str | None = None,
             variant=variant, opponent=opponent, seed=seed, seat=seat,
             error=f"invalid worker result: {exc}",
         )
+    if "framework_error_reasons" not in record:
+        record = {**record, "framework_error_reasons": []}
     record_error = _worker_record_error(record, variant=variant, opponent=opponent, seed=seed, seat=seat)
     if record_error:
         return _worker_failure(
@@ -3208,18 +3715,36 @@ def run_matrix(*, variants: Sequence[str] | None = None,
                candidates: Sequence[str] | None = None,
                opponents: Sequence[str], seeds: Sequence[int], steps: int,
                ablations: Mapping[str, bool] | None = None,
-               seats: Sequence[int] | None = None) -> dict[str, Any]:
+               seats: Sequence[int] | None = None,
+               policy_path: str | None = None,
+               policy_identity: str | None = None,
+               churn_window: int | None = None) -> dict[str, Any]:
     """Run the Cartesian product in stable input order with identical seeds."""
-    selected = _resolve_candidates(variants, candidates)
+    if policy_path is not None:
+        if variants is not None or candidates is not None:
+            raise ValueError("baseline policy is separate from variant and candidate modes")
+        if not isinstance(policy_identity, str) or not policy_identity:
+            raise ValueError("policy_identity is required with policy_path")
+        selected = [policy_identity]
+    else:
+        selected = _resolve_candidates(variants, candidates)
     opponents = list(opponents)
+    if len(set(opponents)) != len(opponents):
+        raise ValueError("opponents must be unique")
     invalid = [opponent for opponent in opponents if opponent not in OPPONENTS]
     if invalid:
         raise ValueError(f"unsupported opponent(s): {', '.join(invalid)}")
     _validate_game_parameters(0, steps)
+    if churn_window is not None and (type(churn_window) is not int or churn_window < 1):
+        raise ValueError("churn_window must be a positive integer")
     seed_values = list(seeds)
+    if len(set(seed_values)) != len(seed_values):
+        raise ValueError("seeds must be unique")
     for seed in seed_values:
         _validate_game_parameters(seed, steps)
     seat_values = [0, 1] if seats is None else list(seats)
+    if len(set(seat_values)) != len(seat_values):
+        raise ValueError("seats must be unique")
     invalid_seats = [seat for seat in seat_values if type(seat) is not int or seat not in (0, 1)]
     if invalid_seats:
         raise ValueError(f"unsupported seat(s): {', '.join(map(str, invalid_seats))}")
@@ -3232,6 +3757,12 @@ def run_matrix(*, variants: Sequence[str] | None = None,
                         "candidate" if candidates is not None else "variant": variant,
                         "opponent": opponent, "seed": seed, "steps": steps,
                     }
+                    if policy_path is not None:
+                        kwargs.pop("variant")
+                        kwargs["policy_path"] = policy_path
+                        kwargs["policy_identity"] = policy_identity
+                    if churn_window is not None:
+                        kwargs["churn_window"] = churn_window
                     kwargs["seat"] = seat
                     if ablations is not None:
                         kwargs["ablations"] = ablations
@@ -3248,7 +3779,14 @@ def run_evaluation(*, variants: Sequence[str] | None = None,
                    ablations: Sequence[tuple[str, bool]] = (),
                    seats: Sequence[int] | None = None,
                    holdout_seeds: Sequence[int] | None = None,
-                   min_valid_games: int = 20) -> dict[str, Any]:
+                   min_valid_games: int = 20,
+                   baseline_policy: str | None = None,
+                   baseline_identity: str = "previous-agent",
+                   churn_window: int = 2,
+                   max_same_item_market_churn: int = 0,
+                   max_market_transactions: int | None = None,
+                   min_terminal_cash: float = 0.0,
+                   min_terminal_inventory_value: float = 0.0) -> dict[str, Any]:
     """Run a baseline and isolated one-component ablations.
 
     Every ablation starts from the same all-enabled baseline. Repeating a
@@ -3258,7 +3796,18 @@ def run_evaluation(*, variants: Sequence[str] | None = None,
     requested = list(ablations)
     if type(min_valid_games) is not int or min_valid_games < 1:
         raise ValueError("min_valid_games must be a positive integer")
+    if type(churn_window) is not int or churn_window < 1:
+        raise ValueError("churn_window must be a positive integer")
+    gate_thresholds = _validate_economic_thresholds(
+        max_same_item_market_churn=max_same_item_market_churn,
+        max_market_transactions=max_market_transactions,
+        min_terminal_cash=min_terminal_cash,
+        min_terminal_inventory_value=min_terminal_inventory_value,
+    )
     components = [component for component, _enabled in requested]
+    unknown_components = [component for component in components if component not in ABLATION_COMPONENTS]
+    if unknown_components:
+        raise ValueError(f"unsupported ablation component(s): {', '.join(unknown_components)}")
     if len(components) != len(set(components)):
         raise ValueError("each ablation component may be requested only once")
     baseline_config = dict(_DEFAULT_ABLATIONS)
@@ -3268,9 +3817,20 @@ def run_evaluation(*, variants: Sequence[str] | None = None,
     _validate_seed_partition(seeds, holdout_seeds)
     if holdout_seeds is not None and set(resolved_seats) != {0, 1}:
         raise ValueError("holdout evaluation requires both candidate seats")
+    matrix_options = {"churn_window": churn_window} if churn_window != 2 else {}
+    baseline_records = None
+    if baseline_policy is not None:
+        if not isinstance(baseline_identity, str) or not baseline_identity:
+            raise ValueError("baseline_identity must be a non-empty string")
+        baseline_records = run_matrix(
+            opponents=opponents, seeds=seeds, steps=steps, seats=resolved_seats,
+            policy_path=baseline_policy, policy_identity=baseline_identity,
+            **matrix_options,
+        )["records"]
     baseline = run_matrix(
         **candidate_kwargs, opponents=opponents, seeds=seeds, steps=steps,
         ablations=baseline_config, seats=resolved_seats,
+        **matrix_options,
     )["records"]
     ablation_records: dict[str, list[dict[str, Any]]] = {}
     ablation_configs: dict[str, dict[str, bool]] = {}
@@ -3281,17 +3841,30 @@ def run_evaluation(*, variants: Sequence[str] | None = None,
         ablation_records[component] = run_matrix(
             **candidate_kwargs, opponents=opponents, seeds=seeds, steps=steps,
             ablations=config, seats=resolved_seats,
+            **matrix_options,
         )["records"]
     result = {
         "records": baseline,
         "ablation_records": ablation_records,
         "ablation_configs": ablation_configs,
+        "gate_thresholds": gate_thresholds,
     }
+    if baseline_policy is not None:
+        result["baseline_records"] = baseline_records
+        result["baseline_policy"] = {"identity": baseline_identity, "path": baseline_policy}
     if holdout_seeds is not None:
         result["holdout_records"] = run_matrix(
             **candidate_kwargs, opponents=opponents, seeds=list(holdout_seeds), steps=steps,
             ablations=baseline_config, seats=resolved_seats,
+            **matrix_options,
         )["records"]
+        if baseline_policy is not None:
+            result["holdout_baseline_records"] = run_matrix(
+                opponents=opponents, seeds=list(holdout_seeds), steps=steps,
+                seats=resolved_seats, policy_path=baseline_policy,
+                policy_identity=baseline_identity,
+                **matrix_options,
+            )["records"]
     return result
 
 
@@ -3368,6 +3941,12 @@ def _apply_candidate_availability_gate(
 def _candidate_metrics(records: Sequence[Mapping[str, Any]], candidates: Sequence[str],
                       *, min_valid_games: int,
                       expected_matrix: Sequence[tuple[str, int, int]] | None = None,
+                      baseline_records: Sequence[Mapping[str, Any]] | None = None,
+                      baseline_policy: str | None = None,
+                      max_same_item_market_churn: int = 0,
+                      max_market_transactions: int | None = None,
+                      min_terminal_cash: float = 0.0,
+                      min_terminal_inventory_value: float = 0.0,
                       ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build deterministic paired summaries and promotion decisions by candidate."""
     summaries = {
@@ -3375,12 +3954,27 @@ def _candidate_metrics(records: Sequence[Mapping[str, Any]], candidates: Sequenc
         for candidate in candidates
     }
     decisions: dict[str, Any] = {}
-    if candidates:
+    if candidates and baseline_records is not None:
+        for candidate in candidates:
+            decisions[candidate] = promotion_decision(
+                _candidate_records(records, candidate), baseline_records,
+                min_valid_games=min_valid_games, expected_matrix=expected_matrix,
+                max_same_item_market_churn=max_same_item_market_churn,
+                max_market_transactions=max_market_transactions,
+                min_terminal_cash=min_terminal_cash,
+                min_terminal_inventory_value=min_terminal_inventory_value,
+                baseline_policy=baseline_policy,
+            )
+    elif candidates:
         baseline_candidate = candidates[0]
         baseline_records = _candidate_records(records, baseline_candidate)
         baseline_reasons = _safety_gate_reasons(
             baseline_records, summaries[baseline_candidate], min_valid_games=min_valid_games,
             expected_matrix=expected_matrix,
+            max_same_item_market_churn=max_same_item_market_churn,
+            max_market_transactions=max_market_transactions,
+            min_terminal_cash=min_terminal_cash,
+            min_terminal_inventory_value=min_terminal_inventory_value,
         )
         for candidate in candidates:
             candidate_summary = summaries[candidate]
@@ -3398,6 +3992,10 @@ def _candidate_metrics(records: Sequence[Mapping[str, Any]], candidates: Sequenc
                 decisions[candidate] = promotion_decision(
                     _candidate_records(records, candidate), baseline_records,
                     min_valid_games=min_valid_games, expected_matrix=expected_matrix,
+                    max_same_item_market_churn=max_same_item_market_churn,
+                    max_market_transactions=max_market_transactions,
+                    min_terminal_cash=min_terminal_cash,
+                    min_terminal_inventory_value=min_terminal_inventory_value,
                 )
     return summaries, decisions
 
@@ -3523,12 +4121,55 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
     min_valid_games = config.get("min_valid_games", 20)
     if type(min_valid_games) is not int or min_valid_games < 1:
         raise ValueError("min_valid_games must be a positive integer")
+    max_same_item_market_churn = config.get(
+        "max_same_item_market_churn", config.get("max_same_item_churn", 0)
+    )
+    gate_config = {
+        "churn_window": config.get("churn_window", 2),
+        "max_same_item_market_churn": max_same_item_market_churn,
+        # Preserve the old report/config key while exposing the canonical name.
+        "max_same_item_churn": max_same_item_market_churn,
+        "max_market_transactions": config.get("max_market_transactions"),
+        "min_terminal_cash": config.get("min_terminal_cash", 0.0),
+        "min_terminal_inventory_value": config.get("min_terminal_inventory_value", 0.0),
+    }
+    if type(gate_config["churn_window"]) is not int or gate_config["churn_window"] < 1:
+        raise ValueError("churn_window must be a positive integer")
+    validated_thresholds = _validate_economic_thresholds(
+        max_same_item_market_churn=gate_config["max_same_item_market_churn"],
+        max_market_transactions=gate_config["max_market_transactions"],
+        min_terminal_cash=gate_config["min_terminal_cash"],
+        min_terminal_inventory_value=gate_config["min_terminal_inventory_value"],
+    )
+    gate_config.update({
+        "max_same_item_churn": validated_thresholds["max_same_item_market_churn"],
+        "max_same_item_market_churn": validated_thresholds["max_same_item_market_churn"],
+        "max_market_transactions": validated_thresholds["max_market_transactions"],
+        "min_terminal_cash": validated_thresholds["min_terminal_cash"],
+        "min_terminal_inventory_value": validated_thresholds["min_terminal_inventory_value"],
+    })
+    external_baseline_requested = (
+        config.get("baseline_policy") is not None or baseline_records is not None
+    )
+    baseline_identity = config.get("baseline_identity") or "previous-agent"
+    development_baseline_records = baseline_records
+    development_baseline_policy = None
+    if external_baseline_requested:
+        development_baseline_policy = baseline_identity
+        if development_baseline_records is None:
+            development_baseline_records = []
     results = _group_results(records, variants, opponents)
     seats = list(config.get("seats", (0, 1)))
     expected_development_matrix = _configured_matrix(config, opponents, seats)
     paired_summaries, promotion_decisions = _candidate_metrics(
         records, variants, min_valid_games=min_valid_games,
         expected_matrix=expected_development_matrix,
+        baseline_records=development_baseline_records,
+        baseline_policy=development_baseline_policy,
+        max_same_item_market_churn=gate_config["max_same_item_market_churn"],
+        max_market_transactions=gate_config["max_market_transactions"],
+        min_terminal_cash=float(gate_config["min_terminal_cash"]),
+        min_terminal_inventory_value=float(gate_config["min_terminal_inventory_value"]),
     )
     promotion_decisions = {
         candidate: _apply_candidate_availability_gate(
@@ -3557,9 +4198,23 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
         ]
         holdout_results = _group_results(holdout_records, variants, opponents)
         expected_holdout_matrix = _configured_matrix(config, opponents, seats, holdout=True)
+        holdout_baseline_for_metrics = holdout_baseline_records
+        holdout_baseline_policy = None
+        if external_baseline_requested:
+            holdout_baseline_policy = baseline_identity
+            if holdout_baseline_for_metrics is None:
+                # Do not let an external-baseline holdout silently compare
+                # against the first candidate when its paired records are absent.
+                holdout_baseline_for_metrics = []
         holdout_paired_summaries, holdout_promotion_decisions = _candidate_metrics(
             holdout_records, variants, min_valid_games=min_valid_games,
             expected_matrix=expected_holdout_matrix,
+            baseline_records=holdout_baseline_for_metrics,
+            baseline_policy=holdout_baseline_policy,
+            max_same_item_market_churn=gate_config["max_same_item_market_churn"],
+            max_market_transactions=gate_config["max_market_transactions"],
+            min_terminal_cash=float(gate_config["min_terminal_cash"]),
+            min_terminal_inventory_value=float(gate_config["min_terminal_inventory_value"]),
         )
         holdout_promotion_decisions = {
             candidate: _apply_candidate_availability_gate(
@@ -3598,6 +4253,10 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
         component_summaries, component_decisions = _candidate_metrics(
             component_records, variants, min_valid_games=min_valid_games,
             expected_matrix=expected_development_matrix,
+            max_same_item_market_churn=gate_config["max_same_item_market_churn"],
+            max_market_transactions=gate_config["max_market_transactions"],
+            min_terminal_cash=float(gate_config["min_terminal_cash"]),
+            min_terminal_inventory_value=float(gate_config["min_terminal_inventory_value"]),
         )
         contribution = {}
         for variant in variants:
@@ -3624,6 +4283,13 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
         "engine_version": ENGINE_VERSION,
         "baseline_convention": _BASELINE_CONVENTION,
         "baseline_candidate": variants[0] if variants else None,
+        "baseline_policy": (
+            {"identity": baseline_identity,
+             "path": Path(str(config["baseline_policy"])).name
+             if config.get("baseline_policy") is not None else None}
+            if external_baseline_requested else None
+        ),
+        "gate_thresholds": dict(gate_config),
         "replay_summary": (
             Path(str(config["replay_summary"])).name
             if config.get("replay_summary") is not None else None
@@ -3646,6 +4312,11 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
         "promotion_decisions": promotion_decisions,
         "ablations": ablations,
     }
+    if baseline_records is not None:
+        document["baseline_paired_summary"] = paired_seed_summary(baseline_records)
+        document["baseline_policy"] = metadata["baseline_policy"]
+    elif external_baseline_requested:
+        document["baseline_policy"] = metadata["baseline_policy"]
     if holdout_document is not None:
         document["holdout"] = holdout_document
         document["holdout_results"] = holdout_document["results"]
@@ -3656,18 +4327,28 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
 
 def write_result_document(path: str | Path, document: Mapping[str, Any], *, records: Sequence[Mapping[str, Any]],
                           ablation_records: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
-                          holdout_records: Sequence[Mapping[str, Any]] | None = None) -> Path:
+                          holdout_records: Sequence[Mapping[str, Any]] | None = None,
+                          baseline_records: Sequence[Mapping[str, Any]] | None = None,
+                          holdout_baseline_records: Sequence[Mapping[str, Any]] | None = None) -> Path:
     """Write the report and deterministic compact replay-record sidecar."""
     report_path = Path(path)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     sidecar = report_path.with_name(f"{report_path.stem}.replays.json")
     sidecar_records = [{"ablation": "baseline", **dict(record)} for record in records]
+    sidecar_records.extend(
+        {"ablation": "baseline-policy", "evaluation_split": "development", **dict(record)}
+        for record in (baseline_records or ())
+    )
     for component, component_records in (ablation_records or {}).items():
         sidecar_records.extend({"ablation": component, **dict(record)} for record in component_records)
     sidecar_records.extend(
         {"ablation": "holdout", "evaluation_split": "holdout", **dict(record)}
         for record in (holdout_records or ())
+    )
+    sidecar_records.extend(
+        {"ablation": "baseline-policy", "evaluation_split": "holdout", **dict(record)}
+        for record in (holdout_baseline_records or ())
     )
     sidecar_records.sort(key=lambda record: (
         str(record.get("ablation", "")), _record_candidate(record),
@@ -3696,6 +4377,13 @@ def main(argv: list[str] | None = None) -> int:
         "seats": list(args.seats),
         "ablations": [f"{component}={'on' if enabled else 'off'}" for component, enabled in args.ablation],
         "min_valid_games": args.min_valid_games,
+        "baseline_policy": args.baseline_policy,
+        "baseline_identity": args.baseline_identity,
+        "churn_window": args.churn_window,
+        "max_same_item_churn": args.max_same_item_churn,
+        "max_market_transactions": args.max_market_transactions,
+        "min_terminal_cash": args.min_terminal_cash,
+        "min_terminal_inventory_value": args.min_terminal_inventory_value,
         "replay_summary": sidecar.name,
         "quick": args.quick,
     }
@@ -3704,6 +4392,13 @@ def main(argv: list[str] | None = None) -> int:
         "ablations": args.ablation, "seats": args.seats,
         "holdout_seeds": args.holdout_seeds,
         "min_valid_games": args.min_valid_games,
+        "baseline_policy": args.baseline_policy,
+        "baseline_identity": args.baseline_identity,
+        "churn_window": args.churn_window,
+        "max_same_item_market_churn": args.max_same_item_churn,
+        "max_market_transactions": args.max_market_transactions,
+        "min_terminal_cash": args.min_terminal_cash,
+        "min_terminal_inventory_value": args.min_terminal_inventory_value,
     }
     if args.candidates is not None:
         evaluation_kwargs["candidates"] = args.candidates
@@ -3715,16 +4410,22 @@ def main(argv: list[str] | None = None) -> int:
         command=["scripts/evaluate.py", *([*sys.argv[1:]] if argv is None else argv)],
         ablation_records=evaluation["ablation_records"], ablation_configs=evaluation["ablation_configs"],
         holdout_records=evaluation.get("holdout_records"),
+        baseline_records=evaluation.get("baseline_records"),
+        holdout_baseline_records=evaluation.get("holdout_baseline_records"),
     )
     write_result_document(
         output, document, records=evaluation["records"],
         ablation_records=evaluation["ablation_records"],
         holdout_records=evaluation.get("holdout_records"),
+        baseline_records=evaluation.get("baseline_records"),
+        holdout_baseline_records=evaluation.get("holdout_baseline_records"),
     )
     games = (
         len(evaluation["records"])
+        + len(evaluation.get("baseline_records", ()))
         + sum(len(records) for records in evaluation["ablation_records"].values())
         + len(evaluation.get("holdout_records", ()))
+        + len(evaluation.get("holdout_baseline_records", ()))
     )
     print(json.dumps({"output": str(output), "selected_default": document["selected_default"], "games": games}, sort_keys=True))
     return 0

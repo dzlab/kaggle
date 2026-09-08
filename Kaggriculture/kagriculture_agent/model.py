@@ -73,6 +73,18 @@ def require_torch() -> Any:
     return torch
 
 
+def resolve_device(requested: str = "auto") -> Any:
+    """Resolve a supported training device name to a PyTorch device."""
+    th = require_torch()
+    if requested not in {"auto", "cpu", "cuda"}:
+        raise ValueError("device must be auto, cpu, or cuda")
+    if requested == "auto":
+        requested = "cuda" if th.cuda.is_available() else "cpu"
+    if requested == "cuda" and not th.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available")
+    return th.device(requested)
+
+
 def set_training_seed(seed: int) -> None:
     """Seed Python, NumPy when installed, and PyTorch when installed."""
     random.seed(int(seed))

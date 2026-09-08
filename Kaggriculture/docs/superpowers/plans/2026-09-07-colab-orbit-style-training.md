@@ -32,25 +32,25 @@ The existing uncommitted user changes and generated reports/artifacts must not b
 - Test: `tests/test_model.py`
 - Test: `tests/test_train_policy.py`
 
-- [ ] **Step 1: Write failing tests for device resolution.**
+- [x] **Step 1: Write failing tests for device resolution.**
 
   Cover `auto` selecting CUDA when available, `auto` selecting CPU otherwise, explicit `cpu`, invalid device names, and a clear failure for explicit `cuda` when CUDA is unavailable.
 
-- [ ] **Step 2: Run the focused tests and verify they fail for the missing API.**
+- [x] **Step 2: Run the focused tests and verify they fail for the missing API.**
 
   Run: `.venv/bin/pytest -q tests/test_model.py tests/test_train_policy.py -k 'device or cuda'`
 
   Expected: failures because device resolution and device-aware training are not implemented.
 
-- [ ] **Step 3: Implement minimal device selection and tensor placement.**
+- [x] **Step 3: Implement minimal device selection and tensor placement.**
 
   Add a small public resolver, use it in the trainer, move `CompactPolicyNet`, features, labels, PPO tensors, and prior networks to the selected device, and keep CPU behavior unchanged. Avoid silently moving individual tensors between devices inside the hot path.
 
-- [ ] **Step 4: Add a CLI `--device auto|cpu|cuda` option.**
+- [x] **Step 4: Add a CLI `--device auto|cpu|cuda` option.**
 
   Record the resolved device in checkpoint metadata and printed run metadata.
 
-- [ ] **Step 5: Run focused tests and a one-batch CPU training smoke test.**
+- [x] **Step 5: Run focused tests and a one-batch CPU training smoke test.**
 
   Run: `.venv/bin/pytest -q tests/test_model.py tests/test_train_policy.py`
 
@@ -66,27 +66,27 @@ The existing uncommitted user changes and generated reports/artifacts must not b
 - Test: `tests/test_checkpoints.py`
 - Test: `tests/test_train_policy.py`
 
-- [ ] **Step 1: Write failing tests for checkpoint round trips.**
+- [x] **Step 1: Write failing tests for checkpoint round trips.**
 
   Verify that a checkpoint contains model state, optimizer state, configuration, round/cursor metadata, Python/NumPy/PyTorch RNG state, engine/schema/action-vocabulary versions, and metrics.
 
-- [ ] **Step 2: Write failing tests for incompatible and corrupt checkpoints.**
+- [x] **Step 2: Write failing tests for incompatible and corrupt checkpoints.**
 
   Cover engine-version mismatch, feature-schema mismatch, action-vocabulary mismatch, malformed payloads, missing files, and truncated temporary files.
 
-- [ ] **Step 3: Run the focused tests and verify the expected failures.**
+- [x] **Step 3: Run the focused tests and verify the expected failures.**
 
   Run: `.venv/bin/pytest -q tests/test_checkpoints.py -x`
 
-- [ ] **Step 4: Implement a focused checkpoint module.**
+- [x] **Step 4: Implement a focused checkpoint module.**
 
   Provide validated save/load helpers using a temporary file in the destination directory, flush/fsync, atomic replace, and cleanup on failure. Keep the registry separate from the tensor checkpoint so a failed registry write cannot corrupt the best checkpoint.
 
-- [ ] **Step 5: Add RNG restoration and resume support to the training loop.**
+- [x] **Step 5: Add RNG restoration and resume support to the training loop.**
 
   Resuming must continue from the saved epoch/round and restore optimizer plus RNG state. A resumed run must not silently start a fresh model when a checkpoint path was supplied.
 
-- [ ] **Step 6: Run focused and regression tests.**
+- [x] **Step 6: Run focused and regression tests.**
 
   Run: `.venv/bin/pytest -q tests/test_checkpoints.py tests/test_train_policy.py`
 
@@ -104,27 +104,27 @@ The existing uncommitted user changes and generated reports/artifacts must not b
 - Test: `tests/test_candidates.py`
 - Test: `tests/test_learned_policy.py`
 
-- [ ] **Step 1: Write failing tests for candidate injection.**
+- [x] **Step 1: Write failing tests for candidate injection.**
 
   Verify that a supplied exported artifact is used for the candidate seat, both seat orders are preserved, the default runner still uses `main.agent`, and invalid/missing artifacts fail before starting an engine game.
 
-- [ ] **Step 2: Write a failing regression test for learned market output.**
+- [x] **Step 2: Write a failing regression test for learned market output.**
 
   If market heads are part of the trained/exported contract, a valid market prediction must reach `PolicyProposal.market_orders` and the normal market legality compiler. Invalid or unavailable orders must remain safely empty.
 
-- [ ] **Step 3: Run focused tests and verify the failures.**
+- [x] **Step 3: Run focused tests and verify the failures.**
 
   Run: `.venv/bin/pytest -q tests/test_run_local.py tests/test_candidates.py tests/test_learned_policy.py -k 'candidate or market'`
 
-- [ ] **Step 4: Implement explicit policy factories and runner injection.**
+- [x] **Step 4: Implement explicit policy factories and runner injection.**
 
   Add an artifact-path candidate factory that validates the artifact once per worker and constructs a fresh stateful `Policy`. Extend the local runner and collector request model with candidate artifact identity/path. Keep arbitrary Python model execution out of rollout workers.
 
-- [ ] **Step 5: Implement market-head compilation.**
+- [x] **Step 5: Implement market-head compilation.**
 
   Convert the predicted item/quantity outputs into conservative market intents, validate them through `build_market_orders`, and preserve the deterministic policy fallback when the model does not produce a usable order.
 
-- [ ] **Step 6: Run focused tests plus an isolated candidate game.**
+- [x] **Step 6: Run focused tests plus an isolated candidate game.**
 
   Run: `.venv/bin/pytest -q tests/test_run_local.py tests/test_candidates.py tests/test_learned_policy.py tests/test_import_replays.py`
 
@@ -141,31 +141,31 @@ The existing uncommitted user changes and generated reports/artifacts must not b
 - Test: `tests/test_import_replays.py`
 - Test: `tests/test_run_local.py`
 
-- [ ] **Step 1: Write failing tests for deterministic rollout scheduling.**
+- [x] **Step 1: Write failing tests for deterministic rollout scheduling.**
 
   Given seeds, opponents, seats, and worker count, verify stable request ordering, no duplicate keys, bounded concurrency, and identical manifest contents regardless of completion order.
 
-- [ ] **Step 2: Write failing tests for worker failures and timeouts.**
+- [x] **Step 2: Write failing tests for worker failures and timeouts.**
 
   Verify a failed game is classified explicitly, is not converted into valid transitions, temporary output is not published, and a successful prior dataset remains intact.
 
-- [ ] **Step 3: Run the focused tests and verify they fail.**
+- [x] **Step 3: Run the focused tests and verify they fail.**
 
   Run: `.venv/bin/pytest -q tests/test_rollouts.py -x`
 
-- [ ] **Step 4: Implement a bounded process-pool rollout service.**
+- [x] **Step 4: Implement a bounded process-pool rollout service.**
 
   Use a configurable worker count capped by available CPUs. Each worker must execute an isolated interpreter/game, pin and validate engine version, enforce a per-game timeout, and return serializable replay/transition data only.
 
-- [ ] **Step 5: Preserve atomic trajectory publication.**
+- [x] **Step 5: Preserve atomic trajectory publication.**
 
   Sort completed records by deterministic request key before writing JSONL. Extend the manifest with worker count, candidate identity, opponent identities, and source artifact hashes without weakening existing replay/hash validation.
 
-- [ ] **Step 6: Add CLI options.**
+- [x] **Step 6: Add CLI options.**
 
   Add `--workers`, `--candidate-artifact`, `--candidate-identity`, and `--game-timeout`, with safe defaults suitable for Colab. A worker count of one must retain the current serial behavior.
 
-- [ ] **Step 7: Run focused and small integration tests.**
+- [x] **Step 7: Run focused and small integration tests.**
 
   Run: `.venv/bin/pytest -q tests/test_rollouts.py tests/test_import_replays.py tests/test_run_local.py`
 
@@ -182,27 +182,27 @@ The existing uncommitted user changes and generated reports/artifacts must not b
 - Test: `tests/test_train_policy.py`
 - Test: `tests/test_rollouts.py`
 
-- [ ] **Step 1: Write failing tests for league scheduling.**
+- [x] **Step 1: Write failing tests for league scheduling.**
 
   Verify each PPO round samples deterministic current, random, starter, and prior learned checkpoints according to the configured probabilities, alternates seats, and does not select a checkpoint that does not exist.
 
-- [ ] **Step 2: Write failing tests for fresh-rollout PPO.**
+- [x] **Step 2: Write failing tests for fresh-rollout PPO.**
 
   Verify the rollout callback receives round/seed/opponent/seat/checkpoint/artifact information, PPO consumes new transitions each round, and offline fallback is used only when explicitly requested.
 
-- [ ] **Step 3: Run the focused tests and verify failure.**
+- [x] **Step 3: Run the focused tests and verify failure.**
 
   Run: `.venv/bin/pytest -q tests/test_train_policy.py tests/test_rollouts.py -k 'league or rollout'`
 
-- [ ] **Step 4: Implement a round rollout adapter.**
+- [x] **Step 4: Implement a round rollout adapter.**
 
   Export a temporary dependency-free artifact for the candidate network when needed, invoke the bounded collector, import validated transitions, and feed them to `run_ppo_training`. Keep temporary artifacts inside the configured run directory and clean them only after successful publication or explicit rejection.
 
-- [ ] **Step 5: Add previous learned checkpoints to the opponent pool.**
+- [x] **Step 5: Add previous learned checkpoints to the opponent pool.**
 
   Maintain at most the configured recent checkpoint window, validate metadata before use, and record exact checkpoint hashes in rollout manifests.
 
-- [ ] **Step 6: Run a deterministic one-round CPU integration smoke test.**
+- [x] **Step 6: Run a deterministic one-round CPU integration smoke test.**
 
   Run one small rollout round against pass/random/current with both seats and verify non-empty transitions, finite PPO metrics, and a new checkpoint.
 
@@ -225,15 +225,15 @@ The existing uncommitted user changes and generated reports/artifacts must not b
 
   Run: `.venv/bin/pytest -q tests/test_train_orbit.py -x`
 
-- [ ] **Step 3: Define a dependency-injected controller interface.**
+- [x] **Step 3: Define a dependency-injected controller interface.**
 
   Inject rollout, train, export, evaluate, clock, and filesystem operations where practical so controller tests do not run full Kaggriculture games. The production defaults must use the real collector/trainer/evaluator.
 
-- [ ] **Step 4: Implement the round state machine.**
+- [x] **Step 4: Implement the round state machine.**
 
   Persist round state before and after each stage. On restart, detect completed stages and resume safely without publishing a partial candidate. Never replace `best` before the complete development evaluation returns a promotion decision.
 
-- [ ] **Step 5: Implement development gates and candidate retention.**
+- [x] **Step 5: Implement development gates and candidate retention.**
 
   Require complete valid records, zero framework errors, zero missed basic-needs events, acceptable tail bank performance, and strict improvement over `current`/best according to the existing evaluator contract. Keep holdout seeds/configuration out of this loop.
 
@@ -255,7 +255,7 @@ The existing uncommitted user changes and generated reports/artifacts must not b
 - Create: `docs/superpowers/references/colab-training.md`
 - Test: `tests/test_colab_train.py`
 
-- [ ] **Step 1: Write failing tests for Colab configuration.**
+- [x] **Step 1: Write failing tests for Colab configuration.**
 
   Verify default paths under a supplied run directory, device auto-selection, worker-count validation, required engine version, resume path handling, and safe rejection of holdout seeds overlapping development seeds.
 
@@ -267,11 +267,11 @@ The existing uncommitted user changes and generated reports/artifacts must not b
 
   Keep orchestration in `train_orbit.py`; the wrapper should validate configuration, create run directories, print the exact reproducible command/configuration, and call the controller. It must not contain a second training implementation.
 
-- [ ] **Step 4: Document the notebook-compatible workflow.**
+- [x] **Step 4: Document the notebook-compatible workflow.**
 
   Include GPU verification, package installation, Drive mounting, smoke run, parallel rollout run, resume command, artifact export, submission smoke test, development evaluation, and the separate holdout command. State that simulator rollouts are CPU-bound and Colab resources are ephemeral.
 
-- [ ] **Step 5: Run documentation/configuration tests.**
+- [x] **Step 5: Run documentation/configuration tests.**
 
   Run: `.venv/bin/pytest -q tests/test_colab_train.py`
 
@@ -293,11 +293,11 @@ The existing uncommitted user changes and generated reports/artifacts must not b
 
   Use CPU fallback if no CUDA device is available: collect a small two-worker dataset, train one round, export the artifact, resume for one more round, evaluate development games, and verify rejected candidates do not replace `best`.
 
-- [ ] **Step 3: Run artifact and submission smoke checks.**
+- [x] **Step 3: Run artifact and submission smoke checks.**
 
   Validate the exported artifact, deterministic package contents, `python -S` fallback behavior, representative action schema, and runtime latency. Confirm the archive excludes checkpoints, scripts, tests, trajectories, reports, and training dependencies.
 
-- [ ] **Step 4: Run `git diff --check` and inspect the complete diff.**
+- [x] **Step 4: Run `git diff --check` and inspect the complete diff.**
 
   Confirm that `main.py` still uses `Policy()` and that no holdout report or production artifact was generated as a promotion claim.
 
@@ -311,13 +311,20 @@ The existing uncommitted user changes and generated reports/artifacts must not b
 
 ## Final acceptance checklist
 
-- [ ] `--device auto` uses CUDA in Colab and CPU fallback locally.
-- [ ] Model, labels, optimizer, and PPO tensors share the selected device.
-- [ ] Checkpoints resume model, optimizer, RNG, round, and cursor state.
-- [ ] Rollouts run in a bounded process pool with deterministic manifests.
-- [ ] Candidate artifacts can play against current, random, starter, and prior learned policies.
-- [ ] PPO consumes fresh rollouts rather than only the initial behavior-cloning dataset.
-- [ ] Rejected candidates never replace `best`; training continues until improvement or an explicit budget limit.
-- [ ] Holdout evaluation is impossible through the development controller unless explicitly invoked after freezing the candidate.
+- [x] `--device auto` uses CUDA in Colab and CPU fallback locally.
+- [x] Model, labels, optimizer, and PPO tensors share the selected device.
+- [x] Checkpoints resume model, optimizer, RNG, round, and cursor state.
+- [x] Rollouts run in a bounded process pool with deterministic manifests.
+- [x] Candidate artifacts can play against current, random, starter, and prior learned policies.
+- [x] PPO consumes fresh rollouts rather than only the initial behavior-cloning dataset.
+- [x] Rejected candidates never replace `best`; training continues until improvement or an explicit budget limit.
+- [x] Holdout evaluation is impossible through the development controller unless explicitly invoked after freezing the candidate.
 - [ ] Exported artifacts and submission archives pass existing safety gates.
-- [ ] The production default remains deterministic until holdout promotion succeeds.
+- [x] The production default remains deterministic until holdout promotion succeeds.
+
+## Implementation notes
+
+- The new workflow's focused suites, real 96-turn candidate replay, two-seed/two-worker collection, and one-round CPU fresh-rollout PPO smoke test pass.
+- The full repository suite still has six legacy deterministic-policy failures for seed 17, including missing `FERTILIZE` coverage and missed basic-needs diagnostics. These failures are outside the new rollout/checkpoint/controller code and must be resolved before claiming release readiness.
+- Controller and Colab command surfaces are intentionally callback/configuration driven today; wiring production collector/trainer/evaluator defaults and a full resume-through-controller integration remains the next implementation item.
+- Commit checkboxes remain open because the worktree contains unrelated user changes and generated artifacts; source changes were not bundled into a mixed commit.

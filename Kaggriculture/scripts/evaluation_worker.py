@@ -7,6 +7,7 @@ prevents one game from contaminating the next game in a matrix.
 
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 from collections.abc import Mapping
@@ -27,6 +28,7 @@ from scripts.evaluate import (
     VariantPolicy,
     _deterministic_random_agent,
     _framework_error_record,
+    _load_policy_reference,
     _resolve_variant,
     replay_record,
 )
@@ -40,7 +42,10 @@ class EvaluatorFailure(RuntimeError):
 class _GuardedCandidate:
     def __init__(self, candidate: Any, *, accepts_configuration: bool = True) -> None:
         self.candidate = candidate
-        self.accepts_configuration = accepts_configuration
+        self.accepts_configuration = (
+            accepts_configuration
+            and _callable_accepts_configuration(candidate, fallback=accepts_configuration)
+        )
         self.failure: EvaluatorFailure | None = None
 
     def __call__(self, observation: Any, configuration: Any = None) -> Any:
@@ -53,6 +58,24 @@ class _GuardedCandidate:
                 f"candidate policy failure: {type(exc).__name__}: {exc}"
             )
             raise self.failure from exc
+
+
+def _callable_accepts_configuration(candidate: Any, *, fallback: bool) -> bool:
+    """Choose the callable arity without trial calls that could mask TypeError."""
+    try:
+        signature = inspect.signature(candidate)
+    except (TypeError, ValueError):
+        return fallback
+    marker = object()
+    try:
+        signature.bind(marker, marker)
+    except TypeError:
+        try:
+            signature.bind(marker)
+        except TypeError:
+            return fallback
+        return False
+    return True
 
 
 def _ordered_agents(candidate: Any, opponent: Any, seat: int) -> list[Any]:
@@ -85,12 +108,15 @@ def _request_value(request: Mapping[str, Any], key: str, default: Any = None) ->
 def _request_failure(request: Mapping[str, Any], error: str) -> dict[str, Any]:
     variant = _request_value(request, "variant")
     candidate = _request_value(request, "candidate")
+    policy_identity = _request_value(request, "policy_identity", "previous-agent")
     opponent = _request_value(request, "opponent", "pass")
     seed = _request_value(request, "seed", 0)
     seat = _request_value(request, "seat", 0)
     if variant is None:
         variant = candidate
-    if not isinstance(variant, str) or variant not in EVALUATION_NAMES:
+    if _request_value(request, "policy_path") is not None:
+        variant = policy_identity
+    if not isinstance(variant, str) or (variant not in EVALUATION_NAMES and not _request_value(request, "policy_path")):
         variant = "mixed"
     if not isinstance(opponent, str) or opponent not in OPPONENTS:
         opponent = "pass"
@@ -109,12 +135,22 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
         return _request_failure({}, "request must be a JSON object")
     variant_value = _request_value(request, "variant")
     candidate_value = _request_value(request, "candidate")
+    policy_path = _request_value(request, "policy_path")
+    policy_identity = _request_value(request, "policy_identity", "previous-agent")
     opponent = _request_value(request, "opponent")
     seed = _request_value(request, "seed")
     steps = _request_value(request, "steps")
     seat = _request_value(request, "seat", 0)
+    churn_window = _request_value(request, "churn_window", 2)
     try:
-        variant = _resolve_variant(variant_value, candidate_value)
+        if policy_path is not None:
+            if variant_value is not None or candidate_value is not None:
+                raise ValueError("baseline policy is separate from variant and candidate modes")
+            if not isinstance(policy_identity, str) or not policy_identity:
+                raise ValueError("policy_identity is required with policy_path")
+            variant = policy_identity
+        else:
+            variant = _resolve_variant(variant_value, candidate_value)
     except ValueError as exc:
         return _request_failure(request, str(exc))
     if type(opponent) is not str or opponent not in OPPONENTS:
@@ -125,6 +161,8 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
         return _request_failure(request, "steps must be a positive integer")
     if type(seat) is not int or seat not in (0, 1):
         return _request_failure(request, "seat must be 0 or 1")
+    if type(churn_window) is not int or churn_window < 1:
+        return _request_failure(request, "churn_window must be a positive integer")
     ablations = request.get("ablations")
     if ablations is not None and not isinstance(ablations, Mapping):
         return _request_failure(request, "ablations must be an object")
@@ -149,10 +187,13 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
     # both namespaces, so its spelling alone cannot determine the policy.
     is_route_candidate = candidate_value is not None
     try:
-        route_policy = candidate_policy(variant) if is_route_candidate else None
-        candidate = VariantPolicy(
-            variant, ablations, env.configuration, is_route_candidate, route_policy,
-        )
+        if policy_path is not None:
+            candidate = _load_policy_reference(policy_path)
+        else:
+            route_policy = candidate_policy(variant) if is_route_candidate else None
+            candidate = VariantPolicy(
+                variant, ablations, env.configuration, is_route_candidate, route_policy,
+            )
     except Exception as exc:
         raise EvaluatorFailure(
             f"candidate policy construction failure: {type(exc).__name__}: {exc}"
@@ -185,6 +226,7 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
         )
     return replay_record(
         replay, variant=variant, opponent=opponent, seed=seed, seat=seat,
+        churn_window=churn_window,
     )
 
 

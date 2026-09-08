@@ -625,10 +625,12 @@ def test_worker_accepts_direct_candidate_request(monkeypatch):
 
     result = worker.run_request({
         "candidate": "mixed", "opponent": "pass", "seed": 1, "steps": 2, "seat": 1,
+        "churn_window": 1,
     })
 
     assert captured["variant"] == "mixed"
     assert captured["replay_kwargs"]["variant"] == "mixed"
+    assert captured["replay_kwargs"]["churn_window"] == 1
     assert result["candidate"] == "mixed"
 
 
@@ -1061,6 +1063,12 @@ def _complete_worker_record():
         "shed_overflow": 0.0,
         "price_floor_sales": 0,
         "missed_basic_needs": 0,
+        "submitted_market_order_count": 0,
+        "market_transaction_count": 0,
+        "same_item_market_churn": 0,
+        "same_item_sell_buy_churn": 0,
+        "terminal_cash": 100.0,
+        "terminal_inventory_value": 0.0,
     }
 
 
@@ -1471,7 +1479,11 @@ def test_run_matrix_accepts_candidates_and_forwards_each_seat_and_seed(monkeypat
     assert [set(record) for record in result["records"]] == [
         {"candidate", "variant", "opponent", "seed", "seat", "outcome",
          "final_bank", "opponent_final_bank", "bank_differential", "framework_error",
-         "shed_overflow", "price_floor_sales", "missed_basic_needs", "error"},
+         "shed_overflow", "price_floor_sales", "missed_basic_needs",
+         "submitted_market_order_count",
+         "market_transaction_count", "same_item_market_churn",
+         "same_item_sell_buy_churn", "terminal_cash", "terminal_inventory_value",
+         "error"},
     ] * 4
     assert [record["candidate"] for record in result["records"]] == ["mixed"] * 4
     assert [record["error"] for record in result["records"]] == ["worker diagnostic"] * 4
@@ -3642,3 +3654,849 @@ def test_same_seed_random_style_evaluator_is_reproducible():
 
     assert first == second
     assert first["framework_error"] is False
+
+
+def _metric_action_state(step, orders):
+    return {
+        "observation": {"step": step},
+        "action": {"farmer": ["PASS"], "hands": [], "market": orders},
+    }
+
+
+def test_replay_market_metrics_count_transactions_and_short_window_churn():
+    from scripts.evaluate import _market_metrics
+
+    states = [
+        _metric_action_state(0, []),  # bootstrap action is not evaluated
+        _metric_action_state(1, [["BUY_PRODUCT", "WHEAT", 2]]),
+        _metric_action_state(2, [["SELL", "WHEAT", 1]]),
+        _metric_action_state(8, [["SELL", "MELON", 1]]),
+    ]
+
+    metrics = _market_metrics(states, churn_window=2)
+
+    assert metrics == {
+        "submitted_market_order_count": 3,
+        "market_transaction_count": 3,
+        "same_item_market_churn": 1,
+        "same_item_sell_buy_churn": 1,
+    }
+
+
+def test_replay_record_exposes_terminal_cash_and_inventory_value():
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    clean_record = replay_record(_strict_two_turn_replay(), variant="mixed", opponent="pass", seed=1)
+    assert clean_record["framework_error"] is False
+    assert clean_record["framework_error_reasons"] == []
+
+    terminal = replay["steps"][-1][0]["observation"]
+    terminal["farms"][0]["money"] = 125
+    terminal["private"]["shed"] = {"WHEAT": 2}
+    terminal["market"]["prices"] = {"WHEAT": 25}
+    replay["rewards"][0] = 125
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["terminal_cash"] == 125
+    assert record["terminal_inventory_value"] == 50
+    assert record["final_bank"] == record["terminal_cash"]
+
+
+def test_malformed_replay_record_reports_malformed_replay_reason():
+    from scripts.evaluate import replay_record
+
+    record = replay_record({}, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+    assert record["framework_error_reasons"] == ["malformed_replay"]
+
+
+def test_framework_error_reasons_are_ordered_and_set_framework_error():
+    from scripts.evaluate import framework_error_reasons
+
+    record = {
+        "framework_error": False,
+        "missed_basic_needs": 1,
+        "same_item_market_churn": 1,
+    }
+
+    reasons = framework_error_reasons(record)
+    record["framework_error_reasons"] = reasons
+    record["framework_error"] = bool(reasons)
+
+    assert record["framework_error"] is True
+    assert record["framework_error_reasons"] == ["missed_basic_needs", "market_churn"]
+
+
+def test_clean_legacy_record_has_no_framework_error_reasons():
+    from scripts.evaluate import framework_error_reasons
+
+    record = {
+        "framework_error": False,
+        "missed_basic_needs": 0,
+        "same_item_market_churn": 0,
+    }
+
+    assert framework_error_reasons(record) == []
+    assert record["framework_error"] is False
+
+
+def test_aggregate_exposes_market_and_terminal_metrics():
+    from scripts.evaluate import aggregate_records
+
+    summary = aggregate_records([
+        {"outcome": "win", "final_bank": 100, "terminal_cash": 100,
+         "terminal_inventory_value": 30, "market_transaction_count": 4,
+         "same_item_market_churn": 1, "same_item_sell_buy_churn": 1,
+         "framework_error": False},
+        {"outcome": "tie", "final_bank": 80, "terminal_cash": 80,
+         "terminal_inventory_value": 10, "market_transaction_count": 2,
+         "same_item_market_churn": 0, "same_item_sell_buy_churn": 0,
+         "framework_error": False},
+    ])
+
+    assert summary["total_market_transaction_count"] == 6
+    assert summary["mean_market_transaction_count"] == 3
+    assert summary["total_same_item_market_churn"] == 1
+    assert summary["max_same_item_market_churn"] == 1
+    assert summary["mean_terminal_cash"] == 90
+    assert summary["mean_terminal_inventory_value"] == 20
+
+
+def test_promotion_decision_discards_candidate_over_market_activity_caps():
+    from scripts.evaluate import promotion_decision
+
+    candidate = [
+        {**_metric_record(seat=seat, seed=1, outcome="win", differential=10),
+         "market_transaction_count": 1, "same_item_market_churn": 2,
+         "same_item_sell_buy_churn": 2, "terminal_cash": 90,
+         "terminal_inventory_value": 5}
+        for seat in (0, 1)
+    ]
+
+    assert promotion_decision(
+        candidate, candidate, min_valid_games=1, max_same_item_market_churn=1,
+    )["reasons"] == ["same_item_market_churn"]
+    assert promotion_decision(
+        candidate, candidate, min_valid_games=1, max_same_item_market_churn=10,
+        max_market_transactions=1,
+    )["reasons"] == ["market_transaction_count"]
+    assert promotion_decision(
+        candidate, candidate, min_valid_games=1, max_same_item_market_churn=10,
+        min_terminal_cash=100,
+    )["reasons"] == ["terminal_cash_below_threshold"]
+    assert promotion_decision(
+        candidate, candidate, min_valid_games=1, max_same_item_market_churn=10,
+        min_terminal_inventory_value=10,
+    )["reasons"] == ["terminal_inventory_value_below_threshold"]
+
+
+def test_legacy_records_apply_terminal_gates_to_each_record():
+    from scripts.evaluate import promotion_decision
+
+    candidate = [
+        {
+            "variant": "mixed", "opponent": "pass", "seed": seed,
+            "outcome": "win", "final_bank": terminal_cash,
+            "opponent_final_bank": 100.0,
+            "bank_differential": terminal_cash - 100.0,
+            "framework_error": False,
+            "terminal_cash": terminal_cash,
+            "terminal_inventory_value": terminal_inventory_value,
+        }
+        for seed, terminal_cash, terminal_inventory_value in (
+            (1, 200.0, 200.0), (2, 0.0, 0.0),
+        )
+    ]
+
+    decision = promotion_decision(
+        candidate, candidate, min_valid_games=1,
+        min_terminal_cash=100.0, min_terminal_inventory_value=100.0,
+    )
+
+    assert decision["reasons"] == ["terminal_cash_below_threshold"]
+
+    inventory_decision = promotion_decision(
+        candidate, candidate, min_valid_games=1,
+        min_terminal_inventory_value=100.0,
+    )
+
+    assert inventory_decision["reasons"] == ["terminal_inventory_value_below_threshold"]
+
+
+def test_external_metric_deltas_are_suppressed_when_candidate_fails_safety_gates():
+    from scripts.evaluate import promotion_decision
+
+    candidate = [
+        {**_metric_record(seat=seat, seed=1, outcome="win", differential=10),
+         "terminal_cash": 0.0}
+        for seat in (0, 1)
+    ]
+    baseline = [
+        {**_metric_record(seat=seat, seed=1, candidate="previous-agent",
+                          outcome="loss", differential=1),
+         "terminal_cash": 100.0}
+        for seat in (0, 1)
+    ]
+
+    decision = promotion_decision(
+        candidate, baseline, min_valid_games=1, min_terminal_cash=100.0,
+        baseline_policy="previous-agent",
+    )
+
+    assert decision["reasons"] == ["terminal_cash_below_threshold"]
+    assert decision["paired_metric_deltas"] is None
+
+
+def test_external_baseline_policy_is_run_on_the_same_matrix(monkeypatch):
+    from scripts.evaluate import run_evaluation
+
+    calls = []
+
+    def fake_run_matrix(**kwargs):
+        calls.append(kwargs)
+        return {"records": []}
+
+    monkeypatch.setattr("scripts.evaluate.run_matrix", fake_run_matrix)
+    result = run_evaluation(
+        candidates=["mixed"], opponents=["pass"], seeds=[4, 9], steps=8,
+        seats=[0, 1], baseline_policy="/tmp/previous_agent.py:agent",
+        baseline_identity="previous-agent",
+    )
+
+    assert calls[0]["policy_path"] == "/tmp/previous_agent.py:agent"
+    assert calls[0]["policy_identity"] == "previous-agent"
+    assert calls[0]["opponents"] == calls[1]["opponents"]
+    assert calls[0]["seeds"] == calls[1]["seeds"]
+    assert calls[0]["seats"] == calls[1]["seats"]
+    assert result["baseline_policy"] == {
+        "identity": "previous-agent", "path": "/tmp/previous_agent.py:agent",
+    }
+
+
+def test_run_matrix_forwards_configured_churn_window(monkeypatch):
+    from scripts.evaluate import run_matrix
+
+    calls = []
+
+    def fake_run_game(**kwargs):
+        calls.append(kwargs)
+        return kwargs
+
+    monkeypatch.setattr("scripts.evaluate.run_game", fake_run_game)
+    run_matrix(variants=["mixed"], opponents=["pass"], seeds=[1], steps=2,
+                seats=[0], churn_window=1)
+
+    assert calls[0]["churn_window"] == 1
+
+
+def test_run_evaluation_forwards_configured_churn_window_to_every_matrix(monkeypatch):
+    from scripts.evaluate import run_evaluation
+
+    calls = []
+
+    def fake_run_matrix(**kwargs):
+        calls.append(kwargs)
+        return {"records": []}
+
+    monkeypatch.setattr("scripts.evaluate.run_matrix", fake_run_matrix)
+    run_evaluation(variants=["mixed"], opponents=["pass"], seeds=[1], steps=2,
+                    seats=[0, 1], churn_window=1)
+
+    assert calls
+    assert all(call["churn_window"] == 1 for call in calls)
+
+
+def test_external_baseline_pairing_failure_is_explicit_in_decision():
+    from scripts.evaluate import promotion_decision
+
+    candidate = [
+        _metric_record(seat=seat, seed=1, outcome="win", differential=10)
+        for seat in (0, 1)
+    ]
+    incomplete_baseline = [_metric_record(seat=0, seed=1, outcome="loss", differential=1)]
+
+    decision = promotion_decision(
+        candidate, incomplete_baseline, min_valid_games=1,
+        expected_matrix=[("pass", 1, 0), ("pass", 1, 1)],
+        baseline_policy="previous-agent",
+    )
+
+    assert decision["status"] == "discard"
+    assert "baseline_incomplete_pairing" in decision["reasons"]
+    assert decision["baseline_safety_gate_reasons"] == ["missing_expected_matrix_records"]
+
+
+def test_cli_parses_economic_gates_and_external_baseline():
+    from scripts.evaluate import parse_args
+
+    args = parse_args([
+        "--candidates", "mixed", "--baseline-policy", "old_agent:agent",
+        "--baseline-identity", "previous-agent", "--churn-window", "3",
+        "--max-same-item-churn", "1", "--max-market-transactions", "4",
+        "--min-terminal-cash", "100", "--min-terminal-inventory-value", "25",
+    ])
+
+    assert args.baseline_policy == "old_agent:agent"
+    assert args.baseline_identity == "previous-agent"
+    assert args.churn_window == 3
+    assert args.max_same_item_churn == 1
+    assert args.max_market_transactions == 4
+    assert args.min_terminal_cash == 100
+    assert args.min_terminal_inventory_value == 25
+
+
+def test_report_exposes_gate_thresholds_and_external_baseline():
+    from scripts.evaluate import build_result_document
+
+    records = [
+        {**_metric_record(seat=seat, seed=1, candidate="challenger",
+                          outcome="win", differential=10),
+         "market_transaction_count": 4, "same_item_market_churn": 0,
+         "same_item_sell_buy_churn": 0, "terminal_cash": 110,
+         "terminal_inventory_value": 30}
+        for seat in (0, 1)
+    ]
+    baseline = [
+        {**_metric_record(seat=seat, seed=1, candidate="previous-agent",
+                          outcome="loss", differential=1),
+         "market_transaction_count": 4, "same_item_market_churn": 0,
+         "same_item_sell_buy_churn": 0, "terminal_cash": 101,
+         "terminal_inventory_value": 20}
+        for seat in (0, 1)
+    ]
+
+    document = build_result_document(
+        config={"candidates": ["challenger"], "opponents": ["pass"],
+                "seed_values": [1], "seats": [0, 1], "min_valid_games": 1,
+                "baseline_policy": "old_agent:agent",
+                "baseline_identity": "previous-agent", "churn_window": 2,
+                "max_same_item_churn": 0, "max_market_transactions": 10,
+                "min_terminal_cash": 100, "min_terminal_inventory_value": 0},
+        records=records, baseline_records=baseline,
+    )
+
+    assert document["metadata"]["baseline_policy"] == {
+        "identity": "previous-agent", "path": "old_agent:agent",
+    }
+    assert document["metadata"]["gate_thresholds"]["max_same_item_churn"] == 0
+    assert document["promotion_decisions"]["challenger"]["status"] == "promote"
+    assert document["promotion_decisions"]["challenger"]["paired_metric_deltas"] == {
+        "market_transaction_count": 0.0,
+        "same_item_market_churn": 0.0,
+        "terminal_cash": 9.0,
+        "terminal_inventory_value": 10.0,
+    }
+
+
+def test_paired_summary_contains_economic_metrics_for_seed_matched_pairs():
+    from scripts.evaluate import paired_seed_summary
+
+    records = [
+        {**_metric_record(seat=seat, seed=1, outcome="win", differential=10),
+         "market_transaction_count": 4 + seat,
+         "same_item_market_churn": seat,
+         "same_item_sell_buy_churn": seat,
+         "terminal_cash": 100 + 10 * seat,
+         "terminal_inventory_value": 20 + 5 * seat}
+        for seat in (0, 1)
+    ]
+
+    summary = paired_seed_summary(records)
+
+    assert summary["total_market_transaction_count"] == 9
+    assert summary["total_submitted_market_order_count"] == 9
+    assert summary["mean_paired_market_transaction_count"] == 4.5
+    assert summary["median_paired_market_transaction_count"] == 4.5
+    assert summary["mean_paired_same_item_market_churn"] == 0.5
+    assert summary["mean_paired_terminal_cash"] == 105
+    assert summary["mean_paired_terminal_inventory_value"] == 22.5
+
+
+def test_write_result_document_includes_external_baseline_records_in_sidecar(tmp_path):
+    from scripts.evaluate import write_result_document
+
+    baseline = [{"candidate": "previous-agent", "seed": 1, "seat": 0}]
+    sidecar = write_result_document(
+        tmp_path / "report.json", {"schema_version": 1}, records=[],
+        baseline_records=baseline,
+    )
+
+    sidecar_document = json.loads(sidecar.read_text())
+    assert sidecar_document["records"] == [
+        {"ablation": "baseline-policy", "evaluation_split": "development", **baseline[0]}
+    ]
+
+
+def test_guarded_external_callable_supports_one_and_two_argument_policies_without_retrying_internal_typeerror():
+    from scripts.evaluation_worker import EvaluatorFailure, _GuardedCandidate
+
+    one_argument_calls = []
+
+    def one_argument(observation):
+        one_argument_calls.append(observation)
+        return "one"
+
+    assert _GuardedCandidate(one_argument)("obs", {"episodeSteps": 2}) == "one"
+    assert one_argument_calls == ["obs"]
+
+    two_argument_calls = []
+
+    def two_arguments(observation, configuration):
+        two_argument_calls.append((observation, configuration))
+        return "two"
+
+    configuration = {"episodeSteps": 2}
+    assert _GuardedCandidate(two_arguments)("obs", configuration) == "two"
+    assert two_argument_calls == [("obs", configuration)]
+
+    internal_typeerror_calls = []
+
+    def internal_typeerror(observation, configuration):
+        internal_typeerror_calls.append((observation, configuration))
+        raise TypeError("policy body failed")
+
+    with pytest.raises(EvaluatorFailure, match="policy body failed"):
+        _GuardedCandidate(internal_typeerror)("obs", configuration)
+    assert len(internal_typeerror_calls) == 1
+
+
+def test_main_agent_reference_is_accepted_as_one_argument_external_policy():
+    from scripts.evaluate import _load_policy_reference
+    from scripts.evaluation_worker import _GuardedCandidate
+
+    policy = _load_policy_reference("main.py:agent")
+
+    assert callable(policy)
+    assert _GuardedCandidate(policy).accepts_configuration is False
+
+
+def test_terminal_inventory_values_products_seeds_and_animals_separately():
+    from scripts.evaluate import _terminal_inventory_value
+
+    observation = {
+        "private": {
+            "shed": {"WHEAT": 2},
+            "inventories": [{"GOOSE": 1}],
+            "seeds": {"WHEAT": 3},
+        },
+        "market": {"prices": {"WHEAT": 25}, "inventory": {}},
+    }
+
+    # Harvested WHEAT is quoted at 25, private WHEAT seed at CROPS[WHEAT].seed,
+    # and the animal at its acquisition cost; seed quantity must not be merged
+    # into harvested product quantity.
+    assert _terminal_inventory_value(observation) == 2 * 25 + 3 * 10 + 300
+
+
+def test_worker_requires_and_type_checks_new_economic_metrics():
+    from scripts.evaluate import _worker_record_error
+
+    record = {
+        **_complete_worker_record(),
+        "submitted_market_order_count": 2,
+        "market_transaction_count": 2,
+        "same_item_market_churn": 1,
+        "same_item_sell_buy_churn": 1,
+        "terminal_cash": 100.0,
+        "terminal_inventory_value": 20.0,
+    }
+    for field in (
+        "submitted_market_order_count", "market_transaction_count", "same_item_market_churn",
+        "same_item_sell_buy_churn", "terminal_cash", "terminal_inventory_value",
+    ):
+        missing = dict(record)
+        del missing[field]
+        assert _worker_record_error(missing, variant="mixed", opponent="pass", seed=4, seat=1)
+
+    for field in ("submitted_market_order_count", "market_transaction_count",
+                  "same_item_market_churn", "same_item_sell_buy_churn"):
+        for value in (-1, True, 1.5):
+            malformed = {**record, field: value}
+            assert _worker_record_error(malformed, variant="mixed", opponent="pass", seed=4, seat=1)
+    for field in ("terminal_cash", "terminal_inventory_value"):
+        malformed = {**record, field: float("nan")}
+        assert _worker_record_error(malformed, variant="mixed", opponent="pass", seed=4, seat=1)
+
+    framework = {
+        **record,
+        "outcome": "framework_error",
+        "framework_error": True,
+        "final_bank": None,
+        "opponent_final_bank": None,
+        "bank_differential": None,
+        "terminal_cash": None,
+        "terminal_inventory_value": None,
+    }
+    assert _worker_record_error(framework, variant="mixed", opponent="pass", seed=4, seat=1) is None
+
+
+def test_legacy_no_seat_records_still_apply_economic_gates():
+    from scripts.evaluate import promotion_decision
+
+    record = {
+        "variant": "mixed", "opponent": "pass", "seed": 1,
+        "outcome": "win", "final_bank": 100.0,
+        "opponent_final_bank": 90.0, "bank_differential": 10.0,
+        "framework_error": False, "market_transaction_count": 2,
+        "terminal_cash": 100.0, "terminal_inventory_value": 10.0,
+    }
+
+    decision = promotion_decision(
+        [record], [record], min_valid_games=1, max_market_transactions=1,
+    )
+
+    assert decision["reasons"] == ["market_transaction_count"]
+
+
+def test_legacy_missing_terminal_inventory_value_counts_as_zero_for_gate():
+    from scripts.evaluate import promotion_decision
+
+    complete = {
+        "variant": "mixed", "opponent": "pass", "seed": 1,
+        "outcome": "win", "final_bank": 100.0,
+        "opponent_final_bank": 90.0, "bank_differential": 10.0,
+        "framework_error": False, "terminal_inventory_value": 200.0,
+    }
+    missing = {**complete, "seed": 2}
+    del missing["terminal_inventory_value"]
+
+    decision = promotion_decision(
+        [complete, missing], [complete, missing], min_valid_games=1,
+        min_terminal_inventory_value=50.0,
+    )
+
+    assert decision["reasons"] == ["terminal_inventory_value_below_threshold"]
+
+
+def test_run_evaluation_accepts_and_reports_economic_thresholds(monkeypatch):
+    from scripts.evaluate import run_evaluation
+
+    monkeypatch.setattr("scripts.evaluate.run_matrix", lambda **kwargs: {"records": []})
+    result = run_evaluation(
+        variants=["mixed"], opponents=["pass"], seeds=[1], steps=2,
+        seats=[0, 1], max_same_item_market_churn=2,
+        max_market_transactions=7, min_terminal_cash=10,
+        min_terminal_inventory_value=3,
+    )
+
+    assert result["gate_thresholds"] == {
+        "max_same_item_market_churn": 2,
+        "max_market_transactions": 7,
+        "min_terminal_cash": 10.0,
+        "min_terminal_inventory_value": 3.0,
+    }
+    with pytest.raises(ValueError, match="max_market_transactions"):
+        run_evaluation(
+            variants=["mixed"], opponents=["pass"], seeds=[1], steps=2,
+            max_market_transactions=-1,
+        )
+
+
+def test_main_forwards_economic_thresholds_to_run_evaluation(monkeypatch, tmp_path):
+    import scripts.evaluate as evaluate
+
+    captured = {}
+
+    def fake_run_evaluation(**kwargs):
+        captured["evaluation"] = kwargs
+        return {"records": [], "ablation_records": {}, "ablation_configs": {}}
+
+    monkeypatch.setattr(evaluate, "run_evaluation", fake_run_evaluation)
+    monkeypatch.setattr(evaluate, "build_result_document", lambda **kwargs: {"selected_default": "mixed"})
+    monkeypatch.setattr(evaluate, "write_result_document", lambda *args, **kwargs: None)
+
+    assert evaluate.main([
+        "--seeds", "1", "--steps", "2", "--max-same-item-churn", "2",
+        "--max-market-transactions", "7", "--min-terminal-cash", "10",
+        "--min-terminal-inventory-value", "3", "--output",
+        str(tmp_path / "evaluation.json"),
+    ]) == 0
+    assert captured["evaluation"]["max_same_item_market_churn"] == 2
+    assert captured["evaluation"]["max_market_transactions"] == 7
+    assert captured["evaluation"]["min_terminal_cash"] == 10
+    assert captured["evaluation"]["min_terminal_inventory_value"] == 3
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"opponents": ["pass", "pass"], "seats": [0]},
+    {"opponents": ["pass"], "seats": [0, 0]},
+])
+def test_run_matrix_rejects_duplicate_opponents_or_seats_before_games(monkeypatch, kwargs):
+    from scripts.evaluate import run_matrix
+
+    monkeypatch.setattr("scripts.evaluate.run_game", lambda **kwargs: pytest.fail("run_game should not run"))
+
+    with pytest.raises(ValueError, match="unique"):
+        run_matrix(variants=["mixed"], seeds=[1], steps=2, **kwargs)
+
+
+def test_market_metrics_exposes_submitted_order_event_semantics():
+    from scripts.evaluate import _market_metrics
+
+    metrics = _market_metrics([
+        _metric_action_state(0, []),
+        _metric_action_state(1, [["BUY_PRODUCT", "WHEAT", 9], ["SELL", "MELON", 4]]),
+    ])
+
+    assert metrics["submitted_market_order_count"] == 2
+    assert metrics["market_transaction_count"] == 2
+
+
+def test_build_result_document_does_not_fallback_when_external_holdout_baseline_is_missing():
+    from scripts.evaluate import build_result_document
+
+    development = [
+        _metric_record(seat=seat, seed=1, candidate=candidate,
+                       outcome="win" if candidate == "challenger" else "tie",
+                       differential=10 if candidate == "challenger" else 1)
+        for candidate in ("baseline", "challenger")
+        for seat in (0, 1)
+    ]
+    holdout = [
+        _metric_record(seat=seat, seed=100, candidate=candidate,
+                       outcome="win" if candidate == "challenger" else "tie",
+                       differential=100 if candidate == "challenger" else 1)
+        for candidate in ("baseline", "challenger")
+        for seat in (0, 1)
+    ]
+
+    document = build_result_document(
+        config={
+            "candidates": ["baseline", "challenger"], "opponents": ["pass"],
+            "seed_values": [1], "holdout_seed_values": [100],
+            "seats": [0, 1], "min_valid_games": 1,
+            "baseline_policy": "old_agent:agent",
+        },
+        records=development, holdout_records=holdout,
+    )
+
+    assert document["selected_candidate"] is None
+    assert all(
+        decision["status"] == "discard"
+        and "baseline_incomplete_pairing" in decision["reasons"]
+        for decision in document["holdout_promotion_decisions"].values()
+    )
+
+
+def test_build_result_document_defaults_external_baseline_identity_for_paired_deltas():
+    from scripts.evaluate import build_result_document
+
+    records = [
+        _metric_record(seat=seat, seed=1, candidate="challenger",
+                       outcome="win", differential=10)
+        for seat in (0, 1)
+    ]
+    baseline = [
+        _metric_record(seat=seat, seed=1, candidate="previous-agent",
+                       outcome="loss", differential=1)
+        for seat in (0, 1)
+    ]
+
+    document = build_result_document(
+        config={
+            "candidates": ["challenger"], "opponents": ["pass"],
+            "seed_values": [1], "seats": [0, 1], "min_valid_games": 1,
+            "baseline_policy": "old_agent:agent",
+        },
+        records=records, baseline_records=baseline,
+    )
+
+    assert document["metadata"]["baseline_policy"] == {
+        "identity": "previous-agent", "path": "old_agent:agent",
+    }
+    assert document["promotion_decisions"]["challenger"]["paired_metric_deltas"] is not None
+
+
+def test_run_matrix_rejects_duplicate_seeds_before_games(monkeypatch):
+    from scripts.evaluate import run_matrix
+
+    monkeypatch.setattr("scripts.evaluate.run_game", lambda **kwargs: pytest.fail("run_game should not run"))
+
+    with pytest.raises(ValueError, match="seeds must be unique"):
+        run_matrix(variants=["mixed"], opponents=["pass"], seeds=[1, 1], steps=2, seats=[0])
+
+
+def test_ablation_decisions_receive_economic_gate_thresholds():
+    from scripts.evaluate import build_result_document
+
+    def records_for(candidate):
+        return [
+            {**_metric_record(seat=seat, seed=1, candidate=candidate,
+                              outcome="tie", differential=0),
+             "market_transaction_count": 2}
+            for seat in (0, 1)
+        ]
+
+    document = build_result_document(
+        config={
+            "candidates": ["baseline", "challenger"], "opponents": ["pass"],
+            "seed_values": [1], "seats": [0, 1], "min_valid_games": 1,
+            "max_market_transactions": 1,
+        },
+        records=records_for("baseline") + records_for("challenger"),
+        ablation_records={"animals": records_for("baseline") + records_for("challenger")},
+    )
+
+    assert document["ablations"]["animals"]["promotion_decisions"]["baseline"]["reasons"] == [
+        "market_transaction_count"
+    ]
+
+
+def test_run_evaluation_rejects_unknown_ablation_component_before_games(monkeypatch):
+    from scripts.evaluate import run_evaluation
+
+    monkeypatch.setattr("scripts.evaluate.run_matrix", lambda **kwargs: pytest.fail("run_matrix should not run"))
+
+    with pytest.raises(ValueError, match="unsupported ablation component"):
+        run_evaluation(
+            variants=["mixed"], opponents=["pass"], seeds=[1], steps=2,
+            ablations=[("unknown", False)],
+        )
+
+
+def test_external_metric_deltas_returns_none_when_no_valid_records():
+    from scripts.evaluate import _external_metric_deltas
+
+    assert _external_metric_deltas([], []) is None
+
+
+def test_build_result_document_accepts_canonical_and_legacy_churn_threshold_names():
+    from scripts.evaluate import build_result_document
+
+    records = [
+        {**_metric_record(seat=seat, seed=1, candidate="baseline",
+                          outcome="tie", differential=0),
+         "same_item_market_churn": 2}
+        for seat in (0, 1)
+    ]
+
+    canonical = build_result_document(
+        config={
+            "candidates": ["baseline"], "opponents": ["pass"],
+            "seed_values": [1], "seats": [0, 1], "min_valid_games": 1,
+            "max_same_item_market_churn": 1,
+        },
+        records=records,
+    )
+    legacy = build_result_document(
+        config={
+            "candidates": ["baseline"], "opponents": ["pass"],
+            "seed_values": [1], "seats": [0, 1], "min_valid_games": 1,
+            "max_same_item_churn": 1,
+        },
+        records=records,
+    )
+
+    assert canonical["metadata"]["gate_thresholds"]["max_same_item_market_churn"] == 1
+    assert canonical["metadata"]["gate_thresholds"]["max_same_item_churn"] == 1
+    assert canonical["promotion_decisions"]["baseline"]["reasons"] == ["same_item_market_churn"]
+    assert legacy["promotion_decisions"]["baseline"]["reasons"] == ["same_item_market_churn"]
+
+
+def test_cli_game_count_includes_external_baseline_records(monkeypatch, tmp_path, capsys):
+    import scripts.evaluate as evaluate
+
+    baseline = [{"seed": 1, "seat": 0}]
+    monkeypatch.setattr(
+        evaluate, "run_evaluation",
+        lambda **kwargs: {
+            "records": [{"seed": 1}], "baseline_records": baseline,
+            "ablation_records": {"animals": [{"seed": 1}]},
+            "ablation_configs": {},
+        },
+    )
+    monkeypatch.setattr(evaluate, "build_result_document", lambda **kwargs: {"selected_default": "mixed"})
+    monkeypatch.setattr(evaluate, "write_result_document", lambda *args, **kwargs: None)
+
+    assert evaluate.main(["--seeds", "1", "--steps", "2", "--output", str(tmp_path / "report.json")]) == 0
+    assert json.loads(capsys.readouterr().out)["games"] == 3
+
+
+def test_worker_requires_submitted_order_count_and_matches_legacy_alias():
+    from scripts.evaluate import _worker_record_error
+
+    record = _complete_worker_record()
+    assert _worker_record_error(record, variant="mixed", opponent="pass", seed=4, seat=1) is None
+
+    missing = dict(record)
+    del missing["submitted_market_order_count"]
+    assert _worker_record_error(missing, variant="mixed", opponent="pass", seed=4, seat=1)
+
+    mismatched = {**record, "submitted_market_order_count": 1}
+    assert _worker_record_error(mismatched, variant="mixed", opponent="pass", seed=4, seat=1)
+
+
+def test_worker_accepts_legacy_record_and_normalizes_missing_framework_reasons():
+    from scripts.evaluate import _worker_record_error
+
+    record = _complete_worker_record()
+
+    assert _worker_record_error(record, variant="mixed", opponent="pass", seed=4, seat=1) is None
+    assert record["framework_error_reasons"] == []
+
+
+def test_run_game_adds_empty_framework_reasons_to_legacy_worker_result(monkeypatch):
+    import scripts.evaluate as evaluate
+
+    response = _complete_worker_record()
+    monkeypatch.setattr(
+        evaluate.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout=json.dumps(response) + "\n", stderr="",
+        ),
+    )
+
+    record = evaluate.run_game(variant="mixed", opponent="pass", seed=4, steps=2, seat=1)
+
+    assert record["framework_error_reasons"] == []
+    assert record["framework_error"] is False
+
+
+@pytest.mark.parametrize("reasons", [
+    ["market_churn", "market_churn"],
+    ["not_a_reason"],
+    ["market_churn", "missed_basic_needs"],
+])
+def test_worker_rejects_invalid_framework_reason_lists(reasons):
+    from scripts.evaluate import _worker_record_error
+
+    record = {**_complete_worker_record(), "framework_error_reasons": reasons}
+    if reasons == ["market_churn", "market_churn"]:
+        record["framework_error"] = True
+        record["outcome"] = "framework_error"
+
+    error = _worker_record_error(record, variant="mixed", opponent="pass", seed=4, seat=1)
+
+    assert error and "framework_error_reasons" in error
+
+
+def test_worker_accepts_all_framework_reasons_in_canonical_order():
+    from scripts.evaluate import FRAMEWORK_REASON_ORDER, _worker_record_error
+
+    record = {
+        **_complete_worker_record(),
+        "framework_error": True,
+        "outcome": "framework_error",
+        "final_bank": None,
+        "opponent_final_bank": None,
+        "bank_differential": None,
+        "terminal_cash": None,
+        "terminal_inventory_value": None,
+        "framework_error_reasons": list(FRAMEWORK_REASON_ORDER),
+    }
+
+    assert _worker_record_error(record, variant="mixed", opponent="pass", seed=4, seat=1) is None
+
+
+def test_worker_rejects_framework_error_inconsistent_with_reasons():
+    from scripts.evaluate import _worker_record_error
+
+    record = {**_complete_worker_record(), "framework_error_reasons": ["market_churn"]}
+
+    error = _worker_record_error(record, variant="mixed", opponent="pass", seed=4, seat=1)
+
+    assert error and "framework_error" in error

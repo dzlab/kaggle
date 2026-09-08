@@ -40,6 +40,11 @@ def _validated_learned_v1_artifact_path() -> Path:
 
 
 def _learned_v1_available() -> bool:
+    # Keep the learned route opt-in for the production/evaluator candidate
+    # list.  A checked-in artifact is useful for explicit rollout requests,
+    # but must not silently change the legacy candidate matrix.
+    if not os.environ.get(LEARNED_V1_ARTIFACT_ENV):
+        return False
     try:
         _validated_learned_v1_artifact_path()
     except ValueError:
@@ -77,7 +82,42 @@ def candidate_metadata(name: str) -> dict[str, Any]:
 def candidate_policy(name: str) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
     """Return a fresh stateful route policy's observation callable."""
     if name == LEARNED_V1:
-        return Policy(strategy="current", learned_model=str(_validated_learned_v1_artifact_path())).act
-    if name not in BASE_CANDIDATES:
+        policy = Policy(strategy="current", learned_model=str(_validated_learned_v1_artifact_path()))
+    elif name in BASE_CANDIDATES:
+        policy = Policy(strategy=name)
+    else:
         raise ValueError(f"unsupported candidate: {name}")
-    return Policy(strategy=name).act
+
+    # Kaggle inspects ``__code__.co_argcount``.  A bound method reports the
+    # underlying function's ``self, obs`` count and is consequently called
+    # with an extra configuration argument.  Keep the stateful Policy object
+    # closed over by a one-argument adapter.
+    def act(observation: Mapping[str, Any]) -> dict[str, Any]:
+        return policy.act(observation)
+
+    # Preserve the introspection hook used by the evaluator and older callers
+    # while keeping the wrapper's one-argument ``__code__`` contract.
+    act.__self__ = policy  # type: ignore[attr-defined]
+    return act
+
+
+def artifact_candidate_policy(path: str | Path) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
+    """Load an exported artifact once and return its stateful action callable."""
+    try:
+        # Keep the validated dependency-free model in memory and hand it to
+        # the normal stateful compiler.  The compiler owns episode memory and
+        # the artifact remains the only model execution boundary.
+        learned_model = load_exported_policy(path)
+        if hasattr(learned_model, "act"):
+            policy = learned_model
+        else:
+            policy = Policy(strategy="current", learned_model=learned_model)
+
+        def act(observation: Mapping[str, Any]) -> dict[str, Any]:
+            return policy.act(observation)
+
+        return act
+    except Exception as exc:
+        raise ValueError(
+            f"candidate artifact is not valid: {type(exc).__name__}: {exc}"
+        ) from exc

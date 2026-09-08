@@ -1660,6 +1660,17 @@ def test_final_day_market_orders_liquidate_saleable_shed_inventory():
     assert orders == [["SELL", "WHEAT", 4]]
 
 
+def test_default_terminal_liquidation_does_not_reserve_feed_after_season_end():
+    state = {
+        "day": 29, "hour": 23, "cash": 0,
+        "animals": [{"species": "SHEEP"}],
+        "private": {"shed": {"WHEAT": 1}, "seeds": {}},
+        "market": {"prices": {"WHEAT": 10}},
+    }
+
+    assert policy_module.build_market_orders(state, []) == [["SELL", "WHEAT", 1]]
+
+
 def test_final_turn_skips_feed_and_normal_purchases_before_liquidation():
     state = {
         "day": 29, "hour": 23, "cash": 10,

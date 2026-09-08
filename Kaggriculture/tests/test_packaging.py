@@ -94,7 +94,12 @@ def test_production_archive_contains_only_runtime_and_selected_artifact(tmp_path
     shutil.copytree(
         PROJECT_ROOT / "kagriculture_agent",
         staging / "kagriculture_agent",
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        # Training-only modules are deliberately excluded from the production
+        # package; the reviewed runtime allowlist in submission_smoke.py is
+        # the authoritative packaging boundary.
+        ignore=shutil.ignore_patterns(
+            "__pycache__", "*.pyc", "checkpoints.py", "model.py", "rollouts.py",
+        ),
     )
     model = staging / "models" / "learned_v1.json"
     model.parent.mkdir()

@@ -4,6 +4,7 @@ from kagriculture_agent.observation import (
     is_tile_actionable,
     is_tile_passable,
     iter_tiles,
+    observation_turn,
     parse_observation,
     shed_access_tiles,
     shed_total,
@@ -113,3 +114,20 @@ def test_episode_start_detects_initial_time_and_time_reset():
     assert not is_episode_start({"day": 2, "hour": 4}, EpisodeMemory(last_day=2, last_hour=4))
     assert is_episode_start({"day": 0, "hour": 0}, None)
     assert not is_episode_start({"day": "bad", "hour": None}, None)
+
+
+def test_observation_turn_uses_day_and_hour_when_step_is_missing():
+    assert observation_turn({"step": None, "day": 7, "hour": 3}) == 171
+
+
+def test_observation_turn_prefers_valid_step_but_rejects_invalid_values():
+    assert observation_turn({"step": 42, "day": 7, "hour": 3}) == 42
+    assert observation_turn({"step": -1, "day": 7, "hour": 3}) == -1
+    assert observation_turn({"step": "42", "day": 7, "hour": 3}) == 171
+    assert observation_turn({"step": True, "day": 7, "hour": 3}) == 171
+
+
+def test_parse_observation_exposes_seat_safe_turn():
+    parsed = parse_observation(make_observation(player=1, day=4, hour=6))
+
+    assert parsed["turn"] == 102

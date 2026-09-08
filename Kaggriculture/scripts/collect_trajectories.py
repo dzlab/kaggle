@@ -23,11 +23,30 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from kagriculture_agent.constants import ENGINE_VERSION
 from kagriculture_agent.features import FEATURE_SCHEMA_VERSION
+from kagriculture_agent.rollouts import resolve_worker_count, run_rollouts
 from kagriculture_agent.trajectory import TRANSITION_SCHEMA_VERSION, transitions_from_replay
 
 COLLECTOR_OPPONENTS = ("pass", "random", "starter", "current")
 OPPONENTS = COLLECTOR_OPPONENTS
 DEFAULT_GAME_TIMEOUT_SECONDS = 120.0
+
+
+class IsolatedGameTimeoutError(TimeoutError, RuntimeError):
+    """A subprocess timeout that remains compatible with the legacy API."""
+
+
+class RolloutCollectionError(RuntimeError, ValueError):
+    """Collection failed before publication; diagnostics cover every request."""
+
+    def __init__(self, diagnostics: list[dict[str, Any]]) -> None:
+        self.diagnostics = diagnostics
+        failed = sum(entry["status"] != "success" for entry in diagnostics)
+        detail = "; ".join(
+            str(entry.get("error")) for entry in diagnostics
+            if entry["status"] != "success" and entry.get("error")
+        )
+        suffix = f": {detail}" if detail else ""
+        super().__init__(f"{failed} rollout(s) failed; no trajectory was published{suffix}")
 
 
 def _positive_int(value: str) -> int:
@@ -65,6 +84,9 @@ def _strict_int_values(values: Sequence[Any], name: str, *, allowed: set[int] | 
 def _run_game_isolated(
     *, opponent: str, seed: int, steps: int, candidate_player: int, replay_path: Path,
     timeout: float = DEFAULT_GAME_TIMEOUT_SECONDS,
+    candidate_artifact: str | Path | None = None,
+    candidate_identity: str | None = None,
+    opponent_artifact: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run one game in a fresh interpreter and return its JSON replay."""
     engine_opponent = "pass" if opponent == "current" else opponent
@@ -77,6 +99,12 @@ def _run_game_isolated(
         "--seat", str(candidate_player),
         "--replay", str(replay_path),
     ]
+    if candidate_artifact is not None:
+        command.extend(["--candidate-artifact", str(candidate_artifact)])
+    if candidate_identity is not None:
+        command.extend(["--candidate-identity", candidate_identity])
+    if opponent_artifact is not None:
+        command.extend(["--opponent-artifact", str(opponent_artifact)])
     if opponent == "current":
         command.append("--current-opponent")
     try:
@@ -89,7 +117,7 @@ def _run_game_isolated(
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
+        raise IsolatedGameTimeoutError(
             f"isolated game timed out after {timeout:g}s for opponent={opponent}, "
             f"seed={seed}, seat={candidate_player}"
         ) from exc
@@ -184,6 +212,11 @@ def collect(
     *, seeds: Sequence[int], opponents: Sequence[str], seats: Sequence[int], steps: int,
     output: str | Path, source_policy_identity: str = "current",
     game_timeout: float = DEFAULT_GAME_TIMEOUT_SECONDS,
+    candidate_artifact: str | Path | None = None,
+    candidate_identity: str | None = None,
+    opponent_artifact: str | Path | None = None,
+    opponent_checkpoint_identity: str | None = None,
+    workers: int | None = 1,
 ) -> dict[str, Any]:
     """Collect and write one validated transition per output JSONL line."""
     normalized_seeds = _strict_int_values(seeds, "seeds")
@@ -199,6 +232,21 @@ def collect(
         raise ValueError("steps must be at least 2 to produce a transition")
     if not isinstance(source_policy_identity, str) or not source_policy_identity:
         raise ValueError("source_policy_identity must be a non-empty string")
+    artifact_path = None
+    if candidate_artifact is not None:
+        artifact_path = Path(candidate_artifact).expanduser().resolve()
+        if not artifact_path.is_file():
+            raise ValueError(f"candidate artifact does not exist: {artifact_path}")
+        if candidate_identity is None:
+            candidate_identity = f"artifact:{hashlib.sha256(artifact_path.read_bytes()).hexdigest()}"
+    if candidate_identity is not None and (
+        type(candidate_identity) is not str or not candidate_identity
+    ):
+        raise ValueError("candidate_identity must be a non-empty string")
+    if opponent_artifact is not None:
+        opponent_artifact = Path(opponent_artifact).expanduser().resolve()
+        if not opponent_artifact.is_file():
+            raise ValueError(f"opponent artifact does not exist: {opponent_artifact}")
     if isinstance(game_timeout, bool) or not isinstance(game_timeout, (int, float)) \
             or not math.isfinite(float(game_timeout)) or float(game_timeout) <= 0:
         raise ValueError("game_timeout must be a positive finite number")
@@ -213,6 +261,26 @@ def collect(
         steps=steps,
         source_policy_identity=source_policy_identity,
     )
+    if artifact_path is not None or candidate_identity is not None:
+        manifest["candidate_artifact"] = str(artifact_path) if artifact_path is not None else None
+        manifest["candidate_identity"] = candidate_identity
+        manifest["candidate_artifact_sha256"] = (
+            hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+            if artifact_path is not None else None
+        )
+    if opponent_artifact is not None:
+        manifest["opponent_artifact"] = str(opponent_artifact)
+        manifest["opponent_artifact_sha256"] = hashlib.sha256(
+            opponent_artifact.read_bytes()
+        ).hexdigest()
+    if opponent_checkpoint_identity is not None:
+        if type(opponent_checkpoint_identity) is not str or not opponent_checkpoint_identity:
+            raise ValueError("opponent_checkpoint_identity must be a non-empty string")
+        manifest["opponent_checkpoint_identity"] = opponent_checkpoint_identity
+    manifest["workers"] = resolve_worker_count(workers)
+    manifest["opponent_identities"] = {
+        opponent: opponent for opponent in normalized_opponents
+    }
     manifest["run_id"] = run_id
     manifest_path = destination.with_suffix(".manifest.json")
     trajectory_temp = None
@@ -235,26 +303,55 @@ def collect(
         with trajectory_temp, manifest_temp:
             with tempfile.TemporaryDirectory(prefix="kagriculture-trajectory-") as temporary_directory:
                 replay_directory = Path(temporary_directory)
-                for seed in normalized_seeds:
-                    for opponent in normalized_opponents:
-                        for candidate_player in normalized_seats:
-                            replay_path = replay_directory / f"seed-{seed}-{opponent}-seat-{candidate_player}.json"
-                            replay = _run_game_isolated(
-                                opponent=opponent,
-                                seed=seed,
-                                steps=steps,
-                                candidate_player=candidate_player,
-                                replay_path=replay_path,
-                                timeout=float(game_timeout),
-                            )
-                            transitions = transitions_from_replay(
-                                replay, candidate_player=candidate_player, requested_seed=seed,
-                            )
-                            for transition in transitions:
-                                serialized = transition.to_json() + "\n"
-                                trajectory_temp.write(serialized)
-                                trajectory_hash.update(serialized.encode("utf-8"))
-                                transition_count += 1
+                results = run_rollouts(
+                    seeds=normalized_seeds, opponents=normalized_opponents,
+                    seats=normalized_seats, steps=steps, workers=workers,
+                    game_runner=_run_game_isolated,
+                    replay_directory=replay_directory,
+                    timeout=float(game_timeout), candidate_artifact=artifact_path,
+                    candidate_identity=candidate_identity,
+                    opponent_artifact=opponent_artifact,
+                    opponent_checkpoint_identity=opponent_checkpoint_identity,
+                )
+                diagnostics = [
+                    {
+                        "request_key": result.request_key,
+                        "status": result.status,
+                        **result.diagnostic,
+                    }
+                    for result in results
+                ]
+                collection_failures = [
+                    entry for entry in diagnostics if entry["status"] != "success"
+                ]
+                for result in results:
+                    if result.status != "success":
+                        continue
+                    request = result.request
+                    try:
+                        transitions = transitions_from_replay(
+                            result.replay, candidate_player=request.candidate_player,
+                            requested_seed=request.seed,
+                        )
+                    except BaseException as exc:
+                        parse_failure = {
+                            "request_key": result.request_key,
+                            "status": "failure",
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        }
+                        diagnostics.append(parse_failure)
+                        collection_failures.append(parse_failure)
+                        continue
+                    for transition in transitions:
+                        serialized = transition.to_json() + "\n"
+                        trajectory_temp.write(serialized)
+                        trajectory_hash.update(serialized.encode("utf-8"))
+                        transition_count += 1
+                if collection_failures:
+                    raise RolloutCollectionError(
+                        sorted(diagnostics, key=lambda entry: entry["request_key"])
+                    )
             manifest["transition_count"] = transition_count
             manifest["trajectory_sha256"] = trajectory_hash.hexdigest()
             manifest_temp.write(
@@ -288,6 +385,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seats", nargs="+", type=int, choices=(0, 1), default=[0, 1])
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-policy-identity", default="current")
+    parser.add_argument("--candidate-artifact", type=Path, default=None)
+    parser.add_argument("--candidate-identity", default=None)
+    parser.add_argument("--workers", type=_positive_int, default=1)
     parser.add_argument(
         "--game-timeout", type=_positive_float, default=DEFAULT_GAME_TIMEOUT_SECONDS,
         help="maximum seconds allowed for each isolated game",
@@ -305,6 +405,9 @@ def main(argv: list[str] | None = None) -> int:
         steps=args.steps,
         output=args.output,
         source_policy_identity=args.source_policy_identity,
+        candidate_artifact=args.candidate_artifact,
+        candidate_identity=args.candidate_identity,
+        workers=args.workers,
         game_timeout=args.game_timeout,
     )
     print(json.dumps(manifest, sort_keys=True, separators=(",", ":")))

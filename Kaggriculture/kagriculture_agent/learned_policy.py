@@ -26,6 +26,11 @@ from operator import mul
 from pathlib import Path
 from typing import Any
 
+try:
+    import numpy as _np
+except ImportError:  # pragma: no cover - exercised by the dependency-free smoke test
+    _np = None
+
 from .constants import ANIMALS, CROPS, PRODUCTS
 from .features import GLOBAL_TOKEN_SIZE, MARKET_TOKEN_SIZE, TILE_TOKEN_SIZE, WORKER_TOKEN_SIZE
 from .memory import PolicyMemory
@@ -420,8 +425,92 @@ class DependencyFreePolicy:
     def __init__(self, artifact: Mapping[str, Any]) -> None:
         self.model_version = str(artifact["headers"]["model_version"])
         self._weights = artifact["weights"]
+        self._numpy_weights = (
+            {name: _np.asarray(value, dtype=_np.float32) for name, value in self._weights.items()}
+            if _np is not None else None
+        )
+
+    def _predict_numpy(self, features: Any) -> dict[str, Any]:
+        """Vectorized inference for Kaggle runtimes that provide NumPy."""
+        weights = self._numpy_weights
+        assert weights is not None
+
+        def linear(rows: Any, weight_name: str, bias_name: str) -> Any:
+            return _np.asarray(rows, dtype=_np.float32) @ weights[weight_name].T + weights[bias_name]
+
+        tile_count = len(features.tile_tokens)
+        worker_count = len(features.worker_tokens)
+        market_count = len(features.market_tokens)
+        tokens = _np.concatenate((
+            linear(features.tile_tokens, "tile_projection.weight", "tile_projection.bias"),
+            linear(features.worker_tokens, "worker_projection.weight", "worker_projection.bias"),
+            linear(features.market_tokens, "market_projection.weight", "market_projection.bias"),
+            linear([features.global_tokens], "global_projection.weight", "global_projection.bias"),
+        ), axis=0)
+        embedding = weights["type_embedding.weight"]
+        offsets = (0, tile_count, tile_count + worker_count,
+                   tile_count + worker_count + market_count, len(tokens))
+        for kind, (start, end) in enumerate(zip(offsets, offsets[1:])):
+            tokens[start:end] += embedding[kind]
+
+        for block in range(4):
+            prefix = f"blocks.{block}"
+            qkv = linear(tokens, f"{prefix}.attention.in_proj_weight", f"{prefix}.attention.in_proj_bias")
+            heads = 4
+            head_width = qkv.shape[1] // 3 // heads
+            q, k, value = _np.split(qkv, 3, axis=1)
+            q = q.reshape(len(tokens), heads, head_width).transpose(1, 0, 2)
+            k = k.reshape(len(tokens), heads, head_width).transpose(1, 0, 2)
+            value = value.reshape(len(tokens), heads, head_width).transpose(1, 0, 2)
+            scores = _np.matmul(q, k.transpose(0, 2, 1)) / _np.sqrt(_np.float32(head_width))
+            scores -= scores.max(axis=-1, keepdims=True)
+            probabilities = _np.exp(scores)
+            probabilities /= probabilities.sum(axis=-1, keepdims=True)
+            attended = _np.matmul(probabilities, value).transpose(1, 0, 2).reshape(len(tokens), -1)
+            attended = attended @ weights[f"{prefix}.attention.out_proj.weight"].T
+            attended += weights[f"{prefix}.attention.out_proj.bias"]
+            residual = tokens + attended
+            norm_weight = weights[f"{prefix}.attention_norm.weight"]
+            norm_bias = weights[f"{prefix}.attention_norm.bias"]
+            mean = residual.mean(axis=1, keepdims=True)
+            variance = ((residual - mean) ** 2).mean(axis=1, keepdims=True)
+            tokens = (residual - mean) / _np.sqrt(variance + _np.float32(1e-5)) * norm_weight + norm_bias
+
+            hidden = linear(tokens, f"{prefix}.mlp.0.weight", f"{prefix}.mlp.0.bias")
+            hidden = _np.float32(0.5) * hidden * (
+                _np.float32(1.0) + _np.tanh(
+                    _np.float32(0.7978845608) * (hidden + _np.float32(0.044715) * hidden ** 3)
+                )
+            )
+            hidden = hidden @ weights[f"{prefix}.mlp.2.weight"].T
+            hidden += weights[f"{prefix}.mlp.2.bias"]
+            residual = tokens + hidden
+            norm_weight = weights[f"{prefix}.mlp_norm.weight"]
+            norm_bias = weights[f"{prefix}.mlp_norm.bias"]
+            mean = residual.mean(axis=1, keepdims=True)
+            variance = ((residual - mean) ** 2).mean(axis=1, keepdims=True)
+            tokens = (residual - mean) / _np.sqrt(variance + _np.float32(1e-5)) * norm_weight + norm_bias
+
+        tile_rows = tokens[:tile_count]
+        worker_rows = tokens[tile_count:tile_count + worker_count]
+        market_rows = tokens[tile_count + worker_count:tile_count + worker_count + market_count]
+        global_row = tokens[-1]
+        worker_target_query = worker_rows @ weights["target_worker_head.weight"].T + weights["target_worker_head.bias"]
+        tile_target_key = tile_rows @ weights["target_tile_head.weight"].T + weights["target_tile_head.bias"]
+        target_logits = worker_target_query @ tile_target_key.T / _np.sqrt(_np.float32(128.0))
+        pooled_market = market_rows.mean(axis=0) if market_count else _np.zeros(128, dtype=_np.float32)
+        return {
+            "worker_act_logits": (worker_rows @ weights["worker_act_head.weight"].T + weights["worker_act_head.bias"]).tolist(),
+            "worker_target_logits": target_logits.tolist(),
+            "worker_kind_logits": (worker_rows @ weights["worker_kind_head.weight"].T + weights["worker_kind_head.bias"]).tolist(),
+            "market_item_logits": (pooled_market @ weights["market_item_head.weight"].T + weights["market_item_head.bias"]).tolist(),
+            "market_quantity_logits": (pooled_market @ weights["market_quantity_head.weight"].T + weights["market_quantity_head.bias"]).tolist(),
+            "value": float((global_row @ weights["value_head.weight"].T + weights["value_head.bias"])[0]),
+        }
 
     def predict(self, features: Any) -> dict[str, Any]:
+        if self._numpy_weights is not None:
+            return self._predict_numpy(features)
         tile = [list(row) for row in features.tile_tokens]
         worker = [list(row) for row in features.worker_tokens]
         market = [list(row) for row in features.market_tokens]
@@ -489,7 +578,20 @@ class DependencyFreePolicy:
             target = positions[max(range(len(target_logits)), key=target_logits.__getitem__)] if positions else None
             kind = _ARTIFACT_WORKER_KINDS[max(range(len(kind_logits)), key=kind_logits.__getitem__)]
             workers.append(WorkerProposal(index, kind, target, None, max(kind_logits)))
-        return PolicyProposal(tuple(workers), (), 1.0, self.model_version)
+        # The artifact has no buy/sell direction head.  Emit only the narrow
+        # product-buy intent that the normal market compiler can validate;
+        # unsupported products and the zero quantity bucket become no-op.
+        market_orders: tuple[tuple[str, str | None, int], ...] = ()
+        item_logits = outputs.get("market_item_logits", ())
+        quantity_logits = outputs.get("market_quantity_logits", ())
+        if item_logits and quantity_logits:
+            item_index = max(range(len(item_logits)), key=item_logits.__getitem__)
+            quantity_index = max(range(len(quantity_logits)), key=quantity_logits.__getitem__)
+            items = tuple(sorted(PRODUCTS))
+            quantity = _ARTIFACT_MARKET_QUANTITIES[quantity_index]
+            if 0 <= item_index < len(items) and items[item_index] in {"WHEAT", "FERTILIZER"} and quantity > 0:
+                market_orders = (("BUY_PRODUCT", items[item_index], quantity),)
+        return PolicyProposal(tuple(workers), market_orders, 1.0, self.model_version)
 
 
 def _get(value: Any, key: str, default: Any = None) -> Any:
@@ -666,7 +768,23 @@ class LearnedPolicy:
             self.diagnostics = {"status": "disabled"}
             return _empty()
         if not self._loaded:
-            ok, loaded = _run_with_timeout(self._load, self.timeout_seconds)
+            # Exported dependency-free models are already validated by the
+            # candidate factory.  Keep their inference in-process: spawning a
+            # child for every turn adds enough startup latency to exceed the
+            # Kaggle action deadline and can result in a recorded ``None``
+            # action.  Arbitrary user models retain the killable isolation
+            # boundary below.
+            if isinstance(self.model_path, DependencyFreePolicy):
+                loaded = self.model_path
+                ok = True
+            elif isinstance(self.model_path, (str, Path)):
+                try:
+                    loaded = self._load()
+                    ok = True
+                except BaseException as exc:
+                    ok, loaded = False, exc
+            else:
+                ok, loaded = _run_with_timeout(self._load, self.timeout_seconds)
             if not ok:
                 status = "slow_model" if isinstance(loaded, TimeoutError) else (
                     "missing_model"
@@ -680,9 +798,16 @@ class LearnedPolicy:
         if self._model is None:
             self.diagnostics = {"status": "incompatible_model"}
             return _empty()
-        ok, output = _run_with_timeout(
-            lambda: self._invoke(self._model, state, features), self.timeout_seconds,
-        )
+        if isinstance(self._model, DependencyFreePolicy):
+            try:
+                output = self._invoke(self._model, state, features)
+                ok = True
+            except BaseException as exc:
+                ok, output = False, exc
+        else:
+            ok, output = _run_with_timeout(
+                lambda: self._invoke(self._model, state, features), self.timeout_seconds,
+            )
         if not ok:
             status = "slow_model" if isinstance(output, TimeoutError) else "inference_error"
             self.diagnostics = {"status": status, "error": type(output).__name__}

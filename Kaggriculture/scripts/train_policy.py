@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import inspect
 import json
 import math
 import random
 import shutil
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -18,9 +19,23 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from kagriculture_agent.checkpoints import (
+    capture_rng_state,
+    read_checkpoint,
+    restore_rng_state,
+    restore_checkpoint,
+    save_checkpoint,
+)
 from kagriculture_agent.constants import ENGINE_VERSION
 from kagriculture_agent.features import FEATURE_SCHEMA_VERSION, extract_features
-from kagriculture_agent.model import ACTION_VOCAB, MODEL_VERSION, CompactPolicyNet, require_torch, set_training_seed
+from kagriculture_agent.model import (
+    ACTION_VOCAB,
+    MODEL_VERSION,
+    CompactPolicyNet,
+    require_torch,
+    resolve_device,
+    set_training_seed,
+)
 
 PROMOTION_MATCH_SIZE = 100
 LOG_RATIO_CLAMP = 20.0
@@ -74,11 +89,147 @@ class PPOConfig:
             raise ValueError("rollout_steps and ppo_epochs must be positive")
 
 
+_RESUME_CONFIGURATION_FIELDS = (
+    "input_trajectory",
+    "steps",
+    "batch_size",
+    "seed",
+    "ppo_steps",
+    "prior_checkpoint",
+    "offline_ppo_fallback",
+    "ppo_config",
+)
+_RUNTIME_CONFIGURATION_FIELDS = {"device", "checkpoint_interval"}
+_PPO_FLOAT_FIELDS = {
+    "gamma", "gae_lambda", "clip_epsilon", "value_coef", "entropy_coef",
+    "target_kl", "kl_coef", "prior_ce_coef",
+}
+_PPO_INTEGER_FIELDS = {"rollout_steps", "ppo_epochs"}
+_PPO_RESUME_METRIC_FIELDS = {
+    "ppo_updates", "rollout_count", "early_stopped", "last_metrics",
+    "promotion", "completed_steps",
+}
+
+
+def _validate_content_identity(value: Any, *, source: str, label: str) -> None:
+    if type(value) is not dict or set(value) != {"path", "sha256"}:
+        raise ValueError(f"{source} {label} must be a content identity object")
+    path = value["path"]
+    digest = value["sha256"]
+    if type(path) is not str or not path or not Path(path).is_absolute():
+        raise ValueError(f"{source} {label} path must be an absolute string")
+    if (
+        type(digest) is not str
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise ValueError(f"{source} {label} sha256 must be a lowercase digest")
+
+
+def _validate_prior_checkpoint_identity(value: Any, *, source: str) -> None:
+    if value is None:
+        return
+    _validate_content_identity(value, source=source, label="prior_checkpoint")
+
+
+def _validate_ppo_configuration(value: Any, *, source: str) -> None:
+    expected_fields = _PPO_FLOAT_FIELDS | _PPO_INTEGER_FIELDS
+    if type(value) is not dict:
+        raise ValueError(f"{source} ppo_config must be an object")
+    missing = sorted(expected_fields - set(value))
+    unexpected = sorted(set(value) - expected_fields)
+    if missing:
+        raise ValueError(f"{source} ppo_config is missing required fields: {', '.join(missing)}")
+    if unexpected:
+        raise ValueError(f"{source} ppo_config has unexpected fields: {', '.join(unexpected)}")
+    for field in sorted(_PPO_FLOAT_FIELDS):
+        if type(value[field]) is not float:
+            raise ValueError(f"{source} ppo_config {field} must be a float")
+    for field in sorted(_PPO_INTEGER_FIELDS):
+        if type(value[field]) is not int:
+            raise ValueError(f"{source} ppo_config {field} must be an integer")
+    try:
+        PPOConfig(**value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{source} ppo_config is invalid: {exc}") from exc
+
+
+def _validate_configuration_shape(configuration: Any, *, source: str) -> None:
+    expected_fields = set(_RESUME_CONFIGURATION_FIELDS) | _RUNTIME_CONFIGURATION_FIELDS
+    if type(configuration) is not dict:
+        raise ValueError(f"{source} configuration must be an object")
+    missing = sorted(expected_fields - set(configuration))
+    unexpected = sorted(set(configuration) - expected_fields)
+    if missing:
+        raise ValueError(f"{source} configuration is missing required fields: {', '.join(missing)}")
+    if unexpected:
+        raise ValueError(f"{source} configuration has unexpected fields: {', '.join(unexpected)}")
+    _validate_content_identity(
+        configuration["input_trajectory"], source=source, label="input trajectory",
+    )
+    for field, minimum in (
+        ("steps", 1), ("batch_size", 1), ("ppo_steps", 0),
+        ("checkpoint_interval", 1),
+    ):
+        value = configuration[field]
+        if type(value) is not int or value < minimum:
+            raise ValueError(
+                f"{source} configuration {field} must be an integer at least {minimum}"
+            )
+    if type(configuration["seed"]) is not int:
+        raise ValueError(f"{source} configuration seed must be an integer")
+    if type(configuration["device"]) is not str or not configuration["device"]:
+        raise ValueError(f"{source} configuration device must be a nonempty string")
+    if type(configuration["offline_ppo_fallback"]) is not bool:
+        raise ValueError(f"{source} configuration offline_ppo_fallback must be boolean")
+    _validate_prior_checkpoint_identity(configuration["prior_checkpoint"], source=source)
+    _validate_ppo_configuration(configuration["ppo_config"], source=source)
+
+
+def _validate_resume_configuration(
+    saved: dict[str, Any], requested: dict[str, Any],
+) -> None:
+    _validate_configuration_shape(saved, source="saved")
+    _validate_configuration_shape(requested, source="requested")
+    for field in _RESUME_CONFIGURATION_FIELDS:
+        if type(saved[field]) is not type(requested[field]) or saved[field] != requested[field]:
+            label = "input trajectory" if field == "input_trajectory" else field
+            raise ValueError(
+                f"resume checkpoint configuration mismatch for {label}: "
+                f"saved {saved[field]!r}, requested {requested[field]!r}"
+            )
+
+
+def _checkpoint_identity(path: str | Path | None) -> dict[str, str] | None:
+    if path is None:
+        return None
+    checkpoint_path = Path(path).resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"prior checkpoint does not exist: {checkpoint_path}")
+    digest = hashlib.sha256()
+    with checkpoint_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"path": str(checkpoint_path), "sha256": digest.hexdigest()}
+
+
+def _trajectory_identity(path: str | Path) -> dict[str, str]:
+    trajectory_path = Path(path).resolve()
+    if not trajectory_path.is_file():
+        raise FileNotFoundError(f"input trajectory does not exist: {trajectory_path}")
+    digest = hashlib.sha256()
+    with trajectory_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"path": str(trajectory_path), "sha256": digest.hexdigest()}
+
+
 @dataclass(frozen=True)
 class OpponentMatch:
     opponent: str
     seat: int
     checkpoint: str | None = None
+    mixed_opponent: str | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +255,8 @@ class RolloutBatch:
 
 class OpponentPool:
     """Deterministic league sampler for self-play PPO rollouts."""
+
+    mixed_opponents = ("current", "random", "starter")
 
     probabilities = {
         "current": 0.40,
@@ -135,7 +288,13 @@ class OpponentPool:
                 checkpoint = self.checkpoint_candidates[rng.randrange(len(self.checkpoint_candidates))]
             else:
                 selected = "current"
-        return OpponentMatch(opponent=selected, seat=int(index) % 2, checkpoint=checkpoint)
+        mixed_opponent = None
+        if selected == "mixed":
+            mixed_opponent = self.mixed_opponents[rng.randrange(len(self.mixed_opponents))]
+        return OpponentMatch(
+            opponent=selected, seat=int(index) % 2, checkpoint=checkpoint,
+            mixed_opponent=mixed_opponent,
+        )
 
     def schedule(self, *, count: int, seed: int = 0) -> list[OpponentMatch]:
         """Return a deterministic stratified schedule with alternating seats."""
@@ -158,7 +317,19 @@ class OpponentPool:
         matches: list[OpponentMatch] = []
         for opponent in self.probabilities:
             if opponent != "checkpoint":
-                matches.extend(OpponentMatch(opponent=opponent, seat=0) for _ in range(counts[opponent]))
+                for index in range(counts[opponent]):
+                    mixed_opponent = None
+                    if opponent == "mixed":
+                        mixed_rng = random.Random(int(seed) + index)
+                        mixed_opponent = self.mixed_opponents[
+                            mixed_rng.randrange(len(self.mixed_opponents))
+                        ]
+                    matches.append(
+                        OpponentMatch(
+                            opponent=opponent, seat=0,
+                            mixed_opponent=mixed_opponent,
+                        )
+                    )
         if self.checkpoint_candidates:
             matches.extend(
                 OpponentMatch(
@@ -171,7 +342,9 @@ class OpponentPool:
             matches.extend(OpponentMatch(opponent="current", seat=0) for _ in range(counts["checkpoint"]))
         random.Random(int(seed)).shuffle(matches)
         return [
-            OpponentMatch(match.opponent, index % 2, match.checkpoint)
+            OpponentMatch(
+                match.opponent, index % 2, match.checkpoint, match.mixed_opponent,
+            )
             for index, match in enumerate(matches)
         ]
 
@@ -493,13 +666,16 @@ def build_rollout_batch(
     )
 
 
-def _select_outputs(outputs: dict[str, Any], batch: RolloutBatch) -> tuple[Any, Any]:
+def _select_outputs(
+    outputs: dict[str, Any], batch: RolloutBatch, *, device: Any = None,
+) -> tuple[Any, Any]:
     th = require_torch()
-    worker_act = th.tensor(batch.worker.act, dtype=th.long)
-    worker_target = th.tensor(batch.worker.target, dtype=th.long)
-    worker_kind = th.tensor(batch.worker.kind, dtype=th.long)
-    market_items = th.tensor(batch.market_items, dtype=th.long)
-    market_quantities = th.tensor(batch.market_quantities, dtype=th.long)
+    device = outputs["value"].device if device is None else device
+    worker_act = th.tensor(batch.worker.act, dtype=th.long, device=device)
+    worker_target = th.tensor(batch.worker.target, dtype=th.long, device=device)
+    worker_kind = th.tensor(batch.worker.kind, dtype=th.long, device=device)
+    market_items = th.tensor(batch.market_items, dtype=th.long, device=device)
+    market_quantities = th.tensor(batch.market_quantities, dtype=th.long, device=device)
     act_log = outputs["worker_act_logits"].log_softmax(dim=-1)
     target_log = outputs["worker_target_logits"].log_softmax(dim=-1)
     kind_log = outputs["worker_kind_logits"].log_softmax(dim=-1)
@@ -558,18 +734,22 @@ def validate_prior_checkpoint_metadata(metadata: Any) -> None:
         raise ValueError("prior checkpoint action_vocab mismatch")
 
 
-def _load_prior_network(prior_checkpoint: str | Path | None) -> Any:
+def _load_prior_network(prior_checkpoint: str | Path | None, *, device: Any) -> Any:
     if prior_checkpoint is None:
         return None
     th = require_torch()
-    prior = CompactPolicyNet()
-    checkpoint = th.load(prior_checkpoint, map_location="cpu")
+    checkpoint = th.load(
+        prior_checkpoint, map_location="cpu", weights_only=True,
+    )
     if not isinstance(checkpoint, dict) or "metadata" not in checkpoint:
         raise ValueError("prior checkpoint metadata is required")
     validate_prior_checkpoint_metadata(checkpoint["metadata"])
     if "model_state_dict" not in checkpoint:
         raise ValueError("prior checkpoint model_state_dict is required")
-    state = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    state = checkpoint["model_state_dict"]
+    if not isinstance(state, Mapping):
+        raise ValueError("prior checkpoint model_state_dict must be an object")
+    prior = CompactPolicyNet().to(device)
     prior.load_state_dict(state)
     prior.eval()
     for parameter in prior.parameters():
@@ -587,7 +767,7 @@ def _ensure_finite_outputs(outputs: dict[str, Any]) -> None:
 def ppo_update(
     network: Any, optimizer: Any, transitions: Sequence[dict[str, Any]], *,
     config: PPOConfig, batch_size: int | None = None, seed: int = 0,
-    prior_checkpoint: str | Path | None = None,
+    prior_checkpoint: str | Path | None = None, device: Any = None,
 ) -> dict[str, float | int | bool]:
     """Run clipped PPO updates over one rollout batch."""
     th = require_torch()
@@ -599,13 +779,14 @@ def ppo_update(
     with th.no_grad():
         old_outputs = network(features)
         _ensure_finite_outputs(old_outputs)
-        old_log_probs, _old_entropy = _select_outputs(old_outputs, bootstrap)
+        device = old_outputs["value"].device if device is None else device
+        old_log_probs, _old_entropy = _select_outputs(old_outputs, bootstrap, device=device)
     rollout = build_rollout_batch(
         rows, config=config,
         value_estimates=old_outputs["value"].detach().tolist(),
         old_log_probs=old_log_probs.detach().tolist(),
     )
-    prior = _load_prior_network(prior_checkpoint)
+    prior = _load_prior_network(prior_checkpoint, device=device)
     metrics: dict[str, float | int | bool] = {
         "updates": 0,
         "early_stopped": False,
@@ -639,11 +820,11 @@ def ppo_update(
             )
             outputs = network(mini_features)
             _ensure_finite_outputs(outputs)
-            log_probs, entropy = _select_outputs(outputs, mini)
-            old_log = th.tensor(mini.old_log_probs, dtype=th.float32)
-            advantages = th.tensor(mini.advantages, dtype=th.float32)
-            returns = th.tensor(mini.returns, dtype=th.float32)
-            old_values = th.tensor(mini.values, dtype=th.float32)
+            log_probs, entropy = _select_outputs(outputs, mini, device=device)
+            old_log = th.tensor(mini.old_log_probs, dtype=th.float32, device=device)
+            advantages = th.tensor(mini.advantages, dtype=th.float32, device=device)
+            returns = th.tensor(mini.returns, dtype=th.float32, device=device)
+            old_values = th.tensor(mini.values, dtype=th.float32, device=device)
             log_ratio = th.clamp(log_probs - old_log, -LOG_RATIO_CLAMP, LOG_RATIO_CLAMP)
             ratio = log_ratio.exp()
             policy_loss = -th.minimum(
@@ -670,7 +851,9 @@ def ppo_update(
             with th.no_grad():
                 post_outputs = network(mini_features)
                 _ensure_finite_outputs(post_outputs)
-                post_log_probs, _post_entropy = _select_outputs(post_outputs, mini)
+                post_log_probs, _post_entropy = _select_outputs(
+                    post_outputs, mini, device=device,
+                )
                 post_log_ratio = th.clamp(post_log_probs - old_log, -LOG_RATIO_CLAMP, LOG_RATIO_CLAMP)
                 post_step_kl = ((post_log_ratio.exp() - 1.0) - post_log_ratio).mean()
             metrics.update({
@@ -689,83 +872,141 @@ def ppo_update(
     return metrics
 
 
+def _accepts_keyword_argument(callback: Any, name: str) -> bool:
+    try:
+        parameters = inspect.signature(callback).parameters
+    except (TypeError, ValueError):
+        return False
+    parameter = parameters.get(name)
+    return (
+        parameter is not None
+        and parameter.kind in {parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY}
+    ) or any(item.kind == item.VAR_KEYWORD for item in parameters.values())
+
+
 def run_ppo_training(
     *, network: Any, optimizer: Any, transitions: Sequence[dict[str, Any]],
     ppo_steps: int, config: PPOConfig, batch_size: int | None = None,
-    seed: int = 0, prior_checkpoint: str | Path | None = None,
+    seed: int = 0, prior_checkpoint: str | Path | None = None, device: Any = None,
     opponent_pool: Any | None = None, rollout_fn: Any | None = None,
     offline_ppo_fallback: bool = False, update_fn: Any | None = None,
     promotion_match_fn: Any | None = None,
     candidate_checkpoint: str | Path | None = None,
     best_checkpoint_path: str | Path | None = None,
     checkpoint_registry: dict[str, Any] | None = None,
+    candidate_artifact: str | Path | None = None,
+    candidate_identity: str | None = None,
     save_candidate_fn: Any | None = None,
     cleanup_candidate_fn: Any | None = None,
+    start_step: int = 0,
+    initial_ppo_updates: int = 0,
+    initial_rollout_count: int = 0,
+    progress_fn: Any | None = None,
 ) -> dict[str, Any]:
     """Run PPO with fresh scheduled league rollouts or explicit offline fallback."""
     steps = max(0, int(ppo_steps))
+    if type(start_step) is not int or not 0 <= start_step <= steps:
+        raise ValueError("start_step must be an integer between zero and ppo_steps")
+    if type(initial_ppo_updates) is not int or initial_ppo_updates < 0:
+        raise ValueError("initial_ppo_updates must be a nonnegative integer")
+    if type(initial_rollout_count) is not int or initial_rollout_count < 0:
+        raise ValueError("initial_rollout_count must be a nonnegative integer")
     if steps == 0:
         return {
-            "ppo_updates": 0,
-            "rollout_count": 0,
+            "ppo_updates": initial_ppo_updates,
+            "rollout_count": initial_rollout_count,
             "early_stopped": False,
             "last_metrics": None,
             "promotion": None,
+            "completed_steps": 0,
         }
     updater = update_fn or ppo_update
     if rollout_fn is None and not offline_ppo_fallback:
         raise ValueError("rollout_fn is required for PPO unless offline_ppo_fallback is explicitly selected")
     pool = opponent_pool or OpponentPool()
     schedule = pool.schedule(count=steps, seed=seed) if rollout_fn is not None else []
-    total_updates = 0
-    rollout_count = 0
+    total_updates = initial_ppo_updates
+    rollout_count = initial_rollout_count
     last_metrics: dict[str, Any] | None = None
     offline_rows = list(transitions)
     if offline_ppo_fallback and not offline_rows:
         raise ValueError("offline_ppo_fallback requires collected transitions")
-    for step in range(steps):
+    ran_step = False
+    for step in range(start_step, steps):
+        ran_step = True
         if rollout_fn is None:
             rollout = offline_rows[:config.rollout_steps]
         else:
             match = schedule[step]
-            rollout = rollout_fn(
-                step=step,
-                opponent=match.opponent,
-                seat=match.seat,
-                checkpoint=match.checkpoint,
-                rollout_steps=config.rollout_steps,
-            )
+            if isinstance(pool, OpponentPool) and match.opponent == "checkpoint" and (
+                match.checkpoint is None or not Path(match.checkpoint).is_file()
+            ):
+                raise FileNotFoundError(
+                    f"league checkpoint does not exist: {match.checkpoint}"
+                )
+            rollout_kwargs = {
+                "step": step,
+                "opponent": match.opponent,
+                "seat": match.seat,
+                "checkpoint": match.checkpoint,
+                "rollout_steps": config.rollout_steps,
+            }
+            if _accepts_keyword_argument(rollout_fn, "candidate_artifact"):
+                rollout_kwargs["candidate_artifact"] = candidate_artifact
+            if _accepts_keyword_argument(rollout_fn, "candidate_identity"):
+                rollout_kwargs["candidate_identity"] = candidate_identity
+            if _accepts_keyword_argument(rollout_fn, "seed"):
+                rollout_kwargs["seed"] = int(seed) + step
+            if _accepts_keyword_argument(rollout_fn, "round_index"):
+                rollout_kwargs["round_index"] = step
+            if _accepts_keyword_argument(rollout_fn, "opponent_identity"):
+                rollout_kwargs["opponent_identity"] = match.opponent
+            if _accepts_keyword_argument(rollout_fn, "checkpoint_identity"):
+                rollout_kwargs["checkpoint_identity"] = match.checkpoint
+            if _accepts_keyword_argument(rollout_fn, "mixed_opponent"):
+                rollout_kwargs["mixed_opponent"] = getattr(match, "mixed_opponent", None)
+            if _accepts_keyword_argument(rollout_fn, "network"):
+                rollout_kwargs["network"] = network
+            rollout = rollout_fn(**rollout_kwargs)
             rollout_count += 1
         if not isinstance(rollout, Sequence) or isinstance(rollout, (str, bytes)):
             raise ValueError("rollout_fn must return a sequence of transitions")
         if not rollout:
             raise ValueError("PPO rollout produced no transitions")
-        last_metrics = updater(
-            network=network,
-            optimizer=optimizer,
-            transitions=list(rollout),
-            config=config,
-            batch_size=batch_size,
-            seed=int(seed) + step,
-            prior_checkpoint=prior_checkpoint,
-        )
+        update_kwargs = {
+            "network": network,
+            "optimizer": optimizer,
+            "transitions": list(rollout),
+            "config": config,
+            "batch_size": batch_size,
+            "seed": int(seed) + step,
+            "prior_checkpoint": prior_checkpoint,
+        }
+        if _accepts_keyword_argument(updater, "device"):
+            update_kwargs["device"] = device
+        last_metrics = updater(**update_kwargs)
         total_updates += int(last_metrics.get("updates", 0))
+        step_summary = {
+            "ppo_updates": total_updates,
+            "rollout_count": rollout_count,
+            "early_stopped": bool(last_metrics.get("early_stopped")),
+            "last_metrics": last_metrics,
+            "promotion": None,
+            "completed_steps": step + 1,
+        }
+        if progress_fn is not None:
+            progress_fn(completed_step=step + 1, metrics=step_summary)
         if last_metrics.get("early_stopped"):
-            return {
-                "ppo_updates": total_updates,
-                "rollout_count": rollout_count,
-                "early_stopped": True,
-                "last_metrics": last_metrics,
-                "promotion": None,
-            }
+            return step_summary
     promotion = None
     summary = {
         "ppo_updates": total_updates,
         "rollout_count": rollout_count,
         "early_stopped": False,
         "last_metrics": last_metrics,
+        "completed_steps": steps,
     }
-    if promotion_match_fn is not None:
+    if promotion_match_fn is not None and ran_step:
         if candidate_checkpoint is None:
             raise ValueError("candidate_checkpoint is required when promotion_match_fn is provided")
         final_candidate = Path(candidate_checkpoint)
@@ -795,7 +1036,9 @@ def run_ppo_training(
     return {**summary, "promotion": promotion}
 
 
-def _checkpoint_metadata(transition_count: int, config: PPOConfig | None = None) -> dict[str, Any]:
+def _checkpoint_metadata(
+    transition_count: int, config: PPOConfig | None = None, *, device: Any = "cpu",
+) -> dict[str, Any]:
     return {
         "model_version": MODEL_VERSION,
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
@@ -803,11 +1046,14 @@ def _checkpoint_metadata(transition_count: int, config: PPOConfig | None = None)
         "engine_version": ENGINE_VERSION,
         "transition_count": int(transition_count),
         "ppo_config": asdict(config or PPOConfig()),
+        "device": str(device),
     }
 
 
-def checkpoint_metadata(transition_count: int, config: PPOConfig | None = None) -> dict[str, Any]:
-    return _checkpoint_metadata(transition_count, config)
+def checkpoint_metadata(
+    transition_count: int, config: PPOConfig | None = None, *, device: Any = "cpu",
+) -> dict[str, Any]:
+    return _checkpoint_metadata(transition_count, config, device=device)
 
 
 def _candidate_won(result: Any) -> bool:
@@ -961,30 +1207,331 @@ def maybe_promote_checkpoint(
     return {"candidate_checkpoint": saved_candidate, **result}
 
 
+def _validate_resume_payload(
+    payload: dict[str, Any], *, configuration: dict[str, Any],
+    transition_count: int,
+) -> None:
+    _validate_resume_configuration(payload["configuration"], configuration)
+    progress = payload["progress"]
+    epoch = progress["epoch"]
+    cursor = progress["cursor"]
+    round_index = progress["round"]
+    epochs = configuration["steps"]
+    if epoch > epochs:
+        raise ValueError(
+            f"resume checkpoint epoch {epoch} exceeds requested steps {epochs}"
+        )
+    if epoch == epochs and cursor != 0:
+        raise ValueError(
+            f"resume checkpoint cursor {cursor} must be zero when epoch "
+            f"{epoch} has completed requested steps"
+        )
+    if epoch < epochs:
+        batch_count = math.ceil(transition_count / configuration["batch_size"])
+        if cursor > batch_count:
+            raise ValueError(
+                f"resume checkpoint cursor {cursor} exceeds epoch batch count {batch_count}"
+            )
+        if round_index != 0:
+            raise ValueError("resume checkpoint PPO round must be zero before behavior cloning completes")
+    if round_index > configuration["ppo_steps"]:
+        raise ValueError(
+            f"resume checkpoint PPO round {round_index} exceeds requested ppo_steps "
+            f"{configuration['ppo_steps']}"
+        )
+    metrics = payload["metrics"]
+    expected_metrics = {"behavior_clone_updates", "ppo_updates", "ppo_metrics"}
+    if set(metrics) != expected_metrics:
+        missing = sorted(expected_metrics - set(metrics))
+        unexpected = sorted(set(metrics) - expected_metrics)
+        detail = missing or unexpected
+        label = "missing required" if missing else "unexpected"
+        raise ValueError(
+            f"resume checkpoint metrics has {label} fields: {', '.join(detail)}"
+        )
+    for field in ("behavior_clone_updates", "ppo_updates"):
+        if type(metrics[field]) is not int or metrics[field] < 0:
+            raise ValueError(f"resume checkpoint metrics {field} must be a nonnegative integer")
+    ppo_metrics = metrics["ppo_metrics"]
+    if round_index == 0:
+        if ppo_metrics is not None:
+            raise ValueError("resume checkpoint metrics ppo_metrics must be null before PPO progress")
+        if metrics["ppo_updates"] != 0:
+            raise ValueError("resume checkpoint metrics ppo_updates must be zero before PPO progress")
+    else:
+        if type(ppo_metrics) is not dict:
+            raise ValueError("resume checkpoint metrics ppo_metrics is required after PPO progress")
+        missing = sorted(_PPO_RESUME_METRIC_FIELDS - set(ppo_metrics))
+        unexpected = sorted(set(ppo_metrics) - _PPO_RESUME_METRIC_FIELDS)
+        if missing:
+            raise ValueError(
+                "resume checkpoint ppo_metrics is missing required fields: "
+                + ", ".join(missing)
+            )
+        if unexpected:
+            raise ValueError(
+                "resume checkpoint ppo_metrics has unexpected fields: "
+                + ", ".join(unexpected)
+            )
+        for field in ("ppo_updates", "rollout_count", "completed_steps"):
+            if type(ppo_metrics[field]) is not int or ppo_metrics[field] < 0:
+                raise ValueError(
+                    f"resume checkpoint ppo_metrics {field} must be a nonnegative integer"
+                )
+        if type(ppo_metrics["early_stopped"]) is not bool:
+            raise ValueError("resume checkpoint ppo_metrics early_stopped must be boolean")
+        for field in ("last_metrics", "promotion"):
+            if ppo_metrics[field] is not None and type(ppo_metrics[field]) is not dict:
+                raise ValueError(
+                    f"resume checkpoint ppo_metrics {field} must be an object or null"
+                )
+        if ppo_metrics["ppo_updates"] != metrics["ppo_updates"]:
+            raise ValueError(
+                "resume checkpoint ppo_metrics ppo_updates does not match metrics ppo_updates"
+            )
+        if ppo_metrics["completed_steps"] != round_index:
+            raise ValueError(
+                "resume checkpoint ppo_metrics completed_steps does not match PPO round"
+            )
+    metadata = payload["metadata"]
+    if type(metadata.get("transition_count")) is not int:
+        raise ValueError("resume checkpoint metadata transition_count must be an integer")
+    if metadata["transition_count"] != transition_count:
+        raise ValueError(
+            "resume checkpoint transition_count does not match the requested input"
+        )
+    if type(metadata.get("device")) is not str or not metadata["device"]:
+        raise ValueError("resume checkpoint metadata device must be a nonempty string")
+
+
+def make_fresh_rollout_fn(
+    *, run_directory: str | Path, candidate_artifact: str | Path | None = None,
+    candidate_artifact_callback: Any | None = None,
+    seeds: Sequence[int], steps: int, workers: int = 1,
+    game_timeout: float = 120.0, candidate_identity: str | None = None,
+) -> Any:
+    """Build a collector-backed callback for one fresh PPO rollout per step.
+
+    ``candidate_artifact`` preserves the original static-artifact API.  For
+    fresh PPO rounds, ``candidate_artifact_callback`` may create or refresh a
+    dependency-free artifact immediately before collection.  It receives
+    keyword arguments for ``network``, ``output_path``, ``candidate_artifact``,
+    ``step``, and ``round_index`` and may return the artifact path; returning
+    ``None`` means that ``output_path`` was updated in place.
+    """
+    normalized_seeds = tuple(int(seed) for seed in seeds)
+    if not normalized_seeds:
+        raise ValueError("seeds must not be empty")
+    if candidate_artifact is None and candidate_artifact_callback is None:
+        raise ValueError(
+            "candidate_artifact or candidate_artifact_callback is required"
+        )
+    artifact = (
+        Path(candidate_artifact).expanduser().resolve()
+        if candidate_artifact is not None else None
+    )
+    if artifact is not None and candidate_artifact_callback is None and not artifact.is_file():
+        raise FileNotFoundError(f"candidate artifact does not exist: {artifact}")
+    if candidate_artifact_callback is not None and not callable(candidate_artifact_callback):
+        raise TypeError("candidate_artifact_callback must be callable")
+    if type(steps) is not int or steps < 2:
+        raise ValueError("steps must be at least 2 to produce a transition")
+    run_path = Path(run_directory)
+    run_path.mkdir(parents=True, exist_ok=True)
+
+    def fresh_rollout(
+        *, step: int, opponent: str, seat: int, checkpoint: str | None,
+        rollout_steps: int, candidate_artifact: str | Path | None = None,
+        opponent_identity: str | None = None,
+        checkpoint_identity: str | None = None,
+        mixed_opponent: str | None = None,
+        seed: int | None = None, round_index: int | None = None,
+        network: Any = None,
+    ) -> list[dict[str, Any]]:
+        from scripts.collect_trajectories import collect
+
+        selected_step = int(step if round_index is None else round_index)
+        selected_seed = int(seed) if seed is not None else normalized_seeds[selected_step % len(normalized_seeds)]
+        selected_artifact = (
+            Path(candidate_artifact).expanduser().resolve()
+            if candidate_artifact is not None else artifact
+        )
+        if candidate_artifact_callback is not None:
+            target_artifact = selected_artifact or run_path / f"candidate-step-{selected_step:05d}.json"
+            callback_kwargs = {
+                "network": network,
+                "output_path": target_artifact,
+                "candidate_artifact": target_artifact,
+                "step": int(step),
+                "round_index": selected_step,
+            }
+            result = candidate_artifact_callback(**{
+                key: value for key, value in callback_kwargs.items()
+                if _accepts_keyword_argument(candidate_artifact_callback, key)
+            })
+            selected_artifact = Path(result or target_artifact).expanduser().resolve()
+        if selected_artifact is None or not selected_artifact.is_file():
+            raise FileNotFoundError(
+                f"candidate artifact does not exist: {selected_artifact}"
+            )
+        digest = hashlib.sha256(selected_artifact.read_bytes()).hexdigest()
+        identity = candidate_identity or candidate_identity_outer or f"artifact:{digest}"
+        output = run_path / f"ppo-step-{selected_step:05d}.jsonl"
+        collector_opponent = opponent
+        opponent_artifact = None
+        checkpoint_provenance = checkpoint_identity or checkpoint
+        if opponent == "checkpoint":
+            if checkpoint is None:
+                raise ValueError("checkpoint opponent requires a checkpoint path")
+            checkpoint_path = Path(checkpoint).expanduser().resolve()
+            if not checkpoint_path.is_file():
+                raise FileNotFoundError(f"league checkpoint does not exist: {checkpoint_path}")
+            from scripts.export_policy import export_checkpoint
+
+            opponent_artifact = run_path / f"opponent-{selected_step:05d}.json"
+            export_checkpoint(checkpoint_path, opponent_artifact)
+            collector_opponent = "pass"
+        elif opponent == "mixed":
+            collector_opponent = mixed_opponent or "current"
+            if collector_opponent not in {"current", "random", "starter"}:
+                raise ValueError(
+                    "mixed_opponent must be one of current, random, starter"
+                )
+        collect(
+            seeds=[selected_seed], opponents=[collector_opponent], seats=[int(seat)],
+            steps=max(int(rollout_steps) + 1, steps), output=output,
+            workers=workers, game_timeout=game_timeout,
+            candidate_artifact=selected_artifact, candidate_identity=identity,
+            opponent_artifact=opponent_artifact,
+            opponent_checkpoint_identity=checkpoint_provenance,
+            source_policy_identity=identity,
+        )
+        return [
+            json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    candidate_identity_outer = candidate_identity
+    return fresh_rollout
+
+
 def train_behavior_clone(
     *, input_path: str | Path, output_path: str | Path, steps: int,
     batch_size: int, seed: int = 0, ppo_steps: int = 0,
+    device: str = "auto", checkpoint_interval: int = 100,
+    resume_checkpoint: str | Path | None = None,
     prior_checkpoint: str | Path | None = None, rollout_fn: Any | None = None,
     opponent_pool: Any | None = None, offline_ppo_fallback: bool = False,
     promotion_match_fn: Any | None = None,
     best_checkpoint_path: str | Path | None = None,
     checkpoint_registry: dict[str, Any] | None = None,
+    candidate_artifact: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run complete behavior-cloning epochs, optional PPO, and checkpoint."""
     th = require_torch()
-    set_training_seed(seed)
+    resolved_device = resolve_device(device)
+    batch_size = max(1, int(batch_size))
+    epochs = max(1, int(steps))
+    if type(checkpoint_interval) is not int or checkpoint_interval < 1:
+        raise ValueError("checkpoint_interval must be a positive integer")
+    input_identity = _trajectory_identity(input_path)
     transitions = _read_transitions(input_path)
     features = [extract_features(transition.get("observation", {})) for transition in transitions]
     actions = [transition.get("action", {}) if isinstance(transition.get("action"), dict) else {} for transition in transitions]
-    network = CompactPolicyNet()
-    optimizer = th.optim.AdamW(network.parameters(), lr=1e-3)
-    batch_size = max(1, int(batch_size))
-    epochs = max(1, int(steps))
+    configuration = {
+        "input_trajectory": input_identity,
+        "steps": epochs,
+        "batch_size": batch_size,
+        "seed": int(seed),
+        "ppo_steps": int(ppo_steps),
+        "device": str(resolved_device),
+        "prior_checkpoint": _checkpoint_identity(prior_checkpoint),
+        "offline_ppo_fallback": bool(offline_ppo_fallback),
+        "ppo_config": asdict(PPOConfig()),
+        "checkpoint_interval": checkpoint_interval,
+    }
+    _validate_configuration_shape(configuration, source="requested")
+    start_epoch = 0
+    start_cursor = 0
+    round_index = 0
     bc_updates = 0
-    for epoch in range(epochs):
-        for permutation in epoch_minibatches(
+    initial_ppo_updates = 0
+    initial_rollout_count = 0
+    previous_ppo_metrics: dict[str, Any] | None = None
+    resumed = None
+    if resume_checkpoint is not None:
+        resumed = read_checkpoint(resume_checkpoint, map_location="cpu")
+        _validate_resume_payload(
+            resumed,
+            configuration=configuration,
+            transition_count=len(transitions),
+        )
+        start_epoch = resumed["progress"]["epoch"]
+        start_cursor = resumed["progress"]["cursor"]
+        round_index = resumed["progress"]["round"]
+        bc_updates = resumed["metrics"]["behavior_clone_updates"]
+        initial_ppo_updates = resumed["metrics"]["ppo_updates"]
+        previous_ppo_metrics = resumed["metrics"]["ppo_metrics"]
+        if previous_ppo_metrics is not None:
+            initial_rollout_count = previous_ppo_metrics.get("rollout_count", 0)
+    rng_before_resume = capture_rng_state() if resumed is not None else None
+    try:
+        set_training_seed(seed)
+        network = CompactPolicyNet().to(resolved_device)
+        optimizer = th.optim.AdamW(network.parameters(), lr=1e-3)
+        if resumed is not None:
+            restore_checkpoint(
+                resumed, model=network, optimizer=optimizer, restore_rng=True,
+            )
+    except Exception:
+        if rng_before_resume is not None:
+            restore_rng_state(rng_before_resume)
+        raise
+    metadata = _checkpoint_metadata(len(transitions), device=resolved_device)
+    metadata["behavior_clone_epochs"] = epochs
+    destination = Path(output_path)
+
+    def checkpoint_metrics(ppo_result: dict[str, Any] | None) -> dict[str, Any]:
+        return {
+            "behavior_clone_updates": bc_updates,
+            "ppo_updates": (
+                initial_ppo_updates
+                if ppo_result is None else int(ppo_result["ppo_updates"])
+            ),
+            "ppo_metrics": ppo_result,
+        }
+
+    def save_current_checkpoint(
+        path: str | Path, *, ppo_result: dict[str, Any] | None,
+        completed_epoch: int, completed_round: int, cursor: int,
+    ) -> str:
+        current_metrics = checkpoint_metrics(ppo_result)
+        candidate_metadata = dict(metadata)
+        candidate_metadata.update(current_metrics)
+        return save_checkpoint(
+            path,
+            model=network,
+            optimizer=optimizer,
+            configuration=configuration,
+            epoch=completed_epoch,
+            round_index=completed_round,
+            cursor=cursor,
+            metrics=current_metrics,
+            metadata=candidate_metadata,
+        )
+
+    for epoch in range(start_epoch, epochs):
+        minibatches = epoch_minibatches(
             count=len(features), batch_size=batch_size, seed=int(seed), epoch=epoch,
-        ):
+        )
+        cursor = start_cursor if epoch == start_epoch else 0
+        if cursor > len(minibatches):
+            raise ValueError(
+                f"resume checkpoint cursor {cursor} exceeds epoch batch count {len(minibatches)}"
+            )
+        for batch_index, permutation in enumerate(minibatches):
+            if batch_index < cursor:
+                continue
             batch_features = [features[index] for index in permutation]
             batch_actions = [actions[index] for index in permutation]
             batch_observations = [
@@ -997,12 +1544,12 @@ def train_behavior_clone(
                 worker_labels(action, observation)
                 for action, observation in zip(batch_actions, batch_observations)
             ]
-            act_target = th.tensor([label.act for label in labels], dtype=th.long)
-            target_target = th.tensor([label.target for label in labels], dtype=th.long)
-            kind_target = th.tensor([label.kind for label in labels], dtype=th.long)
+            act_target = th.tensor([label.act for label in labels], dtype=th.long, device=resolved_device)
+            target_target = th.tensor([label.target for label in labels], dtype=th.long, device=resolved_device)
+            kind_target = th.tensor([label.kind for label in labels], dtype=th.long, device=resolved_device)
             market_items, market_quantities = zip(*(_market_labels(action) for action in batch_actions))
-            item_target = th.tensor(market_items, dtype=th.long)
-            quantity_target = th.tensor(market_quantities, dtype=th.long)
+            item_target = th.tensor(market_items, dtype=th.long, device=resolved_device)
+            quantity_target = th.tensor(market_quantities, dtype=th.long, device=resolved_device)
             loss = (
                 th.nn.functional.cross_entropy(outputs["worker_act_logits"].reshape(-1, 2), act_target.reshape(-1))
                 + th.nn.functional.cross_entropy(outputs["worker_target_logits"].reshape(-1, 100), target_target.reshape(-1))
@@ -1017,27 +1564,55 @@ def train_behavior_clone(
             loss.backward()
             optimizer.step()
             bc_updates += 1
-    metadata = _checkpoint_metadata(len(transitions))
-    metadata["behavior_clone_epochs"] = epochs
+            if bc_updates % checkpoint_interval == 0:
+                completed_cursor = batch_index + 1
+                completed_epoch = epoch
+                if completed_cursor == len(minibatches):
+                    completed_epoch += 1
+                    completed_cursor = 0
+                save_current_checkpoint(
+                    destination,
+                    ppo_result=None,
+                    completed_epoch=completed_epoch,
+                    completed_round=0,
+                    cursor=completed_cursor,
+                )
     metadata["behavior_clone_updates"] = bc_updates
     metadata["ppo_updates"] = 0
     metadata["ppo_metrics"] = None
-    destination = Path(output_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    th.save({"metadata": metadata, "model_state_dict": network.state_dict()}, destination)
+    save_current_checkpoint(
+        destination,
+        ppo_result=previous_ppo_metrics,
+        completed_epoch=epochs,
+        completed_round=round_index,
+        cursor=0,
+    )
 
     def save_current_candidate(path: str | Path, *, ppo_metrics: dict[str, Any] | None = None) -> str:
-        target = Path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        candidate_metadata = dict(metadata)
-        if ppo_metrics is not None:
-            candidate_metadata["ppo_updates"] = ppo_metrics["ppo_updates"]
-            candidate_metadata["ppo_metrics"] = ppo_metrics
-        th.save({"metadata": candidate_metadata, "model_state_dict": network.state_dict()}, target)
-        return str(target)
+        completed_round = (
+            round_index
+            if ppo_metrics is None
+            else int(ppo_metrics.get("completed_steps", ppo_steps))
+        )
+        return save_current_checkpoint(
+            path,
+            ppo_result=ppo_metrics,
+            completed_epoch=epochs,
+            completed_round=completed_round,
+            cursor=0,
+        )
 
-    ppo_metrics = None
-    if ppo_steps:
+    def save_ppo_progress(*, completed_step: int, metrics: dict[str, Any]) -> None:
+        save_current_checkpoint(
+            destination,
+            ppo_result=metrics,
+            completed_epoch=epochs,
+            completed_round=completed_step,
+            cursor=0,
+        )
+
+    ppo_metrics = previous_ppo_metrics
+    if ppo_steps and round_index < int(ppo_steps):
         config = PPOConfig()
         ppo_metrics = run_ppo_training(
             network=network,
@@ -1048,6 +1623,7 @@ def train_behavior_clone(
             batch_size=batch_size,
             seed=int(seed),
             prior_checkpoint=prior_checkpoint,
+            device=resolved_device,
             opponent_pool=opponent_pool,
             rollout_fn=rollout_fn,
             offline_ppo_fallback=offline_ppo_fallback,
@@ -1055,13 +1631,28 @@ def train_behavior_clone(
             candidate_checkpoint=output_path,
             best_checkpoint_path=best_checkpoint_path,
             checkpoint_registry=checkpoint_registry,
+            candidate_artifact=candidate_artifact,
+            candidate_identity=(str(candidate_artifact) if candidate_artifact is not None else None),
             save_candidate_fn=save_current_candidate,
+            start_step=round_index,
+            initial_ppo_updates=initial_ppo_updates,
+            initial_rollout_count=initial_rollout_count,
+            progress_fn=save_ppo_progress,
         )
-        if isinstance(ppo_metrics.get("last_metrics"), dict):
-            ppo_metrics = {**ppo_metrics, **ppo_metrics["last_metrics"]}
-    metadata["ppo_updates"] = 0 if ppo_metrics is None else ppo_metrics["ppo_updates"]
+    metadata["ppo_updates"] = initial_ppo_updates if ppo_metrics is None else ppo_metrics["ppo_updates"]
     metadata["ppo_metrics"] = ppo_metrics
-    th.save({"metadata": metadata, "model_state_dict": network.state_dict()}, destination)
+    completed_round = (
+        round_index
+        if ppo_metrics is None
+        else int(ppo_metrics.get("completed_steps", ppo_steps))
+    )
+    save_current_checkpoint(
+        destination,
+        ppo_result=ppo_metrics,
+        completed_epoch=epochs,
+        completed_round=completed_round,
+        cursor=0,
+    )
     return metadata
 
 
@@ -1102,7 +1693,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True, dest="output_path")
     parser.add_argument("--steps", type=_positive_int, default=1)
     parser.add_argument("--batch-size", type=_positive_int, default=32)
+    parser.add_argument("--checkpoint-interval", type=_positive_int, default=100)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--resume", type=Path, default=None, dest="resume_checkpoint")
     parser.add_argument("--ppo-steps", type=_nonnegative_int, default=0)
     parser.add_argument("--prior-checkpoint", type=Path, default=None)
     parser.add_argument("--best-checkpoint", type=Path, default=None)
@@ -1123,7 +1717,10 @@ def main(argv: list[str] | None = None) -> int:
             output_path=args.output_path,
             steps=args.steps,
             batch_size=args.batch_size,
+            checkpoint_interval=args.checkpoint_interval,
             seed=args.seed,
+            device=args.device,
+            resume_checkpoint=args.resume_checkpoint,
             ppo_steps=args.ppo_steps,
             prior_checkpoint=args.prior_checkpoint,
             offline_ppo_fallback=options["offline_ppo_fallback"],

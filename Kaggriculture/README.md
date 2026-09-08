@@ -81,8 +81,9 @@ gates are applied before score comparisons; a candidate is never selected
 because of mean bank alone, and a `--quick` smoke batch is for feasibility
 checks only.
 
-Reports include the exact matrix, per-game records, paired summaries,
-confidence bounds, and ordered discard reasons. The default production entry
+Reports include the exact matrix, candidate per-game records, paired summaries,
+confidence bounds, and ordered discard reasons. Raw external-baseline per-game
+records are retained in the report's replay sidecar. The default production entry
 point remains `Policy()`/`current`; update `main.py` only after a full holdout
 report has selected a named candidate. The evaluator has two explicit,
 non-interchangeable namespaces: `--variants` and repeated `--variant` select
@@ -93,6 +94,57 @@ selects `Policy(strategy="mixed")`. `mixed` intentionally exists in both
 namespaces; do not supply both request keys or both CLI modes. Legacy variants
 such as `conservative`, `melon-heavy`, `demand-reactive`, and `animal-heavy`
 are not accepted by the stable `--candidates` path.
+
+The economic safety gates are configurable from the CLI and are also accepted
+by `promotion_decision()` and `build_result_document()`:
+
+```bash
+uv run python scripts/evaluate.py \
+  --candidates current mixed --opponents pass random --seats 0 1 \
+  --max-same-item-churn 0 --churn-window 2 \
+  --max-market-transactions 500 \
+  --min-terminal-cash 100 --min-terminal-inventory-value 0
+```
+
+Each replay record reports `same_item_market_churn`,
+`submitted_market_order_count` (with the compatibility alias
+`market_transaction_count`), `terminal_cash`, and
+`terminal_inventory_value`; aggregate and paired summaries expose deterministic
+means/medians and activity totals. Market transaction count is the number of
+submitted market order events observed in the replay (a quantity-bearing order
+counts once; `HIRE` and `BUY_LAND` also count as one). It is not a confirmed-fill
+count: the evaluator cannot infer execution outcomes without changing replay
+semantics. The optional
+`--max-market-transactions` gate discards a candidate above that total cap.
+Churn counts opposite `BUY_PRODUCT`/`SELL` directions for the same item within
+the configured replay-turn window. Terminal inventory is valued at final
+market quotes, with animal purchase cost used where the engine has no sell
+quote; private seeds always use their published seed cost. Missing new fields
+in legacy fixtures are treated as zero
+or fall back to `final_bank` for compatibility.
+
+To compare against a previous agent, pass a callable reference as
+`module:callable` or `file.py:callable`:
+
+```bash
+uv run python scripts/evaluate.py \
+  --candidates mixed --baseline-policy /path/to/previous_agent.py:agent \
+  --baseline-identity previous-agent --seeds 30 --seats 0 1
+```
+
+The evaluator runs that policy on the exact same opponent/seed/seat matrix.
+The Python API equivalent is
+`run_evaluation(..., baseline_policy="file.py:agent", baseline_identity="previous-agent")`.
+The `run_evaluation()` API accepts the same safety settings as named options:
+`max_same_item_market_churn`, `max_market_transactions`, `min_terminal_cash`,
+and `min_terminal_inventory_value` (plus `churn_window`); it validates these
+before starting any matrix.
+Reports include the normalized baseline identity/path, baseline records and
+paired summary, and explicit `baseline_incomplete_pairing` decisions when the
+previous-agent matrix is missing, duplicated, or incomplete. External baseline
+comparisons use paired win rate and median bank differential, alongside
+paired deltas for market activity, churn, terminal cash, and terminal inventory
+value, only after all configured safety gates pass.
 
 In a report, `selected_candidate` is populated only after holdout evidence has
 passed the promotion gates. With no holdout records, `selected_candidate` is
@@ -148,7 +200,8 @@ artifact, manifest, and holdout report archived so the failed rollout remains
 reproducible.
 
 The default report path is `reports/evaluation.json`; each report also gets a
-compact replay-record sidecar beside it. Use `--quick` for a 2-seed, 96-step
+compact replay-record sidecar beside it, including raw external-baseline
+records when configured. Use `--quick` for a 2-seed, 96-step
 smoke batch, and do not commit generated reports unless a report is explicitly
 part of the requested artifact.
 
@@ -213,3 +266,18 @@ evidence.
 The project metadata and lockfile support Python 3.11+ and the local `uv`
 workflow; for example, run `uv sync`, `uv run pytest -q`, or
 `uv run python scripts/run_local.py --opponent pass --seed 0`.
+
+## Colab training
+
+Mount Google Drive and use one GPU for model updates with bounded CPU rollout
+workers. The configuration wrapper validates device selection and keeps
+development and holdout seeds disjoint:
+
+```bash
+python scripts/colab_train.py --run-directory /content/drive/MyDrive/kagriculture-orbit \
+  --device auto --workers 2
+```
+
+Use `scripts/train_policy.py --resume` or the Orbit state file to continue
+after a Colab disconnect; only candidates that pass development gates should
+be evaluated on holdout seeds.

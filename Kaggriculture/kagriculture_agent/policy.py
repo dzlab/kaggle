@@ -559,7 +559,7 @@ def build_market_orders(state: Any, plan: Any,
     carried_wheat = sum(_counts(inventory).get("WHEAT", 0) for inventory in _inventories(state))
     animal_counts = _animals(state)
     strategy_reserve = strategy.reserve_wheat if strategy is not None and animal_counts else 0
-    total_feed_wheat = feed_reserve(
+    total_feed_wheat = 0 if final_turn and strategy is None else feed_reserve(
         animal_counts, _days_left(state), 0,
         strategy_reserve,
     )

@@ -157,6 +157,66 @@ def test_collection_timeout_cleans_temp_files_and_preserves_existing_pair(tmp_pa
     assert not list(tmp_path.glob(".*.tmp"))
 
 
+def test_collection_failure_reports_each_job_and_preserves_existing_pair(tmp_path, monkeypatch):
+    from scripts import collect_trajectories
+
+    output = tmp_path / "failure.jsonl"
+    manifest_path = output.with_suffix(".manifest.json")
+    output.write_text("old-transition\n")
+    manifest_path.write_text("old-manifest\n")
+
+    def fail_one(*, opponent, seed, steps, candidate_player, replay_path, timeout):
+        if seed == 1:
+            raise OSError("fake engine failure")
+        return {}
+
+    monkeypatch.setattr(collect_trajectories, "_run_game_isolated", fail_one)
+    monkeypatch.setattr(collect_trajectories, "transitions_from_replay", lambda *args, **kwargs: [])
+
+    with pytest.raises(collect_trajectories.RolloutCollectionError) as raised:
+        collect_trajectories.collect(
+            seeds=[1, 2], opponents=["pass"], seats=[0], steps=4,
+            output=output, workers=1,
+        )
+
+    diagnostics = raised.value.diagnostics
+    assert [entry["status"] for entry in diagnostics] == ["failure", "success"]
+    assert diagnostics[0]["request_key"] == "seed=1|opponent=pass|seat=0"
+    assert diagnostics[0]["error_type"] == "OSError"
+    assert output.read_text() == "old-transition\n"
+    assert manifest_path.read_text() == "old-manifest\n"
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_collection_keeps_legacy_serial_callback_signature_and_records_identities(tmp_path, monkeypatch):
+    from scripts import collect_trajectories
+
+    calls = []
+
+    def fake_isolated_game(*, opponent, seed, steps, candidate_player, replay_path, timeout):
+        calls.append((opponent, seed, candidate_player, timeout))
+        return {}
+
+    monkeypatch.setattr(collect_trajectories, "_run_game_isolated", fake_isolated_game)
+    monkeypatch.setattr(collect_trajectories, "transitions_from_replay", lambda *args, **kwargs: [])
+    artifact = tmp_path / "candidate.json"
+    artifact.write_text("artifact")
+
+    manifest = collect_trajectories.collect(
+        seeds=[4], opponents=["pass", "current"], seats=[1], steps=4,
+        output=tmp_path / "trajectories.jsonl", workers=1,
+        candidate_artifact=artifact, candidate_identity="candidate-4",
+        game_timeout=2.0,
+    )
+
+    assert calls == [("pass", 4, 1, 2.0), ("current", 4, 1, 2.0)]
+    assert manifest["candidate_identity"] == "candidate-4"
+    assert manifest["candidate_artifact"] == str(artifact.resolve())
+    assert manifest["candidate_artifact_sha256"]
+    assert manifest["opponent_identities"] == {"pass": "pass", "current": "current"}
+    assert manifest["workers"] == 1
+
+
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
 def test_transition_serialization_is_deterministic_and_json_compatible(tmp_path):
     from kagriculture_agent.trajectory import transitions_from_replay

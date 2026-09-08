@@ -41,6 +41,52 @@ def test_model_module_imports_without_torch_dependency():
     assert model.MODEL_VERSION == "learned_v1"
 
 
+@pytest.mark.parametrize(
+    ("requested", "cuda_available", "expected"),
+    [
+        ("auto", True, "cuda"),
+        ("auto", False, "cpu"),
+        ("cpu", True, "cpu"),
+    ],
+)
+def test_resolve_device_selects_requested_available_device(
+    monkeypatch, requested, cuda_available, expected,
+):
+    torch = pytest.importorskip("torch")
+    from kagriculture_agent.model import resolve_device
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+
+    assert resolve_device(requested) == torch.device(expected)
+
+
+def test_resolve_device_rejects_invalid_name():
+    pytest.importorskip("torch")
+    from kagriculture_agent.model import resolve_device
+
+    with pytest.raises(ValueError, match="auto, cpu, or cuda"):
+        resolve_device("mps")
+
+
+def test_resolve_device_rejects_unavailable_explicit_cuda(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from kagriculture_agent.model import resolve_device
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="CUDA.*not available"):
+        resolve_device("cuda")
+
+
+def test_feature_tensors_follow_explicit_device():
+    torch = pytest.importorskip("torch")
+    from kagriculture_agent.model import feature_batch_to_tensors
+
+    tensors = feature_batch_to_tensors(extract_features(sample_state()), device=torch.device("cpu"))
+
+    assert {tensor.device for tensor in tensors.values()} == {torch.device("cpu")}
+
+
 def test_policy_network_forward_shapes_and_schema_validation():
     torch = pytest.importorskip("torch")
     from kagriculture_agent.model import ACTION_VOCAB, CompactPolicyNet
