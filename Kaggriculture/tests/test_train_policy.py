@@ -1274,6 +1274,40 @@ def test_behavior_cloning_smoke_writes_checkpoint_metadata(tmp_path):
     assert checkpoint["metrics"]["behavior_clone_updates"] == 1
 
 
+def test_behavior_cloning_switches_to_conservative_ppo_learning_rate(tmp_path, monkeypatch):
+    pytest.importorskip("torch")
+    from scripts import train_policy
+
+    input_path = tmp_path / "transitions.jsonl"
+    output_path = tmp_path / "policy.pt"
+    input_path.write_text(json.dumps(_transition(done=True)) + "\n", encoding="utf-8")
+    observed = {}
+
+    def observe_ppo(**kwargs):
+        observed["learning_rate"] = kwargs["optimizer"].param_groups[0]["lr"]
+        return {
+            "ppo_updates": 0,
+            "rollout_count": 0,
+            "early_stopped": False,
+            "last_metrics": None,
+            "promotion": None,
+            "completed_steps": 1,
+        }
+
+    monkeypatch.setattr(train_policy, "run_ppo_training", observe_ppo)
+    train_policy.train_behavior_clone(
+        input_path=input_path,
+        output_path=output_path,
+        steps=1,
+        batch_size=1,
+        seed=7,
+        ppo_steps=1,
+        device="cpu",
+    )
+
+    assert observed["learning_rate"] == train_policy.PPO_LEARNING_RATE
+
+
 def test_behavior_cloning_periodic_checkpoint_survives_interruption_and_resumes(
     tmp_path, monkeypatch,
 ):

@@ -39,6 +39,7 @@ from kagriculture_agent.model import (
 
 PROMOTION_MATCH_SIZE = 100
 LOG_RATIO_CLAMP = 20.0
+PPO_LEARNING_RATE = 1e-4
 _DIRECTION_DELTAS = {
     "NORTH": (0, -1),
     "SOUTH": (0, 1),
@@ -1613,6 +1614,11 @@ def train_behavior_clone(
 
     ppo_metrics = previous_ppo_metrics
     if ppo_steps and round_index < int(ppo_steps):
+        # Behavior cloning benefits from a larger step size, but carrying that
+        # rate into on-policy updates can move the policy far outside the
+        # trust region in a single minibatch and trip target_kl immediately.
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = PPO_LEARNING_RATE
         config = PPOConfig()
         ppo_metrics = run_ppo_training(
             network=network,
