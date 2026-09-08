@@ -53,7 +53,10 @@ def test_colab_notebook_stages_candidates_and_resumes_safely():
     assert "export_checkpoint(checkpoint_path, candidate_artifact)" not in code
     assert "output_path=stage_checkpoint_path" in code
     assert "candidate_artifact=stage_artifact_path" in code
-    assert "training_device = 'cuda'" in code
+    assert "runtime_device = 'cuda' if torch.cuda.is_available() else 'cpu'" in code
+    assert "training_device = runtime_device" in code
+    assert "GPU unavailable; falling back to CPU" in code
+    assert "assert torch.cuda.is_available()" not in code
     assert "workers=2" in code
     assert "candidate_artifact_callback=export_current" in code
     assert "output_path=current_checkpoint_path" not in code
