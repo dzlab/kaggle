@@ -149,6 +149,18 @@ def test_parser_accepts_resume_checkpoint_path():
     assert args.resume_checkpoint == Path("previous.pt")
 
 
+def test_parser_accepts_ppo_extension_opt_in_flag():
+    from scripts.train_policy import _parser
+
+    args = _parser().parse_args([
+        "--input", "transitions.jsonl",
+        "--output", "policy.pt",
+        "--allow-ppo-extension",
+    ])
+
+    assert args.allow_ppo_extension is True
+
+
 def test_parser_accepts_positive_checkpoint_interval_and_rejects_zero():
     from scripts.train_policy import _parser
 
@@ -202,6 +214,26 @@ def test_resume_configuration_validation_is_strict(case, error_match):
 
     with pytest.raises(ValueError, match=error_match):
         _validate_resume_configuration(saved, requested)
+
+
+def test_resume_ppo_extension_requires_opt_in_and_only_allows_increase():
+    from scripts.train_policy import _validate_resume_configuration
+
+    requested = _resume_configuration(Path("transitions.jsonl"), ppo_steps=2)
+    saved = {**requested, "ppo_steps": 1}
+
+    with pytest.raises(ValueError, match="ppo_steps"):
+        _validate_resume_configuration(saved, requested)
+
+    _validate_resume_configuration(saved, requested, allow_ppo_extension=True)
+    _validate_resume_configuration(requested, requested)
+
+    with pytest.raises(ValueError, match="ppo_steps"):
+        _validate_resume_configuration(requested, requested, allow_ppo_extension=True)
+
+    decreased = {**requested, "ppo_steps": 3}
+    with pytest.raises(ValueError, match="ppo_steps"):
+        _validate_resume_configuration(decreased, requested, allow_ppo_extension=True)
 
 
 def test_terminal_bank_margin_reward_is_normalized():
@@ -739,6 +771,18 @@ def test_cli_ppo_steps_require_explicit_offline_fallback_for_replay_reuse():
     assert _cli_training_options(explicit)["offline_ppo_fallback"] is True
 
 
+def test_cli_training_options_forwards_ppo_extension_opt_in():
+    from scripts.train_policy import _cli_training_options, _parser
+
+    args = _parser().parse_args([
+        "--input", "transitions.jsonl",
+        "--output", "policy.pt",
+        "--allow-ppo-extension",
+    ])
+
+    assert _cli_training_options(args)["allow_ppo_extension"] is True
+
+
 def test_promotion_match_runs_exactly_fixed_gate_and_counts_wins():
     from scripts.train_policy import PROMOTION_MATCH_SIZE, run_promotion_match
 
@@ -1090,6 +1134,26 @@ def test_cli_main_reports_ambiguous_ppo_mode_without_traceback(capsys):
     assert "Traceback" not in captured.err
 
 
+def test_cli_main_forwards_ppo_extension_opt_in(monkeypatch, capsys):
+    from scripts import train_policy
+
+    observed = {}
+
+    def fake_train(**kwargs):
+        observed.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(train_policy, "train_behavior_clone", fake_train)
+
+    assert train_policy.main([
+        "--input", "transitions.jsonl",
+        "--output", "policy.pt",
+        "--allow-ppo-extension",
+    ]) == 0
+    capsys.readouterr()
+    assert observed["allow_ppo_extension"] is True
+
+
 def test_opponent_pool_probabilities_and_checkpoint_sampling_are_deterministic():
     from scripts.train_policy import OpponentPool
 
@@ -1265,9 +1329,11 @@ def test_behavior_cloning_smoke_writes_checkpoint_metadata(tmp_path):
     assert metadata["behavior_clone_updates"] == 1
     assert metadata["ppo_updates"] == 0
     assert metadata["device"] == "cpu"
+    assert metadata["ppo_steps"] == 0
 
     checkpoint = pytest.importorskip("torch").load(output_path, map_location="cpu")
     assert checkpoint["metadata"]["device"] == "cpu"
+    assert checkpoint["metadata"]["ppo_steps"] == 0
     assert checkpoint["optimizer_state_dict"]["state"]
     assert checkpoint["configuration"]["device"] == "cpu"
     assert checkpoint["progress"] == {"epoch": 1, "round": 0, "cursor": 0}
@@ -1599,6 +1665,76 @@ def test_resume_continues_from_saved_ppo_round(tmp_path, monkeypatch):
     assert payload["progress"] == {"epoch": 1, "round": 3, "cursor": 0}
 
 
+def test_resume_ppo_extension_updates_target_and_skips_behavior_cloning(
+    tmp_path, monkeypatch,
+):
+    torch = pytest.importorskip("torch")
+    from kagriculture_agent.checkpoints import save_checkpoint
+    from kagriculture_agent.model import CompactPolicyNet
+    from scripts import train_policy
+
+    input_path = tmp_path / "transitions.jsonl"
+    resume_path = tmp_path / "resume.pt"
+    output_path = tmp_path / "continued.pt"
+    input_path.write_text(json.dumps(_transition(done=True)) + "\n", encoding="utf-8")
+    model = CompactPolicyNet().to("cpu")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    save_checkpoint(
+        resume_path,
+        model=model,
+        optimizer=optimizer,
+        configuration=_resume_configuration(input_path, ppo_steps=1),
+        epoch=1,
+        round_index=1,
+        cursor=0,
+        metrics={
+            "behavior_clone_updates": 1,
+            "ppo_updates": 4,
+            "ppo_metrics": _ppo_checkpoint_metrics(),
+        },
+        metadata=train_policy.checkpoint_metadata(transition_count=1, device="cpu"),
+    )
+    ppo_calls = []
+
+    def fail_if_behavior_cloning_runs(**_kwargs):
+        raise AssertionError("behavior cloning must not rerun during PPO extension")
+
+    def continue_ppo(**kwargs):
+        ppo_calls.append({key: kwargs[key] for key in ("ppo_steps", "start_step")})
+        return {
+            "ppo_updates": 6,
+            "rollout_count": 3,
+            "early_stopped": False,
+            "last_metrics": None,
+            "promotion": None,
+            "completed_steps": 3,
+        }
+
+    monkeypatch.setattr(train_policy, "epoch_minibatches", fail_if_behavior_cloning_runs)
+    monkeypatch.setattr(train_policy, "run_ppo_training", continue_ppo)
+
+    metadata = train_policy.train_behavior_clone(
+        input_path=input_path,
+        output_path=output_path,
+        steps=1,
+        batch_size=1,
+        seed=7,
+        ppo_steps=3,
+        device="cpu",
+        resume_checkpoint=resume_path,
+        allow_ppo_extension=True,
+    )
+
+    payload = torch.load(output_path, map_location="cpu", weights_only=True)
+    assert ppo_calls == [{"ppo_steps": 3, "start_step": 1}]
+    assert metadata["ppo_updates"] == 6
+    assert metadata["ppo_steps"] == 3
+    assert payload["configuration"]["ppo_steps"] == 3
+    assert payload["metadata"]["ppo_steps"] == 3
+    assert payload["metrics"]["behavior_clone_updates"] == 1
+    assert payload["progress"] == {"epoch": 1, "round": 3, "cursor": 0}
+
+
 @pytest.mark.parametrize(
     "case,error_match",
     [
@@ -1645,6 +1781,85 @@ def test_resume_validates_exact_nested_ppo_metrics(case, error_match, tmp_path):
     }
 
     with pytest.raises(ValueError, match=error_match):
+        train_policy._validate_resume_payload(
+            payload,
+            configuration=configuration,
+            transition_count=1,
+        )
+
+
+def test_resume_allows_legacy_checkpoint_without_metadata_ppo_steps(tmp_path):
+    from scripts import train_policy
+
+    input_path = tmp_path / "transitions.jsonl"
+    input_path.write_text(json.dumps(_transition(done=True)) + "\n", encoding="utf-8")
+    configuration = _resume_configuration(input_path, ppo_steps=2)
+    payload = {
+        "configuration": configuration,
+        "progress": {"epoch": 1, "round": 0, "cursor": 0},
+        "metrics": {
+            "behavior_clone_updates": 1,
+            "ppo_updates": 0,
+            "ppo_metrics": None,
+        },
+        "metadata": train_policy.checkpoint_metadata(transition_count=1, device="cpu"),
+    }
+
+    train_policy._validate_resume_payload(
+        payload,
+        configuration=configuration,
+        transition_count=1,
+    )
+
+
+@pytest.mark.parametrize("value", [True, -1, 1.0, "2", None, []])
+def test_resume_rejects_malformed_metadata_ppo_steps(tmp_path, value):
+    from scripts import train_policy
+
+    input_path = tmp_path / "transitions.jsonl"
+    input_path.write_text(json.dumps(_transition(done=True)) + "\n", encoding="utf-8")
+    configuration = _resume_configuration(input_path, ppo_steps=2)
+    metadata = train_policy.checkpoint_metadata(transition_count=1, device="cpu")
+    metadata["ppo_steps"] = value
+    payload = {
+        "configuration": configuration,
+        "progress": {"epoch": 1, "round": 0, "cursor": 0},
+        "metrics": {
+            "behavior_clone_updates": 1,
+            "ppo_updates": 0,
+            "ppo_metrics": None,
+        },
+        "metadata": metadata,
+    }
+
+    with pytest.raises(ValueError, match="metadata ppo_steps"):
+        train_policy._validate_resume_payload(
+            payload,
+            configuration=configuration,
+            transition_count=1,
+        )
+
+
+def test_resume_rejects_contradictory_metadata_ppo_steps(tmp_path):
+    from scripts import train_policy
+
+    input_path = tmp_path / "transitions.jsonl"
+    input_path.write_text(json.dumps(_transition(done=True)) + "\n", encoding="utf-8")
+    configuration = _resume_configuration(input_path, ppo_steps=2)
+    metadata = train_policy.checkpoint_metadata(transition_count=1, device="cpu")
+    metadata["ppo_steps"] = 1
+    payload = {
+        "configuration": configuration,
+        "progress": {"epoch": 1, "round": 0, "cursor": 0},
+        "metrics": {
+            "behavior_clone_updates": 1,
+            "ppo_updates": 0,
+            "ppo_metrics": None,
+        },
+        "metadata": metadata,
+    }
+
+    with pytest.raises(ValueError, match="metadata ppo_steps"):
         train_policy._validate_resume_payload(
             payload,
             configuration=configuration,

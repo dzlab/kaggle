@@ -191,11 +191,22 @@ def _validate_configuration_shape(configuration: Any, *, source: str) -> None:
 
 
 def _validate_resume_configuration(
-    saved: dict[str, Any], requested: dict[str, Any],
+    saved: dict[str, Any], requested: dict[str, Any], *,
+    allow_ppo_extension: bool = False,
 ) -> None:
+    if type(allow_ppo_extension) is not bool:
+        raise ValueError("allow_ppo_extension must be boolean")
     _validate_configuration_shape(saved, source="saved")
     _validate_configuration_shape(requested, source="requested")
     for field in _RESUME_CONFIGURATION_FIELDS:
+        if field == "ppo_steps" and allow_ppo_extension:
+            if saved[field] >= requested[field]:
+                raise ValueError(
+                    "resume checkpoint configuration mismatch for ppo_steps: "
+                    "allow_ppo_extension requires the requested target to be greater "
+                    f"than the saved target ({requested[field]} <= {saved[field]})"
+                )
+            continue
         if type(saved[field]) is not type(requested[field]) or saved[field] != requested[field]:
             label = "input trajectory" if field == "input_trajectory" else field
             raise ValueError(
@@ -1213,9 +1224,12 @@ def maybe_promote_checkpoint(
 
 def _validate_resume_payload(
     payload: dict[str, Any], *, configuration: dict[str, Any],
-    transition_count: int,
+    transition_count: int, allow_ppo_extension: bool = False,
 ) -> None:
-    _validate_resume_configuration(payload["configuration"], configuration)
+    _validate_resume_configuration(
+        payload["configuration"], configuration,
+        allow_ppo_extension=allow_ppo_extension,
+    )
     progress = payload["progress"]
     epoch = progress["epoch"]
     cursor = progress["cursor"]
@@ -1306,6 +1320,17 @@ def _validate_resume_payload(
         )
     if type(metadata.get("device")) is not str or not metadata["device"]:
         raise ValueError("resume checkpoint metadata device must be a nonempty string")
+    if "ppo_steps" in metadata:
+        metadata_ppo_steps = metadata["ppo_steps"]
+        if type(metadata_ppo_steps) is not int or metadata_ppo_steps < 0:
+            raise ValueError(
+                "resume checkpoint metadata ppo_steps must be a nonnegative integer"
+            )
+        saved_ppo_steps = payload["configuration"]["ppo_steps"]
+        if metadata_ppo_steps != saved_ppo_steps:
+            raise ValueError(
+                "resume checkpoint metadata ppo_steps does not match saved configuration"
+            )
 
 
 def make_fresh_rollout_fn(
@@ -1424,6 +1449,7 @@ def train_behavior_clone(
     batch_size: int, seed: int = 0, ppo_steps: int = 0,
     device: str = "auto", checkpoint_interval: int = 100,
     resume_checkpoint: str | Path | None = None,
+    allow_ppo_extension: bool = False,
     prior_checkpoint: str | Path | None = None, rollout_fn: Any | None = None,
     opponent_pool: Any | None = None, offline_ppo_fallback: bool = False,
     promotion_match_fn: Any | None = None,
@@ -1432,6 +1458,8 @@ def train_behavior_clone(
     candidate_artifact: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run complete behavior-cloning epochs, optional PPO, and checkpoint."""
+    if type(allow_ppo_extension) is not bool:
+        raise ValueError("allow_ppo_extension must be boolean")
     th = require_torch()
     resolved_device = resolve_device(device)
     batch_size = max(1, int(batch_size))
@@ -1469,6 +1497,7 @@ def train_behavior_clone(
             resumed,
             configuration=configuration,
             transition_count=len(transitions),
+            allow_ppo_extension=allow_ppo_extension,
         )
         start_epoch = resumed["progress"]["epoch"]
         start_cursor = resumed["progress"]["cursor"]
@@ -1492,6 +1521,7 @@ def train_behavior_clone(
             restore_rng_state(rng_before_resume)
         raise
     metadata = _checkpoint_metadata(len(transitions), device=resolved_device)
+    metadata["ppo_steps"] = int(ppo_steps)
     metadata["behavior_clone_epochs"] = epochs
     destination = Path(output_path)
 
@@ -1699,6 +1729,7 @@ def _cli_training_options(args: argparse.Namespace) -> dict[str, Any]:
         )
     return {
         "offline_ppo_fallback": bool(args.offline_ppo_fallback),
+        "allow_ppo_extension": bool(args.allow_ppo_extension),
     }
 
 
@@ -1712,6 +1743,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--resume", type=Path, default=None, dest="resume_checkpoint")
+    parser.add_argument(
+        "--allow-ppo-extension",
+        action="store_true",
+        help="allow a resumed checkpoint to increase its PPO training target",
+    )
     parser.add_argument("--ppo-steps", type=_nonnegative_int, default=0)
     parser.add_argument("--prior-checkpoint", type=Path, default=None)
     parser.add_argument("--best-checkpoint", type=Path, default=None)
@@ -1736,6 +1772,7 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             device=args.device,
             resume_checkpoint=args.resume_checkpoint,
+            allow_ppo_extension=options["allow_ppo_extension"],
             ppo_steps=args.ppo_steps,
             prior_checkpoint=args.prior_checkpoint,
             offline_ppo_fallback=options["offline_ppo_fallback"],
