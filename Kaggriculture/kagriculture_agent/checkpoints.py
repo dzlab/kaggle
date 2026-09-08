@@ -9,6 +9,8 @@ import random
 import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from pickle import UnpicklingError
+from stat import S_ISREG
 from typing import Any, BinaryIO
 
 from .constants import ENGINE_VERSION
@@ -285,14 +287,25 @@ def read_checkpoint(
 ) -> dict[str, Any]:
     """Safely deserialize and fully validate a checkpoint without restoring it."""
     checkpoint_path = Path(path)
-    if not checkpoint_path.is_file():
+    try:
+        path_stat = checkpoint_path.stat()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"checkpoint does not exist: {checkpoint_path}")
+    except OSError:
+        raise
+    if not S_ISREG(path_stat.st_mode):
         raise FileNotFoundError(f"checkpoint does not exist: {checkpoint_path}")
     th = require_torch()
     try:
         raw_payload = th.load(
             checkpoint_path, map_location=map_location, weights_only=True,
         )
-    except Exception as exc:
+    except OSError:
+        raise
+    except (
+        AttributeError, EOFError, ImportError, IndexError, KeyError,
+        RuntimeError, TypeError, UnpicklingError, ValueError,
+    ) as exc:
         raise CheckpointError(
             f"checkpoint is malformed or truncated: {checkpoint_path}"
         ) from exc

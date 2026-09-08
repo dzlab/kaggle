@@ -311,6 +311,22 @@ def test_checkpoint_missing_file_is_not_treated_as_fresh_state(tmp_path):
         load_checkpoint(tmp_path / "missing.pt", model=model, optimizer=optimizer)
 
 
+def test_read_checkpoint_propagates_drive_io_errors_from_deserialization(tmp_path, monkeypatch):
+    from kagriculture_agent import checkpoints
+
+    path = tmp_path / "policy.pt"
+    path.write_bytes(b"checkpoint bytes")
+
+    class BrokenTorch:
+        def load(self, *args, **kwargs):
+            raise PermissionError("Drive read unavailable")
+
+    monkeypatch.setattr(checkpoints, "require_torch", lambda: BrokenTorch())
+
+    with pytest.raises(PermissionError, match="Drive read unavailable"):
+        checkpoints.read_checkpoint(path)
+
+
 def test_atomic_checkpoint_save_preserves_destination_and_cleans_temp_on_failure(
     tmp_path, monkeypatch,
 ):

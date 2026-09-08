@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from kagriculture_agent.checkpoints import (
+    CheckpointError,
     capture_rng_state,
     read_checkpoint,
     restore_rng_state,
@@ -91,6 +92,14 @@ class PPOConfig:
             raise ValueError("target_kl must be positive")
         if self.rollout_steps < 1 or self.ppo_epochs < 1:
             raise ValueError("rollout_steps and ppo_epochs must be positive")
+
+
+@dataclass(frozen=True)
+class TrainingContract:
+    """Validated configuration and input count required to resume training."""
+
+    configuration: dict[str, Any]
+    transition_count: int
 
 
 _RESUME_CONFIGURATION_FIELDS = (
@@ -188,6 +197,54 @@ def _validate_configuration_shape(configuration: Any, *, source: str) -> None:
         raise ValueError(f"{source} configuration offline_ppo_fallback must be boolean")
     _validate_prior_checkpoint_identity(configuration["prior_checkpoint"], source=source)
     _validate_ppo_configuration(configuration["ppo_config"], source=source)
+
+
+def build_training_contract(
+    *, input_path: str | Path, steps: int, batch_size: int, seed: int = 0,
+    ppo_steps: int = 0, device: str = "auto", checkpoint_interval: int = 100,
+    prior_checkpoint: str | Path | None = None,
+    offline_ppo_fallback: bool = False, resolved_device: Any | None = None,
+) -> TrainingContract:
+    """Build the canonical input/configuration contract used by training and resume.
+
+    ``steps`` and ``batch_size`` retain the trainer's valid integer normalization
+    where nonpositive values become one. All other public scalar inputs must
+    already have their declared types; strings, floats, and booleans are not
+    silently coerced.
+    """
+    if type(steps) is not int:
+        raise ValueError("steps must be an integer")
+    if type(batch_size) is not int:
+        raise ValueError("batch_size must be an integer")
+    if type(seed) is not int:
+        raise ValueError("seed must be an integer")
+    if type(ppo_steps) is not int:
+        raise ValueError("ppo_steps must be an integer")
+    if type(device) is not str:
+        raise ValueError("device must be a string")
+    if type(checkpoint_interval) is not int or checkpoint_interval < 1:
+        raise ValueError("checkpoint_interval must be a positive integer")
+    if type(offline_ppo_fallback) is not bool:
+        raise ValueError("offline_ppo_fallback must be boolean")
+    resolved = resolve_device(device) if resolved_device is None else resolved_device
+    normalized_batch_size = max(1, batch_size)
+    normalized_steps = max(1, steps)
+    input_identity = _trajectory_identity(input_path)
+    transitions = _read_transitions(input_path)
+    configuration = {
+        "input_trajectory": input_identity,
+        "steps": normalized_steps,
+        "batch_size": normalized_batch_size,
+        "seed": seed,
+        "ppo_steps": ppo_steps,
+        "device": str(resolved),
+        "prior_checkpoint": _checkpoint_identity(prior_checkpoint),
+        "offline_ppo_fallback": offline_ppo_fallback,
+        "ppo_config": asdict(PPOConfig()),
+        "checkpoint_interval": checkpoint_interval,
+    }
+    _validate_configuration_shape(configuration, source="requested")
+    return TrainingContract(configuration=configuration, transition_count=len(transitions))
 
 
 def _validate_resume_configuration(
@@ -1226,15 +1283,28 @@ def _validate_resume_payload(
     payload: dict[str, Any], *, configuration: dict[str, Any],
     transition_count: int, allow_ppo_extension: bool = False,
 ) -> None:
+    if type(payload) is not dict:
+        raise CheckpointError("resume checkpoint payload must be an object")
+    for field in ("configuration", "progress", "metrics", "metadata"):
+        if field not in payload:
+            raise CheckpointError(f"resume checkpoint is missing {field}")
     _validate_resume_configuration(
         payload["configuration"], configuration,
         allow_ppo_extension=allow_ppo_extension,
     )
     progress = payload["progress"]
+    if type(progress) is not dict:
+        raise CheckpointError("resume checkpoint progress must be an object")
     epoch = progress["epoch"]
     cursor = progress["cursor"]
     round_index = progress["round"]
     epochs = configuration["steps"]
+    saved_ppo_steps = payload["configuration"]["ppo_steps"]
+    if round_index > saved_ppo_steps:
+        raise ValueError(
+            f"resume checkpoint progress.round {round_index} exceeds saved PPO target "
+            f"{saved_ppo_steps}"
+        )
     if epoch > epochs:
         raise ValueError(
             f"resume checkpoint epoch {epoch} exceeds requested steps {epochs}"
@@ -1258,6 +1328,8 @@ def _validate_resume_payload(
             f"{configuration['ppo_steps']}"
         )
     metrics = payload["metrics"]
+    if type(metrics) is not dict:
+        raise CheckpointError("resume checkpoint metrics must be an object")
     expected_metrics = {"behavior_clone_updates", "ppo_updates", "ppo_metrics"}
     if set(metrics) != expected_metrics:
         missing = sorted(expected_metrics - set(metrics))
@@ -1271,6 +1343,19 @@ def _validate_resume_payload(
         if type(metrics[field]) is not int or metrics[field] < 0:
             raise ValueError(f"resume checkpoint metrics {field} must be a nonnegative integer")
     ppo_metrics = metrics["ppo_metrics"]
+    if isinstance(ppo_metrics, dict) and type(ppo_metrics.get("completed_steps")) is int:
+        completed_steps = ppo_metrics["completed_steps"]
+        if completed_steps > saved_ppo_steps:
+            raise ValueError(
+                "resume checkpoint ppo_metrics completed_steps "
+                f"{completed_steps} exceeds saved PPO target {saved_ppo_steps}"
+            )
+        if completed_steps > configuration["ppo_steps"]:
+            raise ValueError(
+                "resume checkpoint ppo_metrics completed_steps "
+                f"{completed_steps} exceeds requested PPO target "
+                f"{configuration['ppo_steps']}"
+            )
     if round_index == 0:
         if ppo_metrics is not None:
             raise ValueError("resume checkpoint metrics ppo_metrics must be null before PPO progress")
@@ -1312,6 +1397,8 @@ def _validate_resume_payload(
                 "resume checkpoint ppo_metrics completed_steps does not match PPO round"
             )
     metadata = payload["metadata"]
+    if type(metadata) is not dict:
+        raise CheckpointError("resume checkpoint metadata must be an object")
     if type(metadata.get("transition_count")) is not int:
         raise ValueError("resume checkpoint metadata transition_count must be an integer")
     if metadata["transition_count"] != transition_count:
@@ -1331,6 +1418,26 @@ def _validate_resume_payload(
             raise ValueError(
                 "resume checkpoint metadata ppo_steps does not match saved configuration"
             )
+
+
+def validate_training_checkpoint(
+    payload: dict[str, Any], *, contract: TrainingContract,
+    allow_ppo_extension: bool = False,
+) -> None:
+    """Validate a loaded checkpoint against the canonical training contract."""
+    if not isinstance(contract, TrainingContract):
+        raise TypeError("contract must be a TrainingContract")
+    try:
+        _validate_resume_payload(
+            payload,
+            configuration=contract.configuration,
+            transition_count=contract.transition_count,
+            allow_ppo_extension=allow_ppo_extension,
+        )
+    except CheckpointError:
+        raise
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
+        raise CheckpointError(f"checkpoint is incompatible with training contract: {exc}") from exc
 
 
 def make_fresh_rollout_fn(
@@ -1464,25 +1571,27 @@ def train_behavior_clone(
     resolved_device = resolve_device(device)
     batch_size = max(1, int(batch_size))
     epochs = max(1, int(steps))
+    seed = int(seed)
+    ppo_steps = int(ppo_steps)
+    offline_ppo_fallback = bool(offline_ppo_fallback)
     if type(checkpoint_interval) is not int or checkpoint_interval < 1:
         raise ValueError("checkpoint_interval must be a positive integer")
-    input_identity = _trajectory_identity(input_path)
+    contract = build_training_contract(
+        input_path=input_path,
+        steps=epochs,
+        batch_size=batch_size,
+        seed=seed,
+        ppo_steps=ppo_steps,
+        device=device,
+        checkpoint_interval=checkpoint_interval,
+        prior_checkpoint=prior_checkpoint,
+        offline_ppo_fallback=offline_ppo_fallback,
+        resolved_device=resolved_device,
+    )
+    configuration = contract.configuration
     transitions = _read_transitions(input_path)
     features = [extract_features(transition.get("observation", {})) for transition in transitions]
     actions = [transition.get("action", {}) if isinstance(transition.get("action"), dict) else {} for transition in transitions]
-    configuration = {
-        "input_trajectory": input_identity,
-        "steps": epochs,
-        "batch_size": batch_size,
-        "seed": int(seed),
-        "ppo_steps": int(ppo_steps),
-        "device": str(resolved_device),
-        "prior_checkpoint": _checkpoint_identity(prior_checkpoint),
-        "offline_ppo_fallback": bool(offline_ppo_fallback),
-        "ppo_config": asdict(PPOConfig()),
-        "checkpoint_interval": checkpoint_interval,
-    }
-    _validate_configuration_shape(configuration, source="requested")
     start_epoch = 0
     start_cursor = 0
     round_index = 0
@@ -1493,11 +1602,8 @@ def train_behavior_clone(
     resumed = None
     if resume_checkpoint is not None:
         resumed = read_checkpoint(resume_checkpoint, map_location="cpu")
-        _validate_resume_payload(
-            resumed,
-            configuration=configuration,
-            transition_count=len(transitions),
-            allow_ppo_extension=allow_ppo_extension,
+        validate_training_checkpoint(
+            resumed, contract=contract, allow_ppo_extension=allow_ppo_extension,
         )
         start_epoch = resumed["progress"]["epoch"]
         start_cursor = resumed["progress"]["cursor"]
