@@ -974,6 +974,7 @@ def run_ppo_training(
     initial_ppo_updates: int = 0,
     initial_rollout_count: int = 0,
     progress_fn: Any | None = None,
+    telemetry_callback: Any | None = None,
 ) -> dict[str, Any]:
     """Run PPO with fresh scheduled league rollouts or explicit offline fallback."""
     steps = max(0, int(ppo_steps))
@@ -1066,6 +1067,18 @@ def run_ppo_training(
             "promotion": None,
             "completed_steps": step + 1,
         }
+        if telemetry_callback is not None:
+            telemetry_callback("ppo", {
+                "step": step + 1,
+                "ppo_updates": total_updates,
+                "ppo_updates_step": int(last_metrics.get("updates", 0)),
+                "rollout_count": rollout_count,
+                "early_stopped": bool(last_metrics.get("early_stopped")),
+                "policy_loss": last_metrics.get("policy_loss"),
+                "value_loss": last_metrics.get("value_loss"),
+                "entropy": last_metrics.get("entropy"),
+                "approx_kl": last_metrics.get("approx_kl"),
+            })
         if progress_fn is not None:
             progress_fn(completed_step=step + 1, metrics=step_summary)
         if last_metrics.get("early_stopped"):
@@ -1563,6 +1576,7 @@ def train_behavior_clone(
     best_checkpoint_path: str | Path | None = None,
     checkpoint_registry: dict[str, Any] | None = None,
     candidate_artifact: str | Path | None = None,
+    telemetry_callback: Any | None = None,
 ) -> dict[str, Any]:
     """Run complete behavior-cloning epochs, optional PPO, and checkpoint."""
     if type(allow_ppo_extension) is not bool:
@@ -1630,6 +1644,8 @@ def train_behavior_clone(
     metadata["ppo_steps"] = int(ppo_steps)
     metadata["behavior_clone_epochs"] = epochs
     destination = Path(output_path)
+    last_bc_loss: float | None = None
+    last_bc_telemetry_update = 0
 
     def checkpoint_metrics(ppo_result: dict[str, Any] | None) -> dict[str, Any]:
         return {
@@ -1704,6 +1720,7 @@ def train_behavior_clone(
             loss.backward()
             optimizer.step()
             bc_updates += 1
+            last_bc_loss = float(loss.detach())
             if bc_updates % checkpoint_interval == 0:
                 completed_cursor = batch_index + 1
                 completed_epoch = epoch
@@ -1717,6 +1734,14 @@ def train_behavior_clone(
                     completed_round=0,
                     cursor=completed_cursor,
                 )
+                if telemetry_callback is not None:
+                    telemetry_callback("behavior_clone", {
+                        "step": bc_updates,
+                        "update_count": bc_updates,
+                        "epoch": completed_epoch,
+                        "loss": last_bc_loss,
+                    })
+                    last_bc_telemetry_update = bc_updates
     metadata["behavior_clone_updates"] = bc_updates
     metadata["ppo_updates"] = 0
     metadata["ppo_metrics"] = None
@@ -1727,6 +1752,18 @@ def train_behavior_clone(
         completed_round=round_index,
         cursor=0,
     )
+    if (
+        telemetry_callback is not None
+        and last_bc_loss is not None
+        and last_bc_telemetry_update != bc_updates
+    ):
+        telemetry_callback("behavior_clone", {
+            "step": bc_updates,
+            "update_count": bc_updates,
+            "epoch": epochs,
+            "loss": last_bc_loss,
+        })
+        last_bc_telemetry_update = bc_updates
 
     def save_current_candidate(path: str | Path, *, ppo_metrics: dict[str, Any] | None = None) -> str:
         completed_round = (
@@ -1789,6 +1826,7 @@ def train_behavior_clone(
             initial_ppo_updates=initial_ppo_updates,
             initial_rollout_count=initial_rollout_count,
             progress_fn=save_ppo_progress,
+            telemetry_callback=telemetry_callback,
         )
     metadata["ppo_updates"] = initial_ppo_updates if ppo_metrics is None else ppo_metrics["ppo_updates"]
     metadata["ppo_metrics"] = ppo_metrics

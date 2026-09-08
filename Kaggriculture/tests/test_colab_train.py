@@ -58,6 +58,17 @@ def test_colab_notebook_stages_candidates_and_resumes_safely():
     assert "candidate_artifact_callback=export_current" in code
     assert "output_path=current_checkpoint_path" not in code
     assert "export_checkpoint(current_checkpoint_path" not in code
+    assert ".[training,observability]" in code
+    assert "DEFAULT_WEAVE_PROJECT" in code
+    assert "telemetry_project = DEFAULT_WEAVE_PROJECT" in code
+    assert "training_metrics_path = run_dir / 'orbit-training-metrics.jsonl'" in code
+    assert "TrainingTelemetry(" in code
+    assert "enable_weave=True" in code
+    assert "strict=False" in code
+    assert "telemetry_callback=training_telemetry" in code
+    assert "import matplotlib.pyplot as plt" in code
+    assert "if not training_events:" in code
+    assert "No training telemetry found" in code
     assert "change the target to 32" in markdown
     assert "retained separately" in markdown
 
@@ -184,6 +195,37 @@ def test_colab_notebook_executable_cells_are_valid_python():
                 for line in "".join(cell.get("source", [])).splitlines()
             )
             ast.parse(source, filename=f"cell-{index}")
+
+
+def test_colab_telemetry_callback_is_passed_only_to_training():
+    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_orbit_gpu.ipynb"
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    training_cell = next(
+        "".join(cell.get("source", []))
+        for cell in notebook["cells"]
+        if cell.get("cell_type") == "code" and "training_contract =" in "".join(cell.get("source", []))
+    )
+    tree = ast.parse(training_cell, filename="training-cell")
+    contract_call = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "build_training_contract"
+    )
+    train_call = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "train_behavior_clone"
+    )
+
+    assert not any(keyword.arg == "telemetry_callback" for keyword in contract_call.keywords)
+    assert [
+        keyword.value.id
+        for keyword in train_call.keywords
+        if keyword.arg == "telemetry_callback"
+        and isinstance(keyword.value, ast.Name)
+    ] == ["training_telemetry"]
 
 
 def test_colab_config_resolves_device_and_rejects_seed_overlap(monkeypatch, tmp_path):

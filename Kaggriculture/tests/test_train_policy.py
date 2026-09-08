@@ -750,6 +750,48 @@ def test_ppo_training_preserves_legacy_exact_signature_updater():
     assert len(calls) == 1
 
 
+def test_ppo_training_emits_progress_metrics_to_optional_telemetry_callback():
+    from scripts.train_policy import PPOConfig, run_ppo_training
+
+    events = []
+
+    metrics = run_ppo_training(
+        network=None,
+        optimizer=None,
+        transitions=[_transition(done=True)],
+        ppo_steps=1,
+        config=PPOConfig(),
+        offline_ppo_fallback=True,
+        update_fn=lambda **kwargs: {
+            "updates": 2,
+            "early_stopped": True,
+            "policy_loss": 0.1,
+            "value_loss": 0.2,
+            "entropy": 0.3,
+            "approx_kl": 0.4,
+        },
+        telemetry_callback=lambda event, values: events.append((event, values)),
+    )
+
+    assert metrics["early_stopped"] is True
+    assert events == [
+        (
+            "ppo",
+            {
+                "step": 1,
+                "ppo_updates": 2,
+                "ppo_updates_step": 2,
+                "rollout_count": 0,
+                "early_stopped": True,
+                "policy_loss": 0.1,
+                "value_loss": 0.2,
+                "entropy": 0.3,
+                "approx_kl": 0.4,
+            },
+        )
+    ]
+
+
 def test_cli_ppo_steps_require_explicit_offline_fallback_for_replay_reuse():
     from scripts.train_policy import _cli_training_options, _parser
 
@@ -1338,6 +1380,34 @@ def test_behavior_cloning_smoke_writes_checkpoint_metadata(tmp_path):
     assert checkpoint["configuration"]["device"] == "cpu"
     assert checkpoint["progress"] == {"epoch": 1, "round": 0, "cursor": 0}
     assert checkpoint["metrics"]["behavior_clone_updates"] == 1
+
+
+def test_behavior_cloning_emits_loss_and_update_count_at_checkpoint_intervals(tmp_path):
+    pytest.importorskip("torch")
+    from scripts.train_policy import train_behavior_clone
+
+    input_path = tmp_path / "transitions.jsonl"
+    output_path = tmp_path / "policy.pt"
+    input_path.write_text(
+        "\n".join(json.dumps(_transition(done=True)) for _ in range(2)) + "\n",
+        encoding="utf-8",
+    )
+    events = []
+
+    train_behavior_clone(
+        input_path=input_path,
+        output_path=output_path,
+        steps=1,
+        batch_size=1,
+        seed=7,
+        device="cpu",
+        checkpoint_interval=1,
+        telemetry_callback=lambda event, values: events.append((event, values)),
+    )
+
+    assert [event for event, _values in events] == ["behavior_clone", "behavior_clone"]
+    assert [values["update_count"] for _event, values in events] == [1, 2]
+    assert all(math.isfinite(values["loss"]) for _event, values in events)
 
 
 def test_behavior_cloning_starts_ppo_with_fresh_conservative_optimizer(tmp_path, monkeypatch):

@@ -16,6 +16,9 @@ training = [
     "numpy>=2,<3",
     "torch>=2,<3",
 ]
+observability = [
+    "weave>=0.51,<1",
+]
 
 [dependency-groups]
 dev = [
