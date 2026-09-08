@@ -1312,6 +1312,8 @@ def test_fresh_rollout_callback_can_refresh_candidate_artifact_per_round(tmp_pat
         candidate_artifact_callback=update_candidate,
         seeds=[41],
         steps=4,
+        no_progress_window=3,
+        resolved_margin=125.5,
     )
 
     first = rollout_fn(
@@ -1329,6 +1331,8 @@ def test_fresh_rollout_callback_can_refresh_candidate_artifact_per_round(tmp_pat
     assert updates[0][1] != updates[1][1]
     assert [item["candidate_artifact"] for item in collected] == [item[1] for item in updates]
     assert [item["opponent"] for item in collected] == ["starter", "random"]
+    assert [item["no_progress_window"] for item in collected] == [3, 3]
+    assert [item["resolved_margin"] for item in collected] == [125.5, 125.5]
 
 
 def test_promotion_requires_strictly_more_than_seventy_percent():
@@ -1989,6 +1993,81 @@ def test_resume_with_all_ppo_steps_completed_is_idempotent(tmp_path, monkeypatch
     assert metadata["ppo_metrics"] == ppo_metrics
     assert payload["metrics"]["ppo_metrics"] == ppo_metrics
     assert payload["progress"] == {"epoch": 1, "round": 2, "cursor": 0}
+
+
+def test_resume_ppo_progress_accepts_and_preserves_shaping_counts(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    from kagriculture_agent.checkpoints import save_checkpoint
+    from kagriculture_agent.model import CompactPolicyNet
+    from scripts import train_policy
+
+    input_path = tmp_path / "transitions.jsonl"
+    resume_path = tmp_path / "resume.pt"
+    output_path = tmp_path / "continued.pt"
+    input_path.write_text(json.dumps(_transition(done=True)) + "\n", encoding="utf-8")
+    ppo_metrics = _ppo_checkpoint_metrics(completed_steps=1)
+    ppo_metrics.update({"shaping_count": 3, "truncation_count": 2})
+    model = CompactPolicyNet().to("cpu")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    save_checkpoint(
+        resume_path, model=model, optimizer=optimizer,
+        configuration=_resume_configuration(input_path, ppo_steps=2),
+        epoch=1, round_index=1, cursor=0,
+        metrics={"behavior_clone_updates": 1, "ppo_updates": 4, "ppo_metrics": ppo_metrics},
+        metadata=train_policy.checkpoint_metadata(transition_count=1, device="cpu"),
+    )
+
+    monkeypatch.setattr(
+        train_policy, "ppo_update",
+        lambda **_kwargs: {
+            "updates": 1, "early_stopped": False,
+            "shaping_count": 2, "truncation_count": 1,
+        },
+    )
+    metadata = train_policy.train_behavior_clone(
+        input_path=input_path, output_path=output_path, steps=1, batch_size=1,
+        seed=7, ppo_steps=2, device="cpu", resume_checkpoint=resume_path,
+        rollout_fn=lambda **_kwargs: [_transition(done=True)],
+    )
+
+    payload = torch.load(output_path, map_location="cpu", weights_only=True)
+    assert metadata["ppo_metrics"]["shaping_count"] == 5
+    assert payload["metrics"]["ppo_metrics"]["truncation_count"] == 3
+
+
+def test_restore_checkpoint_accepts_legacy_state_without_training_only_head(tmp_path):
+    torch = pytest.importorskip("torch")
+    from kagriculture_agent.checkpoints import read_checkpoint, restore_checkpoint, save_checkpoint
+    from kagriculture_agent.model import CompactPolicyNet, set_training_seed
+    from scripts import train_policy
+
+    path = tmp_path / "legacy.pt"
+    set_training_seed(17)
+    source = CompactPolicyNet().to("cpu")
+    source_optimizer = torch.optim.AdamW(source.parameters(), lr=1e-3)
+    save_checkpoint(
+        path, model=source, optimizer=source_optimizer,
+        configuration=_resume_configuration(tmp_path / "transitions.jsonl"),
+        epoch=1, round_index=0, cursor=0,
+        metrics={"behavior_clone_updates": 0, "ppo_updates": 0, "ppo_metrics": None},
+        metadata=train_policy.checkpoint_metadata(transition_count=0, device="cpu"),
+    )
+    payload = read_checkpoint(path, map_location="cpu")
+    payload["model_state_dict"] = {
+        name: value for name, value in payload["model_state_dict"].items()
+        if not name.startswith("market_active_head.")
+    }
+    payload["optimizer_state_dict"]["param_groups"][0]["params"] = (
+        payload["optimizer_state_dict"]["param_groups"][0]["params"][:-2]
+    )
+
+    set_training_seed(17)
+    target = CompactPolicyNet().to("cpu")
+    target_optimizer = torch.optim.AdamW(target.parameters(), lr=1e-3)
+    restore_checkpoint(payload, model=target, optimizer=target_optimizer)
+
+    assert torch.count_nonzero(target.market_active_head.weight) == 0
+    assert torch.count_nonzero(target.market_active_head.bias) == 0
 
 
 def test_resume_allows_saved_cuda_device_on_cpu_and_records_current_device(tmp_path):

@@ -36,6 +36,9 @@ _RNG_FIELDS = {"python", "numpy", "torch", "torch_cuda"}
 _NUMPY_RNG_FIELDS = {
     "bit_generator", "keys", "position", "has_gauss", "cached_gaussian",
 }
+_TRAINING_ONLY_MODEL_TENSORS = {
+    "market_active_head.weight", "market_active_head.bias",
+}
 
 
 class CheckpointError(ValueError):
@@ -348,8 +351,25 @@ def restore_checkpoint(
     except Exception as exc:
         raise CheckpointError("could not snapshot current training state") from exc
     try:
-        model.load_state_dict(payload["model_state_dict"])
-        optimizer.load_state_dict(payload["optimizer_state_dict"])
+        model_state = payload["model_state_dict"]
+        expected_model_keys = set(model.state_dict())
+        actual_model_keys = set(model_state)
+        missing_model_keys = expected_model_keys - actual_model_keys
+        unexpected_model_keys = actual_model_keys - expected_model_keys
+        legacy_head_only = (
+            missing_model_keys <= _TRAINING_ONLY_MODEL_TENSORS
+            and not unexpected_model_keys
+        )
+        if not legacy_head_only and missing_model_keys:
+            model.load_state_dict(model_state)
+        else:
+            model.load_state_dict(model_state, strict=not legacy_head_only)
+        if legacy_head_only:
+            _restore_optimizer_legacy_compatible(
+                optimizer, payload["optimizer_state_dict"],
+            )
+        else:
+            optimizer.load_state_dict(payload["optimizer_state_dict"])
         if restore_rng:
             restore_rng_state(payload["rng_state"])
     except Exception as exc:
@@ -370,6 +390,31 @@ def restore_checkpoint(
         if isinstance(exc, CheckpointError):
             raise
         raise CheckpointError("checkpoint model or optimizer state is malformed") from exc
+
+
+def _restore_optimizer_legacy_compatible(optimizer: Any, saved_state: Mapping[str, Any]) -> None:
+    """Restore legacy optimizer slots while leaving new trailing parameters fresh."""
+    current_state = optimizer.state_dict()
+    current_groups = current_state.get("param_groups", [])
+    saved_groups = saved_state.get("param_groups", [])
+    if len(current_groups) != len(saved_groups):
+        raise ValueError("legacy optimizer parameter groups do not match")
+    adapted = copy.deepcopy(dict(saved_state))
+    adapted["state"] = {}
+    adapted["param_groups"] = []
+    saved_slots = saved_state.get("state", {})
+    for current_group, saved_group in zip(current_groups, saved_groups):
+        current_params = list(current_group.get("params", []))
+        saved_params = list(saved_group.get("params", []))
+        if len(saved_params) > len(current_params):
+            raise ValueError("legacy optimizer parameter group is larger than the current model")
+        group = copy.deepcopy(dict(saved_group))
+        group["params"] = current_params
+        adapted["param_groups"].append(group)
+        for saved_id, current_id in zip(saved_params, current_params):
+            if saved_id in saved_slots:
+                adapted["state"][current_id] = copy.deepcopy(saved_slots[saved_id])
+    optimizer.load_state_dict(adapted)
 
 
 def load_checkpoint(

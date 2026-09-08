@@ -228,7 +228,81 @@ def test_transition_serialization_is_deterministic_and_json_compatible(tmp_path)
     second = transition.to_json()
     assert first == second
     assert json.loads(first) == transition.to_dict()
+
+
+def test_transition_preserves_and_validates_termination_metadata():
+    from kagriculture_agent.trajectory import Transition
+
+    transition = Transition(
+        observation={}, action={}, next_observation={}, done=False, reward=0.0,
+        final_bank=1.0, opponent_final_bank=1.0, safety_flags=(),
+        termination_reason="no_progress", bootstrap_truncated=True,
+        no_progress_steps=4,
+    )
+
+    record = transition.to_dict()
+    assert record["termination_reason"] == "no_progress"
+    assert record["bootstrap_truncated"] is True
+    assert record["no_progress_steps"] == 4
+
+    with pytest.raises(ValueError, match="no_progress_steps"):
+        Transition(
+            observation={}, action={}, next_observation={}, done=False, reward=0.0,
+            final_bank=1.0, opponent_final_bank=1.0, safety_flags=(),
+            no_progress_steps=-1,
+        )
+
+
+def test_collection_preserves_termination_metadata_in_jsonl_and_manifest(tmp_path, monkeypatch):
+    from kagriculture_agent.trajectory import Transition
+    from scripts import collect_trajectories
+
+    transition = Transition(
+        observation={}, action={}, next_observation={}, done=False, reward=0.0,
+        final_bank=1.0, opponent_final_bank=1.0, safety_flags=(),
+        termination_reason="no_progress", bootstrap_truncated=True,
+        no_progress_steps=4,
+    )
+    monkeypatch.setattr(collect_trajectories, "_run_game_isolated", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        collect_trajectories, "transitions_from_replay", lambda *args, **kwargs: [transition],
+    )
+
+    output = tmp_path / "trajectory.jsonl"
+    manifest = collect_trajectories.collect(
+        seeds=[0], opponents=["pass"], seats=[0], steps=4, output=output,
+    )
+
+    record = json.loads(output.read_text().strip())
+    assert record["termination_reason"] == "no_progress"
+    assert record["bootstrap_truncated"] is True
+    assert record["no_progress_steps"] == 4
+    assert manifest["termination_reasons"] == {"no_progress": 1}
+    assert manifest["bootstrap_truncated_count"] == 1
+    assert manifest["max_no_progress_steps"] == 4
     json.dumps(transition.to_dict(), allow_nan=False, sort_keys=True, separators=(",", ":"))
+
+
+def test_collection_resolution_marks_no_progress_and_preserves_terminal_done():
+    from kagriculture_agent.trajectory import Transition
+    from scripts.collect_trajectories import _resolve_collection_transitions
+
+    def row(*, done=False, cash=1000, next_cash=1000):
+        return Transition(
+            observation={"cash": cash}, action={}, next_observation={"cash": next_cash},
+            done=done, reward=0.0, final_bank=1.0, opponent_final_bank=1.0,
+            safety_flags=(),
+        )
+
+    resolved = _resolve_collection_transitions(
+        [row(), row(), row(done=True)], no_progress_window=2, resolved_margin=0.0,
+    )
+
+    assert resolved[1].bootstrap_truncated is True
+    assert resolved[1].termination_reason == "no_progress"
+    assert resolved[1].no_progress_steps == 2
+    assert resolved[2].done is True
+    assert resolved[2].bootstrap_truncated is None
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
@@ -252,6 +326,21 @@ def test_local_runner_exposes_current_opponent_and_candidate_seat():
     assert OPPONENTS == ("pass", "random", "starter")
     assert args.opponent == "pass"
     assert args.candidate_player == 1
+
+
+def test_collector_cli_exposes_resolution_options_with_legacy_defaults():
+    from scripts.collect_trajectories import _parser
+
+    defaults = _parser().parse_args(["--output", "trajectory.jsonl"])
+    configured = _parser().parse_args([
+        "--output", "trajectory.jsonl", "--no-progress-window", "3",
+        "--resolved-margin", "125.5",
+    ])
+
+    assert defaults.no_progress_window == 0
+    assert defaults.resolved_margin == 0.0
+    assert configured.no_progress_window == 3
+    assert configured.resolved_margin == pytest.approx(125.5)
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")

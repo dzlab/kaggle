@@ -12,6 +12,7 @@ import sys
 import tempfile
 import uuid
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +25,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from kagriculture_agent.constants import ENGINE_VERSION
 from kagriculture_agent.features import FEATURE_SCHEMA_VERSION
 from kagriculture_agent.rollouts import resolve_worker_count, run_rollouts
-from kagriculture_agent.trajectory import TRANSITION_SCHEMA_VERSION, transitions_from_replay
+from kagriculture_agent.reward_shaping import classify_progress, should_bootstrap_truncate
+from kagriculture_agent.trajectory import TRANSITION_SCHEMA_VERSION, Transition, transitions_from_replay
 
 COLLECTOR_OPPONENTS = ("pass", "random", "starter", "current")
 OPPONENTS = COLLECTOR_OPPONENTS
@@ -66,6 +68,26 @@ def _positive_float(value: str) -> float:
         raise argparse.ArgumentTypeError("must be a positive finite number") from exc
     if number <= 0 or number != number or number == float("inf"):
         raise argparse.ArgumentTypeError("must be a positive finite number")
+    return number
+
+
+def _nonnegative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer") from exc
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer")
+    return number
+
+
+def _nonnegative_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a nonnegative finite number") from exc
+    if number < 0 or not math.isfinite(number):
+        raise argparse.ArgumentTypeError("must be a nonnegative finite number")
     return number
 
 
@@ -153,6 +175,72 @@ def _manifest(
     }
 
 
+def _resolve_collection_transitions(
+    transitions: Sequence[Transition], *, no_progress_window: int = 0,
+    resolved_margin: float = 0.0,
+) -> list[Transition]:
+    """Annotate configured stalls/resolutions without changing genuine terminals."""
+    if (
+        isinstance(no_progress_window, bool)
+        or not isinstance(no_progress_window, int)
+        or no_progress_window < 0
+    ):
+        raise ValueError("no_progress_window must be a nonnegative integer")
+    if (
+        isinstance(resolved_margin, bool)
+        or not isinstance(resolved_margin, (int, float))
+        or not math.isfinite(float(resolved_margin))
+        or resolved_margin < 0
+    ):
+        raise ValueError("resolved_margin must be a nonnegative finite number")
+    resolved: list[Transition] = []
+    no_progress_steps = 0
+    for transition in transitions:
+        if not isinstance(transition, Transition):
+            raise ValueError("collector transitions must be validated Transition records")
+        if transition.done:
+            # A genuine engine terminal remains terminal, even if its replay
+            # metadata contains a stall marker.
+            resolved.append(transition)
+            no_progress_steps = 0
+            continue
+        progress = classify_progress(transition.observation, transition.next_observation)
+        if transition.no_progress_steps is not None:
+            current_steps = transition.no_progress_steps
+        elif progress == "no_progress":
+            current_steps = no_progress_steps + 1
+        else:
+            current_steps = 0
+        no_progress_steps = current_steps
+        bootstrap_truncated = transition.bootstrap_truncated
+        termination_reason = transition.termination_reason
+        if bootstrap_truncated is None and should_bootstrap_truncate(
+            current_steps, no_progress_window,
+        ):
+            bootstrap_truncated = True
+            termination_reason = termination_reason or "no_progress"
+        if bootstrap_truncated and termination_reason is None:
+            termination_reason = "bootstrap_truncated"
+        if not bootstrap_truncated and resolved_margin > 0:
+            raw_margin = transition.observation.get("bank_differential")
+            if raw_margin is None:
+                raw_margin = transition.next_observation.get("bank_differential")
+            try:
+                decided = raw_margin is not None and abs(float(raw_margin)) >= resolved_margin
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("collector bank_differential is malformed") from None
+            if decided:
+                bootstrap_truncated = True
+                termination_reason = termination_reason or "resolved"
+        resolved.append(replace(
+            transition,
+            bootstrap_truncated=bootstrap_truncated,
+            termination_reason=termination_reason,
+            no_progress_steps=current_steps if no_progress_window else transition.no_progress_steps,
+        ))
+    return resolved
+
+
 def _validate_pair(
     trajectory_path: Path, manifest_path: Path, run_id: str,
 ) -> None:
@@ -168,6 +256,38 @@ def _validate_pair(
         raise RuntimeError("trajectory artifact pair has mismatched content hash")
     if manifest.get("transition_count") != trajectory_bytes.count(b"\n"):
         raise RuntimeError("trajectory artifact pair has mismatched transition count")
+    records = []
+    try:
+        records = [json.loads(line) for line in trajectory_bytes.decode("utf-8").splitlines() if line]
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("trajectory artifact pair contains invalid JSON") from exc
+    if any(not isinstance(record, dict) for record in records):
+        raise RuntimeError("trajectory artifact pair contains a non-object transition")
+    reasons: dict[str, int] = {}
+    truncated_count = 0
+    max_no_progress = 0
+    for record in records:
+        reason = record.get("termination_reason")
+        if reason is not None:
+            if type(reason) is not str or not reason:
+                raise RuntimeError("trajectory termination_reason is invalid")
+            reasons[reason] = reasons.get(reason, 0) + 1
+        truncated = record.get("bootstrap_truncated")
+        if truncated is not None and type(truncated) is not bool:
+            raise RuntimeError("trajectory bootstrap_truncated is invalid")
+        if truncated:
+            truncated_count += 1
+        progress = record.get("no_progress_steps")
+        if progress is not None and (type(progress) is not int or progress < 0):
+            raise RuntimeError("trajectory no_progress_steps is invalid")
+        if progress is not None:
+            max_no_progress = max(max_no_progress, progress)
+    if "termination_reasons" in manifest and manifest["termination_reasons"] != reasons:
+        raise RuntimeError("trajectory manifest termination reasons do not match content")
+    if "bootstrap_truncated_count" in manifest and manifest["bootstrap_truncated_count"] != truncated_count:
+        raise RuntimeError("trajectory manifest truncation count does not match content")
+    if "max_no_progress_steps" in manifest and manifest["max_no_progress_steps"] != max_no_progress:
+        raise RuntimeError("trajectory manifest progress count does not match content")
 
 
 def _publish_pair(
@@ -217,6 +337,8 @@ def collect(
     opponent_artifact: str | Path | None = None,
     opponent_checkpoint_identity: str | None = None,
     workers: int | None = 1,
+    no_progress_window: int = 0,
+    resolved_margin: float = 0.0,
 ) -> dict[str, Any]:
     """Collect and write one validated transition per output JSONL line."""
     normalized_seeds = _strict_int_values(seeds, "seeds")
@@ -250,6 +372,9 @@ def collect(
     if isinstance(game_timeout, bool) or not isinstance(game_timeout, (int, float)) \
             or not math.isfinite(float(game_timeout)) or float(game_timeout) <= 0:
         raise ValueError("game_timeout must be a positive finite number")
+    _resolve_collection_transitions(
+        [], no_progress_window=no_progress_window, resolved_margin=resolved_margin,
+    )
 
     destination = Path(output)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -261,6 +386,10 @@ def collect(
         steps=steps,
         source_policy_identity=source_policy_identity,
     )
+    if no_progress_window:
+        manifest["no_progress_window"] = no_progress_window
+    if resolved_margin:
+        manifest["resolved_margin"] = float(resolved_margin)
     if artifact_path is not None or candidate_identity is not None:
         manifest["candidate_artifact"] = str(artifact_path) if artifact_path is not None else None
         manifest["candidate_identity"] = candidate_identity
@@ -289,6 +418,9 @@ def collect(
     manifest_temp_path: Path | None = None
     trajectory_hash = hashlib.sha256()
     transition_count = 0
+    termination_reasons: dict[str, int] = {}
+    bootstrap_truncated_count = 0
+    max_no_progress_steps = 0
     try:
         trajectory_temp = tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", dir=destination.parent,
@@ -333,6 +465,11 @@ def collect(
                             result.replay, candidate_player=request.candidate_player,
                             requested_seed=request.seed,
                         )
+                        transitions = _resolve_collection_transitions(
+                            transitions,
+                            no_progress_window=no_progress_window,
+                            resolved_margin=resolved_margin,
+                        )
                     except BaseException as exc:
                         parse_failure = {
                             "request_key": result.request_key,
@@ -344,6 +481,16 @@ def collect(
                         collection_failures.append(parse_failure)
                         continue
                     for transition in transitions:
+                        if transition.termination_reason is not None:
+                            termination_reasons[transition.termination_reason] = (
+                                termination_reasons.get(transition.termination_reason, 0) + 1
+                            )
+                        if transition.bootstrap_truncated:
+                            bootstrap_truncated_count += 1
+                        if transition.no_progress_steps is not None:
+                            max_no_progress_steps = max(
+                                max_no_progress_steps, transition.no_progress_steps,
+                            )
                         serialized = transition.to_json() + "\n"
                         trajectory_temp.write(serialized)
                         trajectory_hash.update(serialized.encode("utf-8"))
@@ -354,6 +501,12 @@ def collect(
                     )
             manifest["transition_count"] = transition_count
             manifest["trajectory_sha256"] = trajectory_hash.hexdigest()
+            if termination_reasons:
+                manifest["termination_reasons"] = termination_reasons
+            if bootstrap_truncated_count:
+                manifest["bootstrap_truncated_count"] = bootstrap_truncated_count
+            if max_no_progress_steps:
+                manifest["max_no_progress_steps"] = max_no_progress_steps
             manifest_temp.write(
                 json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
             )
@@ -389,6 +542,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate-identity", default=None)
     parser.add_argument("--workers", type=_positive_int, default=1)
     parser.add_argument(
+        "--no-progress-window", type=_nonnegative_int, default=0,
+        help="bootstrap-truncate after this many consecutive no-progress transitions",
+    )
+    parser.add_argument(
+        "--resolved-margin", type=_nonnegative_float, default=0.0,
+        help="bootstrap-truncate configured resolved bank margins",
+    )
+    parser.add_argument(
         "--game-timeout", type=_positive_float, default=DEFAULT_GAME_TIMEOUT_SECONDS,
         help="maximum seconds allowed for each isolated game",
     )
@@ -409,6 +570,8 @@ def main(argv: list[str] | None = None) -> int:
         candidate_identity=args.candidate_identity,
         workers=args.workers,
         game_timeout=args.game_timeout,
+        no_progress_window=args.no_progress_window,
+        resolved_margin=args.resolved_margin,
     )
     print(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
     print(f"trajectories: {args.output}")

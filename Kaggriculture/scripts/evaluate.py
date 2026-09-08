@@ -45,6 +45,7 @@ from kagriculture_agent.observation import is_shed_adjacent  # noqa: E402
 from kagriculture_agent.planner import _has_basic_need_deadline  # noqa: E402
 from kagriculture_agent.policy import Policy  # noqa: E402
 from scripts.run_local import OPPONENTS, _deterministic_random_agent  # noqa: E402
+from scripts.evaluation_metrics import bradley_terry_summary as _league_elo_summary  # noqa: E402
 
 
 VARIANTS = ("conservative", "mixed", "melon-heavy", "demand-reactive", "animal-heavy")
@@ -596,6 +597,17 @@ def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     )
     bootstrap_win_rate = _bootstrap_interval(pair_scores, pair_keys)
     bootstrap = _bootstrap_interval(pair_differentials, pair_keys)
+    elo_matches = [
+        {
+            "player_a": _record_candidate(record),
+            "player_b": str(record.get("opponent")),
+            "outcome": record["outcome"],
+        }
+        for record in records
+        if _metric_record_is_valid(record)
+        and _record_candidate(record) != str(record.get("opponent"))
+    ]
+    elo = _league_elo_summary(elo_matches)
     return {
         "record_count": len(records),
         "valid_records_by_seat": {"0": valid_by_seat[0], "1": valid_by_seat[1]},
@@ -630,6 +642,13 @@ def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "mean_paired_terminal_inventory_value": float(mean(pair_terminal_inventory_value)) if pair_terminal_inventory_value else None,
         "median_paired_terminal_inventory_value": float(median(pair_terminal_inventory_value)) if pair_terminal_inventory_value else None,
         "wilson_win_rate": wilson,
+        "lower_tail_bank_differential": percentile(pair_differentials, 5),
+        "elo": elo,
+        "confidence": {
+            "wilson_win_rate": wilson,
+            "bootstrap_seat_balanced_win_rate": bootstrap_win_rate,
+            "bootstrap_bank_differential": bootstrap,
+        },
         "bootstrap_seat_balanced_win_rate": bootstrap_win_rate,
         "bootstrap_bank_differential": bootstrap,
     }

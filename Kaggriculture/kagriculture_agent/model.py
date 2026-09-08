@@ -6,6 +6,7 @@ Forward contract for a single :class:`FeatureBatch` or a sequence of batches::
         "worker_act_logits": float[B, 10, 2],
         "worker_target_logits": float[B, 10, 100],
         "worker_kind_logits": float[B, 10, len(ACTION_VOCAB["worker_kinds"])],
+        "market_active_logits": float[B, 2],
         "market_item_logits": float[B, len(PRODUCTS)],
         "market_quantity_logits": float[B, len(ACTION_VOCAB["market_quantities"])],
         "value": float[B],
@@ -174,6 +175,13 @@ if nn is not None:
                 self.hidden_width, len(ACTION_VOCAB["market_quantities"]),
             )
             self.value_head = nn.Linear(self.hidden_width, 1)
+            # Training-only branch.  It is declared after the legacy heads so
+            # their seeded initialization and exported behavior stay stable.
+            self.market_active_head = nn.Linear(self.hidden_width, 2)
+            # Keep this head neutral for legacy checkpoints and until market
+            # intent training is explicitly enabled.
+            nn.init.zeros_(self.market_active_head.weight)
+            nn.init.zeros_(self.market_active_head.bias)
 
         def forward(self, feature_batch: FeatureBatch | Sequence[FeatureBatch]) -> dict[str, Any]:
             tensors = feature_batch_to_tensors(feature_batch, device=next(self.parameters()).device)
@@ -201,6 +209,7 @@ if nn is not None:
                 "worker_act_logits": self.worker_act_head(encoded_workers),
                 "worker_target_logits": worker_target_logits,
                 "worker_kind_logits": self.worker_kind_head(encoded_workers),
+                "market_active_logits": self.market_active_head(pooled_market),
                 "market_item_logits": self.market_item_head(pooled_market),
                 "market_quantity_logits": self.market_quantity_head(pooled_market),
                 "value": self.value_head(encoded_global).squeeze(-1),

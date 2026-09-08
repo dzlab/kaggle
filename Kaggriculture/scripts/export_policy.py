@@ -25,6 +25,9 @@ from kagriculture_agent.model import ACTION_VOCAB, HIDDEN_WIDTH, MODEL_VERSION
 
 FORMAT_VERSION = 1
 QUANTIZATION = "int8-per-row"
+_TRAINING_ONLY_TENSOR_NAMES = frozenset({
+    "market_active_head.weight", "market_active_head.bias",
+})
 
 
 def _canonical_bytes(value: dict[str, Any]) -> bytes:
@@ -133,12 +136,17 @@ def validate_checkpoint_state_dict(state: Any) -> None:
     if not isinstance(state, dict):
         raise ValueError("checkpoint model_state_dict is required")
     expected = set(expected_tensor_names())
-    if set(state) != expected:
-        missing = sorted(expected - set(state))
-        extra = sorted(set(state) - expected)
+    actual = set(state)
+    missing = expected - actual
+    unexpected = actual - expected - _TRAINING_ONLY_TENSOR_NAMES
+    if missing or unexpected:
+        missing = sorted(missing)
+        extra = sorted(unexpected)
         raise ValueError(f"checkpoint tensors mismatch (missing={missing}, extra={extra})")
     shapes = artifact_tensor_shapes()
     for name, tensor in state.items():
+        if name not in expected:
+            continue
         actual_shape = tuple(getattr(tensor, "shape", ()))
         if actual_shape != shapes[name]:
             raise ValueError(f"checkpoint tensor {name!r} shape mismatch: expected {shapes[name]}, got {actual_shape}")

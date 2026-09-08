@@ -11,7 +11,7 @@ import random
 import shutil
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -27,8 +27,10 @@ from kagriculture_agent.checkpoints import (
     restore_checkpoint,
     save_checkpoint,
 )
+from kagriculture_agent.action_objectives import conditional_action_objectives
 from kagriculture_agent.constants import ENGINE_VERSION
 from kagriculture_agent.features import FEATURE_SCHEMA_VERSION, extract_features
+from kagriculture_agent.league import LeagueSampler, OpponentMatch
 from kagriculture_agent.model import (
     ACTION_VOCAB,
     MODEL_VERSION,
@@ -37,6 +39,7 @@ from kagriculture_agent.model import (
     resolve_device,
     set_training_seed,
 )
+from kagriculture_agent.reward_shaping import shaped_transition_reward, should_bootstrap_truncate
 
 PROMOTION_MATCH_SIZE = 100
 LOG_RATIO_CLAMP = 20.0
@@ -67,11 +70,16 @@ class PPOConfig:
     kl_coef: float = 0.10
     prior_ce_coef: float = 0.01
     ppo_epochs: int = 1
+    potential_reward_coef: float = 0.0
+    no_progress_window: int = 0
+    resolved_margin: float = 0.0
+    training_action_mask: bool = False
 
     def __post_init__(self) -> None:
         for name in (
             "gamma", "gae_lambda", "clip_epsilon", "value_coef", "entropy_coef",
             "target_kl", "rollout_steps", "kl_coef", "prior_ce_coef", "ppo_epochs",
+            "potential_reward_coef", "no_progress_window", "resolved_margin",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
@@ -79,19 +87,28 @@ class PPOConfig:
         for name in ("rollout_steps", "ppo_epochs"):
             if type(getattr(self, name)) is not int:
                 raise ValueError(f"{name} must be an integer")
+        if type(self.no_progress_window) is not int:
+            raise ValueError("no_progress_window must be an integer")
+        if type(self.training_action_mask) is not bool:
+            raise ValueError("training_action_mask must be boolean")
         if not 0.0 < self.gamma <= 1.0:
             raise ValueError("gamma must be in (0, 1]; gamma=1.0 is for explicit experiments only")
         if not 0.0 <= self.gae_lambda <= 1.0:
             raise ValueError("gae_lambda must be in [0, 1]")
         if self.clip_epsilon <= 0.0:
             raise ValueError("clip_epsilon must be positive")
-        for name in ("value_coef", "entropy_coef", "kl_coef", "prior_ce_coef"):
+        for name in (
+            "value_coef", "entropy_coef", "kl_coef", "prior_ce_coef",
+            "potential_reward_coef", "resolved_margin",
+        ):
             if getattr(self, name) < 0.0:
                 raise ValueError(f"{name} must be nonnegative")
         if self.target_kl <= 0.0:
             raise ValueError("target_kl must be positive")
         if self.rollout_steps < 1 or self.ppo_epochs < 1:
             raise ValueError("rollout_steps and ppo_epochs must be positive")
+        if self.no_progress_window < 0:
+            raise ValueError("no_progress_window must be nonnegative")
 
 
 @dataclass(frozen=True)
@@ -115,13 +132,21 @@ _RESUME_CONFIGURATION_FIELDS = (
 _RUNTIME_CONFIGURATION_FIELDS = {"device", "checkpoint_interval"}
 _PPO_FLOAT_FIELDS = {
     "gamma", "gae_lambda", "clip_epsilon", "value_coef", "entropy_coef",
-    "target_kl", "kl_coef", "prior_ce_coef",
+    "target_kl", "kl_coef", "prior_ce_coef", "potential_reward_coef", "resolved_margin",
 }
-_PPO_INTEGER_FIELDS = {"rollout_steps", "ppo_epochs"}
+_PPO_INTEGER_FIELDS = {"rollout_steps", "ppo_epochs", "no_progress_window"}
+_PPO_BOOLEAN_FIELDS = {"training_action_mask"}
+_PPO_BACKWARDS_COMPATIBLE_DEFAULTS = {
+    "potential_reward_coef": 0.0,
+    "no_progress_window": 0,
+    "resolved_margin": 0.0,
+    "training_action_mask": False,
+}
 _PPO_RESUME_METRIC_FIELDS = {
     "ppo_updates", "rollout_count", "early_stopped", "last_metrics",
     "promotion", "completed_steps",
 }
+_PPO_OPTIONAL_RESUME_METRIC_FIELDS = {"shaping_count", "truncation_count"}
 
 
 def _validate_content_identity(value: Any, *, source: str, label: str) -> None:
@@ -145,26 +170,38 @@ def _validate_prior_checkpoint_identity(value: Any, *, source: str) -> None:
     _validate_content_identity(value, source=source, label="prior_checkpoint")
 
 
-def _validate_ppo_configuration(value: Any, *, source: str) -> None:
-    expected_fields = _PPO_FLOAT_FIELDS | _PPO_INTEGER_FIELDS
+def _validate_ppo_configuration(value: Any, *, source: str) -> dict[str, Any]:
+    expected_fields = _PPO_FLOAT_FIELDS | _PPO_INTEGER_FIELDS | _PPO_BOOLEAN_FIELDS
     if type(value) is not dict:
         raise ValueError(f"{source} ppo_config must be an object")
-    missing = sorted(expected_fields - set(value))
-    unexpected = sorted(set(value) - expected_fields)
+    normalized = dict(value)
+    missing = expected_fields - set(normalized)
+    unsupported_missing = missing - set(_PPO_BACKWARDS_COMPATIBLE_DEFAULTS)
+    if unsupported_missing:
+        missing = unsupported_missing
+    else:
+        for field in missing:
+            normalized[field] = _PPO_BACKWARDS_COMPATIBLE_DEFAULTS[field]
+    missing = sorted(missing)
+    unexpected = sorted(set(normalized) - expected_fields)
     if missing:
         raise ValueError(f"{source} ppo_config is missing required fields: {', '.join(missing)}")
     if unexpected:
         raise ValueError(f"{source} ppo_config has unexpected fields: {', '.join(unexpected)}")
     for field in sorted(_PPO_FLOAT_FIELDS):
-        if type(value[field]) is not float:
+        if type(normalized[field]) is not float:
             raise ValueError(f"{source} ppo_config {field} must be a float")
     for field in sorted(_PPO_INTEGER_FIELDS):
-        if type(value[field]) is not int:
+        if type(normalized[field]) is not int:
             raise ValueError(f"{source} ppo_config {field} must be an integer")
+    for field in sorted(_PPO_BOOLEAN_FIELDS):
+        if type(normalized[field]) is not bool:
+            raise ValueError(f"{source} ppo_config {field} must be a boolean")
     try:
-        PPOConfig(**value)
+        PPOConfig(**normalized)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{source} ppo_config is invalid: {exc}") from exc
+    return normalized
 
 
 def _validate_configuration_shape(configuration: Any, *, source: str) -> None:
@@ -196,7 +233,9 @@ def _validate_configuration_shape(configuration: Any, *, source: str) -> None:
     if type(configuration["offline_ppo_fallback"]) is not bool:
         raise ValueError(f"{source} configuration offline_ppo_fallback must be boolean")
     _validate_prior_checkpoint_identity(configuration["prior_checkpoint"], source=source)
-    _validate_ppo_configuration(configuration["ppo_config"], source=source)
+    configuration["ppo_config"] = _validate_ppo_configuration(
+        configuration["ppo_config"], source=source,
+    )
 
 
 def build_training_contract(
@@ -204,6 +243,7 @@ def build_training_contract(
     ppo_steps: int = 0, device: str = "auto", checkpoint_interval: int = 100,
     prior_checkpoint: str | Path | None = None,
     offline_ppo_fallback: bool = False, resolved_device: Any | None = None,
+    ppo_config: PPOConfig | None = None,
 ) -> TrainingContract:
     """Build the canonical input/configuration contract used by training and resume.
 
@@ -226,6 +266,8 @@ def build_training_contract(
         raise ValueError("checkpoint_interval must be a positive integer")
     if type(offline_ppo_fallback) is not bool:
         raise ValueError("offline_ppo_fallback must be boolean")
+    if ppo_config is not None and not isinstance(ppo_config, PPOConfig):
+        raise ValueError("ppo_config must be a PPOConfig or None")
     resolved = resolve_device(device) if resolved_device is None else resolved_device
     normalized_batch_size = max(1, batch_size)
     normalized_steps = max(1, steps)
@@ -240,7 +282,7 @@ def build_training_contract(
         "device": str(resolved),
         "prior_checkpoint": _checkpoint_identity(prior_checkpoint),
         "offline_ppo_fallback": offline_ppo_fallback,
-        "ppo_config": asdict(PPOConfig()),
+        "ppo_config": asdict(ppo_config or PPOConfig()),
         "checkpoint_interval": checkpoint_interval,
     }
     _validate_configuration_shape(configuration, source="requested")
@@ -297,14 +339,6 @@ def _trajectory_identity(path: str | Path) -> dict[str, str]:
 
 
 @dataclass(frozen=True)
-class OpponentMatch:
-    opponent: str
-    seat: int
-    checkpoint: str | None = None
-    mixed_opponent: str | None = None
-
-
-@dataclass(frozen=True)
 class WorkerLabels:
     act: list[int]
     target: list[int]
@@ -323,6 +357,11 @@ class RolloutBatch:
     worker: WorkerLabels
     market_items: list[int]
     market_quantities: list[int]
+    market_active: list[int]
+    bootstrap_values: list[float] = field(default_factory=list)
+    bootstrap_truncated: list[bool] = field(default_factory=list)
+    shaping_count: int = 0
+    truncation_count: int = 0
 
 
 class OpponentPool:
@@ -338,14 +377,33 @@ class OpponentPool:
         "checkpoint": 0.25,
     }
 
-    def __init__(self, previous_checkpoints: Sequence[str | Path] = ()) -> None:
+    def __init__(
+        self, previous_checkpoints: Sequence[str | Path] | None = None, *,
+        league_sampler: LeagueSampler | None = None,
+        sampler: LeagueSampler | None = None,
+    ) -> None:
+        if league_sampler is not None and sampler is not None:
+            raise ValueError("provide only one of league_sampler or sampler")
+        selected_sampler = league_sampler if league_sampler is not None else sampler
+        if selected_sampler is not None and not isinstance(selected_sampler, LeagueSampler):
+            raise ValueError("league_sampler must be a LeagueSampler or None")
+        self.league_sampler = selected_sampler
+        if previous_checkpoints is None:
+            previous_checkpoints = ()
+        elif isinstance(previous_checkpoints, (str, bytes)) or not isinstance(
+            previous_checkpoints, Sequence,
+        ):
+            raise ValueError("previous_checkpoints must be a sequence or None")
         self.checkpoint_candidates = tuple(str(path) for path in previous_checkpoints[-5:])
         total = sum(self.probabilities.values())
         if abs(total - 1.0) > 1e-12:
             raise ValueError("opponent pool probabilities must sum to one")
 
-    def sample(self, index: int) -> OpponentMatch:
-        rng = random.Random(int(index))
+    def sample(self, index: int, *, seed: int = 0) -> OpponentMatch:
+        rng_seed = int(index) if seed == 0 else ((int(seed) << 32) ^ int(index))
+        rng = random.Random(rng_seed)
+        if self.league_sampler is not None:
+            return self.league_sampler.sample(index, seed=seed)
         draw = rng.random()
         cumulative = 0.0
         selected = "checkpoint"
@@ -370,6 +428,8 @@ class OpponentPool:
 
     def schedule(self, *, count: int, seed: int = 0) -> list[OpponentMatch]:
         """Return a deterministic stratified schedule with alternating seats."""
+        if self.league_sampler is not None:
+            return self.league_sampler.schedule(count, seed=seed)
         if count < 1:
             raise ValueError("count must be positive")
         counts = {
@@ -465,6 +525,8 @@ def normalize_advantages(advantages: Sequence[float], epsilon: float = 1e-8) -> 
 def generalized_advantage_estimate(
     *, rewards: Sequence[float], values: Sequence[float], dones: Sequence[bool],
     gamma: float = PPOConfig.gamma, gae_lambda: float = PPOConfig.gae_lambda,
+    bootstrap_values: Sequence[float] | None = None,
+    bootstrap_truncated: Sequence[bool] | None = None,
 ) -> tuple[list[float], list[float]]:
     if not (len(rewards) == len(values) == len(dones)):
         raise ValueError("rewards, values, and dones must have the same length")
@@ -472,15 +534,43 @@ def generalized_advantage_estimate(
     gae_lambda = _finite_float(gae_lambda, "gae_lambda")
     rewards = [_finite_float(reward, "rewards") for reward in rewards]
     values = [_finite_float(value, "values") for value in values]
+    if bootstrap_values is None:
+        final_bootstrap_values = [0.0 for _value in rewards]
+    else:
+        if len(bootstrap_values) != len(rewards):
+            raise ValueError("bootstrap_values must have the same length as rewards")
+        final_bootstrap_values = [
+            _finite_float(value, "bootstrap_values") for value in bootstrap_values
+        ]
+    if bootstrap_truncated is None:
+        truncation_flags = [False for _value in rewards]
+        if bootstrap_values is not None and truncation_flags:
+            # Preserve the old single-final-bootstrap API for direct callers.
+            truncation_flags[-1] = True
+    else:
+        if len(bootstrap_truncated) != len(rewards):
+            raise ValueError("bootstrap_truncated must have the same length as rewards")
+        if any(type(value) is not bool for value in bootstrap_truncated):
+            raise ValueError("bootstrap_truncated must contain only booleans")
+        truncation_flags = list(bootstrap_truncated)
     advantages = [0.0 for _ in rewards]
     next_advantage = 0.0
-    next_value = 0.0
     for index in range(len(rewards) - 1, -1, -1):
-        nonterminal = 0.0 if dones[index] else 1.0
-        delta = rewards[index] + gamma * next_value * nonterminal - values[index]
-        next_advantage = delta + gamma * gae_lambda * nonterminal * next_advantage
+        is_terminal = bool(dones[index])
+        is_truncated = truncation_flags[index] and not is_terminal
+        delta_nonterminal = 0.0 if is_terminal else 1.0
+        continuation = 0.0 if is_terminal or is_truncated else 1.0
+        if is_terminal:
+            next_value = 0.0
+        elif is_truncated:
+            next_value = final_bootstrap_values[index]
+        elif index + 1 < len(rewards):
+            next_value = values[index + 1]
+        else:
+            next_value = 0.0
+        delta = rewards[index] + gamma * next_value * delta_nonterminal - values[index]
+        next_advantage = delta + gamma * gae_lambda * continuation * next_advantage
         advantages[index] = next_advantage
-        next_value = values[index]
     returns = [advantage + value for advantage, value in zip(advantages, values)]
     return advantages, returns
 
@@ -679,18 +769,87 @@ def _market_labels(action: dict[str, Any]) -> tuple[int, int]:
     return item_lookup.get(item, 0), quantity_lookup.get(quantity, 0)
 
 
+def _market_active_label(action: dict[str, Any]) -> int:
+    market = action.get("market", [])
+    return int(
+        isinstance(market, Sequence)
+        and not isinstance(market, (str, bytes))
+        and bool(market)
+    )
+
+
+def _transition_base_reward(transition: Mapping[str, Any], *, done: bool, config: PPOConfig) -> float:
+    if done:
+        terminal = terminal_bank_margin_reward(
+            transition.get("final_bank"), transition.get("opponent_final_bank"),
+        )
+        if transition.get("final_bank") is None and transition.get("opponent_final_bank") is None:
+            try:
+                reward = float(transition.get("reward", 0.0))
+            except (TypeError, ValueError, OverflowError):
+                reward = 0.0
+            return reward if math.isfinite(reward) else 0.0
+        return terminal
+    if config.potential_reward_coef == 0.0:
+        # Preserve the legacy trajectory contract: nonterminal base rewards
+        # are zero unless shaping is explicitly enabled.
+        return 0.0
+    try:
+        reward = float(transition.get("reward", 0.0))
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return reward if math.isfinite(reward) else 0.0
+
+
+def _resolved_transition(transition: Mapping[str, Any], *, config: PPOConfig) -> bool:
+    if bool(transition.get("done")):
+        return False
+    if bool(transition.get("bootstrap_truncated")):
+        return True
+    if should_bootstrap_truncate(
+        transition.get("no_progress_steps", 0), config.no_progress_window,
+    ):
+        return True
+    if config.resolved_margin <= 0.0:
+        return False
+    raw_margin = transition.get("bank_differential")
+    if raw_margin is None:
+        try:
+            raw_margin = float(transition.get("final_bank")) - float(
+                transition.get("opponent_final_bank"),
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+    try:
+        margin = abs(float(raw_margin))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return math.isfinite(margin) and margin >= config.resolved_margin
+
+
 def build_rollout_batch(
     transitions: Sequence[dict[str, Any]], *, config: PPOConfig,
     value_estimates: Sequence[float] | None = None,
     old_log_probs: Sequence[float] | None = None,
+    bootstrap_values: Sequence[float] | None = None,
 ) -> RolloutBatch:
     rows = list(transitions)
     if not rows:
         raise ValueError("rollout batch requires at least one transition")
     values = [0.0 for _ in rows] if value_estimates is None else [float(value) for value in value_estimates]
     old = [0.0 for _ in rows] if old_log_probs is None else [float(value) for value in old_log_probs]
-    if len(values) != len(rows) or len(old) != len(rows):
-        raise ValueError("value_estimates and old_log_probs must match transition count")
+    if bootstrap_values is None:
+        next_values = [0.0 for _ in rows]
+    else:
+        next_values = [float(value) for value in bootstrap_values]
+    if (
+        len(values) != len(rows)
+        or len(old) != len(rows)
+        or len(next_values) != len(rows)
+    ):
+        raise ValueError(
+            "value_estimates, old_log_probs, and bootstrap_values must match transition count"
+        )
     rewards: list[float] = []
     dones: list[bool] = []
     worker_act: list[list[int]] = []
@@ -698,15 +857,31 @@ def build_rollout_batch(
     worker_kind: list[list[int]] = []
     market_items: list[int] = []
     market_quantities: list[int] = []
+    market_active: list[int] = []
+    truncation_flags: list[bool] = []
+    shaping_count = 0
+    truncation_count = 0
     for transition in rows:
+        if not isinstance(transition, Mapping):
+            raise ValueError("each transition must be a mapping")
         done = bool(transition.get("done"))
+        bootstrap_truncated = _resolved_transition(transition, config=config)
+        if bootstrap_truncated:
+            truncation_count += 1
+        truncation_flags.append(bootstrap_truncated)
         dones.append(done)
-        rewards.append(
-            terminal_bank_margin_reward(
-                transition.get("final_bank"), transition.get("opponent_final_bank"),
+        base_reward = _transition_base_reward(transition, done=done, config=config)
+        if config.potential_reward_coef != 0.0:
+            shaped_reward = shaped_transition_reward(
+                {**transition, "reward": base_reward},
+                gamma=config.gamma,
+                coefficient=config.potential_reward_coef,
             )
-            if done else 0.0
-        )
+            if shaped_reward != base_reward:
+                shaping_count += 1
+            rewards.append(shaped_reward)
+        else:
+            rewards.append(base_reward)
         action = transition.get("action", {})
         if not isinstance(action, dict):
             action = {}
@@ -720,9 +895,12 @@ def build_rollout_batch(
         item, quantity = _market_labels(action)
         market_items.append(item)
         market_quantities.append(quantity)
+        market_active.append(_market_active_label(action))
     advantages, returns = generalized_advantage_estimate(
         rewards=rewards, values=values, dones=dones,
         gamma=config.gamma, gae_lambda=config.gae_lambda,
+        bootstrap_values=next_values,
+        bootstrap_truncated=truncation_flags,
     )
     return RolloutBatch(
         transitions=rows,
@@ -735,58 +913,114 @@ def build_rollout_batch(
         worker=WorkerLabels(worker_act, worker_target, worker_kind),
         market_items=market_items,
         market_quantities=market_quantities,
+        market_active=market_active,
+        bootstrap_values=next_values,
+        bootstrap_truncated=truncation_flags,
+        shaping_count=shaping_count,
+        truncation_count=truncation_count,
     )
 
 
 def _select_outputs(
     outputs: dict[str, Any], batch: RolloutBatch, *, device: Any = None,
+    training_action_mask: bool = False,
 ) -> tuple[Any, Any]:
     th = require_torch()
+    if "market_active_logits" not in outputs:
+        # Older injected/test policies predate the training-only head.  Give
+        # them a neutral market-intent distribution while keeping the strict
+        # helper contract intact for all objective calculations.
+        outputs = dict(outputs)
+        market_items = outputs.get("market_item_logits")
+        if market_items is None or market_items.ndim != 2:
+            raise ValueError("outputs is missing market_active_logits")
+        outputs["market_active_logits"] = market_items.new_zeros(
+            (market_items.shape[0], 2),
+        )
     device = outputs["value"].device if device is None else device
     worker_act = th.tensor(batch.worker.act, dtype=th.long, device=device)
     worker_target = th.tensor(batch.worker.target, dtype=th.long, device=device)
     worker_kind = th.tensor(batch.worker.kind, dtype=th.long, device=device)
     market_items = th.tensor(batch.market_items, dtype=th.long, device=device)
     market_quantities = th.tensor(batch.market_quantities, dtype=th.long, device=device)
-    act_log = outputs["worker_act_logits"].log_softmax(dim=-1)
-    target_log = outputs["worker_target_logits"].log_softmax(dim=-1)
-    kind_log = outputs["worker_kind_logits"].log_softmax(dim=-1)
-    item_log = outputs["market_item_logits"].log_softmax(dim=-1)
-    quantity_log = outputs["market_quantity_logits"].log_softmax(dim=-1)
-    log_probs = (
-        act_log.gather(-1, worker_act.unsqueeze(-1)).squeeze(-1).sum(dim=1)
-        + target_log.gather(-1, worker_target.unsqueeze(-1)).squeeze(-1).sum(dim=1)
-        + kind_log.gather(-1, worker_kind.unsqueeze(-1)).squeeze(-1).sum(dim=1)
-        + item_log.gather(-1, market_items.unsqueeze(-1)).squeeze(-1)
-        + quantity_log.gather(-1, market_quantities.unsqueeze(-1)).squeeze(-1)
+    market_active = th.tensor(batch.market_active, dtype=th.long, device=device)
+    masks: dict[str, Any] = {}
+    if training_action_mask:
+        raw_masks = [
+            row.get("action_masks", row.get("training_action_masks"))
+            if isinstance(row, Mapping) else None
+            for row in batch.transitions
+        ]
+        if any(mask is not None for mask in raw_masks):
+            if not all(isinstance(mask, Mapping) for mask in raw_masks):
+                raise ValueError("training action masks must be present for every transition")
+            for output_name, objective_name in (
+                ("worker_target_logits", "worker_target_mask"),
+                ("worker_kind_logits", "worker_kind_mask"),
+                ("market_item_logits", "market_item_mask"),
+                ("market_quantity_logits", "market_quantity_mask"),
+            ):
+                values = [mask.get(objective_name, mask.get(objective_name.removesuffix("_mask"))) for mask in raw_masks]
+                if any(value is not None for value in values):
+                    if not all(value is not None for value in values):
+                        raise ValueError(f"{objective_name} must be present for every transition")
+                    masks[objective_name] = th.tensor(values, dtype=th.bool, device=device)
+    return conditional_action_objectives(
+        outputs,
+        worker_active=worker_act,
+        worker_target=worker_target,
+        worker_kind=worker_kind,
+        market_active=market_active,
+        market_item=market_items,
+        market_quantity=market_quantities,
+        **masks,
     )
-    entropy = (
-        -(act_log.exp() * act_log).sum(dim=-1).sum(dim=1)
-        - (target_log.exp() * target_log).sum(dim=-1).sum(dim=1)
-        - (kind_log.exp() * kind_log).sum(dim=-1).sum(dim=1)
-        - (item_log.exp() * item_log).sum(dim=-1)
-        - (quantity_log.exp() * quantity_log).sum(dim=-1)
-    ).mean()
-    return log_probs, entropy
 
 
-def _distribution_regularization(outputs: dict[str, Any], prior_outputs: dict[str, Any] | None) -> tuple[Any, Any]:
+def _distribution_regularization(
+    outputs: dict[str, Any], prior_outputs: dict[str, Any] | None,
+    *, batch: RolloutBatch | None = None,
+) -> tuple[Any, Any]:
     th = require_torch()
     zero = outputs["value"].sum() * 0.0
     if prior_outputs is None:
         return zero, zero
+    worker_active = None
+    market_active = None
+    if batch is not None:
+        worker_active = th.tensor(
+            batch.worker.act, dtype=th.bool, device=outputs["value"].device,
+        )
+        market_active = th.tensor(
+            batch.market_active, dtype=th.bool, device=outputs["value"].device,
+        )
+
+    def masked_mean(values: Any, mask: Any | None) -> Any:
+        if mask is None:
+            return values.mean()
+        mask = mask.to(dtype=values.dtype, device=values.device)
+        while mask.ndim < values.ndim:
+            mask = mask.unsqueeze(-1)
+        denominator = mask.expand_as(values).sum().clamp_min(1.0)
+        return (values * mask).sum() / denominator
+
     kl_terms = []
     ce_terms = []
-    for name in (
-        "worker_act_logits", "worker_target_logits", "worker_kind_logits",
-        "market_item_logits", "market_quantity_logits",
-    ):
+    branch_masks = {
+        "worker_act_logits": None,
+        "worker_target_logits": worker_active,
+        "worker_kind_logits": worker_active,
+        "market_active_logits": None,
+        "market_item_logits": market_active,
+        "market_quantity_logits": market_active,
+    }
+    for name, mask in branch_masks.items():
         log_probs = outputs[name].log_softmax(dim=-1)
         with th.no_grad():
             prior_log_probs = prior_outputs[name].log_softmax(dim=-1)
             prior_probs = prior_log_probs.exp()
-        kl_terms.append((prior_probs * (prior_log_probs - log_probs)).sum(dim=-1).mean())
-        ce_terms.append(-(prior_probs * log_probs).sum(dim=-1).mean())
+        kl_terms.append(masked_mean((prior_probs * (prior_log_probs - log_probs)).sum(dim=-1), mask))
+        ce_terms.append(masked_mean(-(prior_probs * log_probs).sum(dim=-1), mask))
     return sum(kl_terms) / len(kl_terms), sum(ce_terms) / len(ce_terms)
 
 
@@ -836,6 +1070,31 @@ def _ensure_finite_outputs(outputs: dict[str, Any]) -> None:
             raise ValueError(f"{name} must contain only finite values")
 
 
+def _bootstrap_value_estimates(
+    network: Any, transitions: Sequence[dict[str, Any]], *, config: PPOConfig,
+) -> list[float]:
+    """Evaluate next-state values only for nonterminal bootstrap truncations."""
+    th = require_torch()
+    rows = list(transitions)
+    values = [0.0 for _row in rows]
+    indices = [
+        index for index, row in enumerate(rows)
+        if _resolved_transition(row, config=config)
+    ]
+    if not indices:
+        return values
+    next_features = [
+        extract_features(rows[index].get("next_observation", {})) for index in indices
+    ]
+    with th.no_grad():
+        next_outputs = network(next_features)
+        _ensure_finite_outputs(next_outputs)
+        next_values = next_outputs["value"].detach().tolist()
+    for index, value in zip(indices, next_values):
+        values[index] = float(value)
+    return values
+
+
 def ppo_update(
     network: Any, optimizer: Any, transitions: Sequence[dict[str, Any]], *,
     config: PPOConfig, batch_size: int | None = None, seed: int = 0,
@@ -852,11 +1111,16 @@ def ppo_update(
         old_outputs = network(features)
         _ensure_finite_outputs(old_outputs)
         device = old_outputs["value"].device if device is None else device
-        old_log_probs, _old_entropy = _select_outputs(old_outputs, bootstrap, device=device)
+        old_log_probs, _old_entropy = _select_outputs(
+            old_outputs, bootstrap, device=device,
+            training_action_mask=config.training_action_mask,
+        )
+        bootstrap_values = _bootstrap_value_estimates(network, rows, config=config)
     rollout = build_rollout_batch(
         rows, config=config,
         value_estimates=old_outputs["value"].detach().tolist(),
         old_log_probs=old_log_probs.detach().tolist(),
+        bootstrap_values=bootstrap_values,
     )
     prior = _load_prior_network(prior_checkpoint, device=device)
     metrics: dict[str, float | int | bool] = {
@@ -869,6 +1133,8 @@ def ppo_update(
         "kl_to_prior": 0.0,
         "prior_cross_entropy": 0.0,
         "loss": 0.0,
+        "shaping_count": rollout.shaping_count,
+        "truncation_count": rollout.truncation_count,
     }
     size = max(1, int(batch_size or len(rows)))
     for epoch in range(config.ppo_epochs):
@@ -889,10 +1155,18 @@ def ppo_update(
                 ),
                 market_items=[rollout.market_items[index] for index in indices],
                 market_quantities=[rollout.market_quantities[index] for index in indices],
+                market_active=[rollout.market_active[index] for index in indices],
+                bootstrap_values=[rollout.bootstrap_values[index] for index in indices],
+                bootstrap_truncated=[rollout.bootstrap_truncated[index] for index in indices],
+                shaping_count=0,
+                truncation_count=0,
             )
             outputs = network(mini_features)
             _ensure_finite_outputs(outputs)
-            log_probs, entropy = _select_outputs(outputs, mini, device=device)
+            log_probs, entropy = _select_outputs(
+                outputs, mini, device=device,
+                training_action_mask=config.training_action_mask,
+            )
             old_log = th.tensor(mini.old_log_probs, dtype=th.float32, device=device)
             advantages = th.tensor(mini.advantages, dtype=th.float32, device=device)
             returns = th.tensor(mini.returns, dtype=th.float32, device=device)
@@ -908,7 +1182,9 @@ def ppo_update(
             )
             value_loss = th.maximum((outputs["value"] - returns) ** 2, (clipped_values - returns) ** 2).mean()
             prior_outputs = prior(mini_features) if prior is not None else None
-            kl_to_prior, prior_ce = _distribution_regularization(outputs, prior_outputs)
+            kl_to_prior, prior_ce = _distribution_regularization(
+                outputs, prior_outputs, batch=mini,
+            )
             loss = (
                 policy_loss
                 + config.value_coef * value_loss
@@ -925,6 +1201,7 @@ def ppo_update(
                 _ensure_finite_outputs(post_outputs)
                 post_log_probs, _post_entropy = _select_outputs(
                     post_outputs, mini, device=device,
+                    training_action_mask=config.training_action_mask,
                 )
                 post_log_ratio = th.clamp(post_log_probs - old_log, -LOG_RATIO_CLAMP, LOG_RATIO_CLAMP)
                 post_step_kl = ((post_log_ratio.exp() - 1.0) - post_log_ratio).mean()
@@ -973,6 +1250,8 @@ def run_ppo_training(
     start_step: int = 0,
     initial_ppo_updates: int = 0,
     initial_rollout_count: int = 0,
+    initial_shaping_count: int = 0,
+    initial_truncation_count: int = 0,
     progress_fn: Any | None = None,
     telemetry_callback: Any | None = None,
 ) -> dict[str, Any]:
@@ -984,6 +1263,10 @@ def run_ppo_training(
         raise ValueError("initial_ppo_updates must be a nonnegative integer")
     if type(initial_rollout_count) is not int or initial_rollout_count < 0:
         raise ValueError("initial_rollout_count must be a nonnegative integer")
+    if type(initial_shaping_count) is not int or initial_shaping_count < 0:
+        raise ValueError("initial_shaping_count must be a nonnegative integer")
+    if type(initial_truncation_count) is not int or initial_truncation_count < 0:
+        raise ValueError("initial_truncation_count must be a nonnegative integer")
     if steps == 0:
         return {
             "ppo_updates": initial_ppo_updates,
@@ -992,14 +1275,18 @@ def run_ppo_training(
             "last_metrics": None,
             "promotion": None,
             "completed_steps": 0,
+            "shaping_count": initial_shaping_count,
+            "truncation_count": initial_truncation_count,
         }
     updater = update_fn or ppo_update
     if rollout_fn is None and not offline_ppo_fallback:
         raise ValueError("rollout_fn is required for PPO unless offline_ppo_fallback is explicitly selected")
-    pool = opponent_pool or OpponentPool()
+    pool = opponent_pool if opponent_pool is not None else OpponentPool()
     schedule = pool.schedule(count=steps, seed=seed) if rollout_fn is not None else []
     total_updates = initial_ppo_updates
     rollout_count = initial_rollout_count
+    shaping_count = initial_shaping_count
+    truncation_count = initial_truncation_count
     last_metrics: dict[str, Any] | None = None
     offline_rows = list(transitions)
     if offline_ppo_fallback and not offline_rows:
@@ -1059,16 +1346,20 @@ def run_ppo_training(
             update_kwargs["device"] = device
         last_metrics = updater(**update_kwargs)
         total_updates += int(last_metrics.get("updates", 0))
+        shaping_count += int(last_metrics.get("shaping_count", 0))
+        truncation_count += int(last_metrics.get("truncation_count", 0))
         step_summary = {
             "ppo_updates": total_updates,
             "rollout_count": rollout_count,
             "early_stopped": bool(last_metrics.get("early_stopped")),
             "last_metrics": last_metrics,
+            "shaping_count": shaping_count,
+            "truncation_count": truncation_count,
             "promotion": None,
             "completed_steps": step + 1,
         }
         if telemetry_callback is not None:
-            telemetry_callback("ppo", {
+                telemetry_payload = {
                 "step": step + 1,
                 "ppo_updates": total_updates,
                 "ppo_updates_step": int(last_metrics.get("updates", 0)),
@@ -1076,9 +1367,10 @@ def run_ppo_training(
                 "early_stopped": bool(last_metrics.get("early_stopped")),
                 "policy_loss": last_metrics.get("policy_loss"),
                 "value_loss": last_metrics.get("value_loss"),
-                "entropy": last_metrics.get("entropy"),
-                "approx_kl": last_metrics.get("approx_kl"),
-            })
+                    "entropy": last_metrics.get("entropy"),
+                    "approx_kl": last_metrics.get("approx_kl"),
+                }
+                telemetry_callback("ppo", telemetry_payload)
         if progress_fn is not None:
             progress_fn(completed_step=step + 1, metrics=step_summary)
         if last_metrics.get("early_stopped"):
@@ -1090,6 +1382,8 @@ def run_ppo_training(
         "early_stopped": False,
         "last_metrics": last_metrics,
         "completed_steps": steps,
+        "shaping_count": shaping_count,
+        "truncation_count": truncation_count,
     }
     if promotion_match_fn is not None and ran_step:
         if candidate_checkpoint is None:
@@ -1378,7 +1672,8 @@ def _validate_resume_payload(
         if type(ppo_metrics) is not dict:
             raise ValueError("resume checkpoint metrics ppo_metrics is required after PPO progress")
         missing = sorted(_PPO_RESUME_METRIC_FIELDS - set(ppo_metrics))
-        unexpected = sorted(set(ppo_metrics) - _PPO_RESUME_METRIC_FIELDS)
+        allowed_fields = _PPO_RESUME_METRIC_FIELDS | _PPO_OPTIONAL_RESUME_METRIC_FIELDS
+        unexpected = sorted(set(ppo_metrics) - allowed_fields)
         if missing:
             raise ValueError(
                 "resume checkpoint ppo_metrics is missing required fields: "
@@ -1391,6 +1686,13 @@ def _validate_resume_payload(
             )
         for field in ("ppo_updates", "rollout_count", "completed_steps"):
             if type(ppo_metrics[field]) is not int or ppo_metrics[field] < 0:
+                raise ValueError(
+                    f"resume checkpoint ppo_metrics {field} must be a nonnegative integer"
+                )
+        for field in _PPO_OPTIONAL_RESUME_METRIC_FIELDS:
+            if field in ppo_metrics and (
+                type(ppo_metrics[field]) is not int or ppo_metrics[field] < 0
+            ):
                 raise ValueError(
                     f"resume checkpoint ppo_metrics {field} must be a nonnegative integer"
                 )
@@ -1458,6 +1760,7 @@ def make_fresh_rollout_fn(
     candidate_artifact_callback: Any | None = None,
     seeds: Sequence[int], steps: int, workers: int = 1,
     game_timeout: float = 120.0, candidate_identity: str | None = None,
+    no_progress_window: int = 0, resolved_margin: float = 0.0,
 ) -> Any:
     """Build a collector-backed callback for one fresh PPO rollout per step.
 
@@ -1485,6 +1788,15 @@ def make_fresh_rollout_fn(
         raise TypeError("candidate_artifact_callback must be callable")
     if type(steps) is not int or steps < 2:
         raise ValueError("steps must be at least 2 to produce a transition")
+    if type(no_progress_window) is not int or no_progress_window < 0:
+        raise ValueError("no_progress_window must be a nonnegative integer")
+    if (
+        isinstance(resolved_margin, bool)
+        or not isinstance(resolved_margin, (int, float))
+        or not math.isfinite(float(resolved_margin))
+        or resolved_margin < 0
+    ):
+        raise ValueError("resolved_margin must be a nonnegative finite number")
     run_path = Path(run_directory)
     run_path.mkdir(parents=True, exist_ok=True)
 
@@ -1554,6 +1866,8 @@ def make_fresh_rollout_fn(
             opponent_artifact=opponent_artifact,
             opponent_checkpoint_identity=checkpoint_provenance,
             source_policy_identity=identity,
+            no_progress_window=no_progress_window,
+            resolved_margin=resolved_margin,
         )
         return [
             json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
@@ -1568,6 +1882,7 @@ def train_behavior_clone(
     *, input_path: str | Path, output_path: str | Path, steps: int,
     batch_size: int, seed: int = 0, ppo_steps: int = 0,
     device: str = "auto", checkpoint_interval: int = 100,
+    ppo_config: PPOConfig | None = None,
     resume_checkpoint: str | Path | None = None,
     allow_ppo_extension: bool = False,
     prior_checkpoint: str | Path | None = None, rollout_fn: Any | None = None,
@@ -1587,6 +1902,9 @@ def train_behavior_clone(
     epochs = max(1, int(steps))
     seed = int(seed)
     ppo_steps = int(ppo_steps)
+    ppo_config = ppo_config or PPOConfig()
+    if not isinstance(ppo_config, PPOConfig):
+        raise ValueError("ppo_config must be a PPOConfig or None")
     offline_ppo_fallback = bool(offline_ppo_fallback)
     if type(checkpoint_interval) is not int or checkpoint_interval < 1:
         raise ValueError("checkpoint_interval must be a positive integer")
@@ -1601,6 +1919,7 @@ def train_behavior_clone(
         prior_checkpoint=prior_checkpoint,
         offline_ppo_fallback=offline_ppo_fallback,
         resolved_device=resolved_device,
+        ppo_config=ppo_config,
     )
     configuration = contract.configuration
     transitions = _read_transitions(input_path)
@@ -1612,6 +1931,8 @@ def train_behavior_clone(
     bc_updates = 0
     initial_ppo_updates = 0
     initial_rollout_count = 0
+    initial_shaping_count = 0
+    initial_truncation_count = 0
     previous_ppo_metrics: dict[str, Any] | None = None
     resumed = None
     if resume_checkpoint is not None:
@@ -1627,6 +1948,8 @@ def train_behavior_clone(
         previous_ppo_metrics = resumed["metrics"]["ppo_metrics"]
         if previous_ppo_metrics is not None:
             initial_rollout_count = previous_ppo_metrics.get("rollout_count", 0)
+            initial_shaping_count = previous_ppo_metrics.get("shaping_count", 0)
+            initial_truncation_count = previous_ppo_metrics.get("truncation_count", 0)
     rng_before_resume = capture_rng_state() if resumed is not None else None
     try:
         set_training_seed(seed)
@@ -1640,7 +1963,9 @@ def train_behavior_clone(
         if rng_before_resume is not None:
             restore_rng_state(rng_before_resume)
         raise
-    metadata = _checkpoint_metadata(len(transitions), device=resolved_device)
+    metadata = _checkpoint_metadata(
+        len(transitions), ppo_config, device=resolved_device,
+    )
     metadata["ppo_steps"] = int(ppo_steps)
     metadata["behavior_clone_epochs"] = epochs
     destination = Path(output_path)
@@ -1704,18 +2029,35 @@ def train_behavior_clone(
             target_target = th.tensor([label.target for label in labels], dtype=th.long, device=resolved_device)
             kind_target = th.tensor([label.kind for label in labels], dtype=th.long, device=resolved_device)
             market_items, market_quantities = zip(*(_market_labels(action) for action in batch_actions))
+            market_active = th.tensor(
+                [_market_active_label(action) for action in batch_actions],
+                dtype=th.long,
+                device=resolved_device,
+            )
             item_target = th.tensor(market_items, dtype=th.long, device=resolved_device)
             quantity_target = th.tensor(market_quantities, dtype=th.long, device=resolved_device)
-            loss = (
-                th.nn.functional.cross_entropy(outputs["worker_act_logits"].reshape(-1, 2), act_target.reshape(-1))
-                + th.nn.functional.cross_entropy(outputs["worker_target_logits"].reshape(-1, 100), target_target.reshape(-1))
-                + th.nn.functional.cross_entropy(
-                    outputs["worker_kind_logits"].reshape(-1, len(ACTION_VOCAB["worker_kinds"])),
-                    kind_target.reshape(-1),
-                )
-                + th.nn.functional.cross_entropy(outputs["market_item_logits"], item_target)
-                + th.nn.functional.cross_entropy(outputs["market_quantity_logits"], quantity_target)
+            bc_batch = RolloutBatch(
+                transitions=[transitions[index] for index in permutation],
+                rewards=[0.0 for _ in permutation],
+                dones=[False for _ in permutation],
+                values=[0.0 for _ in permutation],
+                old_log_probs=[0.0 for _ in permutation],
+                advantages=[0.0 for _ in permutation],
+                returns=[0.0 for _ in permutation],
+                worker=WorkerLabels(
+                    [label.act for label in labels],
+                    [label.target for label in labels],
+                    [label.kind for label in labels],
+                ),
+                market_items=list(market_items),
+                market_quantities=list(market_quantities),
+                market_active=market_active.detach().tolist(),
             )
+            log_probs, _entropy = _select_outputs(
+                outputs, bc_batch, device=resolved_device,
+                training_action_mask=ppo_config.training_action_mask,
+            )
+            loss = -log_probs.mean()
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -1801,7 +2143,7 @@ def train_behavior_clone(
             optimizer.state.clear()
         for parameter_group in optimizer.param_groups:
             parameter_group["lr"] = PPO_LEARNING_RATE
-        config = PPOConfig()
+        config = ppo_config
         ppo_metrics = run_ppo_training(
             network=network,
             optimizer=optimizer,
@@ -1825,6 +2167,8 @@ def train_behavior_clone(
             start_step=round_index,
             initial_ppo_updates=initial_ppo_updates,
             initial_rollout_count=initial_rollout_count,
+            initial_shaping_count=initial_shaping_count,
+            initial_truncation_count=initial_truncation_count,
             progress_fn=save_ppo_progress,
             telemetry_callback=telemetry_callback,
         )

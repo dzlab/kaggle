@@ -37,9 +37,22 @@ class Transition:
     final_bank: float
     opponent_final_bank: float
     safety_flags: tuple[str, ...]
+    termination_reason: str | None = None
+    bootstrap_truncated: bool | None = None
+    no_progress_steps: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "safety_flags", tuple(self.safety_flags))
+        if self.termination_reason is not None and (
+            type(self.termination_reason) is not str or not self.termination_reason
+        ):
+            raise ValueError("termination_reason must be a non-empty string or None")
+        if self.bootstrap_truncated is not None and type(self.bootstrap_truncated) is not bool:
+            raise ValueError("bootstrap_truncated must be a boolean or None")
+        if self.no_progress_steps is not None and (
+            type(self.no_progress_steps) is not int or self.no_progress_steps < 0
+        ):
+            raise ValueError("no_progress_steps must be a nonnegative integer or None")
 
     @staticmethod
     def _json_normalize(value: Any) -> Any:
@@ -51,7 +64,11 @@ class Transition:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached, JSON-compatible representation."""
-        return copy.deepcopy(self._json_normalize(asdict(self)))
+        record = self._json_normalize(asdict(self))
+        for field in ("termination_reason", "bootstrap_truncated", "no_progress_steps"):
+            if record[field] is None:
+                del record[field]
+        return copy.deepcopy(record)
 
     def to_json(self) -> str:
         """Serialize deterministically for stable JSONL output and tests."""
@@ -70,6 +87,25 @@ def _sequence(value: Any) -> Sequence[Any] | None:
 
 def _failure(message: str, **details: Any) -> ReplayValidationError:
     return ReplayValidationError("malformed_replay", message, **details)
+
+
+def _record_metadata(record: Mapping[str, Any]) -> dict[str, Any]:
+    info = _mapping(record.get("info"))
+    metadata: dict[str, Any] = {}
+    for field in ("termination_reason", "bootstrap_truncated", "no_progress_steps"):
+        if field in info:
+            metadata[field] = info[field]
+        elif field in record:
+            metadata[field] = record[field]
+    try:
+        return Transition(
+            observation={}, action={}, next_observation={}, done=False, reward=0.0,
+            final_bank=0.0, opponent_final_bank=0.0, safety_flags=(), **metadata,
+        ).to_dict()
+    except ValueError as exc:
+        raise _failure(
+            "termination metadata is malformed", reason="invalid_termination_metadata",
+        ) from exc
 
 
 def _validated_player_states(
@@ -201,6 +237,7 @@ def transitions_from_replay(
                 reason="incomplete_pairing",
                 step=index + 1,
             )
+        metadata = _record_metadata(state)
         transitions.append(
             Transition(
                 observation=copy.deepcopy(dict(preceding)),
@@ -211,6 +248,13 @@ def transitions_from_replay(
                 final_bank=float(candidate_bank),
                 opponent_final_bank=float(opponent_bank),
                 safety_flags=(),
+                **{
+                    field: metadata[field]
+                    for field in (
+                        "termination_reason", "bootstrap_truncated", "no_progress_steps",
+                    )
+                    if field in metadata
+                },
             )
         )
     return transitions
