@@ -62,6 +62,97 @@ def test_colab_notebook_stages_candidates_and_resumes_safely():
     assert "retained separately" in markdown
 
 
+def test_colab_notebook_has_rerunnable_development_and_gated_holdout_cells():
+    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_orbit_gpu.ipynb"
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    code_cells = [
+        "".join(cell.get("source", []))
+        for cell in notebook["cells"]
+        if cell.get("cell_type") == "code"
+    ]
+    code = "\n".join(code_cells)
+    development_source = next(
+        source for source in code_cells
+        if "# Run the complete development gate" in source
+    )
+    holdout_source = next(
+        source for source in code_cells
+        if "# Run holdout only after" in source
+    )
+    development_index = code.index(development_source)
+    holdout_index = code.index(holdout_source)
+
+    assert development_index < holdout_index
+    assert "scripts/evaluate_artifact.py" in development_source
+    assert "'--output'" in development_source or '"--output"' in development_source
+    assert "development_report_path" in development_source
+    assert "check=False" in development_source
+    assert "development_report_path.exists()" in development_source
+    assert "development_decision.get('status')" in development_source
+    assert "matrix_completeness" in development_source
+    assert "discard means continue training" in development_source
+    assert "not promoted" in development_source
+
+    assert "scripts/evaluate_artifact.py" in holdout_source
+    assert "if development_evaluation_promoted:" in holdout_source
+    assert "holdout_report_path" in holdout_source
+    assert "holdout_seed_values" in holdout_source
+    assert "development_seed_values" in holdout_source
+    assert "holdout_seed_values != development_seed_values" in holdout_source
+    assert "--start-seed" in holdout_source
+    assert "--output" in holdout_source
+    assert "holdout evaluation skipped" in holdout_source.lower()
+
+    holdout_tree = ast.parse(holdout_source, filename="holdout-cell")
+    guarded_evaluation = [
+        node
+        for node in ast.walk(holdout_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "subprocess"
+        and node.func.attr == "run"
+    ]
+    assert guarded_evaluation, "holdout cell must invoke the evaluator"
+    assert any(
+        isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "development_evaluation_promoted"
+        and any(
+            any(
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and isinstance(child.func.value, ast.Name)
+                and child.func.value.id == "subprocess"
+                and child.func.attr == "run"
+                for child in ast.walk(statement)
+            )
+            for statement in node.body
+        )
+        for node in ast.walk(holdout_tree)
+    ), "holdout evaluator must be inside the development promotion gate"
+
+
+def test_colab_notebook_filters_prior_checkpoints_before_building_opponent_pool():
+    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_orbit_gpu.ipynb"
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    code = "\n".join(
+        "".join(cell.get("source", []))
+        for cell in notebook["cells"]
+        if cell.get("cell_type") == "code"
+    )
+
+    assert "prior_checkpoint_candidates" in code
+    assert "compatible_prior_checkpoints = []" in code
+    assert "colab_train.select_resume_checkpoint(" in code
+    assert "except ValueError as exc:" in code
+    assert "continue" in code
+    assert "train_policy.OpponentPool(" in code
+    assert "previous_checkpoints=compatible_prior_checkpoints" in code
+    assert "opponent_pool=training_opponent_pool" in code
+    assert "malformed or incompatible checkpoint" in code
+
+
 def test_colab_notebook_executable_cells_are_valid_python():
     notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_orbit_gpu.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
