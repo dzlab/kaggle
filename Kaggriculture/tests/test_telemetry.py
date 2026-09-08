@@ -3,7 +3,13 @@ from pathlib import Path
 
 import pytest
 
-from scripts.telemetry import DEFAULT_WEAVE_PROJECT, TrainingTelemetry, load_metrics
+from scripts.telemetry import (
+    DEFAULT_WANDB_ENTITY,
+    DEFAULT_WANDB_PROJECT,
+    DEFAULT_WEAVE_PROJECT,
+    TrainingTelemetry,
+    load_metrics,
+)
 
 
 class FakeWeave:
@@ -31,6 +37,38 @@ class FakeWeave:
         return wrapped
 
 
+class FakeWandbRun:
+    def __init__(self, *, log_error=None, finish_error=None):
+        self.log_error = log_error
+        self.finish_error = finish_error
+        self.logs = []
+        self.finish_calls = 0
+        self.url = "https://wandb.ai/dzlab/kaggriculture/runs/test"
+
+    def log(self, payload):
+        if self.log_error is not None:
+            raise self.log_error
+        self.logs.append(payload)
+
+    def finish(self):
+        if self.finish_error is not None:
+            raise self.finish_error
+        self.finish_calls += 1
+
+
+class FakeWandb:
+    def __init__(self, *, run=None, init_error=None):
+        self.run = run or FakeWandbRun()
+        self.init_error = init_error
+        self.init_calls = []
+
+    def init(self, **kwargs):
+        self.init_calls.append(kwargs)
+        if self.init_error is not None:
+            raise self.init_error
+        return self.run
+
+
 def test_training_telemetry_writes_jsonl_without_weave(tmp_path):
     metrics_path = tmp_path / "metrics.jsonl"
     telemetry = TrainingTelemetry(metrics_path)
@@ -55,6 +93,47 @@ def test_training_telemetry_initializes_fake_weave_with_default_project(tmp_path
     assert fake_weave.events == [
         {"event": "ppo", "policy_loss": 0.5, "step": 1}
     ]
+
+
+def test_training_telemetry_initializes_wandb_and_logs_metrics(tmp_path):
+    fake_wandb = FakeWandb()
+    telemetry = TrainingTelemetry(
+        tmp_path / "metrics.jsonl",
+        enable_wandb=True,
+        wandb_module=fake_wandb,
+        wandb_config={"ppo_steps": 16},
+        wandb_run_name="ppo16-gpu",
+    )
+
+    telemetry("ppo", {"policy_loss": 0.5, "step": 1})
+    telemetry.finish()
+
+    assert fake_wandb.init_calls == [{
+        "entity": DEFAULT_WANDB_ENTITY,
+        "project": DEFAULT_WANDB_PROJECT,
+        "name": "ppo16-gpu",
+        "config": {"ppo_steps": 16},
+        "mode": "online",
+    }]
+    assert fake_wandb.run.logs == [
+        {"telemetry/event": "ppo", "ppo/policy_loss": 0.5, "ppo/step": 1}
+    ]
+    assert fake_wandb.run.finish_calls == 1
+
+
+def test_wandb_initialization_failure_warns_but_local_logging_continues(tmp_path, caplog):
+    fake_wandb = FakeWandb(init_error=RuntimeError("login unavailable"))
+    telemetry = TrainingTelemetry(
+        tmp_path / "metrics.jsonl",
+        enable_wandb=True,
+        wandb_module=fake_wandb,
+    )
+
+    telemetry("ppo", {"step": 1})
+
+    assert load_metrics(tmp_path / "metrics.jsonl") == [{"event": "ppo", "step": 1}]
+    assert "W&B telemetry disabled" in caplog.text
+    assert "login unavailable" in caplog.text
 
 
 def test_weave_initialization_failure_warns_but_local_logging_continues(tmp_path, caplog):

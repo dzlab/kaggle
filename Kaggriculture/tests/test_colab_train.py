@@ -59,13 +59,18 @@ def test_colab_notebook_stages_candidates_and_resumes_safely():
     assert "output_path=current_checkpoint_path" not in code
     assert "export_checkpoint(current_checkpoint_path" not in code
     assert ".[training,observability]" in code
-    assert "DEFAULT_WEAVE_PROJECT" in code
-    assert "telemetry_project = DEFAULT_WEAVE_PROJECT" in code
+    assert "DEFAULT_WANDB_PROJECT" in code
+    assert "DEFAULT_WANDB_ENTITY" in code
+    assert "wandb.login" in code
+    assert "WANDB_API_KEY" in code
+    assert "telemetry_project = DEFAULT_WANDB_PROJECT" in code
     assert "training_metrics_path = run_dir / f'{candidate_tag}-training-metrics.jsonl'" in code
     assert "TrainingTelemetry(" in code
-    assert "enable_weave=True" in code
-    assert "strict=False" in code
+    assert "enable_wandb=True" in code
+    assert "wandb_entity=wandb_entity" in code
+    assert "strict=True" in code
     assert "telemetry_callback=record_training_event" in code
+    assert "training_telemetry.finish()" in code
     assert "import matplotlib.pyplot as plt" in code
     assert "if not training_events:" in code
     assert "No {candidate_tag} training telemetry found" in code

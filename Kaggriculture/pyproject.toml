@@ -17,6 +17,7 @@ training = [
     "torch>=2,<3",
 ]
 observability = [
+    "wandb>=0.19,<1",
     "weave>=0.51,<1",
 ]
 
