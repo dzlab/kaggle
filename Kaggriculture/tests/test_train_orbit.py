@@ -120,6 +120,46 @@ def test_orbit_controller_passes_partial_checkpoint_for_train_resume(tmp_path):
     assert calls["resume_checkpoint"] == checkpoint
 
 
+def test_orbit_controller_resumes_interrupted_train_from_reserved_candidate(tmp_path):
+    from scripts.train_orbit import OrbitConfig, OrbitController
+
+    candidate = tmp_path / "round-0000" / "candidate.pt"
+    train_calls = []
+
+    def train_fn(**kwargs):
+        train_calls.append(kwargs)
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_bytes(b"partial-checkpoint")
+        if len(train_calls) == 1:
+            raise KeyboardInterrupt
+        return candidate
+
+    controller_kwargs = {
+        "rollout_fn": lambda **_kwargs: {"complete": True},
+        "train_fn": train_fn,
+        "evaluate_fn": lambda **_kwargs: {"promoted": False},
+        "candidate_path_fn": lambda **_kwargs: candidate,
+    }
+
+    with pytest.raises(KeyboardInterrupt):
+        OrbitController(
+            OrbitConfig(tmp_path, max_rounds=1), **controller_kwargs
+        ).run()
+
+    saved_state = json.loads((tmp_path / "orbit-state.json").read_text())
+    assert saved_state["current"] == {
+        "round": 0,
+        "stage": "train",
+        "rollout": {"complete": True},
+        "candidate": str(candidate),
+    }
+    assert "resume_checkpoint" not in train_calls[0]
+
+    OrbitController(OrbitConfig(tmp_path, max_rounds=1), **controller_kwargs).run()
+
+    assert train_calls[1]["resume_checkpoint"] == candidate
+
+
 def test_orbit_cli_parses_production_configuration_and_resume(tmp_path):
     from scripts.train_orbit import config_from_args, parse_args
 

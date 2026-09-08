@@ -82,6 +82,7 @@ class OrbitController:
         self, config: OrbitConfig, *, rollout_fn: Callable[..., Any],
         train_fn: Callable[..., str | Path], evaluate_fn: Callable[..., dict[str, Any]],
         export_fn: Callable[..., str | Path] | None = None,
+        candidate_path_fn: Callable[..., str | Path] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.config = config
@@ -89,6 +90,7 @@ class OrbitController:
         self.train_fn = train_fn
         self.evaluate_fn = evaluate_fn
         self.export_fn = export_fn
+        self.candidate_path_fn = candidate_path_fn
         self.clock = clock
         self.run_directory = config.run_directory
         self.state_path = self.run_directory / "orbit-state.json"
@@ -170,7 +172,10 @@ class OrbitController:
                     round_state.get("candidate_artifact")
                 ) else None
                 if candidate_checkpoint is None:
-                    if round_state.get("stage") == "train" and "rollout" in round_state:
+                    resuming_train = (
+                        round_state.get("stage") == "train" and "rollout" in round_state
+                    )
+                    if resuming_train:
                         rollout = round_state["rollout"]
                     else:
                         rollout = self.rollout_fn(
@@ -180,14 +185,26 @@ class OrbitController:
                         )
                     round_state["stage"] = "train"
                     round_state["rollout"] = rollout
+                    if round_state.get("candidate"):
+                        reserved_candidate = Path(round_state["candidate"])
+                    elif self.candidate_path_fn is not None:
+                        reserved_candidate = Path(self.candidate_path_fn(
+                            round_index=round_index, run_directory=self.run_directory,
+                        ))
+                        round_state["candidate"] = str(reserved_candidate)
+                    else:
+                        reserved_candidate = None
                     self._write_state(state)
                     train_kwargs = {
                         "rollout": rollout, "round_index": round_index,
                         "run_directory": self.run_directory,
                     }
-                    resume_checkpoint = round_state.get("candidate")
-                    if resume_checkpoint and Path(resume_checkpoint).is_file():
-                        train_kwargs["resume_checkpoint"] = Path(resume_checkpoint)
+                    if (
+                        resuming_train
+                        and reserved_candidate is not None
+                        and reserved_candidate.is_file()
+                    ):
+                        train_kwargs["resume_checkpoint"] = reserved_candidate
                     candidate_checkpoint = Path(self.train_fn(**train_kwargs))
                     round_state["candidate"] = str(candidate_checkpoint)
                     if self.export_fn is not None:
@@ -489,6 +506,9 @@ def build_production_controller(config: OrbitConfig) -> OrbitController:
         train_fn=callbacks["train"],
         export_fn=callbacks["export"],
         evaluate_fn=callbacks["evaluate"],
+        candidate_path_fn=lambda *, round_index, **_kwargs: (
+            _round_directory(config, round_index) / "candidate.pt"
+        ),
     )
 
 
