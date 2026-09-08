@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
@@ -182,7 +183,7 @@ def _error_record(request: Mapping[str, Any], error: str) -> dict[str, Any]:
     return {**record, "candidate": candidate, "variant": candidate}
 
 
-def _run_game(request: Mapping[str, Any]) -> dict[str, Any]:
+def _run_game_direct(request: Mapping[str, Any]) -> dict[str, Any]:
     """Run and normalize one isolated game; never let a game error escape."""
     try:
         with tempfile.TemporaryDirectory(prefix="kaggriculture-artifact-") as directory:
@@ -214,6 +215,49 @@ def _run_game(request: Mapping[str, Any]) -> dict[str, Any]:
             request,
             f"{type(exc).__name__}: {exc}",
         )
+
+
+def _run_game_subprocess(request: Mapping[str, Any]) -> dict[str, Any]:
+    """Run one game in a killable interpreter with a per-game timeout."""
+    timeout = float(request.get("game_timeout", DEFAULT_EVALUATION_TIMEOUT))
+    command = [sys.executable, str(Path(__file__).resolve()), "--worker"]
+    try:
+        completed = subprocess.run(
+            command,
+            input=json.dumps(dict(request)),
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+        if completed.returncode != 0:
+            details = (completed.stderr or completed.stdout or "").strip()
+            if details:
+                details = f": {details[:500]}"
+            raise RuntimeError(
+                f"game subprocess exited with status {completed.returncode}{details}"
+            )
+        record = json.loads(completed.stdout)
+        if not isinstance(record, Mapping):
+            raise ValueError("game subprocess did not return an object")
+        return {**dict(record), "candidate": request["candidate"], "variant": request["candidate"]}
+    except subprocess.TimeoutExpired:
+        return _error_record(request, f"game timeout after {timeout:g} seconds")
+    except Exception as exc:
+        return _error_record(request, f"{type(exc).__name__}: {exc}")
+
+
+def _run_game(request: Mapping[str, Any]) -> dict[str, Any]:
+    """Pool worker entry point; the game itself runs in a killable subprocess."""
+    return _run_game_subprocess(request)
+
+
+def _worker_main() -> int:
+    request = json.load(sys.stdin)
+    record = _run_game_direct(request)
+    json.dump(record, sys.stdout, sort_keys=True, separators=(",", ":"))
+    sys.stdout.write("\n")
+    return 0
 
 
 def _run_request(runner: Callable[[Mapping[str, Any]], Mapping[str, Any]], request: Mapping[str, Any]) -> dict[str, Any]:
@@ -339,6 +383,7 @@ def evaluate(
                 "candidate": candidate,
                 "steps": steps,
                 "artifact_path": snapshot_info["path"],
+                "game_timeout": float(evaluation_timeout),
             }
             for candidate in (CURRENT_CANDIDATE, snapshot_info["identity"])
             for item in matrix
@@ -548,8 +593,108 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _option_value(argv: Sequence[str], option: str, default: Any = None) -> Any:
+    for index, value in enumerate(argv):
+        if value == option and index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+            return argv[index + 1]
+        if value.startswith(f"{option}="):
+            return value.split("=", 1)[1]
+    return default
+
+
+def _explicit_output(argv: Sequence[str]) -> Path | None:
+    value = _option_value(argv, "--output")
+    return Path(value) if value is not None else None
+
+
+def _cli_failure_report(argv: Sequence[str], error: BaseException) -> dict[str, Any]:
+    artifact_value = _option_value(argv, "--artifact", "artifact.json")
+    identity = _option_value(argv, "--identity", "learned_artifact")
+    if type(identity) is not str or not identity.strip() or identity == CURRENT_CANDIDATE:
+        identity = "learned_artifact"
+    empty_summary = paired_seed_summary([])
+    return {
+        "schema_version": 1,
+        "configuration": {"valid": False, "argv": list(argv)},
+        "artifact": _best_effort_artifact_metadata(artifact_value, identity),
+        "expected_matrix": [],
+        "records": {CURRENT_CANDIDATE: [], identity: []},
+        "summaries": {CURRENT_CANDIDATE: empty_summary, identity: empty_summary},
+        "matrix_completeness": {CURRENT_CANDIDATE: None, identity: None},
+        "decision": {
+            "status": "discard",
+            "reasons": ["cli_invalid"],
+            "error": str(error)[:1000] or "invalid command-line arguments",
+        },
+    }
+
+
+def _is_valid_comparison(result: Mapping[str, Any]) -> bool:
+    records = result.get("records")
+    if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+        return False
+    if any(not isinstance(record, Mapping) for record in records):
+        return False
+    if any(record.get("framework_error") for record in records):
+        return False
+    if any(
+        record.get("outcome") not in {"win", "loss", "tie"}
+        or record.get("framework_error") is not False
+        or not isinstance(record.get("bank_differential"), Real)
+        or isinstance(record.get("bank_differential"), bool)
+        or not math.isfinite(float(record["bank_differential"]))
+        for record in records
+    ):
+        return False
+    decision = result.get("decision", {})
+    if not isinstance(decision, Mapping):
+        return False
+    if decision.get("status") != "discard":
+        return False
+    reasons = decision.get("reasons", ())
+    if not isinstance(reasons, Sequence) or isinstance(reasons, (str, bytes)):
+        return False
+    if {"framework_error", "timeout", "evaluation_timeout"} & set(reasons):
+        return False
+    completeness = result.get("matrix_completeness")
+    if not isinstance(completeness, Mapping):
+        return False
+    artifact = result.get("artifact")
+    if not isinstance(artifact, Mapping):
+        return False
+    identity = artifact.get("identity")
+    if not isinstance(identity, str) or identity == CURRENT_CANDIDATE:
+        return False
+    for candidate in (CURRENT_CANDIDATE, identity):
+        candidate_completeness = completeness.get(candidate)
+        if not isinstance(candidate_completeness, Mapping):
+            return False
+        if any(candidate_completeness.get(key) for key in ("missing", "duplicate", "extra", "invalid_records")):
+            return False
+    expected_matrix = result.get("expected_matrix")
+    if not isinstance(expected_matrix, Sequence) or len(records) != 2 * len(expected_matrix):
+        return False
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        args = parse_args(raw_argv)
+    except SystemExit as exc:
+        output_arg = _explicit_output(raw_argv)
+        if exc.code != 0 and output_arg is not None:
+            output = output_arg if output_arg.is_absolute() else PROJECT_ROOT / output_arg
+            try:
+                write_report(output, _cli_failure_report(raw_argv, exc))
+                print(f"artifact evaluation: discard ({output})", file=sys.stderr)
+            except Exception as report_exc:
+                print(
+                    f"artifact evaluation: discard; failure report unavailable: "
+                    f"{type(report_exc).__name__}: {report_exc}",
+                    file=sys.stderr,
+                )
+        return int(exc.code) if isinstance(exc.code, int) else 2
     output = args.output if args.output.is_absolute() else PROJECT_ROOT / args.output
     try:
         result = evaluate(
@@ -579,12 +724,17 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 1
     status = result["decision"].get("status")
-    if status != "promote":
+    if status != "promote" and not _is_valid_comparison(result):
         print(f"artifact evaluation: discard ({output})", file=sys.stderr)
         return 1
+    if status != "promote":
+        print(f"artifact evaluation: discard ({output})")
+        return 0
     print(f"artifact evaluation: promote ({output})")
     return 0
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 2 and sys.argv[1] == "--worker":
+        raise SystemExit(_worker_main())
     raise SystemExit(main())

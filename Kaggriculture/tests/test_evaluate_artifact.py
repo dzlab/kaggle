@@ -2,6 +2,7 @@ import hashlib
 import json
 from concurrent.futures import Future
 from pathlib import Path
+import subprocess
 import time
 
 import pytest
@@ -251,6 +252,33 @@ def test_evaluate_timeout_marks_pending_futures_and_does_not_wait_for_pool(tmp_p
     assert "framework_error" in result["decision"]["reasons"]
 
 
+def test_game_worker_bounds_each_subprocess_game(tmp_path, monkeypatch):
+    from scripts import evaluate_artifact
+
+    request = {
+        "candidate": "current",
+        "opponent": "pass",
+        "seed": 3,
+        "seat": 0,
+        "steps": 4,
+        "artifact_path": str(tmp_path / "artifact.json"),
+        "game_timeout": 0.01,
+    }
+    observed = {}
+
+    def fake_run(*args, **kwargs):
+        observed["timeout"] = kwargs["timeout"]
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    monkeypatch.setattr(evaluate_artifact.subprocess, "run", fake_run)
+
+    record = evaluate_artifact._run_game(request)
+
+    assert observed["timeout"] == 0.01
+    assert record["framework_error"] is True
+    assert "timeout" in record["error"]
+
+
 def test_evaluate_marks_pool_submission_failure_as_framework_error(tmp_path, monkeypatch):
     from scripts import evaluate_artifact
 
@@ -310,22 +338,69 @@ def test_evaluate_uses_one_read_only_snapshot_and_cleans_it_afterward(tmp_path, 
     assert all(not path.exists() for path in seen)
 
 
-def test_cli_returns_nonzero_and_writes_discard_report(tmp_path, monkeypatch):
+def test_cli_returns_zero_for_complete_policy_discard(tmp_path, monkeypatch):
     from scripts import evaluate_artifact
 
     artifact = _artifact(tmp_path / "artifact.json")
     output = tmp_path / "discard.json"
+    expected_matrix = [["pass", 3, 0]]
+    records = [
+        _record("current", "pass", 3, 0),
+        _record("learned_artifact", "pass", 3, 0),
+    ]
+    completeness = {
+        "expected": expected_matrix,
+        "expected_count": 1,
+        "observed_count": 1,
+        "missing": [],
+        "duplicate": [],
+        "extra": [],
+        "invalid_records": 0,
+    }
     result = {
         "configuration": {"steps": 4},
         "artifact": {
             "path": str(artifact), "name": artifact.name,
             "identity": "learned_artifact", "sha256": "a" * 64,
         },
-        "expected_matrix": [],
+        "expected_matrix": expected_matrix,
+        "records": records,
+        "summaries": {},
+        "matrix_completeness": {
+            "current": completeness,
+            "learned_artifact": completeness,
+        },
+        "decision": {"status": "discard", "reasons": ["no_paired_improvement"]},
+    }
+    monkeypatch.setattr(evaluate_artifact, "evaluate", lambda **kwargs: result)
+
+    exit_code = evaluate_artifact.main([
+        "--artifact", str(artifact), "--output", str(output), "--quick",
+    ])
+
+    assert exit_code == 0
+    assert json.loads(output.read_text(encoding="utf-8"))["decision"]["status"] == "discard"
+
+
+def test_cli_returns_nonzero_for_incomplete_comparison(tmp_path, monkeypatch):
+    from scripts import evaluate_artifact
+
+    artifact = _artifact(tmp_path / "artifact.json")
+    output = tmp_path / "incomplete.json"
+    result = {
+        "configuration": {"steps": 4},
+        "artifact": {
+            "path": str(artifact), "name": artifact.name,
+            "identity": "learned_artifact", "sha256": "a" * 64,
+        },
+        "expected_matrix": [["pass", 3, 0]],
         "records": [],
         "summaries": {},
-        "matrix_completeness": {},
-        "decision": {"status": "discard", "reasons": ["no_paired_improvement"]},
+        "matrix_completeness": {
+            "current": {"missing": [["pass", 3, 0]], "duplicate": [], "extra": [], "invalid_records": 0},
+            "learned_artifact": {"missing": [["pass", 3, 0]], "duplicate": [], "extra": [], "invalid_records": 0},
+        },
+        "decision": {"status": "discard", "reasons": ["incomplete_matrix"]},
     }
     monkeypatch.setattr(evaluate_artifact, "evaluate", lambda **kwargs: result)
 
@@ -335,6 +410,22 @@ def test_cli_returns_nonzero_and_writes_discard_report(tmp_path, monkeypatch):
 
     assert exit_code == 1
     assert json.loads(output.read_text(encoding="utf-8"))["decision"]["status"] == "discard"
+
+
+def test_cli_writes_failure_report_for_invalid_arguments(tmp_path):
+    from scripts import evaluate_artifact
+
+    artifact = _artifact(tmp_path / "artifact.json")
+    output = tmp_path / "invalid-args.json"
+
+    exit_code = evaluate_artifact.main([
+        "--artifact", str(artifact), "--output", str(output), "--seats", "0", "0",
+    ])
+
+    assert exit_code != 0
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["decision"]["status"] == "discard"
+    assert report["decision"]["reasons"] == ["cli_invalid"]
 
 
 def test_cli_writes_discard_report_for_invalid_artifact(tmp_path):
