@@ -5,7 +5,7 @@ pool for isolated Kaggriculture games. Mount Google Drive and keep the run
 directory on Drive so checkpoints and `training-state.json` survive disconnects.
 
 ```bash
-python scripts/colab_train.py --run-directory /content/drive/MyDrive/kagriculture-training \
+python scripts/train.py --run-directory /content/drive/MyDrive/kagriculture-training \
   --device auto --workers 2 --development-seeds 0 1 2 3 --holdout-seeds 100 101
 ```
 

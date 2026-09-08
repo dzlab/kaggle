@@ -1,331 +1,130 @@
 import ast
+import hashlib
 import json
 import importlib
 import os
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
 
 
-def test_colab_notebook_stages_candidates_and_resumes_safely():
+def _notebook_code_cells():
     notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_gpu.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    code = "\n".join(
+    return notebook, [
         "".join(cell.get("source", []))
         for cell in notebook["cells"]
         if cell.get("cell_type") == "code"
-    )
-    markdown = "\n".join(
-        "".join(cell.get("source", []))
-        for cell in notebook["cells"]
-        if cell.get("cell_type") == "markdown"
-    )
+    ]
+
+
+def test_colab_notebook_is_a_small_setup_and_helper_launch_wrapper():
+    notebook, code_cells = _notebook_code_cells()
+    code = "\n".join(code_cells)
 
     assert notebook["nbformat"] == 4
-    assert "ppo_target_steps = 16" in code
-    assert 'candidate_tag = f"ppo{ppo_target_steps}"' in code
-    assert 'stage_checkpoint_path = run_dir / f"policy-{candidate_tag}.pt"' in code
-    assert 'stage_artifact_path = run_dir / f"policy-{candidate_tag}.json"' in code
-    assert "current_checkpoint_path = run_dir / 'policy.pt'" in code
-    assert "select_resume_checkpoint(" in code
-    assert "resume_selection.path" in code
-    assert "import scripts.colab_train as colab_train" in code
-    assert "importlib.reload(colab_train)" in code
-    assert code.index("importlib.reload(train_policy)") < code.index("importlib.reload(colab_train)")
-    assert "colab_train.select_resume_checkpoint(" in code
-    assert "from scripts.colab_train import select_resume_checkpoint" not in code
-    assert "training_contract = train_policy.build_training_contract(" in code
-    assert "training_contract=training_contract" in code
-    assert "checkpoint_validator=" not in code
-    assert "train_policy._trajectory_identity(trajectory_path)" not in code
-    assert "train_policy._read_transitions(trajectory_path)" not in code
-    assert "train_policy._validate_resume_payload(" not in code
-    assert "training_steps = 25" in code
-    assert "training_batch_size = 256" in code
-    assert "training_seed = 7" in code
-    assert "training_prior_checkpoint = None" in code
-    assert "training_offline_ppo_fallback = False" in code
-    assert "saved_ppo_target < ppo_target_steps" in code
-    assert "allow_ppo_extension=allow_ppo_extension" in code
-    assert "allow_ppo_extension=True" not in code
-    assert "export_checkpoint(stage_checkpoint_path, output_path)" in code
-    assert "export_checkpoint(stage_checkpoint_path, stage_artifact_path)" in code
-    assert "export_checkpoint(checkpoint_path, candidate_artifact)" not in code
-    assert "output_path=stage_checkpoint_path" in code
-    assert "candidate_artifact=stage_artifact_path" in code
-    assert "runtime_device = 'cuda' if torch.cuda.is_available() else 'cpu'" in code
-    assert "training_device = runtime_device" in code
-    assert "GPU unavailable; falling back to CPU" in code
-    assert "assert torch.cuda.is_available()" not in code
-    assert "workers=2" in code
-    assert "candidate_artifact_callback=export_current" in code
-    assert "output_path=current_checkpoint_path" not in code
-    assert "export_checkpoint(current_checkpoint_path" not in code
-    assert ".[training,observability]" in code
-    assert "DEFAULT_WANDB_PROJECT" in code
-    assert "DEFAULT_WANDB_ENTITY" in code
-    assert "wandb.login" in code
-    assert "wandb.login(key=wandb_api_key, relogin=False)" in code
-    assert "quiet=True" not in code
-    assert "WANDB_API_KEY" in code
-    assert "telemetry_project = DEFAULT_WANDB_PROJECT" in code
-    assert "training_metrics_path = run_dir / f'{candidate_tag}-training-metrics.jsonl'" in code
-    assert "TrainingTelemetry(" in code
-    assert "enable_wandb=True" in code
-    assert "wandb_entity=wandb_entity" in code
-    assert "strict=True" in code
-    assert "telemetry_callback=record_training_event" in code
-    assert "training_telemetry.finish()" in code
-    assert "import matplotlib.pyplot as plt" in code
-    assert "if not training_events:" in code
-    assert "No {candidate_tag} training telemetry found" in code
-    assert "change the target to 32" in markdown
-    assert "retained separately" in markdown
+    assert notebook["metadata"]["accelerator"] == "GPU"
+    assert len(notebook["cells"]) == 4
+    assert len(code_cells) == 3
 
+    clone_source, install_source, launch_source = code_cells
+    assert "repo_url" in clone_source
+    assert "repo_branch" in clone_source
+    assert "git" in clone_source and "clone" in clone_source
+    assert "--branch" in clone_source
+    assert "/content/kaggle" in clone_source
+    assert "Kaggriculture" in clone_source
 
-def test_colab_notebook_has_rerunnable_development_and_gated_holdout_cells():
-    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_gpu.ipynb"
-    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    code_cells = [
-        "".join(cell.get("source", []))
-        for cell in notebook["cells"]
-        if cell.get("cell_type") == "code"
-    ]
-    code = "\n".join(code_cells)
-    development_source = next(
-        source for source in code_cells
-        if "# Run the complete development gate" in source
+    assert "pip" in install_source
+    assert ".[training,observability]" in install_source
+    assert "Kaggriculture" in install_source
+
+    required_flags = (
+        "--mount-drive",
+        "--run-directory",
+        "--ppo-target-steps",
+        "--training-steps",
+        "--training-batch-size",
+        "--training-seed",
+        "--training-checkpoint-interval",
+        "--training-prior-checkpoint",
+        "--no-training-offline-ppo-fallback",
+        "--collection-seeds",
+        "--collection-start-seed",
+        "--collection-steps",
+        "--collection-opponents",
+        "--collection-seats",
+        "--rollout-seeds",
+        "--rollout-steps",
+        "--development-seeds",
+        "--development-opponents",
+        "--development-steps",
+        "--development-seats",
+        "--holdout-seeds",
+        "--holdout-opponents",
+        "--holdout-steps",
+        "--holdout-seats",
+        "--workers",
+        "--device",
+        "--wandb-project",
+        "--wandb-entity",
+        "--wandb-run-name",
+        "--smoke-opponent",
+        "--smoke-seed",
+        "--smoke-steps",
+        "--plot",
     )
-    holdout_source = next(
-        source for source in code_cells
-        if "# Run holdout only after" in source
+    assert "scripts/train.py" in launch_source
+    assert all(flag in launch_source for flag in required_flags)
+    assert "--no-wandb" not in launch_source
+
+    workflow_references = ("scripts/train.py", *required_flags)
+    setup_source = "\n".join(code_cells[:2])
+    assert all(setup_source.count(reference) == 0 for reference in workflow_references)
+    assert all(code.count(reference) == 1 for reference in workflow_references)
+    assert "pip" not in clone_source
+    assert "git" not in install_source
+
+    old_inline_orchestration_markers = (
+        "select_resume_checkpoint",
+        "train_behavior_clone",
+        "train_candidate",
+        "training_contract",
+        "OpponentPool",
+        "collect_trajectories.py",
+        "evaluate_artifact.py",
+        "run_local.py",
+        "TrainingTelemetry",
+        "wandb.login",
+        "export_checkpoint",
+        "matplotlib",
+        "load_metrics",
     )
-    development_index = code.index(development_source)
-    holdout_index = code.index(holdout_source)
-
-    assert development_index < holdout_index
-    assert "scripts/evaluate_artifact.py" in development_source
-    assert "'--output'" in development_source or '"--output"' in development_source
-    assert "development_report_path" in development_source
-    assert "check=False" in development_source
-    assert "development_report_path.exists()" in development_source
-    assert "development_decision.get('status')" in development_source
-    assert "matrix_completeness" in development_source
-    assert "discard means continue training" in development_source
-    assert "not promoted" in development_source
-
-    assert "scripts/evaluate_artifact.py" in holdout_source
-    assert "if development_evaluation_promoted:" in holdout_source
-    assert "holdout_report_path" in holdout_source
-    assert "holdout_seed_values" in holdout_source
-    assert "development_seed_values" in holdout_source
-    assert "holdout_seed_values != development_seed_values" in holdout_source
-    assert "--start-seed" in holdout_source
-    assert "--output" in holdout_source
-    assert "holdout evaluation skipped" in holdout_source.lower()
-    assert "holdout_min_valid_games = len(holdout_seed_values) * len(holdout_opponents)" in holdout_source
-    assert "holdout_evaluation_complete" in holdout_source
-    assert "holdout_decision.get('status') in {'promote', 'discard'}" in holdout_source
-
-    holdout_tree = ast.parse(holdout_source, filename="holdout-cell")
-    guarded_evaluation = [
-        node
-        for node in ast.walk(holdout_tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "subprocess"
-        and node.func.attr == "run"
-    ]
-    assert guarded_evaluation, "holdout cell must invoke the evaluator"
-    assert any(
-        isinstance(node, ast.If)
-        and isinstance(node.test, ast.Name)
-        and node.test.id == "development_evaluation_promoted"
-        and any(
-            any(
-                isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Attribute)
-                and isinstance(child.func.value, ast.Name)
-                and child.func.value.id == "subprocess"
-                and child.func.attr == "run"
-                for child in ast.walk(statement)
-            )
-            for statement in node.body
-        )
-        for node in ast.walk(holdout_tree)
-    ), "holdout evaluator must be inside the development promotion gate"
-
-
-def test_colab_notebook_computes_per_seat_thresholds_for_both_evaluations():
-    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_gpu.ipynb"
-    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    code = "\n".join(
-        "".join(cell.get("source", []))
-        for cell in notebook["cells"]
-        if cell.get("cell_type") == "code"
-    )
-
-    assert "development_min_valid_games = len(development_seed_values) * len(development_opponents)" in code
-    assert "'--min-valid-games', str(development_min_valid_games)" in code
-    assert "holdout_min_valid_games = len(holdout_seed_values) * len(holdout_opponents)" in code
-    assert "'--min-valid-games', str(holdout_min_valid_games)" in code
-    assert "holdout_seed_values" in code
-    assert "development_seed_values" in code
-
-
-def test_colab_notebook_filters_prior_checkpoints_before_building_opponent_pool():
-    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_gpu.ipynb"
-    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    code = "\n".join(
-        "".join(cell.get("source", []))
-        for cell in notebook["cells"]
-        if cell.get("cell_type") == "code"
-    )
-
-    assert "prior_checkpoint_candidates" in code
-    assert "compatible_prior_checkpoints = []" in code
-    assert "colab_train.select_resume_checkpoint(" in code
-    assert "except ValueError as exc:" in code
-    assert "continue" in code
-    assert "train_policy.OpponentPool(" in code
-    assert "previous_checkpoints=compatible_prior_checkpoints" in code
-    assert "opponent_pool=training_opponent_pool" in code
-    assert "malformed or incompatible checkpoint" in code
+    assert not any(marker in code for marker in old_inline_orchestration_markers)
 
 
 def test_colab_notebook_executable_cells_are_valid_python():
-    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_gpu.ipynb"
-    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    notebook, _ = _notebook_code_cells()
+    parsed_code_cells = []
 
     for index, cell in enumerate(notebook["cells"]):
         if cell.get("cell_type") == "code":
             source = "\n".join(
-                "pass" if line.lstrip().startswith(("%", "!")) else line
+                "pass" if line.lstrip().startswith(("%", "!", "--")) else line
                 for line in "".join(cell.get("source", [])).splitlines()
             )
-            ast.parse(source, filename=f"cell-{index}")
+            parsed_code_cells.append(ast.parse(source, filename=f"cell-{index}"))
 
-
-def test_colab_telemetry_callback_is_passed_only_to_training():
-    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_gpu.ipynb"
-    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    training_cell = next(
-        "".join(cell.get("source", []))
-        for cell in notebook["cells"]
-        if cell.get("cell_type") == "code" and "training_contract =" in "".join(cell.get("source", []))
-    )
-    tree = ast.parse(training_cell, filename="training-cell")
-    contract_call = next(
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
+    assert len(parsed_code_cells) == 3
+    clone_tree = parsed_code_cells[0]
+    assert any(
+        isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "build_training_contract"
-    )
-    train_call = next(
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "train_behavior_clone"
-    )
-
-    assert not any(keyword.arg == "telemetry_callback" for keyword in contract_call.keywords)
-    assert [
-        keyword.value.id
-        for keyword in train_call.keywords
-        if keyword.arg == "telemetry_callback"
-        and isinstance(keyword.value, ast.Name)
-    ] == ["record_training_event"]
-
-
-def test_colab_telemetry_is_stage_scoped_and_labels_plot():
-    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_gpu.ipynb"
-    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    code_cells = [
-        "".join(cell.get("source", []))
-        for cell in notebook["cells"]
-        if cell.get("cell_type") == "code"
-    ]
-    training_cell = next(source for source in code_cells if "training_contract =" in source)
-    plotting_cell = next(source for source in code_cells if "load_metrics" in source)
-    training_tree = ast.parse(training_cell, filename="training-cell")
-    plotting_tree = ast.parse(plotting_cell, filename="plotting-cell")
-
-    metrics_assignment = next(
-        node for node in ast.walk(training_tree)
-        if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "training_metrics_path" for target in node.targets)
-    )
-    metrics_path = metrics_assignment.value
-    assert isinstance(metrics_path, ast.BinOp)
-    assert isinstance(metrics_path.op, ast.Div)
-    assert isinstance(metrics_path.left, ast.Name)
-    assert metrics_path.left.id == "run_dir"
-    assert isinstance(metrics_path.right, ast.JoinedStr)
-    assert any(
-        isinstance(value, ast.FormattedValue)
-        and isinstance(value.value, ast.Name)
-        and value.value.id == "candidate_tag"
-        for value in metrics_path.right.values
-    )
-    assert any(
-        isinstance(value, ast.Constant)
-        and value.value == "-training-metrics.jsonl"
-        for value in metrics_path.right.values
-    )
-
-    adapter = next(
-        node for node in training_tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "record_training_event"
-    )
-    telemetry_calls = [
-        node for node in ast.walk(adapter)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "training_telemetry"
-    ]
-    assert len(telemetry_calls) == 1
-    telemetry_call = telemetry_calls[0]
-    assert [
-        argument.id for argument in telemetry_call.args
-        if isinstance(argument, ast.Name)
-    ] == ["event", "metrics"]
-    assert {
-        keyword.arg for keyword in telemetry_call.keywords
-        if keyword.arg is not None
-    } >= {"candidate_tag", "ppo_target_steps"}
-
-    train_call = next(
-        node for node in ast.walk(training_tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "train_behavior_clone"
-    )
-    callback_values = [
-        keyword.value.id for keyword in train_call.keywords
-        if keyword.arg == "telemetry_callback"
-        and isinstance(keyword.value, ast.Name)
-    ]
-    assert callback_values == ["record_training_event"]
-
-    load_call = next(
-        node for node in ast.walk(plotting_tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "load_metrics"
-    )
-    assert [argument.id for argument in load_call.args if isinstance(argument, ast.Name)] == [
-        "training_metrics_path"
-    ]
-    assert any(
-        isinstance(node, ast.JoinedStr)
-        and any(
-            isinstance(value, ast.FormattedValue)
-            and isinstance(value.value, ast.Name)
-            and value.value.id == "candidate_tag"
-            for value in node.values
-        )
-        for node in ast.walk(plotting_tree)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "subprocess"
+        and node.func.attr == "run"
+        for node in ast.walk(clone_tree)
     )
 
 
@@ -366,6 +165,537 @@ def test_build_training_contract_records_requested_training_identity_and_options
     assert contract.configuration["prior_checkpoint"] is None
     assert contract.configuration["offline_ppo_fallback"] is False
     assert contract.configuration["checkpoint_interval"] == 25
+
+
+def test_colab_cli_parses_complete_workflow_parameters(tmp_path):
+    from scripts import colab_train
+
+    args = colab_train.parse_args([
+        "--run-directory", str(tmp_path),
+        "--trajectory-path", str(tmp_path / "input.jsonl"),
+        "--ppo-target-steps", "32",
+        "--training-steps", "9",
+        "--training-batch-size", "64",
+        "--training-seed", "11",
+        "--collection-seeds", "8",
+        "--collection-start-seed", "4",
+        "--collection-steps", "48",
+        "--collection-opponents", "pass", "random",
+        "--rollout-seeds", "5", "6",
+        "--development-seeds", "10", "11",
+        "--holdout-seeds", "100", "101",
+        "--development-opponents", "pass", "starter",
+        "--holdout-opponents", "random", "starter",
+        "--device", "cpu",
+        "--workers", "3",
+        "--wandb-project", "project",
+        "--wandb-entity", "entity",
+        "--no-wandb",
+        "--mount-drive",
+        "--smoke-seed", "12",
+        "--smoke-steps", "49",
+        "--plot",
+        "--dry-run",
+    ])
+
+    assert args.run_directory == tmp_path
+    assert args.trajectory_path == tmp_path / "input.jsonl"
+    assert args.ppo_target_steps == 32
+    assert args.training_steps == 9
+    assert args.training_batch_size == 64
+    assert args.training_seed == 11
+    assert args.collection_seeds == 8
+    assert args.collection_start_seed == 4
+    assert args.collection_steps == 48
+    assert args.collection_opponents == ["pass", "random"]
+    assert args.rollout_seeds == [5, 6]
+    assert args.development_seeds == [10, 11]
+    assert args.holdout_seeds == [100, 101]
+    assert args.development_opponents == ["pass", "starter"]
+    assert args.holdout_opponents == ["random", "starter"]
+    assert args.device == "cpu"
+    assert args.workers == 3
+    assert args.wandb_project == "project"
+    assert args.wandb_entity == "entity"
+    assert args.wandb is False
+    assert args.mount_drive is True
+    assert args.smoke_seed == 12
+    assert args.smoke_steps == 49
+    assert args.plot is True
+    assert args.dry_run is True
+
+
+def test_colab_cli_supports_explicit_none_checkpoint_and_fallback_opt_out():
+    from scripts import colab_train
+
+    defaults = colab_train.parse_args(["--dry-run"])
+    explicit = colab_train.parse_args([
+        "--training-prior-checkpoint", "none",
+        "--no-training-offline-ppo-fallback",
+        "--dry-run",
+    ])
+    enabled = colab_train.parse_args([
+        "--training-offline-ppo-fallback",
+        "--dry-run",
+    ])
+
+    assert defaults.training_prior_checkpoint is None
+    assert defaults.training_offline_ppo_fallback is False
+    assert explicit.training_prior_checkpoint is None
+    assert explicit.training_offline_ppo_fallback is False
+    assert enabled.training_offline_ppo_fallback is True
+    config = colab_train.config_from_args(explicit)
+    assert config.training_prior_checkpoint is None
+    assert config.training_offline_ppo_fallback is False
+
+
+def test_colab_workflow_builds_parameterized_commands(tmp_path, monkeypatch):
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    config = colab_train.build_config(
+        run_directory=tmp_path,
+        trajectory_path=tmp_path / "input.jsonl",
+        ppo_target_steps=32,
+        collection_seed_values=(4, 5),
+        collection_steps=48,
+        collection_opponents=("pass", "random"),
+        rollout_seed_values=(6, 7),
+        development_seeds=(10, 11),
+        holdout_seeds=(100, 101),
+        development_opponents=("pass", "starter"),
+        holdout_opponents=("random", "starter"),
+        device="cpu",
+        workers=3,
+        wandb_enabled=False,
+        smoke_seed=12,
+        smoke_steps=49,
+    )
+
+    collection = colab_train.build_collection_command(config)
+    assert collection[:2] == [colab_train.sys.executable, str(colab_train.COLLECT_SCRIPT)]
+    assert collection[collection.index("--seeds") + 1] == "2"
+    assert collection[collection.index("--start-seed") + 1] == "4"
+    assert collection[collection.index("--steps") + 1] == "48"
+    assert collection[collection.index("--workers") + 1] == "3"
+    assert collection[collection.index("--output") + 1] == str(tmp_path / "input.jsonl")
+
+    development = colab_train.build_evaluation_command(config, phase="development")
+    assert development[development.index("--artifact") + 1] == str(config.stage_artifact_path)
+    assert development[development.index("--identity") + 1] == "ppo32"
+    assert development[development.index("--seeds") + 1] == "2"
+    assert development[development.index("--start-seed") + 1] == "10"
+    assert development[development.index("--min-valid-games") + 1] == "4"
+    assert development[development.index("--output") + 1] == str(config.development_report_path)
+
+    holdout = colab_train.build_evaluation_command(config, phase="holdout")
+    assert holdout[holdout.index("--start-seed") + 1] == "100"
+    assert holdout[holdout.index("--min-valid-games") + 1] == "4"
+    assert holdout[holdout.index("--output") + 1] == str(config.holdout_report_path)
+
+    smoke = colab_train.build_smoke_command(config)
+    assert smoke[:2] == [colab_train.sys.executable, str(colab_train.RUN_LOCAL_SCRIPT)]
+    assert smoke[smoke.index("--seed") + 1] == "12"
+    assert smoke[smoke.index("--steps") + 1] == "49"
+    assert smoke[smoke.index("--candidate-artifact") + 1] == str(config.stage_artifact_path)
+
+
+def test_colab_relative_paths_are_stable_when_cwd_changes(tmp_path, monkeypatch):
+    from scripts import colab_train
+
+    path_kwargs = {
+        "run_directory": "runs/kagriculture",
+        "trajectory_path": "inputs/trajectories.jsonl",
+        "resume": "checkpoints/resume.pt",
+        "training_prior_checkpoint": "checkpoints/prior.pt",
+        "drive_mountpoint": "colab-drive",
+        "plot_path": "plots/training.png",
+    }
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    first = colab_train.build_config(
+        **path_kwargs, device="cpu", mount_drive=False,
+    )
+
+    other_cwd = tmp_path / "different-cwd"
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+    second = colab_train.build_config(
+        **path_kwargs, device="cpu", mount_drive=False,
+    )
+
+    assert first.run_directory == second.run_directory
+    assert first.trajectory_path == second.trajectory_path
+    assert first.resume == second.resume
+    assert first.training_prior_checkpoint == second.training_prior_checkpoint
+    assert first.drive_mountpoint == second.drive_mountpoint
+    assert first.plot_path == second.plot_path
+    assert first.run_directory == colab_train.PROJECT_ROOT / "runs/kagriculture"
+    assert first.trajectory_path == colab_train.PROJECT_ROOT / "inputs/trajectories.jsonl"
+    assert first.resume == colab_train.PROJECT_ROOT / "checkpoints/resume.pt"
+    assert first.training_prior_checkpoint == colab_train.PROJECT_ROOT / "checkpoints/prior.pt"
+    assert first.drive_mountpoint == colab_train.PROJECT_ROOT / "colab-drive"
+    assert first.plot_path == colab_train.PROJECT_ROOT / "plots/training.png"
+    assert colab_train.build_collection_command(first) == colab_train.build_collection_command(second)
+    assert colab_train.build_evaluation_command(first, phase="development") == colab_train.build_evaluation_command(second, phase="development")
+    assert colab_train.build_smoke_command(first) == colab_train.build_smoke_command(second)
+    assert first.stage_artifact_path == second.stage_artifact_path
+    assert first.development_report_path == second.development_report_path
+    assert first.smoke_replay_path == second.smoke_replay_path
+
+
+def test_colab_dry_run_returns_plan_without_external_integrations(tmp_path, monkeypatch):
+    from scripts import colab_train
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("external integration used during dry-run")
+
+    monkeypatch.setattr(colab_train, "mount_drive", forbidden)
+    monkeypatch.setattr(colab_train, "run_command", forbidden)
+    monkeypatch.setattr(colab_train, "initialize_telemetry", forbidden)
+    monkeypatch.setattr(colab_train, "train_candidate", forbidden)
+
+    result = colab_train.run_workflow(
+        colab_train.build_config(
+            run_directory=tmp_path,
+            device="cpu",
+            mount_drive=True,
+            wandb_enabled=True,
+        ),
+        dry_run=True,
+    )
+
+    assert result.dry_run is True
+    assert result.commands
+    assert result.commands[0][1] == str(colab_train.COLLECT_SCRIPT)
+    assert result.commands[-1][1] == str(colab_train.RUN_LOCAL_SCRIPT)
+    assert result.development_evaluation_promoted is None
+
+
+def test_colab_mount_drive_defaults_true_but_dry_run_does_not_mount(monkeypatch):
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    args = colab_train.parse_args(["--dry-run"])
+    assert args.mount_drive is True
+    assert colab_train.build_config(device="cpu").mount_drive is True
+    assert colab_train.parse_args(["--dry-run", "--no-mount-drive"]).mount_drive is False
+
+
+def _complete_colab_evaluation_report(config, *, phase):
+    seeds = config.development_seeds if phase == "development" else config.holdout_seeds
+    opponents = config.development_opponents if phase == "development" else config.holdout_opponents
+    seats = config.development_seats if phase == "development" else config.holdout_seats
+    expected_matrix = [
+        [opponent, seed, seat]
+        for opponent in opponents
+        for seed in seeds
+        for seat in seats
+    ]
+    completeness = {
+        "current": {
+            "expected": expected_matrix,
+            "expected_count": len(expected_matrix),
+            "observed_count": len(expected_matrix),
+            "missing": [], "duplicate": [], "extra": [], "invalid_records": [],
+        },
+        config.candidate_tag: {
+            "expected": expected_matrix,
+            "expected_count": len(expected_matrix),
+            "observed_count": len(expected_matrix),
+            "missing": [], "duplicate": [], "extra": [], "invalid_records": [],
+        },
+    }
+    records = {
+        "current": [
+            {"opponent": opponent, "seed": seed, "seat": seat}
+            for opponent, seed, seat in expected_matrix
+        ],
+        config.candidate_tag: [
+            {"opponent": opponent, "seed": seed, "seat": seat}
+            for opponent, seed, seat in expected_matrix
+        ],
+    }
+    artifact_path = config.stage_artifact_path
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    if not artifact_path.exists():
+        artifact_path.write_text("fixture artifact", encoding="utf-8")
+    return {
+        "schema_version": 1,
+        "configuration": {
+            "seed_values": list(seeds),
+            "opponents": list(opponents),
+            "seats": list(seats),
+        },
+        "artifact": {
+            "identity": config.candidate_tag,
+            "sha256": hashlib.sha256(artifact_path.read_bytes()).hexdigest(),
+        },
+        "expected_matrix": expected_matrix,
+        "records": records,
+        "matrix_completeness": completeness,
+        "decision": {"status": "promote"},
+    }
+
+
+def test_evaluation_report_rejects_self_declared_malformed_matrix(tmp_path, monkeypatch):
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+    report = _complete_colab_evaluation_report(config, phase="development")
+    report["expected_matrix"][0] = ["pass", 999, 0]
+
+    assert not colab_train.evaluation_report_is_complete(
+        report, identity=config.candidate_tag,
+        seed_values=config.development_seeds,
+        opponents=config.development_opponents,
+        seats=config.development_seats,
+        artifact_path=config.stage_artifact_path,
+    )
+
+
+@pytest.mark.parametrize(
+    "field,phase",
+    [
+        ("collection_seed_values", "collection"),
+        ("development_seeds", "development"),
+        ("holdout_seeds", "holdout"),
+    ],
+)
+def test_colab_commands_reject_non_contiguous_seed_lists(tmp_path, monkeypatch, field, phase):
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    kwargs = {
+        "run_directory": tmp_path,
+        "device": "cpu",
+        "mount_drive": False,
+        "development_seeds": (0, 1),
+        "holdout_seeds": (100, 101),
+    }
+    kwargs[field] = (100, 102) if field == "holdout_seeds" else (0, 2)
+    config = colab_train.build_config(**kwargs)
+
+    with pytest.raises(ValueError, match="contiguous"):
+        if phase == "collection":
+            colab_train.build_collection_command(config)
+        else:
+            colab_train.build_evaluation_command(config, phase=phase)
+
+
+@pytest.mark.parametrize("seat_field", ["collection_seats", "development_seats", "holdout_seats"])
+@pytest.mark.parametrize("seats", [(), (0, 0), (0, 2)])
+def test_colab_config_rejects_invalid_seat_tuples(tmp_path, monkeypatch, seat_field, seats):
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    with pytest.raises(ValueError, match=seat_field):
+        colab_train.build_config(
+            run_directory=tmp_path, device="cpu", mount_drive=False,
+            **{seat_field: seats},
+        )
+
+
+@pytest.mark.parametrize("resume_path", ["missing", "directory"])
+def test_colab_explicit_resume_must_be_a_regular_file(tmp_path, monkeypatch, resume_path):
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    resume = tmp_path / "resume.pt"
+    if resume_path == "directory":
+        resume.mkdir()
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        resume=resume, development_seeds=(0,), holdout_seeds=(100,),
+    )
+    training_calls = []
+
+    def fake_run(command, *, check, capture_output=False):
+        if Path(command[1]).name == colab_train.COLLECT_SCRIPT.name:
+            config.trajectory_path.write_text("{}\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(colab_train, "run_command", fake_run)
+    monkeypatch.setattr(
+        colab_train, "train_candidate",
+        lambda *args, **kwargs: training_calls.append(True),
+    )
+    monkeypatch.setattr(colab_train, "initialize_telemetry", lambda config: None)
+
+    with pytest.raises((FileNotFoundError, ValueError), match="resume"):
+        colab_train.run_workflow(config)
+    assert not training_calls
+
+
+def test_plot_training_metrics_creates_parent_and_closes_figure(tmp_path, monkeypatch):
+    plt = pytest.importorskip("matplotlib.pyplot")
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        plot_path=tmp_path / "nested" / "telemetry.png",
+    )
+    config.training_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    config.training_metrics_path.write_text(
+        '{"event":"behavior_clone","step":1,"loss":0.5}\n'
+        '{"event":"ppo","step":1,"policy_loss":0.25}\n',
+        encoding="utf-8",
+    )
+    closed = []
+    monkeypatch.setattr(plt, "close", lambda figure: closed.append(figure))
+
+    output = colab_train.plot_training_metrics(config)
+
+    assert output == config.plot_path
+    assert output.is_file()
+    assert closed
+
+
+@pytest.mark.parametrize("hash_value", [None, "", "not-a-sha256", "0" * 64])
+def test_evaluation_report_requires_matching_artifact_sha256(tmp_path, monkeypatch, hash_value):
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+    report = _complete_colab_evaluation_report(config, phase="development")
+    if hash_value is None:
+        del report["artifact"]["sha256"]
+    else:
+        report["artifact"]["sha256"] = hash_value
+
+    assert not colab_train.evaluation_report_is_complete(
+        report, identity=config.candidate_tag,
+        seed_values=config.development_seeds,
+        artifact_path=config.stage_artifact_path,
+    )
+
+
+def test_colab_rejects_stale_complete_report_when_development_evaluator_fails(tmp_path, monkeypatch):
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+    config.development_report_path.write_text(
+        json.dumps(_complete_colab_evaluation_report(config, phase="development")),
+        encoding="utf-8",
+    )
+    invoked = []
+
+    def fake_run(command, *, check, capture_output=False):
+        script = Path(command[1]).name
+        invoked.append(script)
+        if script == colab_train.COLLECT_SCRIPT.name:
+            config.trajectory_path.write_text("{}\n", encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if script == colab_train.EVALUATE_SCRIPT.name:
+            return SimpleNamespace(returncode=1, stdout="", stderr="evaluator failed")
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(colab_train, "run_command", fake_run)
+    monkeypatch.setattr(colab_train, "train_candidate", lambda *args, **kwargs: {})
+    monkeypatch.setattr(colab_train, "initialize_telemetry", lambda config: None)
+    monkeypatch.setattr(colab_train, "smoke_test_artifact", lambda config: None)
+
+    with pytest.raises(RuntimeError, match="development evaluator"):
+        colab_train.run_workflow(config)
+
+    assert not config.development_report_path.exists()
+    assert colab_train.EVALUATE_SCRIPT.name in invoked
+    assert colab_train.RUN_LOCAL_SCRIPT.name not in invoked
+
+
+def test_colab_smoke_failure_prevents_holdout_evaluation(tmp_path, monkeypatch):
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+    invoked = []
+
+    def fake_run(command, *, check, capture_output=False):
+        script = Path(command[1]).name
+        invoked.append(script)
+        if script == colab_train.COLLECT_SCRIPT.name:
+            config.trajectory_path.write_text("{}\n", encoding="utf-8")
+        elif script == colab_train.EVALUATE_SCRIPT.name:
+            phase = "holdout" if "holdout" in command[-1] else "development"
+            report_path = config.holdout_report_path if phase == "holdout" else config.development_report_path
+            report_path.write_text(
+                json.dumps(_complete_colab_evaluation_report(config, phase=phase)),
+                encoding="utf-8",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(colab_train, "run_command", fake_run)
+    monkeypatch.setattr(colab_train, "train_candidate", lambda *args, **kwargs: {})
+    monkeypatch.setattr(colab_train, "initialize_telemetry", lambda config: None)
+
+    def failed_smoke(config):
+        invoked.append("smoke")
+        raise RuntimeError("smoke failed")
+
+    monkeypatch.setattr(colab_train, "smoke_test_artifact", failed_smoke)
+
+    with pytest.raises(RuntimeError, match="smoke failed"):
+        colab_train.run_workflow(config)
+
+    assert invoked == [
+        colab_train.COLLECT_SCRIPT.name,
+        colab_train.EVALUATE_SCRIPT.name,
+        "smoke",
+    ]
+    assert not config.holdout_report_path.exists()
+
+
+def test_colab_workflow_does_not_automatically_promote_candidate(tmp_path, monkeypatch):
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+
+    def fake_run(command, *, check, capture_output=False):
+        script = Path(command[1]).name
+        if script == colab_train.COLLECT_SCRIPT.name:
+            config.trajectory_path.write_text("{}\n", encoding="utf-8")
+        elif script == colab_train.EVALUATE_SCRIPT.name:
+            phase = "holdout" if "holdout" in command[-1] else "development"
+            report_path = config.holdout_report_path if phase == "holdout" else config.development_report_path
+            report_path.write_text(
+                json.dumps(_complete_colab_evaluation_report(config, phase=phase)),
+                encoding="utf-8",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_train(config, **kwargs):
+        config.stage_checkpoint_path.write_bytes(b"checkpoint")
+        config.stage_artifact_path.write_text("artifact", encoding="utf-8")
+        return {}
+
+    monkeypatch.setattr(colab_train, "run_command", fake_run)
+    monkeypatch.setattr(colab_train, "train_candidate", fake_train)
+    monkeypatch.setattr(colab_train, "initialize_telemetry", lambda config: None)
+    monkeypatch.setattr(colab_train, "smoke_test_artifact", lambda config: None)
+
+    result = colab_train.run_workflow(config)
+
+    assert result.holdout_evaluation_complete is True
+    assert config.stage_artifact_path.exists()
+    assert not config.current_checkpoint_path.exists()
 
 
 def test_build_training_contract_normalizes_zero_steps_and_batch_size(monkeypatch, tmp_path):

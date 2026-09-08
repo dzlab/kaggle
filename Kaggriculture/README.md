@@ -269,15 +269,60 @@ workflow; for example, run `uv sync`, `uv run pytest -q`, or
 
 ## Colab training
 
-Mount Google Drive and use one GPU for model updates with bounded CPU rollout
-workers. The configuration wrapper validates device selection and keeps
-development and holdout seeds disjoint:
+Open `notebooks/colab_gpu.ipynb` and run its three setup/launch cells. For a
+direct launch, run `scripts/train.py` with the workflow parameters you
+want to keep explicit:
 
 ```bash
-python scripts/colab_train.py --run-directory /content/drive/MyDrive/kagriculture-training \
-  --device auto --workers 2
+python scripts/train.py \
+  --mount-drive \
+  --run-directory /content/drive/MyDrive/kagriculture-training \
+  --device auto \
+  --ppo-target-steps 16 \
+  --training-steps 25 --training-batch-size 256 --training-seed 7 \
+  --training-prior-checkpoint none \
+  --no-training-offline-ppo-fallback \
+  --collection-seeds 8 --collection-start-seed 0 \
+  --development-seeds 0 1 2 3 \
+  --holdout-seeds 100 101 \
+  --workers 2 \
+  --wandb \
+  --smoke-opponent pass --smoke-seed 0 --smoke-steps 96 \
+  --plot
 ```
 
-Use `scripts/train_policy.py --resume` or the training state file to continue
-after a Colab disconnect; only candidates that pass development gates should
-be evaluated on holdout seeds.
+`--training-prior-checkpoint none` and
+`--no-training-offline-ppo-fallback` preserve the fresh-run defaults. To resume
+or stage more PPO training, rerun the same command with a larger
+`--ppo-target-steps`; the run directory provides the existing training state.
+
+## Experimental context and training ladder
+
+`kagriculture_agent.experimental_features.extract_experimental_context()` is
+an opt-in, observation-only context variant. It reports bounded recent-action,
+price/demand trend, recovery-slack, and task-opportunity signals; it does not
+change `features.py` or the production artifact schema.
+
+The scaling ladder is dry-run-first and imports no GPU training dependencies:
+
+```bash
+uv run python scripts/benchmark_training_ladder.py \
+  --ladder '{"widths":[32,64],"depths":[1,2],"ppo_budgets":[1000,5000],"seeds":[0,1],"rollout_episodes":8,"rollout_steps":64}'
+```
+
+Pass `--output training-ladder.json` only when a report should be written; it
+is validated inside the explicit `reports/` root by default. Model, artifact,
+and checkpoint paths—including generic names such as `model.json` and
+`trained_model.json`—are rejected.
+
+Execute mode accepts an injected `module:function` callback. The callback
+receives one expanded experiment and returns a JSON metrics object (for
+example `elo`, `safety`, `latency_ms`, and `evaluation`); those metrics are
+recorded in the report:
+
+```bash
+uv run python scripts/benchmark_training_ladder.py \
+  --execute --callback my_benchmark:run \
+  --ladder '{"widths":[32],"depths":[2],"ppo_budgets":[1000],"seeds":[0]}' \
+  --report-root reports --output training-ladder.json
+```
