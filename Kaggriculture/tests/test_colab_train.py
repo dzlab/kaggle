@@ -102,6 +102,9 @@ def test_colab_notebook_has_rerunnable_development_and_gated_holdout_cells():
     assert "--start-seed" in holdout_source
     assert "--output" in holdout_source
     assert "holdout evaluation skipped" in holdout_source.lower()
+    assert "holdout_min_valid_games = len(holdout_seed_values) * len(holdout_opponents)" in holdout_source
+    assert "holdout_evaluation_complete" in holdout_source
+    assert "holdout_decision.get('status') in {'promote', 'discard'}" in holdout_source
 
     holdout_tree = ast.parse(holdout_source, filename="holdout-cell")
     guarded_evaluation = [
@@ -131,6 +134,23 @@ def test_colab_notebook_has_rerunnable_development_and_gated_holdout_cells():
         )
         for node in ast.walk(holdout_tree)
     ), "holdout evaluator must be inside the development promotion gate"
+
+
+def test_colab_notebook_computes_per_seat_thresholds_for_both_evaluations():
+    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_orbit_gpu.ipynb"
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    code = "\n".join(
+        "".join(cell.get("source", []))
+        for cell in notebook["cells"]
+        if cell.get("cell_type") == "code"
+    )
+
+    assert "development_min_valid_games = len(development_seed_values) * len(development_opponents)" in code
+    assert "'--min-valid-games', str(development_min_valid_games)" in code
+    assert "holdout_min_valid_games = len(holdout_seed_values) * len(holdout_opponents)" in code
+    assert "'--min-valid-games', str(holdout_min_valid_games)" in code
+    assert "holdout_seed_values" in code
+    assert "development_seed_values" in code
 
 
 def test_colab_notebook_filters_prior_checkpoints_before_building_opponent_pool():

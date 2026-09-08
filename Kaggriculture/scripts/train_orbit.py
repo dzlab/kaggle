@@ -162,11 +162,14 @@ class OrbitController:
                 state["current"] = round_state
                 self._write_state(state)
             try:
-                candidate = Path(round_state["candidate"]) if (
+                candidate_checkpoint = Path(round_state["candidate"]) if (
                     round_state.get("stage") in {"evaluate", "promoting"}
                     and round_state.get("candidate")
                 ) else None
-                if candidate is None:
+                candidate_artifact = Path(round_state["candidate_artifact"]) if (
+                    round_state.get("candidate_artifact")
+                ) else None
+                if candidate_checkpoint is None:
                     if round_state.get("stage") == "train" and "rollout" in round_state:
                         rollout = round_state["rollout"]
                     else:
@@ -178,23 +181,38 @@ class OrbitController:
                     round_state["stage"] = "train"
                     round_state["rollout"] = rollout
                     self._write_state(state)
-                    candidate = Path(self.train_fn(
-                        rollout=rollout, round_index=round_index,
-                        run_directory=self.run_directory,
-                    ))
-                    round_state["candidate"] = str(candidate)
+                    train_kwargs = {
+                        "rollout": rollout, "round_index": round_index,
+                        "run_directory": self.run_directory,
+                    }
+                    resume_checkpoint = round_state.get("candidate")
+                    if resume_checkpoint and Path(resume_checkpoint).is_file():
+                        train_kwargs["resume_checkpoint"] = Path(resume_checkpoint)
+                    candidate_checkpoint = Path(self.train_fn(**train_kwargs))
+                    round_state["candidate"] = str(candidate_checkpoint)
                     if self.export_fn is not None:
-                        round_state["candidate_artifact"] = str(self.export_fn(
-                            candidate=candidate, round_index=round_index,
+                        candidate_artifact = Path(self.export_fn(
+                            candidate=candidate_checkpoint, round_index=round_index,
                             run_directory=self.run_directory,
                         ))
+                        round_state["candidate_artifact"] = str(candidate_artifact)
                     round_state["stage"] = "evaluate"
                     self._write_state(state)
+                elif candidate_artifact is None and self.export_fn is not None:
+                    candidate_artifact = Path(self.export_fn(
+                        candidate=candidate_checkpoint, round_index=round_index,
+                        run_directory=self.run_directory,
+                    ))
+                    round_state["candidate_artifact"] = str(candidate_artifact)
+                    self._write_state(state)
+                evaluation_candidate = candidate_artifact or candidate_checkpoint
+                if evaluation_candidate is None:
+                    raise ValueError("round has no candidate checkpoint")
                 if round_state.get("stage") == "promoting":
                     decision = round_state.get("decision")
                 else:
                     decision = self.evaluate_fn(
-                        candidate=candidate, current=state.get("best"),
+                        candidate=evaluation_candidate, current=state.get("best"),
                         seeds=self.config.development_seeds, round_index=round_index,
                     )
                 if not isinstance(decision, dict) or type(decision.get("promoted")) is not bool:
@@ -205,7 +223,7 @@ class OrbitController:
                     self._write_state(state)
                     best = self.run_directory / "best.pt"
                     temporary = self.run_directory / f".best.{round_index}.tmp"
-                    shutil.copyfile(candidate, temporary)
+                    shutil.copyfile(candidate_checkpoint, temporary)
                     os.replace(temporary, best)
                     round_state["stage"] = "retained"
                     state["best"] = str(best)
@@ -297,7 +315,8 @@ def _production_rollout(config: OrbitConfig, *, round_index: int, seeds: Sequenc
 
 
 def _production_train(config: OrbitConfig, *, rollout: Mapping[str, Any],
-                      round_index: int, run_directory: Path) -> Path:
+                      round_index: int, run_directory: Path,
+                      resume_checkpoint: str | Path | None = None) -> Path:
     """Train BC then fresh-rollout PPO, refreshing the exported policy each step."""
     input_path = Path(str(rollout.get("input_path", ""))).expanduser().resolve()
     if not input_path.is_file():
@@ -308,9 +327,12 @@ def _production_train(config: OrbitConfig, *, rollout: Mapping[str, Any],
     from scripts.export_policy import export_checkpoint
     from scripts.train_policy import (
         OpponentPool,
+        build_training_contract,
         make_fresh_rollout_fn,
         train_behavior_clone,
+        validate_training_checkpoint,
     )
+    from kagriculture_agent.checkpoints import read_checkpoint
 
     round_directory = _round_directory(config, round_index)
     candidate_checkpoint = round_directory / "candidate.pt"
@@ -319,23 +341,45 @@ def _production_train(config: OrbitConfig, *, rollout: Mapping[str, Any],
     prior = prior_checkpoint if prior_checkpoint.is_file() else None
     pool = OpponentPool(_existing_checkpoint_window(config))
 
-    # Create a valid BC checkpoint and artifact first. Increasing the PPO target
-    # one step at a time lets each fresh rollout use the preceding network state
-    # through the public train_policy API.
-    train_behavior_clone(
-        input_path=input_path,
-        output_path=candidate_checkpoint,
-        steps=1,
-        batch_size=_DEFAULT_BATCH_SIZE,
-        seed=round_index,
-        ppo_steps=0,
-        device=config.device,
-        checkpoint_interval=1,
-        prior_checkpoint=prior,
-    )
+    resumed_target = 0
+    resumed_round = 0
+    if resume_checkpoint is not None:
+        resume_path = Path(resume_checkpoint).expanduser().resolve()
+        if resume_path != candidate_checkpoint.resolve() or not resume_path.is_file():
+            raise ValueError("resume checkpoint must be the current round candidate.pt")
+        payload = read_checkpoint(resume_path, map_location="cpu")
+        contract = build_training_contract(
+            input_path=input_path, steps=1, batch_size=_DEFAULT_BATCH_SIZE,
+            seed=round_index, ppo_steps=config.ppo_rounds, device=config.device,
+            checkpoint_interval=1, prior_checkpoint=prior,
+        )
+        saved_target = payload.get("configuration", {}).get("ppo_steps")
+        if type(saved_target) is not int or saved_target < 0 or saved_target > config.ppo_rounds:
+            raise ValueError("candidate checkpoint has an incompatible PPO target")
+        validate_training_checkpoint(
+            payload, contract=contract, allow_ppo_extension=saved_target < config.ppo_rounds,
+        )
+        resumed_target = saved_target
+        resumed_round = payload["progress"]["round"]
+
+    # Fresh rounds create BC first. Resumed rounds reuse the validated checkpoint
+    # and continue from its saved PPO progress without replacing its bytes.
+    if resume_checkpoint is None:
+        train_behavior_clone(
+            input_path=input_path,
+            output_path=candidate_checkpoint,
+            steps=1,
+            batch_size=_DEFAULT_BATCH_SIZE,
+            seed=round_index,
+            ppo_steps=0,
+            device=config.device,
+            checkpoint_interval=1,
+            prior_checkpoint=prior,
+        )
     export_checkpoint(candidate_checkpoint, candidate_artifact)
 
-    for ppo_target in range(1, config.ppo_rounds + 1):
+    first_ppo_target = max(1, resumed_target, resumed_round + 1)
+    for ppo_target in range(first_ppo_target, config.ppo_rounds + 1):
         rollout_fn = make_fresh_rollout_fn(
             run_directory=round_directory / "ppo-rollouts",
             candidate_artifact=candidate_artifact,
@@ -391,13 +435,30 @@ def _production_evaluate(config: OrbitConfig, *, candidate: str | Path,
         opponents=list(config.opponents),
         seats=list(config.seats),
         workers=config.workers,
-        min_valid_games=len(seeds) * len(config.opponents) * len(config.seats),
+        min_valid_games=len(seeds) * len(config.opponents),
     )
     report_path = _round_directory(config, round_index) / "development-evaluation.json"
     write_report(report_path, build_report(result))
     decision = result.get("decision")
     if not isinstance(decision, Mapping) or decision.get("status") not in {"promote", "discard"}:
         raise ValueError("development evaluator returned no valid promotion decision")
+    reasons = set(decision.get("reasons", ()))
+    invalid_evaluation_reasons = {
+        "framework_error",
+        "incomplete_matrix",
+        "insufficient_valid_games",
+        "missing_seat_pairs",
+        "duplicate_seat_pairs",
+        "missing_expected_matrix_records",
+        "duplicate_expected_matrix_records",
+        "extra_expected_matrix_records",
+    }
+    invalid_reasons = sorted(reasons & invalid_evaluation_reasons)
+    if invalid_reasons:
+        raise RuntimeError(
+            "development evaluation could not establish a valid comparison: "
+            + ", ".join(invalid_reasons)
+        )
     return {
         "promoted": decision["status"] == "promote",
         "status": decision["status"],

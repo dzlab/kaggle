@@ -54,6 +54,72 @@ def test_orbit_controller_resumes_completed_round_state(tmp_path):
     assert calls == [("rollout", 1)]
 
 
+def test_orbit_controller_evaluates_exported_artifact_but_retains_checkpoint(tmp_path):
+    from scripts.train_orbit import OrbitConfig, OrbitController
+
+    checkpoint = tmp_path / "round-0000" / "candidate.pt"
+    artifact = tmp_path / "round-0000" / "candidate.json"
+    calls = {}
+
+    def train_fn(**_kwargs):
+        checkpoint.parent.mkdir()
+        checkpoint.write_bytes(b"checkpoint-bytes")
+        return checkpoint
+
+    def export_fn(**kwargs):
+        calls["export_candidate"] = kwargs["candidate"]
+        artifact.write_text("exported-artifact", encoding="utf-8")
+        return artifact
+
+    def evaluate_fn(**kwargs):
+        calls["evaluated_candidate"] = kwargs["candidate"]
+        return {"promoted": True}
+
+    result = OrbitController(
+        OrbitConfig(tmp_path, max_rounds=1),
+        rollout_fn=lambda **_kwargs: {"complete": True},
+        train_fn=train_fn,
+        export_fn=export_fn,
+        evaluate_fn=evaluate_fn,
+    ).run()
+
+    assert calls["export_candidate"] == checkpoint
+    assert calls["evaluated_candidate"] == artifact
+    assert Path(result["best"]).read_bytes() == b"checkpoint-bytes"
+    assert result["history"][0]["candidate"] == str(checkpoint)
+    assert result["history"][0]["candidate_artifact"] == str(artifact)
+
+
+def test_orbit_controller_passes_partial_checkpoint_for_train_resume(tmp_path):
+    from scripts.train_orbit import OrbitConfig, OrbitController
+
+    checkpoint = tmp_path / "round-0000" / "candidate.pt"
+    checkpoint.parent.mkdir()
+    checkpoint.write_bytes(b"partial-checkpoint")
+    (tmp_path / "orbit-state.json").write_text(json.dumps({
+        "round": 0, "failures": 0, "best": None, "history": [],
+        "current": {
+            "round": 0, "stage": "train", "rollout": {"complete": True},
+            "candidate": str(checkpoint),
+        },
+    }))
+    calls = {}
+
+    def train_fn(**kwargs):
+        calls.update(kwargs)
+        checkpoint.write_bytes(b"resumed-checkpoint")
+        return checkpoint
+
+    OrbitController(
+        OrbitConfig(tmp_path, max_rounds=1),
+        rollout_fn=lambda **_kwargs: pytest.fail("completed rollout must be reused"),
+        train_fn=train_fn,
+        evaluate_fn=lambda **_kwargs: {"promoted": False},
+    ).run()
+
+    assert calls["resume_checkpoint"] == checkpoint
+
+
 def test_orbit_cli_parses_production_configuration_and_resume(tmp_path):
     from scripts.train_orbit import config_from_args, parse_args
 
@@ -142,6 +208,7 @@ def test_production_evaluator_passes_only_development_matrix(monkeypatch, tmp_pa
 
     assert result["promoted"] is True
     assert calls["seeds"] == [11, 13]
+    assert calls["min_valid_games"] == len((11, 13)) * len(("pass",))
     assert "holdout_seeds" not in calls
 
 
@@ -213,3 +280,65 @@ def test_production_train_adapter_refreshes_artifact_between_ppo_rounds(monkeypa
     assert [call["ppo_steps"] for call in train_calls] == [0, 1, 2]
     assert all(call["rollout_fn"] for call in train_calls[1:])
     assert len(export_calls) == 3
+
+
+def test_production_train_adapter_validates_and_resumes_partial_candidate(
+    monkeypatch, tmp_path,
+):
+    import kagriculture_agent.checkpoints as checkpoints
+    import scripts.export_policy as exporter
+    import scripts.train_policy as trainer
+    from scripts.train_orbit import OrbitConfig, build_production_callbacks
+
+    input_path = tmp_path / "rollout.jsonl"
+    input_path.write_text("transition\n")
+    candidate = tmp_path / "round-0000" / "candidate.pt"
+    candidate.parent.mkdir()
+    candidate.write_bytes(b"partial-checkpoint")
+    train_calls = []
+    validation_calls = []
+
+    def fake_train(**kwargs):
+        train_calls.append(kwargs)
+        kwargs["output_path"].write_bytes(b"resumed-checkpoint")
+        return {}
+
+    def fake_export(checkpoint, artifact):
+        artifact.write_text(f"exported:{checkpoint}")
+        return {}
+
+    class FakePool:
+        def __init__(self, _checkpoints):
+            pass
+
+    monkeypatch.setattr(
+        checkpoints, "read_checkpoint",
+        lambda _path, *, map_location: {
+            "configuration": {"ppo_steps": 1},
+            "progress": {"round": 1},
+        },
+    )
+    monkeypatch.setattr(trainer, "build_training_contract", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        trainer, "validate_training_checkpoint",
+        lambda payload, *, contract, allow_ppo_extension: validation_calls.append(
+            (payload, contract, allow_ppo_extension)
+        ),
+    )
+    monkeypatch.setattr(trainer, "train_behavior_clone", fake_train)
+    monkeypatch.setattr(trainer, "make_fresh_rollout_fn", lambda **kwargs: kwargs)
+    monkeypatch.setattr(trainer, "OpponentPool", FakePool)
+    monkeypatch.setattr(exporter, "export_checkpoint", fake_export)
+
+    config = OrbitConfig(tmp_path, ppo_rounds=2, opponents=("pass",), workers=1)
+    train_fn = build_production_callbacks(config)["train"]
+    result = train_fn(
+        rollout={"input_path": str(input_path)}, round_index=0,
+        run_directory=tmp_path, resume_checkpoint=candidate,
+    )
+
+    assert result == candidate
+    assert len(validation_calls) == 1
+    assert validation_calls[0][2] is True
+    assert [call["ppo_steps"] for call in train_calls] == [2]
+    assert train_calls[0]["resume_checkpoint"] == candidate
