@@ -1617,6 +1617,12 @@ def train_behavior_clone(
         # Behavior cloning benefits from a larger step size, but carrying that
         # rate into on-policy updates can move the policy far outside the
         # trust region in a single minibatch and trip target_kl immediately.
+        # Adam's accumulated behavior-cloning moments can have the same effect
+        # even after changing the scalar learning rate, so the first PPO phase
+        # always starts with fresh optimizer state.  Later PPO rounds keep the
+        # state so checkpoint resume remains continuous.
+        if round_index == 0 and initial_ppo_updates == 0 and initial_rollout_count == 0:
+            optimizer.state.clear()
         for parameter_group in optimizer.param_groups:
             parameter_group["lr"] = PPO_LEARNING_RATE
         config = PPOConfig()
