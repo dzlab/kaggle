@@ -6,11 +6,18 @@ import argparse
 import json
 import os
 import shutil
+import sys
 import tempfile
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+
+_DEVELOPMENT_OPPONENTS = ("pass", "random", "starter")
+_DEFAULT_GAME_TIMEOUT_SECONDS = 120.0
+_DEFAULT_BATCH_SIZE = 32
 
 
 @dataclass(frozen=True)
@@ -33,10 +40,23 @@ class OrbitConfig:
             raise ValueError("max_rounds must be positive and max_failures nonnegative")
         if not self.development_seeds:
             raise ValueError("development_seeds must not be empty")
+        if any(type(seed) is not int for seed in self.development_seeds):
+            raise ValueError("development_seeds must contain only integers")
+        if len(set(self.development_seeds)) != len(self.development_seeds):
+            raise ValueError("development_seeds must be unique")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ValueError("device must be auto, cpu, or cuda")
-        if not self.opponents or any(not isinstance(value, str) or not value for value in self.opponents):
+        if not self.opponents or any(
+            not isinstance(value, str) or not value for value in self.opponents
+        ):
             raise ValueError("opponents must be a non-empty tuple of names")
+        if any(opponent not in _DEVELOPMENT_OPPONENTS for opponent in self.opponents):
+            raise ValueError(
+                "opponents must be drawn from "
+                f"{', '.join(_DEVELOPMENT_OPPONENTS)}"
+            )
+        if len(set(self.opponents)) != len(self.opponents):
+            raise ValueError("opponents must be unique")
         if tuple(self.seats) != (0, 1):
             raise ValueError("seats must contain both candidate seat orders: (0, 1)")
         for name, value in (
@@ -45,6 +65,8 @@ class OrbitConfig:
         ):
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.episode_steps < 2:
+            raise ValueError("episode_steps must be at least 2 to produce a transition")
         if self.max_hours is not None and (
             isinstance(self.max_hours, bool) or not isinstance(self.max_hours, (int, float))
             or self.max_hours <= 0 or not float(self.max_hours) == float(self.max_hours)
@@ -206,34 +228,316 @@ class OrbitController:
         return state
 
 
+def _round_directory(config: OrbitConfig, round_index: int) -> Path:
+    directory = config.run_directory / f"round-{int(round_index):04d}"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _existing_checkpoint_window(config: OrbitConfig) -> list[Path]:
+    """Return the newest valid learned checkpoints for the PPO league."""
+    candidates = sorted(
+        config.run_directory.glob("round-*/candidate.pt"),
+        key=lambda path: path.stat().st_mtime,
+    )
+    best = config.run_directory / "best.pt"
+    if best.is_file():
+        candidates.append(best)
+    result: list[Path] = []
+    seen: set[Path] = set()
+    for path in reversed(candidates):
+        resolved = path.resolve()
+        if resolved in seen or not resolved.is_file():
+            continue
+        seen.add(resolved)
+        result.append(resolved)
+        if len(result) == config.checkpoint_window:
+            break
+    return list(reversed(result))
+
+
+def _best_artifact(config: OrbitConfig, round_directory: Path) -> Path | None:
+    """Export the retained checkpoint for use as the next round's candidate."""
+    best_checkpoint = config.run_directory / "best.pt"
+    if not best_checkpoint.is_file():
+        return None
+    from scripts.export_policy import export_checkpoint
+
+    artifact = round_directory / "current.json"
+    export_checkpoint(best_checkpoint, artifact)
+    return artifact
+
+
+def _production_rollout(config: OrbitConfig, *, round_index: int, seeds: Sequence[int],
+                        run_directory: Path) -> dict[str, Any]:
+    """Collect a complete, atomic training dataset with the real collector."""
+    from scripts.collect_trajectories import collect
+
+    round_directory = _round_directory(config, round_index)
+    artifact = _best_artifact(config, round_directory)
+    output = round_directory / "rollout.jsonl"
+    manifest = collect(
+        seeds=list(seeds),
+        opponents=list(config.opponents),
+        seats=list(config.seats),
+        steps=config.episode_steps,
+        output=output,
+        source_policy_identity=("best" if artifact is not None else "main.agent"),
+        workers=config.workers,
+        game_timeout=_DEFAULT_GAME_TIMEOUT_SECONDS,
+        candidate_artifact=artifact,
+        candidate_identity=(f"best:{artifact.name}" if artifact is not None else None),
+    )
+    return {
+        "input_path": str(output),
+        "manifest_path": str(output.with_suffix(".manifest.json")),
+        "manifest": manifest,
+        "candidate_artifact": str(artifact) if artifact is not None else None,
+    }
+
+
+def _production_train(config: OrbitConfig, *, rollout: Mapping[str, Any],
+                      round_index: int, run_directory: Path) -> Path:
+    """Train BC then fresh-rollout PPO, refreshing the exported policy each step."""
+    input_path = Path(str(rollout.get("input_path", ""))).expanduser().resolve()
+    if not input_path.is_file():
+        raise FileNotFoundError(
+            f"rollout adapter returned no readable input trajectory: {input_path}"
+        )
+
+    from scripts.export_policy import export_checkpoint
+    from scripts.train_policy import (
+        OpponentPool,
+        make_fresh_rollout_fn,
+        train_behavior_clone,
+    )
+
+    round_directory = _round_directory(config, round_index)
+    candidate_checkpoint = round_directory / "candidate.pt"
+    candidate_artifact = round_directory / "candidate.json"
+    prior_checkpoint = config.run_directory / "best.pt"
+    prior = prior_checkpoint if prior_checkpoint.is_file() else None
+    pool = OpponentPool(_existing_checkpoint_window(config))
+
+    # Create a valid BC checkpoint and artifact first. Increasing the PPO target
+    # one step at a time lets each fresh rollout use the preceding network state
+    # through the public train_policy API.
+    train_behavior_clone(
+        input_path=input_path,
+        output_path=candidate_checkpoint,
+        steps=1,
+        batch_size=_DEFAULT_BATCH_SIZE,
+        seed=round_index,
+        ppo_steps=0,
+        device=config.device,
+        checkpoint_interval=1,
+        prior_checkpoint=prior,
+    )
+    export_checkpoint(candidate_checkpoint, candidate_artifact)
+
+    for ppo_target in range(1, config.ppo_rounds + 1):
+        rollout_fn = make_fresh_rollout_fn(
+            run_directory=round_directory / "ppo-rollouts",
+            candidate_artifact=candidate_artifact,
+            seeds=config.development_seeds,
+            steps=config.episode_steps,
+            workers=config.workers,
+            game_timeout=_DEFAULT_GAME_TIMEOUT_SECONDS,
+            candidate_identity=f"round-{round_index}-ppo-{ppo_target}",
+        )
+        train_behavior_clone(
+            input_path=input_path,
+            output_path=candidate_checkpoint,
+            steps=1,
+            batch_size=_DEFAULT_BATCH_SIZE,
+            seed=round_index,
+            ppo_steps=ppo_target,
+            device=config.device,
+            checkpoint_interval=1,
+            resume_checkpoint=candidate_checkpoint,
+            allow_ppo_extension=True,
+            prior_checkpoint=prior,
+            opponent_pool=pool,
+            rollout_fn=rollout_fn,
+            candidate_artifact=candidate_artifact,
+        )
+        export_checkpoint(candidate_checkpoint, candidate_artifact)
+    return candidate_checkpoint
+
+
+def _production_export(config: OrbitConfig, *, candidate: str | Path,
+                       round_index: int, run_directory: Path) -> Path:
+    """Publish the final dependency-free artifact for a completed round."""
+    from scripts.export_policy import export_checkpoint
+
+    destination = _round_directory(config, round_index) / "candidate.json"
+    export_checkpoint(Path(candidate), destination)
+    return destination
+
+
+def _production_evaluate(config: OrbitConfig, *, candidate: str | Path,
+                         current: str | Path | None, seeds: Sequence[int],
+                         round_index: int) -> dict[str, Any]:
+    """Evaluate only the development matrix and translate its gate result."""
+    del current  # The artifact evaluator's current policy is the fixed baseline.
+    from scripts.evaluate_artifact import build_report, evaluate, write_report
+
+    candidate_path = Path(candidate).expanduser().resolve()
+    result = evaluate(
+        artifact=candidate_path,
+        identity=f"candidate-round-{round_index}",
+        seeds=list(seeds),
+        steps=config.episode_steps,
+        opponents=list(config.opponents),
+        seats=list(config.seats),
+        workers=config.workers,
+        min_valid_games=len(seeds) * len(config.opponents) * len(config.seats),
+    )
+    report_path = _round_directory(config, round_index) / "development-evaluation.json"
+    write_report(report_path, build_report(result))
+    decision = result.get("decision")
+    if not isinstance(decision, Mapping) or decision.get("status") not in {"promote", "discard"}:
+        raise ValueError("development evaluator returned no valid promotion decision")
+    return {
+        "promoted": decision["status"] == "promote",
+        "status": decision["status"],
+        "reasons": list(decision.get("reasons", [])),
+        "report": str(report_path),
+        "decision": dict(decision),
+    }
+
+
+def build_production_callbacks(config: OrbitConfig) -> dict[str, Callable[..., Any]]:
+    """Build the real collector/trainer/exporter/evaluator adapters."""
+    if not isinstance(config, OrbitConfig):
+        raise TypeError("config must be an OrbitConfig")
+    return {
+        "rollout": lambda **kwargs: _production_rollout(config, **kwargs),
+        "train": lambda **kwargs: _production_train(config, **kwargs),
+        "export": lambda **kwargs: _production_export(config, **kwargs),
+        "evaluate": lambda **kwargs: _production_evaluate(config, **kwargs),
+    }
+
+
+def build_production_controller(config: OrbitConfig) -> OrbitController:
+    """Construct an OrbitController with all production defaults wired."""
+    callbacks = build_production_callbacks(config)
+    return OrbitController(
+        config,
+        rollout_fn=callbacks["rollout"],
+        train_fn=callbacks["train"],
+        export_fn=callbacks["export"],
+        evaluate_fn=callbacks["evaluate"],
+    )
+
+
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def _nonnegative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer") from exc
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer")
+    return number
+
+
+def _positive_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive finite number") from exc
+    if number <= 0 or number != number or number == float("inf"):
+        raise argparse.ArgumentTypeError("must be a positive finite number")
+    return number
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-directory", type=Path, required=True)
-    parser.add_argument("--max-rounds", type=int, default=10)
-    parser.add_argument("--max-failures", type=int, default=3)
-    parser.add_argument("--development-seeds", nargs="+", type=int, default=[0, 1, 2, 3])
+    parser.add_argument("--max-rounds", type=_positive_int, default=10)
+    parser.add_argument("--max-failures", type=_nonnegative_int, default=3)
+    parser.add_argument(
+        "--rollout-seeds", "--development-seeds", dest="development_seeds",
+        nargs="+", type=int, default=[0, 1, 2, 3],
+        help="explicit development seeds used for collection and promotion",
+    )
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
-    parser.add_argument("--opponents", nargs="+", default=["pass", "random", "starter"])
+    parser.add_argument(
+        "--opponents", nargs="+", choices=_DEVELOPMENT_OPPONENTS,
+        default=list(_DEVELOPMENT_OPPONENTS),
+    )
     parser.add_argument("--seats", nargs="+", type=int, choices=(0, 1), default=[0, 1])
-    parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--episode-steps", type=int, default=96)
-    parser.add_argument("--ppo-rounds", type=int, default=1)
-    parser.add_argument("--checkpoint-window", type=int, default=5)
-    parser.add_argument("--max-hours", type=float, default=None)
+    parser.add_argument("--workers", type=_positive_int, default=2)
+    parser.add_argument("--episode-steps", type=_positive_int, default=96)
+    parser.add_argument("--ppo-rounds", type=_positive_int, default=1)
+    parser.add_argument("--checkpoint-window", type=_positive_int, default=5)
+    parser.add_argument("--max-hours", type=_positive_float, default=None)
+    parser.add_argument("--resume", action="store_true", help="resume an existing run directory")
     parser.add_argument("--dry-run", action="store_true", help="validate and print configuration only")
+    parser.add_argument(
+        "--validate-config", action="store_true",
+        help="validate configuration without creating or running a controller",
+    )
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
-    config = OrbitConfig(
-        args.run_directory, args.max_rounds, args.max_failures, tuple(args.development_seeds),
-        args.device, tuple(args.opponents), tuple(args.seats), args.workers,
-        args.episode_steps, args.ppo_rounds, args.checkpoint_window, args.max_hours,
+def config_from_args(args: argparse.Namespace) -> OrbitConfig:
+    """Convert parsed CLI values into the validated controller configuration."""
+    return OrbitConfig(
+        run_directory=Path(args.run_directory).expanduser().resolve(),
+        max_rounds=args.max_rounds,
+        max_failures=args.max_failures,
+        development_seeds=tuple(args.development_seeds),
+        device=args.device,
+        opponents=tuple(args.opponents),
+        seats=tuple(args.seats),
+        workers=args.workers,
+        episode_steps=args.episode_steps,
+        ppo_rounds=args.ppo_rounds,
+        checkpoint_window=args.checkpoint_window,
+        max_hours=args.max_hours,
     )
-    if not args.dry_run:
-        raise SystemExit("train_orbit.py requires injected rollout/train/evaluate callbacks; use the Python API or --dry-run")
-    print(json.dumps(asdict(config), default=str, sort_keys=True))
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = _parser()
+    args = parser.parse_args(argv)
+    try:
+        config_from_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    config = config_from_args(args)
+    if args.dry_run or args.validate_config:
+        print(json.dumps(asdict(config), default=str, sort_keys=True))
+        return 0
+    state_path = config.run_directory / "orbit-state.json"
+    if state_path.exists() and not args.resume:
+        print(
+            f"run directory already contains {state_path}; pass --resume to continue",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        result = build_production_controller(config).run()
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"orbit run failed: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, default=str, sort_keys=True))
     return 0
 
 

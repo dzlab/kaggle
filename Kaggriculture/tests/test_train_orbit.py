@@ -1,4 +1,7 @@
 import json
+from pathlib import Path
+
+import pytest
 
 
 def test_orbit_controller_retries_after_rejection_and_retains_only_winner(tmp_path):
@@ -49,3 +52,164 @@ def test_orbit_controller_resumes_completed_round_state(tmp_path):
     )
     controller.run()
     assert calls == [("rollout", 1)]
+
+
+def test_orbit_cli_parses_production_configuration_and_resume(tmp_path):
+    from scripts.train_orbit import config_from_args, parse_args
+
+    args = parse_args([
+        "--run-directory", str(tmp_path),
+        "--rollout-seeds", "7", "8",
+        "--opponents", "pass", "random",
+        "--seats", "0", "1",
+        "--workers", "3",
+        "--episode-steps", "12",
+        "--ppo-rounds", "2",
+        "--checkpoint-window", "4",
+        "--max-rounds", "6",
+        "--max-hours", "1.5",
+        "--max-failures", "2",
+        "--device", "cpu",
+        "--resume",
+        "--dry-run",
+    ])
+
+    config = config_from_args(args)
+
+    assert config.development_seeds == (7, 8)
+    assert config.opponents == ("pass", "random")
+    assert config.seats == (0, 1)
+    assert config.workers == 3
+    assert config.episode_steps == 12
+    assert config.ppo_rounds == 2
+    assert config.checkpoint_window == 4
+    assert config.max_rounds == 6
+    assert config.max_hours == 1.5
+    assert config.max_failures == 2
+    assert args.resume is True
+    assert args.dry_run is True
+
+
+def test_orbit_cli_dry_run_only_validates_configuration(tmp_path, capsys):
+    from scripts.train_orbit import main
+
+    assert main(["--run-directory", str(tmp_path), "--dry-run"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["run_directory"] == str(tmp_path)
+    assert not (tmp_path / "orbit-state.json").exists()
+
+
+def test_orbit_cli_rejects_invalid_rollout_matrix(tmp_path):
+    from scripts.train_orbit import parse_args
+
+    with pytest.raises(SystemExit):
+        parse_args([
+            "--run-directory", str(tmp_path),
+            "--rollout-seeds", "3", "3",
+            "--opponents", "pass", "pass",
+            "--episode-steps", "1",
+        ])
+
+
+def test_production_evaluator_passes_only_development_matrix(monkeypatch, tmp_path):
+    import scripts.evaluate_artifact as evaluate_artifact
+    from scripts.train_orbit import OrbitConfig, build_production_callbacks
+
+    calls = {}
+
+    def fake_evaluate(**kwargs):
+        calls.update(kwargs)
+        return {
+            "artifact": {"identity": "candidate", "name": "candidate.json", "sha256": "0" * 64},
+            "records": [],
+            "decision": {"status": "promote", "reasons": []},
+        }
+
+    monkeypatch.setattr(evaluate_artifact, "evaluate", fake_evaluate)
+    monkeypatch.setattr(evaluate_artifact, "build_report", lambda result: result)
+    monkeypatch.setattr(evaluate_artifact, "write_report", lambda path, report: path)
+
+    artifact = tmp_path / "candidate.json"
+    artifact.write_text("artifact")
+    evaluate_fn = build_production_callbacks(
+        OrbitConfig(tmp_path, development_seeds=(11, 13), opponents=("pass",), workers=1)
+    )["evaluate"]
+
+    result = evaluate_fn(
+        candidate=artifact, current=None, seeds=(11, 13), round_index=2,
+    )
+
+    assert result["promoted"] is True
+    assert calls["seeds"] == [11, 13]
+    assert "holdout_seeds" not in calls
+
+
+def test_production_rollout_adapter_uses_bounded_collector(monkeypatch, tmp_path):
+    import scripts.collect_trajectories as collector
+    from scripts.train_orbit import OrbitConfig, build_production_callbacks
+
+    calls = {}
+
+    def fake_collect(**kwargs):
+        calls.update(kwargs)
+        Path(kwargs["output"]).write_text("transition\n")
+        return {"run_id": "round-0"}
+
+    monkeypatch.setattr(collector, "collect", fake_collect)
+    rollout_fn = build_production_callbacks(
+        OrbitConfig(tmp_path, development_seeds=(3, 5), opponents=("pass",), workers=2)
+    )["rollout"]
+
+    result = rollout_fn(
+        round_index=0, seeds=(3, 5), run_directory=tmp_path,
+    )
+
+    assert result["input_path"].endswith("round-0000/rollout.jsonl")
+    assert calls["seeds"] == [3, 5]
+    assert calls["opponents"] == ["pass"]
+    assert calls["seats"] == [0, 1]
+    assert calls["workers"] == 2
+    assert calls["candidate_artifact"] is None
+
+
+def test_production_train_adapter_refreshes_artifact_between_ppo_rounds(monkeypatch, tmp_path):
+    import scripts.export_policy as exporter
+    import scripts.train_policy as trainer
+    from scripts.train_orbit import OrbitConfig, build_production_callbacks
+
+    input_path = tmp_path / "rollout.jsonl"
+    input_path.write_text("transition\n")
+    train_calls = []
+    export_calls = []
+
+    def fake_train(**kwargs):
+        train_calls.append(kwargs)
+        kwargs["output_path"].write_bytes(b"checkpoint")
+        return {}
+
+    def fake_export(checkpoint, artifact):
+        export_calls.append((checkpoint, artifact))
+        artifact.write_text("artifact")
+        return {}
+
+    class FakePool:
+        def __init__(self, checkpoints):
+            self.checkpoints = tuple(checkpoints)
+
+    monkeypatch.setattr(trainer, "train_behavior_clone", fake_train)
+    monkeypatch.setattr(trainer, "make_fresh_rollout_fn", lambda **kwargs: kwargs)
+    monkeypatch.setattr(trainer, "OpponentPool", FakePool)
+    monkeypatch.setattr(exporter, "export_checkpoint", fake_export)
+
+    config = OrbitConfig(tmp_path, ppo_rounds=2, opponents=("pass",), workers=1)
+    train_fn = build_production_callbacks(config)["train"]
+    candidate = train_fn(
+        rollout={"input_path": str(input_path)}, round_index=0,
+        run_directory=tmp_path,
+    )
+
+    assert candidate == tmp_path / "round-0000/candidate.pt"
+    assert [call["ppo_steps"] for call in train_calls] == [0, 1, 2]
+    assert all(call["rollout_fn"] for call in train_calls[1:])
+    assert len(export_calls) == 3
