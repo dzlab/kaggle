@@ -1,4 +1,4 @@
-"""Colab/Drive-friendly configuration and entrypoint for Orbit training."""
+"""Colab/Drive-friendly configuration and entrypoint for candidate training."""
 
 from __future__ import annotations
 
@@ -212,7 +212,7 @@ def select_resume_checkpoint(
 
 
 def build_config(
-    *, run_directory: str | Path = "/content/drive/MyDrive/kagriculture-orbit",
+    *, run_directory: str | Path = "/content/drive/MyDrive/kagriculture-training",
     device: str = "auto", workers: int = 2,
     development_seeds: tuple[int, ...] = (0, 1, 2, 3),
     holdout_seeds: tuple[int, ...] = (100, 101),
@@ -233,7 +233,7 @@ def build_config(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-directory", type=Path, default=Path("/content/drive/MyDrive/kagriculture-orbit"))
+    parser.add_argument("--run-directory", type=Path, default=Path("/content/drive/MyDrive/kagriculture-training"))
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--development-seeds", nargs="+", type=int, default=[0, 1, 2, 3])

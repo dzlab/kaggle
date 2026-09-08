@@ -274,10 +274,10 @@ workers. The configuration wrapper validates device selection and keeps
 development and holdout seeds disjoint:
 
 ```bash
-python scripts/colab_train.py --run-directory /content/drive/MyDrive/kagriculture-orbit \
+python scripts/colab_train.py --run-directory /content/drive/MyDrive/kagriculture-training \
   --device auto --workers 2
 ```
 
-Use `scripts/train_policy.py --resume` or the Orbit state file to continue
+Use `scripts/train_policy.py --resume` or the training state file to continue
 after a Colab disconnect; only candidates that pass development gates should
 be evaluated on holdout seeds.

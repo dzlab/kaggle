@@ -1,4 +1,4 @@
-"""Resumable Orbit-style candidate training and promotion controller."""
+"""Resumable Resumable candidate training and promotion controller."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ _DEFAULT_BATCH_SIZE = 32
 
 
 @dataclass(frozen=True)
-class OrbitConfig:
+class TrainingConfig:
     run_directory: Path
     max_rounds: int = 10
     max_failures: int = 3
@@ -75,11 +75,11 @@ class OrbitConfig:
             raise ValueError("max_hours must be a positive finite number")
 
 
-class OrbitController:
+class TrainingController:
     """Run rollout/train/evaluate/retain rounds with durable stage boundaries."""
 
     def __init__(
-        self, config: OrbitConfig, *, rollout_fn: Callable[..., Any],
+        self, config: TrainingConfig, *, rollout_fn: Callable[..., Any],
         train_fn: Callable[..., str | Path], evaluate_fn: Callable[..., dict[str, Any]],
         export_fn: Callable[..., str | Path] | None = None,
         candidate_path_fn: Callable[..., str | Path] | None = None,
@@ -93,12 +93,12 @@ class OrbitController:
         self.candidate_path_fn = candidate_path_fn
         self.clock = clock
         self.run_directory = config.run_directory
-        self.state_path = self.run_directory / "orbit-state.json"
+        self.state_path = self.run_directory / "training-state.json"
         self.run_directory.mkdir(parents=True, exist_ok=True)
 
     def _write_state(self, state: dict[str, Any]) -> None:
         descriptor, temporary = tempfile.mkstemp(
-            prefix=".orbit-state.", suffix=".tmp", dir=self.run_directory,
+            prefix=".training-state.", suffix=".tmp", dir=self.run_directory,
         )
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -125,9 +125,9 @@ class OrbitController:
             }
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         if not isinstance(state, dict) or not isinstance(state.get("history"), list):
-            raise ValueError("orbit state is malformed")
+            raise ValueError("training state is malformed")
         if state.get("configuration") not in (None, self._configuration()):
-            raise ValueError("orbit state configuration does not match the requested run")
+            raise ValueError("training state configuration does not match the requested run")
         state.setdefault("configuration", self._configuration())
         return state
 
@@ -263,13 +263,13 @@ class OrbitController:
         return state
 
 
-def _round_directory(config: OrbitConfig, round_index: int) -> Path:
+def _round_directory(config: TrainingConfig, round_index: int) -> Path:
     directory = config.run_directory / f"round-{int(round_index):04d}"
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 
 
-def _existing_checkpoint_window(config: OrbitConfig) -> list[Path]:
+def _existing_checkpoint_window(config: TrainingConfig) -> list[Path]:
     """Return the newest valid learned checkpoints for the PPO league."""
     candidates = sorted(
         config.run_directory.glob("round-*/candidate.pt"),
@@ -291,7 +291,7 @@ def _existing_checkpoint_window(config: OrbitConfig) -> list[Path]:
     return list(reversed(result))
 
 
-def _best_artifact(config: OrbitConfig, round_directory: Path) -> Path | None:
+def _best_artifact(config: TrainingConfig, round_directory: Path) -> Path | None:
     """Export the retained checkpoint for use as the next round's candidate."""
     best_checkpoint = config.run_directory / "best.pt"
     if not best_checkpoint.is_file():
@@ -303,7 +303,7 @@ def _best_artifact(config: OrbitConfig, round_directory: Path) -> Path | None:
     return artifact
 
 
-def _production_rollout(config: OrbitConfig, *, round_index: int, seeds: Sequence[int],
+def _production_rollout(config: TrainingConfig, *, round_index: int, seeds: Sequence[int],
                         run_directory: Path) -> dict[str, Any]:
     """Collect a complete, atomic training dataset with the real collector."""
     from scripts.collect_trajectories import collect
@@ -331,7 +331,7 @@ def _production_rollout(config: OrbitConfig, *, round_index: int, seeds: Sequenc
     }
 
 
-def _production_train(config: OrbitConfig, *, rollout: Mapping[str, Any],
+def _production_train(config: TrainingConfig, *, rollout: Mapping[str, Any],
                       round_index: int, run_directory: Path,
                       resume_checkpoint: str | Path | None = None) -> Path:
     """Train BC then fresh-rollout PPO, refreshing the exported policy each step."""
@@ -426,7 +426,7 @@ def _production_train(config: OrbitConfig, *, rollout: Mapping[str, Any],
     return candidate_checkpoint
 
 
-def _production_export(config: OrbitConfig, *, candidate: str | Path,
+def _production_export(config: TrainingConfig, *, candidate: str | Path,
                        round_index: int, run_directory: Path) -> Path:
     """Publish the final dependency-free artifact for a completed round."""
     from scripts.export_policy import export_checkpoint
@@ -436,7 +436,7 @@ def _production_export(config: OrbitConfig, *, candidate: str | Path,
     return destination
 
 
-def _production_evaluate(config: OrbitConfig, *, candidate: str | Path,
+def _production_evaluate(config: TrainingConfig, *, candidate: str | Path,
                          current: str | Path | None, seeds: Sequence[int],
                          round_index: int) -> dict[str, Any]:
     """Evaluate only the development matrix and translate its gate result."""
@@ -485,10 +485,10 @@ def _production_evaluate(config: OrbitConfig, *, candidate: str | Path,
     }
 
 
-def build_production_callbacks(config: OrbitConfig) -> dict[str, Callable[..., Any]]:
+def build_production_callbacks(config: TrainingConfig) -> dict[str, Callable[..., Any]]:
     """Build the real collector/trainer/exporter/evaluator adapters."""
-    if not isinstance(config, OrbitConfig):
-        raise TypeError("config must be an OrbitConfig")
+    if not isinstance(config, TrainingConfig):
+        raise TypeError("config must be a TrainingConfig")
     return {
         "rollout": lambda **kwargs: _production_rollout(config, **kwargs),
         "train": lambda **kwargs: _production_train(config, **kwargs),
@@ -497,10 +497,10 @@ def build_production_callbacks(config: OrbitConfig) -> dict[str, Callable[..., A
     }
 
 
-def build_production_controller(config: OrbitConfig) -> OrbitController:
-    """Construct an OrbitController with all production defaults wired."""
+def build_production_controller(config: TrainingConfig) -> TrainingController:
+    """Construct a TrainingController with all production defaults wired."""
     callbacks = build_production_callbacks(config)
-    return OrbitController(
+    return TrainingController(
         config,
         rollout_fn=callbacks["rollout"],
         train_fn=callbacks["train"],
@@ -572,9 +572,9 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def config_from_args(args: argparse.Namespace) -> OrbitConfig:
+def config_from_args(args: argparse.Namespace) -> TrainingConfig:
     """Convert parsed CLI values into the validated controller configuration."""
-    return OrbitConfig(
+    return TrainingConfig(
         run_directory=Path(args.run_directory).expanduser().resolve(),
         max_rounds=args.max_rounds,
         max_failures=args.max_failures,
@@ -606,7 +606,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run or args.validate_config:
         print(json.dumps(asdict(config), default=str, sort_keys=True))
         return 0
-    state_path = config.run_directory / "orbit-state.json"
+    state_path = config.run_directory / "training-state.json"
     if state_path.exists() and not args.resume:
         print(
             f"run directory already contains {state_path}; pass --resume to continue",
@@ -616,7 +616,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = build_production_controller(config).run()
     except (OSError, RuntimeError, ValueError) as exc:
-        print(f"orbit run failed: {exc}", file=sys.stderr)
+        print(f"training run failed: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(result, default=str, sort_keys=True))
     return 0

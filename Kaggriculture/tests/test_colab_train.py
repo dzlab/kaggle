@@ -8,7 +8,7 @@ import pytest
 
 
 def test_colab_notebook_stages_candidates_and_resumes_safely():
-    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_orbit_gpu.ipynb"
+    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_gpu.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     code = "\n".join(
         "".join(cell.get("source", []))
@@ -24,9 +24,9 @@ def test_colab_notebook_stages_candidates_and_resumes_safely():
     assert notebook["nbformat"] == 4
     assert "ppo_target_steps = 16" in code
     assert 'candidate_tag = f"ppo{ppo_target_steps}"' in code
-    assert 'stage_checkpoint_path = run_dir / f"orbit-policy-{candidate_tag}.pt"' in code
-    assert 'stage_artifact_path = run_dir / f"orbit-policy-{candidate_tag}.json"' in code
-    assert "current_checkpoint_path = run_dir / 'orbit-policy.pt'" in code
+    assert 'stage_checkpoint_path = run_dir / f"policy-{candidate_tag}.pt"' in code
+    assert 'stage_artifact_path = run_dir / f"policy-{candidate_tag}.json"' in code
+    assert "current_checkpoint_path = run_dir / 'policy.pt'" in code
     assert "select_resume_checkpoint(" in code
     assert "resume_selection.path" in code
     assert "import scripts.colab_train as colab_train" in code
@@ -79,7 +79,7 @@ def test_colab_notebook_stages_candidates_and_resumes_safely():
 
 
 def test_colab_notebook_has_rerunnable_development_and_gated_holdout_cells():
-    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_orbit_gpu.ipynb"
+    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_gpu.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     code_cells = [
         "".join(cell.get("source", []))
@@ -153,7 +153,7 @@ def test_colab_notebook_has_rerunnable_development_and_gated_holdout_cells():
 
 
 def test_colab_notebook_computes_per_seat_thresholds_for_both_evaluations():
-    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_orbit_gpu.ipynb"
+    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_gpu.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     code = "\n".join(
         "".join(cell.get("source", []))
@@ -170,7 +170,7 @@ def test_colab_notebook_computes_per_seat_thresholds_for_both_evaluations():
 
 
 def test_colab_notebook_filters_prior_checkpoints_before_building_opponent_pool():
-    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_orbit_gpu.ipynb"
+    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_gpu.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     code = "\n".join(
         "".join(cell.get("source", []))
@@ -190,7 +190,7 @@ def test_colab_notebook_filters_prior_checkpoints_before_building_opponent_pool(
 
 
 def test_colab_notebook_executable_cells_are_valid_python():
-    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_orbit_gpu.ipynb"
+    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_gpu.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
 
     for index, cell in enumerate(notebook["cells"]):
@@ -203,7 +203,7 @@ def test_colab_notebook_executable_cells_are_valid_python():
 
 
 def test_colab_telemetry_callback_is_passed_only_to_training():
-    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_orbit_gpu.ipynb"
+    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_gpu.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     training_cell = next(
         "".join(cell.get("source", []))
@@ -234,7 +234,7 @@ def test_colab_telemetry_callback_is_passed_only_to_training():
 
 
 def test_colab_telemetry_is_stage_scoped_and_labels_plot():
-    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_orbit_gpu.ipynb"
+    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_gpu.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     code_cells = [
         "".join(cell.get("source", []))
@@ -420,7 +420,7 @@ def test_colab_module_reload_order_accepts_current_training_contract(tmp_path):
     importlib.reload(train_policy)
     importlib.reload(colab_train)
     contract = _training_contract(tmp_path, target=16)
-    checkpoint = tmp_path / "orbit-policy-ppo16.pt"
+    checkpoint = tmp_path / "policy-ppo16.pt"
     checkpoint.touch()
     payload = _resume_payload(contract, target=16, progress_round=1)
 
@@ -497,8 +497,8 @@ def test_resume_selection_skips_bad_candidates_and_ranks_completed_progress(tmp_
     from scripts import colab_train
 
     corrupt = tmp_path / "corrupt.pt"
-    partial = tmp_path / "orbit-policy-ppo32.pt"
-    completed = tmp_path / "orbit-policy-ppo16.pt"
+    partial = tmp_path / "policy-ppo32.pt"
+    completed = tmp_path / "policy-ppo16.pt"
     for path in (corrupt, partial, completed):
         path.touch()
     contract = _training_contract(tmp_path, target=32)
@@ -531,7 +531,7 @@ def test_resume_selection_skips_bad_candidates_and_ranks_completed_progress(tmp_
 def test_resume_selection_requires_canonical_training_contract(tmp_path):
     from scripts import colab_train
 
-    checkpoint = tmp_path / "orbit-policy-ppo16.pt"
+    checkpoint = tmp_path / "policy-ppo16.pt"
     checkpoint.touch()
 
     with pytest.raises(TypeError, match="training_contract"):
@@ -594,7 +594,7 @@ def test_resume_selection_treats_missing_candidates_as_fresh_run(tmp_path):
 def test_resume_selection_propagates_drive_stat_errors(tmp_path, monkeypatch):
     from scripts import colab_train
 
-    checkpoint = tmp_path / "orbit-policy-ppo16.pt"
+    checkpoint = tmp_path / "policy-ppo16.pt"
     checkpoint.touch()
     contract = _training_contract(tmp_path, target=16)
     original_stat = Path.stat
@@ -615,8 +615,8 @@ def test_resume_selection_propagates_drive_stat_errors(tmp_path, monkeypatch):
 def test_resume_selection_skips_semantically_incompatible_high_progress_candidate(tmp_path):
     from scripts import colab_train
 
-    high_progress = tmp_path / "orbit-policy-ppo16-high-progress.pt"
-    valid_lower_progress = tmp_path / "orbit-policy-ppo8-valid.pt"
+    high_progress = tmp_path / "policy-ppo16-high-progress.pt"
+    valid_lower_progress = tmp_path / "policy-ppo8-valid.pt"
     high_progress.touch()
     valid_lower_progress.touch()
     contract = _training_contract(tmp_path, target=16)
@@ -648,8 +648,8 @@ def test_resume_selection_skips_semantically_incompatible_high_progress_candidat
 def test_resume_selection_prioritizes_behavior_clone_progress_before_ppo_target(tmp_path):
     from scripts import colab_train
 
-    stale_bc = tmp_path / "orbit-policy-ppo32-stale-bc.pt"
-    completed_bc = tmp_path / "orbit-policy-ppo16-complete-bc.pt"
+    stale_bc = tmp_path / "policy-ppo32-stale-bc.pt"
+    completed_bc = tmp_path / "policy-ppo16-complete-bc.pt"
     stale_bc.touch()
     completed_bc.touch()
     contract = _training_contract(tmp_path, target=32)
@@ -679,7 +679,7 @@ def test_resume_selection_prioritizes_behavior_clone_progress_before_ppo_target(
 def test_resume_selection_skips_nested_metadata_corruption(tmp_path):
     from scripts import colab_train
 
-    checkpoint = tmp_path / "orbit-policy-ppo16.pt"
+    checkpoint = tmp_path / "policy-ppo16.pt"
     checkpoint.touch()
     contract = _training_contract(tmp_path, target=16)
     payload = _resume_payload(contract, target=16, progress_round=1)
@@ -699,7 +699,7 @@ def test_resume_selection_skips_nested_metadata_corruption(tmp_path):
 def test_resume_selection_propagates_validator_programming_errors(tmp_path):
     from scripts import colab_train
 
-    checkpoint = tmp_path / "orbit-policy-ppo16.pt"
+    checkpoint = tmp_path / "policy-ppo16.pt"
     checkpoint.touch()
     contract = _training_contract(tmp_path, target=16)
     payload = _resume_payload(contract, target=16, progress_round=1)
@@ -718,8 +718,8 @@ def test_resume_selection_propagates_validator_programming_errors(tmp_path):
 def test_resume_selection_rejects_all_present_candidates_when_none_are_compatible(tmp_path):
     from scripts import colab_train
 
-    incompatible = tmp_path / "orbit-policy-ppo64.pt"
-    malformed = tmp_path / "orbit-policy-ppo16.pt"
+    incompatible = tmp_path / "policy-ppo64.pt"
+    malformed = tmp_path / "policy-ppo16.pt"
     incompatible.touch()
     malformed.touch()
     contract = _training_contract(tmp_path, target=32)
@@ -742,7 +742,7 @@ def test_resume_selection_rejects_all_present_candidates_when_none_are_compatibl
 def test_resume_selection_allows_completed_equal_target_reruns(tmp_path):
     from scripts import colab_train
 
-    checkpoint = tmp_path / "orbit-policy-ppo16.pt"
+    checkpoint = tmp_path / "policy-ppo16.pt"
     checkpoint.touch()
     contract = _training_contract(tmp_path, target=16)
     validator_calls = []
@@ -766,9 +766,9 @@ def test_resume_selection_allows_completed_equal_target_reruns(tmp_path):
 def test_resume_selection_uses_target_then_mtime_after_progress_ties(tmp_path):
     from scripts import colab_train
 
-    lower_target = tmp_path / "orbit-policy-ppo16.pt"
-    higher_target = tmp_path / "orbit-policy-ppo32.pt"
-    newer_same_target = tmp_path / "orbit-policy-ppo16-newer.pt"
+    lower_target = tmp_path / "policy-ppo16.pt"
+    higher_target = tmp_path / "policy-ppo32.pt"
+    newer_same_target = tmp_path / "policy-ppo16-newer.pt"
     for path in (lower_target, higher_target, newer_same_target):
         path.touch()
     contract = _training_contract(tmp_path, target=32)

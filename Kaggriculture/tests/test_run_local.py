@@ -97,7 +97,7 @@ def test_run_episode_uses_candidate_and_preserves_both_seat_orders(monkeypatch, 
 def test_parser_exposes_candidate_artifact_and_identity():
     from scripts.run_local import _parser
 
-    args = _parser().parse_args(["--candidate-artifact", "model.json", "--candidate-identity", "orbit"])
+    args = _parser().parse_args(["--candidate-artifact", "model.json", "--candidate-identity", "trained"])
 
     assert args.candidate_artifact == Path("model.json")
-    assert args.candidate_identity == "orbit"
+    assert args.candidate_identity == "trained"
