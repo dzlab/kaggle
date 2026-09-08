@@ -256,8 +256,8 @@ def test_run_ppo_training_telemetry_records_shaping_and_truncation_counts():
     )
 
     assert events[0][0] == "ppo"
-    assert "shaping_count" not in events[0][1]
-    assert "truncation_count" not in events[0][1]
+    assert events[0][1]["shaping_count"] == 2
+    assert events[0][1]["truncation_count"] == 3
 
 
 def test_legacy_opponent_pool_sample_uses_seed_deterministically():

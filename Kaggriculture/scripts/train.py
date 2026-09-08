@@ -23,6 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from kagriculture_agent.checkpoints import CheckpointError, read_checkpoint
 from kagriculture_agent.model import resolve_device
+from scripts.telemetry import record_validation_report
 from scripts.train_policy import (
     TrainingContract,
     validate_training_checkpoint,
@@ -1034,73 +1035,110 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
 
     telemetry = initialize_telemetry(config)
     try:
-        train_candidate(
+        training_result = train_candidate(
             config, training_contract=training_contract,
             resume_checkpoint=resume_checkpoint,
             allow_ppo_extension=allow_ppo_extension,
             opponent_pool=opponent_pool, telemetry=telemetry,
         )
+        training_metadata: Mapping[str, Any] = (
+            training_result if isinstance(training_result, Mapping) else {}
+        )
+        if telemetry is not None:
+            telemetry(
+                "training_complete",
+                {
+                    "candidate": config.candidate_tag,
+                    "checkpoint": str(config.stage_checkpoint_path),
+                    "artifact": str(config.stage_artifact_path),
+                    "behavior_clone_updates": training_metadata.get("behavior_clone_updates"),
+                    "ppo_updates": training_metadata.get("ppo_updates"),
+                    "ppo_steps": config.ppo_target_steps,
+                    "configuration": {
+                        "training_contract": training_contract.configuration,
+                        "candidate_tag": config.candidate_tag,
+                        "device": config.device,
+                        "workers": config.workers,
+                        "development_seeds": list(config.development_seeds),
+                        "development_opponents": list(config.development_opponents),
+                        "development_seats": list(config.development_seats),
+                        "holdout_seeds": list(config.holdout_seeds),
+                        "holdout_opponents": list(config.holdout_opponents),
+                        "holdout_seats": list(config.holdout_seats),
+                    },
+                },
+            )
+
+        development_process, development_report = _run_evaluation(
+            config, phase="development", command=commands[1],
+            report_path=config.development_report_path,
+        )
+        if telemetry is not None:
+            record_validation_report(
+                telemetry, development_report, phase="development",
+                checkpoint=config.stage_artifact_path, candidate_tag=config.candidate_tag,
+            )
+        development_decision = development_report.get("decision", {})
+        development_complete = (
+            evaluation_report_is_complete(
+                development_report, identity=config.candidate_tag,
+                seed_values=config.development_seeds,
+                opponents=config.development_opponents,
+                seats=config.development_seats,
+                artifact_path=config.stage_artifact_path,
+            )
+            and development_decision.get("status") in {"promote", "discard"}
+        )
+        development_promoted = development_complete and development_decision.get("status") == "promote"
+        print("Development evaluator exit:", development_process.returncode)
+        print("Development status:", development_decision.get("status"))
+        if not development_promoted:
+            print("Development candidate discarded or incomplete; continue training, not promotion.")
+
+        holdout_complete: bool | None = None
+        if development_promoted:
+            _invalidate_evaluation_report(config.holdout_report_path)
+        smoke_test_artifact(config)
+        if config.plot:
+            plot_training_metrics(config)
+        if development_promoted:
+            holdout_process, holdout_report = _run_evaluation(
+                config, phase="holdout", command=commands[2],
+                report_path=config.holdout_report_path,
+            )
+            if telemetry is not None:
+                record_validation_report(
+                    telemetry, holdout_report, phase="holdout",
+                    checkpoint=config.stage_artifact_path, candidate_tag=config.candidate_tag,
+                )
+            holdout_decision = holdout_report.get("decision", {})
+            holdout_complete = (
+                evaluation_report_is_complete(
+                    holdout_report, identity=config.candidate_tag,
+                    seed_values=config.holdout_seeds,
+                    opponents=config.holdout_opponents,
+                    seats=config.holdout_seats,
+                    artifact_path=config.stage_artifact_path,
+                )
+                and holdout_decision.get("status") in {"promote", "discard"}
+            )
+            if not holdout_complete:
+                raise RuntimeError("Holdout report is incomplete or has no valid decision status")
+            print("Holdout evaluator exit:", holdout_process.returncode)
+            print("Holdout status:", holdout_decision.get("status"))
+        else:
+            print("Holdout evaluation skipped: development report is not complete/promote.")
+
+        print("Candidate remains stage-scoped; no automatic promotion to policy.json or policy.pt was performed.")
+        return WorkflowResult(
+            dry_run=False, commands=commands, resume_checkpoint=resume_checkpoint,
+            development_evaluation_promoted=development_promoted,
+            holdout_evaluation_complete=holdout_complete,
+            stage_artifact_path=config.stage_artifact_path,
+        )
     finally:
         if telemetry is not None:
             telemetry.finish()
-
-    development_process, development_report = _run_evaluation(
-        config, phase="development", command=commands[1],
-        report_path=config.development_report_path,
-    )
-    development_decision = development_report.get("decision", {})
-    development_complete = (
-        evaluation_report_is_complete(
-            development_report, identity=config.candidate_tag,
-            seed_values=config.development_seeds,
-            opponents=config.development_opponents,
-            seats=config.development_seats,
-            artifact_path=config.stage_artifact_path,
-        )
-        and development_decision.get("status") in {"promote", "discard"}
-    )
-    development_promoted = development_complete and development_decision.get("status") == "promote"
-    print("Development evaluator exit:", development_process.returncode)
-    print("Development status:", development_decision.get("status"))
-    if not development_promoted:
-        print("Development candidate discarded or incomplete; continue training, not promotion.")
-
-    holdout_complete: bool | None = None
-    if development_promoted:
-        _invalidate_evaluation_report(config.holdout_report_path)
-    smoke_test_artifact(config)
-    if config.plot:
-        plot_training_metrics(config)
-    if development_promoted:
-        holdout_process, holdout_report = _run_evaluation(
-            config, phase="holdout", command=commands[2],
-            report_path=config.holdout_report_path,
-        )
-        holdout_decision = holdout_report.get("decision", {})
-        holdout_complete = (
-            evaluation_report_is_complete(
-                holdout_report, identity=config.candidate_tag,
-                seed_values=config.holdout_seeds,
-                opponents=config.holdout_opponents,
-                seats=config.holdout_seats,
-                artifact_path=config.stage_artifact_path,
-            )
-            and holdout_decision.get("status") in {"promote", "discard"}
-        )
-        if not holdout_complete:
-            raise RuntimeError("Holdout report is incomplete or has no valid decision status")
-        print("Holdout evaluator exit:", holdout_process.returncode)
-        print("Holdout status:", holdout_decision.get("status"))
-    else:
-        print("Holdout evaluation skipped: development report is not complete/promote.")
-
-    print("Candidate remains stage-scoped; no automatic promotion to policy.json or policy.pt was performed.")
-    return WorkflowResult(
-        dry_run=False, commands=commands, resume_checkpoint=resume_checkpoint,
-        development_evaluation_promoted=development_promoted,
-        holdout_evaluation_complete=holdout_complete,
-        stage_artifact_path=config.stage_artifact_path,
-    )
 
 
 def main(argv: list[str] | None = None) -> int:

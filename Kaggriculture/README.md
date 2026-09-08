@@ -296,6 +296,22 @@ python scripts/train.py \
 or stage more PPO training, rerun the same command with a larger
 `--ppo-target-steps`; the run directory provides the existing training state.
 
+Training writes `<candidate>-training-metrics.jsonl` in the run directory and
+keeps the same telemetry run open through development and holdout evaluation.
+The `behavior_clone` and `ppo` events include optimizer health and learning
+signals such as loss, entropy, KL, clip fraction, explained variance,
+return/advantage statistics, gradient norm, parameter norm, learning rate, and
+reward-shaping/truncation counts. Validation emits `validation_game` for each
+raw candidate/current game, `validation_summary` for each candidate, and
+`validation_breakdown` by opponent and seat. The summary includes
+seat-balanced win rate, wins/losses/ties, candidate deltas versus `current`,
+Wilson and bootstrap bounds, Elo, mean/median/fifth-percentile bank
+differential, terminal cash/inventory, framework-error and missed-needs rates,
+matrix completeness, and the evaluator decision. Win rate is the primary
+performance signal; framework errors, missed needs, incomplete matrices, and
+negative bank-differential tails remain safety gates rather than metrics to
+average away.
+
 ## Experimental context and training ladder
 
 `kagriculture_agent.experimental_features.extract_experimental_context()` is

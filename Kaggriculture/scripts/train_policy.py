@@ -1095,6 +1095,53 @@ def _bootstrap_value_estimates(
     return values
 
 
+def _parameter_norm(network: Any) -> float:
+    th = require_torch()
+    squared_norms = [
+        parameter.detach().norm(2).pow(2)
+        for parameter in network.parameters()
+    ]
+    if not squared_norms:
+        return 0.0
+    return float(th.stack(squared_norms).sum().sqrt())
+
+
+def _gradient_norm(network: Any) -> float:
+    th = require_torch()
+    squared_norms = [
+        parameter.grad.detach().norm(2).pow(2)
+        for parameter in network.parameters()
+        if parameter.grad is not None
+    ]
+    if not squared_norms:
+        return 0.0
+    return float(th.stack(squared_norms).sum().sqrt())
+
+
+def _active_learning_rate(optimizer: Any) -> float:
+    for parameter_group in optimizer.param_groups:
+        if "lr" in parameter_group:
+            return float(parameter_group["lr"])
+    return 0.0
+
+
+def _tensor_mean_std(values: Sequence[float], *, device: Any) -> tuple[float, float]:
+    th = require_torch()
+    tensor = th.tensor(values, dtype=th.float32, device=device)
+    return float(tensor.mean()), float(tensor.std(unbiased=False))
+
+
+def _explained_variance(*, values: Sequence[float], returns: Sequence[float], device: Any) -> float:
+    th = require_torch()
+    predictions = th.tensor(values, dtype=th.float32, device=device)
+    targets = th.tensor(returns, dtype=th.float32, device=device)
+    target_variance = targets.var(unbiased=False)
+    if float(target_variance) == 0.0:
+        return 0.0
+    residual_variance = (targets - predictions).var(unbiased=False)
+    return float(1.0 - residual_variance / target_variance)
+
+
 def ppo_update(
     network: Any, optimizer: Any, transitions: Sequence[dict[str, Any]], *,
     config: PPOConfig, batch_size: int | None = None, seed: int = 0,
@@ -1123,6 +1170,12 @@ def ppo_update(
         bootstrap_values=bootstrap_values,
     )
     prior = _load_prior_network(prior_checkpoint, device=device)
+    return_mean, return_std = _tensor_mean_std(
+        rollout.returns, device=device,
+    )
+    advantage_mean, advantage_std = _tensor_mean_std(
+        rollout.advantages, device=device,
+    )
     metrics: dict[str, float | int | bool] = {
         "updates": 0,
         "early_stopped": False,
@@ -1133,6 +1186,19 @@ def ppo_update(
         "kl_to_prior": 0.0,
         "prior_cross_entropy": 0.0,
         "loss": 0.0,
+        "clip_fraction": 0.0,
+        "explained_variance": _explained_variance(
+            values=rollout.values,
+            returns=rollout.returns,
+            device=device,
+        ),
+        "return_mean": return_mean,
+        "return_std": return_std,
+        "advantage_mean": advantage_mean,
+        "advantage_std": advantage_std,
+        "gradient_norm": 0.0,
+        "parameter_norm": _parameter_norm(network),
+        "learning_rate": _active_learning_rate(optimizer),
         "shaping_count": rollout.shaping_count,
         "truncation_count": rollout.truncation_count,
     }
@@ -1177,6 +1243,11 @@ def ppo_update(
                 ratio * advantages,
                 th.clamp(ratio, 1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon) * advantages,
             ).mean()
+            clip_fraction = (
+                ((ratio < 1.0 - config.clip_epsilon) | (ratio > 1.0 + config.clip_epsilon))
+                .to(dtype=th.float32)
+                .mean()
+            )
             clipped_values = old_values + th.clamp(
                 outputs["value"] - old_values, -config.clip_epsilon, config.clip_epsilon,
             )
@@ -1195,7 +1266,10 @@ def ppo_update(
             approx = (old_log - log_probs).mean().detach()
             optimizer.zero_grad()
             loss.backward()
+            gradient_norm = _gradient_norm(network)
             optimizer.step()
+            parameter_norm = _parameter_norm(network)
+            learning_rate = _active_learning_rate(optimizer)
             with th.no_grad():
                 post_outputs = network(mini_features)
                 _ensure_finite_outputs(post_outputs)
@@ -1214,6 +1288,10 @@ def ppo_update(
                 "kl_to_prior": float(kl_to_prior.detach()),
                 "prior_cross_entropy": float(prior_ce.detach()),
                 "loss": float(loss.detach()),
+                "clip_fraction": float(clip_fraction.detach()),
+                "gradient_norm": gradient_norm,
+                "parameter_norm": parameter_norm,
+                "learning_rate": learning_rate,
             })
             if float(post_step_kl) > config.target_kl:
                 metrics["early_stopped"] = True
@@ -1359,7 +1437,7 @@ def run_ppo_training(
             "completed_steps": step + 1,
         }
         if telemetry_callback is not None:
-                telemetry_payload = {
+            telemetry_payload = {
                 "step": step + 1,
                 "ppo_updates": total_updates,
                 "ppo_updates_step": int(last_metrics.get("updates", 0)),
@@ -1367,10 +1445,17 @@ def run_ppo_training(
                 "early_stopped": bool(last_metrics.get("early_stopped")),
                 "policy_loss": last_metrics.get("policy_loss"),
                 "value_loss": last_metrics.get("value_loss"),
-                    "entropy": last_metrics.get("entropy"),
-                    "approx_kl": last_metrics.get("approx_kl"),
-                }
-                telemetry_callback("ppo", telemetry_payload)
+                "entropy": last_metrics.get("entropy"),
+                "approx_kl": last_metrics.get("approx_kl"),
+            }
+            for name in (
+                "clip_fraction", "explained_variance", "return_mean", "return_std",
+                "advantage_mean", "advantage_std", "gradient_norm", "parameter_norm",
+                "learning_rate", "shaping_count", "truncation_count",
+            ):
+                if name in last_metrics:
+                    telemetry_payload[name] = last_metrics[name]
+            telemetry_callback("ppo", telemetry_payload)
         if progress_fn is not None:
             progress_fn(completed_step=step + 1, metrics=step_summary)
         if last_metrics.get("early_stopped"):
@@ -1970,6 +2055,10 @@ def train_behavior_clone(
     metadata["behavior_clone_epochs"] = epochs
     destination = Path(output_path)
     last_bc_loss: float | None = None
+    last_bc_entropy: float | None = None
+    last_bc_gradient_norm: float | None = None
+    last_bc_parameter_norm: float | None = None
+    last_bc_learning_rate: float | None = None
     last_bc_telemetry_update = 0
 
     def checkpoint_metrics(ppo_result: dict[str, Any] | None) -> dict[str, Any]:
@@ -2053,16 +2142,20 @@ def train_behavior_clone(
                 market_quantities=list(market_quantities),
                 market_active=market_active.detach().tolist(),
             )
-            log_probs, _entropy = _select_outputs(
+            log_probs, entropy = _select_outputs(
                 outputs, bc_batch, device=resolved_device,
                 training_action_mask=ppo_config.training_action_mask,
             )
             loss = -log_probs.mean()
             optimizer.zero_grad()
             loss.backward()
+            last_bc_gradient_norm = _gradient_norm(network)
             optimizer.step()
+            last_bc_parameter_norm = _parameter_norm(network)
+            last_bc_learning_rate = _active_learning_rate(optimizer)
             bc_updates += 1
             last_bc_loss = float(loss.detach())
+            last_bc_entropy = float(entropy.detach())
             if bc_updates % checkpoint_interval == 0:
                 completed_cursor = batch_index + 1
                 completed_epoch = epoch
@@ -2082,6 +2175,10 @@ def train_behavior_clone(
                         "update_count": bc_updates,
                         "epoch": completed_epoch,
                         "loss": last_bc_loss,
+                        "learning_rate": last_bc_learning_rate,
+                        "gradient_norm": last_bc_gradient_norm,
+                        "parameter_norm": last_bc_parameter_norm,
+                        "entropy": last_bc_entropy,
                     })
                     last_bc_telemetry_update = bc_updates
     metadata["behavior_clone_updates"] = bc_updates
@@ -2104,6 +2201,10 @@ def train_behavior_clone(
             "update_count": bc_updates,
             "epoch": epochs,
             "loss": last_bc_loss,
+            "learning_rate": last_bc_learning_rate,
+            "gradient_norm": last_bc_gradient_norm,
+            "parameter_norm": last_bc_parameter_norm,
+            "entropy": last_bc_entropy,
         })
         last_bc_telemetry_update = bc_updates
 

@@ -499,6 +499,39 @@ def test_ppo_update_measures_target_kl_after_optimizer_step():
     assert metrics["approx_kl"] > 1e-12
 
 
+def test_ppo_update_reports_training_health_metrics():
+    torch = pytest.importorskip("torch")
+    from kagriculture_agent.model import CompactPolicyNet
+    from scripts.train_policy import PPOConfig, ppo_update
+
+    network = CompactPolicyNet()
+    optimizer = torch.optim.AdamW(network.parameters(), lr=1e-3)
+
+    metrics = ppo_update(
+        network,
+        optimizer,
+        [_transition(done=False), _transition(done=True, final_bank=2000, opponent_final_bank=0)],
+        config=PPOConfig(target_kl=100.0, ppo_epochs=1),
+        batch_size=2,
+    )
+
+    expected = {
+        "clip_fraction",
+        "explained_variance",
+        "return_mean",
+        "return_std",
+        "advantage_mean",
+        "advantage_std",
+        "gradient_norm",
+        "parameter_norm",
+        "learning_rate",
+    }
+    assert expected <= metrics.keys()
+    assert 0.0 <= metrics["clip_fraction"] <= 1.0
+    assert metrics["learning_rate"] == pytest.approx(1e-3)
+    assert all(math.isfinite(float(metrics[name])) for name in expected)
+
+
 def test_ppo_update_rejects_nonfinite_logits_before_optimizer_step():
     pytest.importorskip("torch")
     import torch
@@ -790,6 +823,71 @@ def test_ppo_training_emits_progress_metrics_to_optional_telemetry_callback():
             },
         )
     ]
+
+
+def test_ppo_callback_forwards_training_health_metrics_from_injected_update():
+    from scripts.train_policy import PPOConfig, run_ppo_training
+
+    events = []
+    health = {
+        "clip_fraction": 0.25,
+        "explained_variance": 0.5,
+        "return_mean": 1.0,
+        "return_std": 2.0,
+        "advantage_mean": 0.0,
+        "advantage_std": 1.0,
+        "gradient_norm": 3.0,
+        "parameter_norm": 4.0,
+        "learning_rate": 0.001,
+    }
+
+    run_ppo_training(
+        network=None,
+        optimizer=None,
+        transitions=[_transition(done=True)],
+        ppo_steps=1,
+        config=PPOConfig(),
+        offline_ppo_fallback=True,
+        update_fn=lambda **kwargs: {
+            "updates": 1,
+            "early_stopped": False,
+            "policy_loss": 0.1,
+            "value_loss": 0.2,
+            "entropy": 0.3,
+            "approx_kl": 0.4,
+            **health,
+        },
+        telemetry_callback=lambda event, values: events.append((event, values)),
+    )
+
+    assert events[0][0] == "ppo"
+    assert events[0][1]["policy_loss"] == 0.1
+    for name, value in health.items():
+        assert events[0][1][name] == value
+
+
+def test_ppo_callback_forwards_reward_shaping_and_truncation_counts():
+    from scripts.train_policy import PPOConfig, run_ppo_training
+
+    events = []
+    run_ppo_training(
+        network=None,
+        optimizer=None,
+        transitions=[_transition(done=True)],
+        ppo_steps=1,
+        config=PPOConfig(),
+        offline_ppo_fallback=True,
+        update_fn=lambda **kwargs: {
+            "updates": 1,
+            "early_stopped": False,
+            "shaping_count": 2,
+            "truncation_count": 3,
+        },
+        telemetry_callback=lambda event, values: events.append((event, values)),
+    )
+
+    assert events[0][1]["shaping_count"] == 2
+    assert events[0][1]["truncation_count"] == 3
 
 
 def test_cli_ppo_steps_require_explicit_offline_fallback_for_replay_reuse():
@@ -1412,6 +1510,10 @@ def test_behavior_cloning_emits_loss_and_update_count_at_checkpoint_intervals(tm
     assert [event for event, _values in events] == ["behavior_clone", "behavior_clone"]
     assert [values["update_count"] for _event, values in events] == [1, 2]
     assert all(math.isfinite(values["loss"]) for _event, values in events)
+    for _event, values in events:
+        for name in ("learning_rate", "gradient_norm", "parameter_norm", "entropy"):
+            assert math.isfinite(values[name])
+        assert values["learning_rate"] == pytest.approx(1e-3)
 
 
 def test_behavior_cloning_starts_ppo_with_fresh_conservative_optimizer(tmp_path, monkeypatch):

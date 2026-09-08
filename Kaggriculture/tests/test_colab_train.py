@@ -698,6 +698,59 @@ def test_colab_workflow_does_not_automatically_promote_candidate(tmp_path, monke
     assert not config.current_checkpoint_path.exists()
 
 
+def test_colab_workflow_records_validation_before_finishing_telemetry(tmp_path, monkeypatch):
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+
+    def fake_run(command, *, check, capture_output=False):
+        script = Path(command[1]).name
+        if script == colab_train.COLLECT_SCRIPT.name:
+            config.trajectory_path.write_text("{}\n", encoding="utf-8")
+        elif script == colab_train.EVALUATE_SCRIPT.name:
+            phase = "holdout" if "holdout" in command[-1] else "development"
+            report_path = config.holdout_report_path if phase == "holdout" else config.development_report_path
+            report_path.write_text(
+                json.dumps(_complete_colab_evaluation_report(config, phase=phase)),
+                encoding="utf-8",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    class FakeTelemetry:
+        def __init__(self):
+            self.events = []
+            self.finished = False
+
+        def __call__(self, event, metrics=None, **values):
+            self.events.append({"event": event, **dict(metrics or {}), **values})
+
+        def finish(self):
+            self.finished = True
+            self.events.append({"event": "finish"})
+
+    telemetry = FakeTelemetry()
+    monkeypatch.setattr(colab_train, "run_command", fake_run)
+    monkeypatch.setattr(colab_train, "train_candidate", lambda *args, **kwargs: {})
+    monkeypatch.setattr(colab_train, "initialize_telemetry", lambda config: telemetry)
+    monkeypatch.setattr(colab_train, "smoke_test_artifact", lambda config: None)
+
+    result = colab_train.run_workflow(config)
+
+    validation_events = [event for event in telemetry.events if event["event"] == "validation_summary"]
+    assert {event["phase"] for event in validation_events} == {"development", "holdout"}
+    assert {event["candidate"] for event in validation_events} == {"current", config.candidate_tag}
+    training_complete = next(event for event in telemetry.events if event["event"] == "training_complete")
+    assert training_complete["configuration"]["candidate_tag"] == config.candidate_tag
+    assert training_complete["configuration"]["training_contract"]["ppo_steps"] == config.ppo_target_steps
+    assert telemetry.events.index(validation_events[-1]) < telemetry.events.index({"event": "finish"})
+    assert telemetry.finished is True
+    assert result.holdout_evaluation_complete is True
+
+
 def test_build_training_contract_normalizes_zero_steps_and_batch_size(monkeypatch, tmp_path):
     from scripts import train_policy
 
