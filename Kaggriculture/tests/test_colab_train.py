@@ -65,6 +65,8 @@ def test_colab_notebook_stages_candidates_and_resumes_safely():
     assert "DEFAULT_WANDB_PROJECT" in code
     assert "DEFAULT_WANDB_ENTITY" in code
     assert "wandb.login" in code
+    assert "wandb.login(key=wandb_api_key, relogin=False)" in code
+    assert "quiet=True" not in code
     assert "WANDB_API_KEY" in code
     assert "telemetry_project = DEFAULT_WANDB_PROJECT" in code
     assert "training_metrics_path = run_dir / f'{candidate_tag}-training-metrics.jsonl'" in code
