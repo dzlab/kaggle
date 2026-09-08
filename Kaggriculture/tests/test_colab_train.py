@@ -61,14 +61,14 @@ def test_colab_notebook_stages_candidates_and_resumes_safely():
     assert ".[training,observability]" in code
     assert "DEFAULT_WEAVE_PROJECT" in code
     assert "telemetry_project = DEFAULT_WEAVE_PROJECT" in code
-    assert "training_metrics_path = run_dir / 'orbit-training-metrics.jsonl'" in code
+    assert "training_metrics_path = run_dir / f'{candidate_tag}-training-metrics.jsonl'" in code
     assert "TrainingTelemetry(" in code
     assert "enable_weave=True" in code
     assert "strict=False" in code
-    assert "telemetry_callback=training_telemetry" in code
+    assert "telemetry_callback=record_training_event" in code
     assert "import matplotlib.pyplot as plt" in code
     assert "if not training_events:" in code
-    assert "No training telemetry found" in code
+    assert "No {candidate_tag} training telemetry found" in code
     assert "change the target to 32" in markdown
     assert "retained separately" in markdown
 
@@ -225,7 +225,98 @@ def test_colab_telemetry_callback_is_passed_only_to_training():
         for keyword in train_call.keywords
         if keyword.arg == "telemetry_callback"
         and isinstance(keyword.value, ast.Name)
-    ] == ["training_telemetry"]
+    ] == ["record_training_event"]
+
+
+def test_colab_telemetry_is_stage_scoped_and_labels_plot():
+    notebook_path = Path(__file__).parents[1] / "notebooks" / "colab_orbit_gpu.ipynb"
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    code_cells = [
+        "".join(cell.get("source", []))
+        for cell in notebook["cells"]
+        if cell.get("cell_type") == "code"
+    ]
+    training_cell = next(source for source in code_cells if "training_contract =" in source)
+    plotting_cell = next(source for source in code_cells if "load_metrics" in source)
+    training_tree = ast.parse(training_cell, filename="training-cell")
+    plotting_tree = ast.parse(plotting_cell, filename="plotting-cell")
+
+    metrics_assignment = next(
+        node for node in ast.walk(training_tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "training_metrics_path" for target in node.targets)
+    )
+    metrics_path = metrics_assignment.value
+    assert isinstance(metrics_path, ast.BinOp)
+    assert isinstance(metrics_path.op, ast.Div)
+    assert isinstance(metrics_path.left, ast.Name)
+    assert metrics_path.left.id == "run_dir"
+    assert isinstance(metrics_path.right, ast.JoinedStr)
+    assert any(
+        isinstance(value, ast.FormattedValue)
+        and isinstance(value.value, ast.Name)
+        and value.value.id == "candidate_tag"
+        for value in metrics_path.right.values
+    )
+    assert any(
+        isinstance(value, ast.Constant)
+        and value.value == "-training-metrics.jsonl"
+        for value in metrics_path.right.values
+    )
+
+    adapter = next(
+        node for node in training_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "record_training_event"
+    )
+    telemetry_calls = [
+        node for node in ast.walk(adapter)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "training_telemetry"
+    ]
+    assert len(telemetry_calls) == 1
+    telemetry_call = telemetry_calls[0]
+    assert [
+        argument.id for argument in telemetry_call.args
+        if isinstance(argument, ast.Name)
+    ] == ["event", "metrics"]
+    assert {
+        keyword.arg for keyword in telemetry_call.keywords
+        if keyword.arg is not None
+    } >= {"candidate_tag", "ppo_target_steps"}
+
+    train_call = next(
+        node for node in ast.walk(training_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "train_behavior_clone"
+    )
+    callback_values = [
+        keyword.value.id for keyword in train_call.keywords
+        if keyword.arg == "telemetry_callback"
+        and isinstance(keyword.value, ast.Name)
+    ]
+    assert callback_values == ["record_training_event"]
+
+    load_call = next(
+        node for node in ast.walk(plotting_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "load_metrics"
+    )
+    assert [argument.id for argument in load_call.args if isinstance(argument, ast.Name)] == [
+        "training_metrics_path"
+    ]
+    assert any(
+        isinstance(node, ast.JoinedStr)
+        and any(
+            isinstance(value, ast.FormattedValue)
+            and isinstance(value.value, ast.Name)
+            and value.value.id == "candidate_tag"
+            for value in node.values
+        )
+        for node in ast.walk(plotting_tree)
+    )
 
 
 def test_colab_config_resolves_device_and_rejects_seed_overlap(monkeypatch, tmp_path):
