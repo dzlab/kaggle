@@ -39,7 +39,10 @@ from kagriculture_agent.model import (
 
 PROMOTION_MATCH_SIZE = 100
 LOG_RATIO_CLAMP = 20.0
-PPO_LEARNING_RATE = 1e-4
+# PPO starts from a behavior-cloned policy and uses a small trust-region step.
+# The BC optimizer state is cleared before this phase; this rate keeps the first
+# on-policy update below the default target-KL gate on the compact network.
+PPO_LEARNING_RATE = 1e-5
 _DIRECTION_DELTAS = {
     "NORTH": (0, -1),
     "SOUTH": (0, 1),

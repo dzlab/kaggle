@@ -1306,7 +1306,7 @@ def test_behavior_cloning_starts_ppo_with_fresh_conservative_optimizer(tmp_path,
         device="cpu",
     )
 
-    assert observed["learning_rate"] == train_policy.PPO_LEARNING_RATE
+    assert observed["learning_rate"] == 1e-5
     assert observed["optimizer_state"] == {}
 
 
