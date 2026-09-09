@@ -92,15 +92,25 @@ def _failure(message: str, **details: Any) -> ReplayValidationError:
 def _record_metadata(record: Mapping[str, Any]) -> dict[str, Any]:
     info = _mapping(record.get("info"))
     metadata: dict[str, Any] = {}
-    for field in ("termination_reason", "bootstrap_truncated", "no_progress_steps"):
+    for field in (
+        "termination_reason", "bootstrap_truncated", "no_progress_steps", "safety_flags",
+    ):
         if field in info:
             metadata[field] = info[field]
         elif field in record:
             metadata[field] = record[field]
+    if "safety_flags" not in metadata and info.get("safety_regression") is True:
+        metadata["safety_flags"] = ["safety_regression"]
     try:
+        safety_flags = metadata.pop("safety_flags", ())
+        if not isinstance(safety_flags, Sequence) or isinstance(safety_flags, (str, bytes)):
+            raise ValueError("safety_flags must be a sequence")
+        if any(type(flag) is not str or not flag for flag in safety_flags):
+            raise ValueError("safety_flags must contain nonempty strings")
         return Transition(
             observation={}, action={}, next_observation={}, done=False, reward=0.0,
-            final_bank=0.0, opponent_final_bank=0.0, safety_flags=(), **metadata,
+            final_bank=0.0, opponent_final_bank=0.0,
+            safety_flags=tuple(safety_flags), **metadata,
         ).to_dict()
     except ValueError as exc:
         raise _failure(
@@ -247,7 +257,7 @@ def transitions_from_replay(
                 reward=float(terminal_reward if index == len(own_states) - 2 else 0.0),
                 final_bank=float(candidate_bank),
                 opponent_final_bank=float(opponent_bank),
-                safety_flags=(),
+                safety_flags=metadata.get("safety_flags", ()),
                 **{
                     field: metadata[field]
                     for field in (

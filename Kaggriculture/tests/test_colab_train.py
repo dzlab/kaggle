@@ -160,6 +160,33 @@ def test_default_wandb_run_name_describes_training_configuration(tmp_path):
     )
 
 
+def test_colab_wandb_config_records_stall_and_shaping_ablations(tmp_path, monkeypatch):
+    from scripts import train
+
+    captured = {}
+
+    class FakeTelemetry:
+        def __init__(self, *_args, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("scripts.telemetry.TrainingTelemetry", FakeTelemetry)
+    config = train.build_config(
+        run_directory=tmp_path,
+        device="cpu",
+        resolve_runtime_device=False,
+        potential_reward_coef=0.05,
+        no_progress_window=24,
+        resolved_margin=1000.0,
+        wandb_enabled=False,
+    )
+
+    train.initialize_telemetry(config)
+
+    assert captured["wandb_config"]["potential_reward_coef"] == pytest.approx(0.05)
+    assert captured["wandb_config"]["no_progress_window"] == 24
+    assert captured["wandb_config"]["resolved_margin"] == pytest.approx(1000.0)
+
+
 def test_colab_config_exposes_validated_experiment_identity(tmp_path, monkeypatch):
     from scripts import train
 

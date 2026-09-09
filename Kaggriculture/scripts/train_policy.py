@@ -648,22 +648,63 @@ def _diagnostic_counts(transitions: Sequence[Mapping[str, Any]]) -> dict[str, An
 def promotion_safety_regression(
     *, candidate: Mapping[str, Any], baseline: Mapping[str, Any], tolerance: int = 0,
 ) -> dict[str, Any]:
-    """Fail closed when the candidate adds observable safety regressions."""
+    """Fail closed when a candidate worsens any stall or safety diagnostic."""
     if type(tolerance) is not int or tolerance < 0:
         raise ValueError("tolerance must be a nonnegative integer")
-    candidate_count = candidate.get("safety_regression_count", 0)
-    baseline_count = baseline.get("safety_regression_count", 0)
-    if type(candidate_count) is not int or candidate_count < 0:
-        raise ValueError("candidate safety_regression_count must be a nonnegative integer")
-    if type(baseline_count) is not int or baseline_count < 0:
-        raise ValueError("baseline safety_regression_count must be a nonnegative integer")
-    regressed = candidate_count > baseline_count + tolerance
+    def diagnostics(metrics: Mapping[str, Any], *, source: str) -> dict[str, Any]:
+        if not isinstance(metrics, Mapping):
+            raise ValueError(f"{source} diagnostics must be an object")
+
+        def count(*names: str) -> int:
+            value = next((metrics[name] for name in names if name in metrics), 0)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{source} {names[0]} must be a nonnegative integer")
+            return value
+
+        reasons = metrics.get("termination_reasons", {})
+        if not isinstance(reasons, Mapping):
+            raise ValueError(f"{source} termination_reasons must be an object")
+        normalized_reasons: dict[str, int] = {}
+        for reason, value in reasons.items():
+            if type(reason) is not str or not reason or type(value) is not int or value < 0:
+                raise ValueError(
+                    f"{source} termination_reasons must map nonempty strings "
+                    "to nonnegative integers"
+                )
+            normalized_reasons[reason] = value
+        streak = count("max_no_progress_streak", "max_no_progress_steps")
+        return {
+            "safety_regression_count": count("safety_regression_count"),
+            "time_limit_endings": count("time_limit_endings"),
+            "truncation_count": count("truncation_count", "bootstrap_truncated_count"),
+            "resolved_count": normalized_reasons.get("resolved", 0),
+            "no_progress_count": normalized_reasons.get("no_progress", 0),
+            "max_no_progress_streak": streak,
+            "termination_reasons": normalized_reasons,
+        }
+
+    candidate_metrics = diagnostics(candidate, source="candidate")
+    baseline_metrics = diagnostics(baseline, source="baseline")
+    compared_fields = (
+        "safety_regression_count", "time_limit_endings", "truncation_count",
+        "resolved_count", "no_progress_count", "max_no_progress_streak",
+    )
+    regressions = {
+        field: {
+            "candidate": candidate_metrics[field],
+            "baseline": baseline_metrics[field],
+        }
+        for field in compared_fields
+        if candidate_metrics[field] > baseline_metrics[field] + tolerance
+    }
+    regressed = bool(regressions)
     return {
         "safety_regression": regressed,
         "promotion_safe": not regressed,
         "reason": "safety_regression" if regressed else None,
-        "candidate_safety_regression_count": candidate_count,
-        "baseline_safety_regression_count": baseline_count,
+        "regressions": regressions,
+        "candidate_diagnostics": candidate_metrics,
+        "baseline_diagnostics": baseline_metrics,
     }
 
 
@@ -958,16 +999,9 @@ def _market_active_label(action: dict[str, Any]) -> int:
 
 def _transition_base_reward(transition: Mapping[str, Any], *, done: bool, config: PPOConfig) -> float:
     if done:
-        terminal = terminal_bank_margin_reward(
+        return terminal_bank_margin_reward(
             transition.get("final_bank"), transition.get("opponent_final_bank"),
         )
-        if transition.get("final_bank") is None and transition.get("opponent_final_bank") is None:
-            try:
-                reward = float(transition.get("reward", 0.0))
-            except (TypeError, ValueError, OverflowError):
-                reward = 0.0
-            return reward if math.isfinite(reward) else 0.0
-        return terminal
     if config.potential_reward_coef == 0.0:
         # Preserve the legacy trajectory contract: nonterminal base rewards
         # are zero unless shaping is explicitly enabled.
@@ -992,12 +1026,11 @@ def _resolved_transition(transition: Mapping[str, Any], *, config: PPOConfig) ->
         return False
     raw_margin = transition.get("bank_differential")
     if raw_margin is None:
-        try:
-            raw_margin = float(transition.get("final_bank")) - float(
-                transition.get("opponent_final_bank"),
-            )
-        except (TypeError, ValueError, OverflowError):
-            return False
+        observation = transition.get("observation")
+        if isinstance(observation, Mapping):
+            raw_margin = observation.get("bank_differential")
+    if raw_margin is None:
+        return False
     try:
         margin = abs(float(raw_margin))
     except (TypeError, ValueError, OverflowError):
@@ -1534,6 +1567,7 @@ def run_ppo_training(
     opponent_pool: Any | None = None, rollout_fn: Any | None = None,
     offline_ppo_fallback: bool = False, update_fn: Any | None = None,
     promotion_match_fn: Any | None = None,
+    promotion_baseline_diagnostics: Mapping[str, Any] | None = None,
     candidate_checkpoint: str | Path | None = None,
     best_checkpoint_path: str | Path | None = None,
     checkpoint_registry: dict[str, Any] | None = None,
@@ -1860,6 +1894,7 @@ def run_ppo_training(
             cleanup_candidate_fn=cleanup_candidate_fn,
             best_checkpoint_path=best_checkpoint_path,
             promoted_checkpoint_path=registry_best_checkpoint,
+            baseline_diagnostics=promotion_baseline_diagnostics,
         )
         if promotion["promoted"]:
             try:
@@ -1986,21 +2021,77 @@ def _candidate_won(result: Any) -> bool:
 
 def run_promotion_match(
     match_fn: Any, *, match_size: int = PROMOTION_MATCH_SIZE,
-) -> dict[str, int | bool]:
+    baseline_diagnostics: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Run the fixed promotion match and apply the strict >70% win gate."""
     if match_size != PROMOTION_MATCH_SIZE:
         raise ValueError(f"promotion match must run exactly {PROMOTION_MATCH_SIZE} games")
     wins = 0
+    candidate_diagnostics: dict[str, Any] = {}
+    observed_baseline_diagnostics: dict[str, Any] = {}
+    diagnostics_seen = False
+
+    def merge(target: dict[str, Any], source: Mapping[str, Any]) -> None:
+        normalized = promotion_safety_regression(
+            candidate=source, baseline={},
+        )["candidate_diagnostics"]
+        for field in (
+            "safety_regression_count", "time_limit_endings", "truncation_count",
+            "resolved_count", "no_progress_count",
+        ):
+            target[field] = target.get(field, 0) + normalized[field]
+        target["max_no_progress_streak"] = max(
+            target.get("max_no_progress_streak", 0),
+            normalized["max_no_progress_streak"],
+        )
+        reasons = target.setdefault("termination_reasons", {})
+        for reason, count in normalized["termination_reasons"].items():
+            reasons[reason] = reasons.get(reason, 0) + count
+
     for index in range(PROMOTION_MATCH_SIZE):
         try:
-            wins += int(_candidate_won(match_fn(index)))
+            raw_result = match_fn(index)
+            wins += int(_candidate_won(raw_result))
+            if isinstance(raw_result, Mapping):
+                candidate_source = raw_result.get("candidate_diagnostics")
+                baseline_source = raw_result.get("baseline_diagnostics")
+                if candidate_source is None and any(
+                    key in raw_result for key in (
+                        "safety_regression_count", "time_limit_endings", "truncation_count",
+                        "bootstrap_truncated_count", "termination_reasons",
+                        "max_no_progress_streak", "max_no_progress_steps",
+                    )
+                ):
+                    candidate_source = raw_result
+                if isinstance(candidate_source, Mapping):
+                    merge(candidate_diagnostics, candidate_source)
+                    diagnostics_seen = True
+                if isinstance(baseline_source, Mapping):
+                    merge(observed_baseline_diagnostics, baseline_source)
+                    diagnostics_seen = True
         except ValueError as exc:
             raise ValueError(f"promotion match result {index} is malformed: {exc}") from exc
-    return {
+    result: dict[str, Any] = {
         "games": PROMOTION_MATCH_SIZE,
         "wins": wins,
-        "promoted": should_promote(wins=wins, games=PROMOTION_MATCH_SIZE),
     }
+    if diagnostics_seen or baseline_diagnostics is not None:
+        baseline = (
+            observed_baseline_diagnostics
+            if observed_baseline_diagnostics
+            else (baseline_diagnostics or {})
+        )
+        promotion_safety = promotion_safety_regression(
+            candidate=candidate_diagnostics, baseline=baseline,
+        )
+        result["promotion_safety"] = promotion_safety
+        result["promoted"] = (
+            should_promote(wins=wins, games=PROMOTION_MATCH_SIZE)
+            and promotion_safety["promotion_safe"]
+        )
+    else:
+        result["promoted"] = should_promote(wins=wins, games=PROMOTION_MATCH_SIZE)
+    return result
 
 
 def _cleanup_checkpoint(path: str | Path) -> None:
@@ -2079,6 +2170,7 @@ def maybe_promote_checkpoint(
     cleanup_candidate_fn: Any | None = None,
     best_checkpoint_path: str | Path | None = None,
     promoted_checkpoint_path: str | Path | None = None,
+    baseline_diagnostics: Mapping[str, Any] | None = None,
     best_key: str = "best",
 ) -> dict[str, Any]:
     """Register a candidate, run the fixed promotion match, and update best only on promotion."""
@@ -2102,7 +2194,9 @@ def maybe_promote_checkpoint(
         )
 
     try:
-        result = run_promotion_match(candidate_match)
+        result = run_promotion_match(
+            candidate_match, baseline_diagnostics=baseline_diagnostics,
+        )
     except Exception:
         entry["status"] = "error"
         registry[best_key] = previous_best
@@ -2535,6 +2629,7 @@ def train_behavior_clone(
     prior_checkpoint: str | Path | None = None, rollout_fn: Any | None = None,
     opponent_pool: Any | None = None, offline_ppo_fallback: bool = False,
     promotion_match_fn: Any | None = None,
+    promotion_baseline_diagnostics: Mapping[str, Any] | None = None,
     best_checkpoint_path: str | Path | None = None,
     checkpoint_registry: dict[str, Any] | None = None,
     candidate_artifact: str | Path | None = None,
@@ -2893,6 +2988,7 @@ def train_behavior_clone(
             rollout_fn=rollout_fn,
             offline_ppo_fallback=offline_ppo_fallback,
             promotion_match_fn=promotion_match_fn,
+            promotion_baseline_diagnostics=promotion_baseline_diagnostics,
             candidate_checkpoint=output_path,
             best_checkpoint_path=best_checkpoint_path,
             checkpoint_registry=checkpoint_registry,

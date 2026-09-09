@@ -314,7 +314,7 @@ def _resolve_collection_transitions(
             try:
                 decided = raw_margin is not None and abs(float(raw_margin)) >= resolved_margin
             except (TypeError, ValueError, OverflowError):
-                raise ValueError("collector bank_differential is malformed") from None
+                decided = False
             if decided:
                 bootstrap_truncated = True
                 termination_reason = termination_reason or "resolved"

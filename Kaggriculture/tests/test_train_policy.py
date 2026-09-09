@@ -86,6 +86,23 @@ def test_default_ppo_config_matches_plan_values():
     assert PPOConfig(gamma=1.0).gamma == 1.0
 
 
+def test_checkpoint_metadata_records_stall_and_shaping_ablations():
+    from scripts.train_policy import PPOConfig, checkpoint_metadata
+
+    metadata = checkpoint_metadata(
+        1, PPOConfig(
+            potential_reward_coef=0.05,
+            no_progress_window=24,
+            resolved_margin=1000.0,
+        ),
+    )
+
+    assert metadata["potential_reward_coef"] == pytest.approx(0.05)
+    assert metadata["no_progress_window"] == 24
+    assert metadata["resolved_margin"] == pytest.approx(1000.0)
+    assert metadata["ppo_config"]["potential_reward_coef"] == pytest.approx(0.05)
+
+
 @pytest.mark.parametrize("field,value", [
     ("gamma", 0.0),
     ("gamma", 1.1),
@@ -184,6 +201,32 @@ def test_rollout_batch_reports_termination_and_safety_diagnostics():
     assert batch.safety_regression_count == 1
 
 
+def test_resolved_margin_uses_current_transition_margin_not_terminal_metadata():
+    from scripts.train_policy import PPOConfig, build_rollout_batch
+
+    row = _transition(done=False, final_bank=5000, opponent_final_bank=0)
+    row["bank_differential"] = "not-a-number"
+
+    batch = build_rollout_batch(
+        [row], config=PPOConfig(resolved_margin=1000),
+        value_estimates=[0.1], bootstrap_values=[0.7],
+    )
+
+    assert batch.bootstrap_truncated == [False]
+    assert batch.dones == [False]
+
+
+@pytest.mark.parametrize("bad_bank", [None, "malformed", float("nan"), float("inf")])
+def test_terminal_bank_margin_reward_does_not_fallback_to_transition_reward(bad_bank):
+    from scripts.train_policy import PPOConfig, build_rollout_batch
+
+    row = _transition(done=True, reward=123.0, final_bank=bad_bank, opponent_final_bank=bad_bank)
+    batch = build_rollout_batch([row], config=PPOConfig())
+
+    assert batch.rewards == [0.0]
+    assert math.isfinite(batch.rewards[0])
+
+
 def test_promotion_safety_regression_is_fail_closed_even_when_reward_improves():
     from scripts.train_policy import promotion_safety_regression
 
@@ -195,6 +238,85 @@ def test_promotion_safety_regression_is_fail_closed_even_when_reward_improves():
     assert result["safety_regression"] is True
     assert result["promotion_safe"] is False
     assert result["reason"] == "safety_regression"
+
+
+def test_promotion_safety_regression_covers_all_stall_diagnostics():
+    from scripts.train_policy import promotion_safety_regression
+
+    result = promotion_safety_regression(
+        candidate={
+            "safety_regression_count": 1,
+            "time_limit_endings": 2,
+            "truncation_count": 3,
+            "termination_reasons": {"resolved": 2, "no_progress": 4},
+            "max_no_progress_streak": 8,
+        },
+        baseline={
+            "safety_regression_count": 0,
+            "time_limit_endings": 0,
+            "truncation_count": 1,
+            "termination_reasons": {"resolved": 0, "no_progress": 1},
+            "max_no_progress_streak": 2,
+        },
+    )
+
+    assert result["promotion_safe"] is False
+    assert set(result["regressions"]) == {
+        "safety_regression_count", "time_limit_endings", "truncation_count",
+        "resolved_count", "no_progress_count", "max_no_progress_streak",
+    }
+
+
+def test_direct_promotion_gate_rejects_safety_regression_despite_win_rate():
+    from scripts.train_policy import run_promotion_match
+
+    def match_fn(index):
+        return {
+            "candidate_win": index < 71,
+            "candidate_diagnostics": {
+                "safety_regression_count": 1,
+                "time_limit_endings": 0,
+                "truncation_count": 0,
+                "termination_reasons": {},
+                "max_no_progress_streak": 0,
+            },
+            "baseline_diagnostics": {
+                "safety_regression_count": 0,
+                "time_limit_endings": 0,
+                "truncation_count": 0,
+                "termination_reasons": {},
+                "max_no_progress_streak": 0,
+            },
+        }
+
+    result = run_promotion_match(match_fn)
+
+    assert result["wins"] == 71
+    assert result["promoted"] is False
+    assert result["promotion_safety"]["safety_regression"] is True
+
+
+def test_ppo_promotion_path_applies_safety_gate(tmp_path):
+    from scripts.train_policy import PPOConfig, run_ppo_training
+
+    def match_fn(index, **_kwargs):
+        return {
+            "candidate_win": index < 71,
+            "candidate_diagnostics": {"safety_regression_count": 1},
+            "baseline_diagnostics": {"safety_regression_count": 0},
+        }
+
+    result = run_ppo_training(
+        network=None, optimizer=None, transitions=[_transition(done=True)],
+        ppo_steps=1, config=PPOConfig(), offline_ppo_fallback=True,
+        update_fn=lambda **_kwargs: {"updates": 1, "early_stopped": False},
+        promotion_match_fn=match_fn,
+        candidate_checkpoint=tmp_path / "candidate.pt",
+    )
+
+    assert result["promotion"]["wins"] == 71
+    assert result["promotion"]["promoted"] is False
+    assert result["promotion"]["promotion_safety"]["safety_regression"] is True
 
 
 @pytest.mark.parametrize(

@@ -300,6 +300,36 @@ def test_transition_preserves_and_validates_termination_metadata():
         )
 
 
+def test_replay_conversion_preserves_safety_flags_from_step_metadata(monkeypatch):
+    from kagriculture_agent import trajectory
+
+    def state(player, money, *, safety_flags=()):
+        return {
+            "observation": {
+                "player": player,
+                "farms": [{"money": money}, {"money": money}],
+            },
+            "action": {"farmer": ["PASS"], "hands": [], "market": []},
+            "info": {"safety_flags": list(safety_flags)},
+        }
+
+    own_states = [
+        state(0, 100),
+        state(0, 100, safety_flags=("safety_regression",)),
+        state(0, 100),
+    ]
+    other_states = [state(1, 100), state(1, 100), state(1, 100)]
+    monkeypatch.setattr(
+        trajectory, "_validated_player_states",
+        lambda *_args, **_kwargs: (own_states, other_states, {}),
+    )
+
+    transitions = trajectory.transitions_from_replay({"steps": []})
+
+    assert transitions[0].safety_flags == ("safety_regression",)
+    assert transitions[1].safety_flags == ()
+
+
 def test_collection_preserves_termination_metadata_in_jsonl_and_manifest(tmp_path, monkeypatch):
     from kagriculture_agent.trajectory import Transition
     from scripts import collect_trajectories
@@ -350,6 +380,24 @@ def test_collection_resolution_marks_no_progress_and_preserves_terminal_done():
     assert resolved[1].no_progress_steps == 2
     assert resolved[2].done is True
     assert resolved[2].bootstrap_truncated is None
+
+
+def test_collection_resolution_ignores_malformed_bank_differential(tmp_path):
+    from kagriculture_agent.trajectory import Transition
+    from scripts.collect_trajectories import _resolve_collection_transitions
+
+    transition = Transition(
+        observation={"bank_differential": "malformed"}, action={},
+        next_observation={}, done=False, reward=0.0,
+        final_bank=5000.0, opponent_final_bank=0.0, safety_flags=(),
+    )
+
+    resolved = _resolve_collection_transitions(
+        [transition], no_progress_window=0, resolved_margin=1000.0,
+    )
+
+    assert resolved[0].bootstrap_truncated is None
+    assert resolved[0].termination_reason is None
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
