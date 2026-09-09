@@ -799,7 +799,61 @@ def test_ppo_update_measures_target_kl_after_optimizer_step():
 
     assert metrics["updates"] == 1
     assert metrics["early_stopped"] is True
-    assert metrics["approx_kl"] > 1e-12
+    assert metrics["post_step_kl"] > 1e-12
+
+
+def test_ppo_update_labels_known_kl_metrics_by_update_phase(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from scripts import train_policy
+
+    class OneParameterPolicy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bias = torch.nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, features):
+            return {"value": self.bias.repeat(len(features))}
+
+    old_log_probs = [0.0, 0.0]
+    pre_step_log_probs = [math.log(0.5), math.log(0.25)]
+    post_step_log_probs = [math.log(1.5), math.log(0.5)]
+    selected_log_probs = iter(
+        (old_log_probs, pre_step_log_probs, post_step_log_probs)
+    )
+    network = OneParameterPolicy()
+
+    def select_known_log_probs(*_args, **_kwargs):
+        values = torch.tensor(next(selected_log_probs), dtype=torch.float32)
+        return network.bias * 0.0 + values, network.bias * 0.0
+
+    monkeypatch.setattr(train_policy, "_select_outputs", select_known_log_probs)
+    optimizer = torch.optim.SGD(network.parameters(), lr=0.1)
+
+    metrics = train_policy.ppo_update(
+        network,
+        optimizer,
+        [
+            _transition(done=True),
+            _transition(done=True, final_bank=2000, opponent_final_bank=0),
+        ],
+        config=train_policy.PPOConfig(target_kl=100.0),
+        batch_size=2,
+    )
+
+    expected_pre_step_approx_kl = sum(
+        old - new for old, new in zip(old_log_probs, pre_step_log_probs)
+    ) / 2
+    post_step_log_ratios = [
+        new - old for old, new in zip(old_log_probs, post_step_log_probs)
+    ]
+    expected_post_step_kl = sum(
+        math.exp(log_ratio) - 1.0 - log_ratio
+        for log_ratio in post_step_log_ratios
+    ) / 2
+    assert metrics["pre_step_approx_kl"] == pytest.approx(expected_pre_step_approx_kl)
+    assert metrics["post_step_kl"] == pytest.approx(expected_post_step_kl)
+    assert metrics["approx_kl"] == metrics["pre_step_approx_kl"]
+    assert metrics["pre_step_approx_kl"] != pytest.approx(metrics["post_step_kl"])
 
 
 def test_ppo_update_reports_training_health_metrics():
@@ -1225,6 +1279,8 @@ def test_ppo_training_emits_progress_metrics_to_optional_telemetry_callback():
             "value_loss": 0.2,
             "entropy": 0.3,
             "approx_kl": 0.4,
+            "pre_step_approx_kl": 0.4,
+            "post_step_kl": 0.6,
         },
         telemetry_callback=lambda event, values: events.append((event, values)),
     )
@@ -1243,6 +1299,8 @@ def test_ppo_training_emits_progress_metrics_to_optional_telemetry_callback():
                 "value_loss": 0.2,
                 "entropy": 0.3,
                 "approx_kl": 0.4,
+                "pre_step_approx_kl": 0.4,
+                "post_step_kl": 0.6,
             },
         )
     ]

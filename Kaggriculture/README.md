@@ -355,6 +355,24 @@ performance signal; framework errors, missed needs, incomplete matrices, and
 negative bank-differential tails remain safety gates rather than metrics to
 average away.
 
+PPO telemetry labels KL by optimizer phase. `pre_step_approx_kl` is the mean
+old-minus-new selected-action log probability computed from the forward pass
+before the optimizer update. `post_step_kl` is the nonnegative ratio-based
+estimate `mean(exp(log_ratio) - 1 - log_ratio)` from a fresh forward pass after
+the update; the target-KL early-stop gate uses this post-step value. The
+`approx_kl` field remains an explicit compatibility alias for
+`pre_step_approx_kl`.
+
+The training objective remains unchanged: worker target and kind terms are
+conditioned on active workers, market item and quantity terms are conditioned
+on `market_active`, and the worker-active and market-active heads are always
+scored as part of the joint-action objective. Changing `market_active` or
+joint-action loss weighting is a separate follow-up decision that requires an
+identical-seed ablation covering validation reward, feed-deadline violations,
+terminal cash, artifact latency, and action-contract violations. In
+particular, the runtime does not currently consume the exported market-active
+head.
+
 ## Experimental context and training ladder
 
 `kagriculture_agent.experimental_features.extract_experimental_context()` is

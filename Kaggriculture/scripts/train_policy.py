@@ -1567,6 +1567,8 @@ def ppo_update(
         "policy_loss": 0.0,
         "value_loss": 0.0,
         "entropy": 0.0,
+        "pre_step_approx_kl": 0.0,
+        "post_step_kl": 0.0,
         "approx_kl": 0.0,
         "kl_to_prior": 0.0,
         "prior_cross_entropy": 0.0,
@@ -1656,7 +1658,7 @@ def ppo_update(
                 + config.kl_coef * kl_to_prior
                 + config.prior_ce_coef * prior_ce
             )
-            approx = (old_log - log_probs).mean().detach()
+            pre_step_approx_kl = (old_log - log_probs).mean().detach()
             optimizer.zero_grad()
             loss.backward()
             gradient_norm = _gradient_norm(network)
@@ -1678,7 +1680,9 @@ def ppo_update(
                 "policy_loss": float(policy_loss.detach()),
                 "value_loss": float(value_loss.detach()),
                 "entropy": float(entropy.detach()),
-                "approx_kl": float(post_step_kl.detach()),
+                "pre_step_approx_kl": float(pre_step_approx_kl),
+                "post_step_kl": float(post_step_kl.detach()),
+                "approx_kl": float(pre_step_approx_kl),
                 "kl_to_prior": float(kl_to_prior.detach()),
                 "prior_cross_entropy": float(prior_ce.detach()),
                 "loss": float(loss.detach()),
@@ -1985,7 +1989,13 @@ def run_ppo_training(
                 "policy_loss": last_metrics.get("policy_loss"),
                 "value_loss": last_metrics.get("value_loss"),
                 "entropy": last_metrics.get("entropy"),
-                "approx_kl": last_metrics.get("approx_kl"),
+                "pre_step_approx_kl": last_metrics.get(
+                    "pre_step_approx_kl", last_metrics.get("approx_kl"),
+                ),
+                "post_step_kl": last_metrics.get("post_step_kl"),
+                "approx_kl": last_metrics.get(
+                    "approx_kl", last_metrics.get("pre_step_approx_kl"),
+                ),
             }
             if (
                 feature_variant != "production_v1"
