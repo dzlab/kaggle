@@ -68,6 +68,7 @@ _ARTIFACT_MODEL_VERSION = "learned_v1"
 _ARTIFACT_FEATURE_SCHEMA_VERSION = 1
 _ARTIFACT_ENGINE_VERSION = "1.32.7"
 _ARTIFACT_HIDDEN_WIDTH = 128
+_ARTIFACT_MODEL_DEPTH = 4
 _ARTIFACT_QUANTIZATION = "int8-per-row"
 _BLAS_WEIGHT_CACHE: dict[int, tuple[list[list[float]], array, Any]] = {}
 _BLAS_WORKSPACE = threading.local()
@@ -78,7 +79,15 @@ _ARTIFACT_WORKER_KINDS = (
 _ARTIFACT_MARKET_QUANTITIES = (0, 1, 2, 4, 8, 16, 32, 64)
 
 
-def _artifact_tensor_names() -> tuple[str, ...]:
+def _validate_artifact_model_shape(hidden_width: Any, model_depth: Any) -> tuple[int, int]:
+    if type(hidden_width) is not int or hidden_width < 1 or hidden_width % 4:
+        raise ValueError("unsupported learned artifact hidden_width")
+    if type(model_depth) is not int or model_depth < 1:
+        raise ValueError("unsupported learned artifact model_depth")
+    return hidden_width, model_depth
+
+
+def _artifact_tensor_names(model_depth: int = _ARTIFACT_MODEL_DEPTH) -> tuple[str, ...]:
     names = [
         "tile_projection.weight", "tile_projection.bias",
         "worker_projection.weight", "worker_projection.bias",
@@ -86,7 +95,7 @@ def _artifact_tensor_names() -> tuple[str, ...]:
         "global_projection.weight", "global_projection.bias",
         "type_embedding.weight",
     ]
-    for index in range(4):
+    for index in range(model_depth):
         prefix = f"blocks.{index}"
         names.extend([
             f"{prefix}.attention.in_proj_weight", f"{prefix}.attention.in_proj_bias",
@@ -108,49 +117,54 @@ def _artifact_tensor_names() -> tuple[str, ...]:
     return tuple(names)
 
 
-def artifact_tensor_shapes() -> dict[str, tuple[int, ...]]:
-    """Return the exact state-dict shapes for CompactPolicyNet."""
+def artifact_tensor_shapes(
+    hidden_width: int = _ARTIFACT_HIDDEN_WIDTH,
+    model_depth: int = _ARTIFACT_MODEL_DEPTH,
+) -> dict[str, tuple[int, ...]]:
+    """Return the exact state-dict shapes for a CompactPolicyNet topology."""
+    hidden_width, model_depth = _validate_artifact_model_shape(hidden_width, model_depth)
+    mlp_width = 2 * hidden_width
     shapes: dict[str, tuple[int, ...]] = {
-        "tile_projection.weight": (128, TILE_TOKEN_SIZE),
-        "tile_projection.bias": (128,),
-        "worker_projection.weight": (128, WORKER_TOKEN_SIZE),
-        "worker_projection.bias": (128,),
-        "market_projection.weight": (128, MARKET_TOKEN_SIZE),
-        "market_projection.bias": (128,),
-        "global_projection.weight": (128, GLOBAL_TOKEN_SIZE),
-        "global_projection.bias": (128,),
-        "type_embedding.weight": (4, 128),
+        "tile_projection.weight": (hidden_width, TILE_TOKEN_SIZE),
+        "tile_projection.bias": (hidden_width,),
+        "worker_projection.weight": (hidden_width, WORKER_TOKEN_SIZE),
+        "worker_projection.bias": (hidden_width,),
+        "market_projection.weight": (hidden_width, MARKET_TOKEN_SIZE),
+        "market_projection.bias": (hidden_width,),
+        "global_projection.weight": (hidden_width, GLOBAL_TOKEN_SIZE),
+        "global_projection.bias": (hidden_width,),
+        "type_embedding.weight": (4, hidden_width),
     }
-    for index in range(4):
+    for index in range(model_depth):
         prefix = f"blocks.{index}"
         shapes.update({
-            f"{prefix}.attention.in_proj_weight": (384, 128),
-            f"{prefix}.attention.in_proj_bias": (384,),
-            f"{prefix}.attention.out_proj.weight": (128, 128),
-            f"{prefix}.attention.out_proj.bias": (128,),
-            f"{prefix}.attention_norm.weight": (128,),
-            f"{prefix}.attention_norm.bias": (128,),
-            f"{prefix}.mlp.0.weight": (256, 128),
-            f"{prefix}.mlp.0.bias": (256,),
-            f"{prefix}.mlp.2.weight": (128, 256),
-            f"{prefix}.mlp.2.bias": (128,),
-            f"{prefix}.mlp_norm.weight": (128,),
-            f"{prefix}.mlp_norm.bias": (128,),
+            f"{prefix}.attention.in_proj_weight": (3 * hidden_width, hidden_width),
+            f"{prefix}.attention.in_proj_bias": (3 * hidden_width,),
+            f"{prefix}.attention.out_proj.weight": (hidden_width, hidden_width),
+            f"{prefix}.attention.out_proj.bias": (hidden_width,),
+            f"{prefix}.attention_norm.weight": (hidden_width,),
+            f"{prefix}.attention_norm.bias": (hidden_width,),
+            f"{prefix}.mlp.0.weight": (mlp_width, hidden_width),
+            f"{prefix}.mlp.0.bias": (mlp_width,),
+            f"{prefix}.mlp.2.weight": (hidden_width, mlp_width),
+            f"{prefix}.mlp.2.bias": (hidden_width,),
+            f"{prefix}.mlp_norm.weight": (hidden_width,),
+            f"{prefix}.mlp_norm.bias": (hidden_width,),
         })
     shapes.update({
-        "worker_act_head.weight": (2, 128),
+        "worker_act_head.weight": (2, hidden_width),
         "worker_act_head.bias": (2,),
-        "worker_kind_head.weight": (len(_ARTIFACT_WORKER_KINDS), 128),
+        "worker_kind_head.weight": (len(_ARTIFACT_WORKER_KINDS), hidden_width),
         "worker_kind_head.bias": (len(_ARTIFACT_WORKER_KINDS),),
-        "target_worker_head.weight": (128, 128),
-        "target_worker_head.bias": (128,),
-        "target_tile_head.weight": (128, 128),
-        "target_tile_head.bias": (128,),
-        "market_item_head.weight": (len(PRODUCTS), 128),
+        "target_worker_head.weight": (hidden_width, hidden_width),
+        "target_worker_head.bias": (hidden_width,),
+        "target_tile_head.weight": (hidden_width, hidden_width),
+        "target_tile_head.bias": (hidden_width,),
+        "market_item_head.weight": (len(PRODUCTS), hidden_width),
         "market_item_head.bias": (len(PRODUCTS),),
-        "market_quantity_head.weight": (len(_ARTIFACT_MARKET_QUANTITIES), 128),
+        "market_quantity_head.weight": (len(_ARTIFACT_MARKET_QUANTITIES), hidden_width),
         "market_quantity_head.bias": (len(_ARTIFACT_MARKET_QUANTITIES),),
-        "value_head.weight": (1, 128),
+        "value_head.weight": (1, hidden_width),
         "value_head.bias": (1,),
     })
     return shapes
@@ -224,18 +238,24 @@ def _read_artifact_tensor(name: str, value: Any, expected_shape: tuple[int, ...]
 def _validate_artifact(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError("learned artifact must be a JSON object")
+    hidden_width = value.get("hidden_width")
+    model_depth = value.get("model_depth", _ARTIFACT_MODEL_DEPTH)
+    hidden_width, model_depth = _validate_artifact_model_shape(hidden_width, model_depth)
     expected_headers = {
         "format_version": _ARTIFACT_FORMAT_VERSION,
         "model_version": _ARTIFACT_MODEL_VERSION,
         "feature_schema_version": _ARTIFACT_FEATURE_SCHEMA_VERSION,
         "engine_version": _ARTIFACT_ENGINE_VERSION,
-        "hidden_width": _ARTIFACT_HIDDEN_WIDTH,
+        "hidden_width": hidden_width,
         "quantization": _ARTIFACT_QUANTIZATION,
     }
     for key, expected in expected_headers.items():
         actual = value.get(key)
         if type(actual) is not type(expected) or actual != expected:
             raise ValueError(f"unsupported learned artifact {key}")
+    if "model_depth" in value and value["model_depth"] != model_depth:
+        raise ValueError("unsupported learned artifact model_depth")
+    expected_headers["model_depth"] = model_depth
     _validate_artifact_vocab(value.get("action_vocab"))
     checksum = value.get("checksum")
     if not isinstance(checksum, str) or len(checksum) != 64 or any(char not in "0123456789abcdef" for char in checksum):
@@ -244,12 +264,12 @@ def _validate_artifact(value: Any) -> dict[str, Any]:
     if not hmac.compare_digest(actual, checksum):
         raise ValueError("learned artifact checksum mismatch")
     weights = value.get("weights")
-    expected_names = set(_artifact_tensor_names())
+    expected_names = set(_artifact_tensor_names(model_depth))
     if not isinstance(weights, Mapping) or set(weights) != expected_names:
         missing = sorted(expected_names - set(weights or ())) if isinstance(weights, Mapping) else sorted(expected_names)
         raise ValueError(f"learned artifact tensors mismatch; missing={missing}")
-    shapes = artifact_tensor_shapes()
-    decoded = {name: _read_artifact_tensor(name, weights[name], shapes[name]) for name in _artifact_tensor_names()}
+    shapes = artifact_tensor_shapes(hidden_width, model_depth)
+    decoded = {name: _read_artifact_tensor(name, weights[name], shapes[name]) for name in _artifact_tensor_names(model_depth)}
     return {"headers": dict(expected_headers), "action_vocab": value["action_vocab"], "weights": decoded}
 
 
@@ -424,6 +444,8 @@ class DependencyFreePolicy:
 
     def __init__(self, artifact: Mapping[str, Any]) -> None:
         self.model_version = str(artifact["headers"]["model_version"])
+        self._hidden_width = int(artifact["headers"]["hidden_width"])
+        self._model_depth = int(artifact["headers"]["model_depth"])
         self._weights = artifact["weights"]
         self._numpy_weights = (
             {name: _np.asarray(value, dtype=_np.float32) for name, value in self._weights.items()}
@@ -453,7 +475,7 @@ class DependencyFreePolicy:
         for kind, (start, end) in enumerate(zip(offsets, offsets[1:])):
             tokens[start:end] += embedding[kind]
 
-        for block in range(4):
+        for block in range(self._model_depth):
             prefix = f"blocks.{block}"
             qkv = linear(tokens, f"{prefix}.attention.in_proj_weight", f"{prefix}.attention.in_proj_bias")
             heads = 4
@@ -497,8 +519,8 @@ class DependencyFreePolicy:
         global_row = tokens[-1]
         worker_target_query = worker_rows @ weights["target_worker_head.weight"].T + weights["target_worker_head.bias"]
         tile_target_key = tile_rows @ weights["target_tile_head.weight"].T + weights["target_tile_head.bias"]
-        target_logits = worker_target_query @ tile_target_key.T / _np.sqrt(_np.float32(128.0))
-        pooled_market = market_rows.mean(axis=0) if market_count else _np.zeros(128, dtype=_np.float32)
+        target_logits = worker_target_query @ tile_target_key.T / _np.sqrt(_np.float32(self._hidden_width))
+        pooled_market = market_rows.mean(axis=0) if market_count else _np.zeros(self._hidden_width, dtype=_np.float32)
         return {
             "worker_act_logits": (worker_rows @ weights["worker_act_head.weight"].T + weights["worker_act_head.bias"]).tolist(),
             "worker_target_logits": target_logits.tolist(),
@@ -527,7 +549,7 @@ class DependencyFreePolicy:
         for index, kind in enumerate((0, 1, 2, 3)):
             for position in range(offsets[index], offsets[index + 1]):
                 tokens[position] = [value + type_embedding[kind][column] for column, value in enumerate(tokens[position])]
-        for block in range(4):
+        for block in range(self._model_depth):
             prefix = f"blocks.{block}"
             attended = _attention(tokens, weights, prefix)
             tokens = _layer_norm(
@@ -550,13 +572,13 @@ class DependencyFreePolicy:
         tile_target_key = _linear(tile_rows, weights["target_tile_head.weight"], weights["target_tile_head.bias"])
         tile_target_transposed = [
             [tile_target_key[row][column] for row in range(len(tile_target_key))]
-            for column in range(128)
+            for column in range(self._hidden_width)
         ]
         target_logits = [
-            [value / math.sqrt(128.0) for value in row]
+            [value / math.sqrt(self._hidden_width) for value in row]
             for row in _matrix_multiply(worker_target_query, tile_target_transposed)
         ]
-        pooled_market = [sum(row[index] for row in market_rows) / len(market_rows) for index in range(128)]
+        pooled_market = [sum(row[index] for row in market_rows) / len(market_rows) for index in range(self._hidden_width)]
         return {
             "worker_act_logits": _linear(worker_rows, weights["worker_act_head.weight"], weights["worker_act_head.bias"]),
             "worker_target_logits": target_logits,

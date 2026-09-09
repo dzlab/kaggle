@@ -69,8 +69,9 @@ def test_artifact_headers_and_checksum_are_valid(tmp_path):
 
     broken = _artifact()
     broken["hidden_width"] = 64
+    broken["checksum"] = __import__("scripts.export_policy", fromlist=["artifact_checksum"]).artifact_checksum(broken)
     path.write_text(json.dumps(broken), encoding="utf-8")
-    with pytest.raises(ValueError, match="unsupported.*hidden_width"):
+    with pytest.raises(ValueError, match="shape mismatch"):
         load_exported_policy(path)
 
 
@@ -165,7 +166,7 @@ def test_exporter_rejects_hidden_width_metadata_mismatch():
 
     metadata = {
         "model_version": "learned_v1", "feature_schema_version": 1,
-        "engine_version": "1.32.7", "hidden_width": 64,
+        "engine_version": "1.32.7", "hidden_width": 65,
         "action_vocab": {key: list(value) for key, value in ACTION_VOCAB.items()},
     }
     with pytest.raises(ValueError, match="hidden_width"):
@@ -310,3 +311,33 @@ def test_exported_model_agrees_with_training_fixture_when_torch_is_available(tmp
         matches = sum(max(range(len(row)), key=row.__getitem__) == max(range(len(other)), key=other.__getitem__) for row, other in zip(expected_values, actual_values))
         assert matches / max(1, len(expected_values)) >= 0.99
     assert abs(float(expected["value"].item()) - float(actual["value"])) < 1e-2
+
+
+@pytest.mark.parametrize("model_width,model_depth", [(256, 4), (128, 8)])
+def test_non_default_model_shape_round_trips_through_export_and_runtime(
+    tmp_path, model_width, model_depth,
+):
+    torch = pytest.importorskip("torch", reason="model export requires PyTorch")
+    from kagriculture_agent.model import ACTION_VOCAB, CompactPolicyNet
+    from scripts.export_policy import export_checkpoint
+
+    checkpoint = tmp_path / f"policy-{model_width}x{model_depth}.pt"
+    artifact_path = tmp_path / f"policy-{model_width}x{model_depth}.json"
+    network = CompactPolicyNet(hidden_width=model_width, depth=model_depth)
+    metadata = {
+        "model_version": "learned_v1", "feature_schema_version": 1,
+        "engine_version": "1.32.7", "model_width": model_width,
+        "model_depth": model_depth,
+        "action_vocab": {key: list(value) for key, value in ACTION_VOCAB.items()},
+    }
+    torch.save({"metadata": metadata, "model_state_dict": network.state_dict()}, checkpoint)
+
+    artifact = export_checkpoint(checkpoint, artifact_path)
+    assert artifact["hidden_width"] == model_width
+    assert artifact["model_depth"] == model_depth
+
+    runtime = load_exported_policy(artifact_path)
+    outputs = runtime.predict(extract_features({}))
+    assert len(outputs["worker_act_logits"]) == 10
+    assert len(outputs["worker_act_logits"][0]) == 2
+    assert all(value == pytest.approx(value) for value in outputs["worker_act_logits"][0])

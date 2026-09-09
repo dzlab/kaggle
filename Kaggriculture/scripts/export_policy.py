@@ -21,7 +21,13 @@ if str(PROJECT_ROOT) not in sys.path:
 from kagriculture_agent.constants import ENGINE_VERSION
 from kagriculture_agent.features import FEATURE_SCHEMA_VERSION
 from kagriculture_agent.learned_policy import artifact_tensor_shapes
-from kagriculture_agent.model import ACTION_VOCAB, HIDDEN_WIDTH, MODEL_VERSION
+from kagriculture_agent.model import (
+    ACTION_VOCAB,
+    DEFAULT_MODEL_DEPTH,
+    HIDDEN_WIDTH,
+    MODEL_VERSION,
+    validate_model_shape,
+)
 
 FORMAT_VERSION = 1
 QUANTIZATION = "int8-per-row"
@@ -116,6 +122,15 @@ def validate_action_vocab(action_vocab: Any) -> dict[str, list[Any]]:
     return expected_vocab
 
 
+def _checkpoint_model_shape(metadata: dict[str, Any]) -> tuple[int, int]:
+    width = metadata.get("model_width", metadata.get("hidden_width", HIDDEN_WIDTH))
+    depth = metadata.get("model_depth", metadata.get("depth", DEFAULT_MODEL_DEPTH))
+    try:
+        return validate_model_shape(width, depth, source="checkpoint")
+    except ValueError as exc:
+        raise ValueError(f"checkpoint model shape is invalid: {exc}") from exc
+
+
 def validate_checkpoint_metadata(metadata: Any) -> dict[str, list[Any]]:
     if not isinstance(metadata, dict):
         raise ValueError("checkpoint metadata is required")
@@ -126,16 +141,17 @@ def validate_checkpoint_metadata(metadata: Any) -> dict[str, list[Any]]:
     ):
         if not _strict_equal(metadata.get(key), expected):
             raise ValueError(f"checkpoint {key} mismatch")
-    hidden_width = metadata.get("hidden_width", HIDDEN_WIDTH)
-    if type(hidden_width) is not int or hidden_width != HIDDEN_WIDTH:
-        raise ValueError(f"checkpoint hidden_width mismatch: expected {HIDDEN_WIDTH}, got {hidden_width!r}")
+    _checkpoint_model_shape(metadata)
     return validate_action_vocab(metadata.get("action_vocab"))
 
 
-def validate_checkpoint_state_dict(state: Any) -> None:
+def validate_checkpoint_state_dict(
+    state: Any, *, model_width: int = HIDDEN_WIDTH, model_depth: int = DEFAULT_MODEL_DEPTH,
+) -> None:
     if not isinstance(state, dict):
         raise ValueError("checkpoint model_state_dict is required")
-    expected = set(expected_tensor_names())
+    shapes = artifact_tensor_shapes(model_width, model_depth)
+    expected = set(shapes)
     actual = set(state)
     missing = expected - actual
     unexpected = actual - expected - _TRAINING_ONLY_TENSOR_NAMES
@@ -143,7 +159,6 @@ def validate_checkpoint_state_dict(state: Any) -> None:
         missing = sorted(missing)
         extra = sorted(unexpected)
         raise ValueError(f"checkpoint tensors mismatch (missing={missing}, extra={extra})")
-    shapes = artifact_tensor_shapes()
     for name, tensor in state.items():
         if name not in expected:
             continue
@@ -152,20 +167,25 @@ def validate_checkpoint_state_dict(state: Any) -> None:
             raise ValueError(f"checkpoint tensor {name!r} shape mismatch: expected {shapes[name]}, got {actual_shape}")
 
 
-def build_artifact(state: dict[str, Any], action_vocab: dict[str, list[Any]]) -> dict[str, Any]:
+def build_artifact(
+    state: dict[str, Any], action_vocab: dict[str, list[Any]], *,
+    model_width: int = HIDDEN_WIDTH, model_depth: int = DEFAULT_MODEL_DEPTH,
+) -> dict[str, Any]:
     """Build the serialized artifact after checkpoint validation."""
-    validate_checkpoint_state_dict(state)
+    validate_model_shape(model_width, model_depth, source="artifact")
+    validate_checkpoint_state_dict(state, model_width=model_width, model_depth=model_depth)
     validated_vocab = validate_action_vocab(action_vocab)
-    shapes = artifact_tensor_shapes()
+    shapes = artifact_tensor_shapes(model_width, model_depth)
     artifact: dict[str, Any] = {
         "format_version": FORMAT_VERSION,
         "model_version": MODEL_VERSION,
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "engine_version": ENGINE_VERSION,
-        "hidden_width": HIDDEN_WIDTH,
+        "hidden_width": model_width,
+        "model_depth": model_depth,
         "quantization": QUANTIZATION,
         "action_vocab": validated_vocab,
-        "weights": {name: _tensor_to_artifact(name, state[name], shapes[name]) for name in expected_tensor_names()},
+        "weights": {name: _tensor_to_artifact(name, state[name], shapes[name]) for name in shapes},
     }
     artifact["checksum"] = artifact_checksum(artifact)
     return artifact
@@ -210,7 +230,10 @@ def write_artifact(artifact: dict[str, Any], artifact_path: str | Path) -> None:
                 pass
 
 
-def export_checkpoint(checkpoint_path: str | Path, artifact_path: str | Path) -> dict[str, Any]:
+def export_checkpoint(
+    checkpoint_path: str | Path, artifact_path: str | Path, *,
+    model_width: int | None = None, model_depth: int | None = None,
+) -> dict[str, Any]:
     """Export a torch checkpoint, failing clearly when torch is unavailable."""
     try:
         import torch
@@ -221,8 +244,20 @@ def export_checkpoint(checkpoint_path: str | Path, artifact_path: str | Path) ->
         raise ValueError("checkpoint must be an object")
     metadata = checkpoint.get("metadata")
     expected_vocab = validate_checkpoint_metadata(metadata)
+    checkpoint_width, checkpoint_depth = _checkpoint_model_shape(metadata)
+    if model_width is not None or model_depth is not None:
+        requested_width = checkpoint_width if model_width is None else model_width
+        requested_depth = checkpoint_depth if model_depth is None else model_depth
+        requested_shape = validate_model_shape(requested_width, requested_depth, source="export request")
+        if requested_shape != (checkpoint_width, checkpoint_depth):
+            raise ValueError(
+                "export model shape does not match checkpoint metadata: "
+                f"checkpoint={(checkpoint_width, checkpoint_depth)!r}, requested={requested_shape!r}"
+            )
     state = checkpoint.get("model_state_dict")
-    artifact = build_artifact(state, expected_vocab)
+    artifact = build_artifact(
+        state, expected_vocab, model_width=checkpoint_width, model_depth=checkpoint_depth,
+    )
     write_artifact(artifact, artifact_path)
     return artifact
 

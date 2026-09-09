@@ -953,7 +953,10 @@ def train_candidate(
     from scripts.train_policy import make_fresh_rollout_fn, train_behavior_clone
 
     def export_current(*, output_path: str | Path, **_kwargs: Any) -> Path:
-        export_checkpoint(config.stage_checkpoint_path, output_path)
+        export_checkpoint(
+            config.stage_checkpoint_path, output_path,
+            model_width=config.model_width, model_depth=config.model_depth,
+        )
         return Path(output_path)
 
     fresh_rollout = make_fresh_rollout_fn(
@@ -1002,7 +1005,10 @@ def train_candidate(
         model_width=config.model_width,
         model_depth=config.model_depth,
     )
-    export_checkpoint(config.stage_checkpoint_path, config.stage_artifact_path)
+    export_checkpoint(
+        config.stage_checkpoint_path, config.stage_artifact_path,
+        model_width=config.model_width, model_depth=config.model_depth,
+    )
     return metadata
 
 
