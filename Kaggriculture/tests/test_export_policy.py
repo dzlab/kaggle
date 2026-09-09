@@ -339,14 +339,21 @@ def test_non_default_model_shape_round_trips_through_export_and_runtime(
     assert artifact["model_depth"] == model_depth
 
     runtime = load_exported_policy(artifact_path)
-    features = extract_features({})
+    features = extract_features({"day": 7, "hour": 13, "cash": 42.5})
     outputs = runtime.predict(features)
-    reference_state = network.state_dict()
-    assert len(outputs["worker_act_logits"]) == 10
-    assert len(outputs["worker_act_logits"][0]) == 2
-    assert runtime._weights["value_head.bias"] == pytest.approx(
-        reference_state["value_head.bias"].tolist(), abs=1e-6,
-    )
-    assert runtime._weights["tile_projection.weight"][0] == pytest.approx(
-        reference_state["tile_projection.weight"][0].tolist(), abs=1e-2,
-    )
+    with torch.no_grad():
+        reference = network(features)
+    reference_outputs = {
+        "worker_act_logits": reference["worker_act_logits"][0],
+        "worker_target_logits": reference["worker_target_logits"][0],
+        "worker_kind_logits": reference["worker_kind_logits"][0],
+        "market_item_logits": reference["market_item_logits"][0],
+        "market_quantity_logits": reference["market_quantity_logits"][0],
+        "value": reference["value"].reshape(-1),
+    }
+    for name, expected in reference_outputs.items():
+        actual = outputs[name] if name != "value" else [outputs[name]]
+        torch.testing.assert_close(
+            torch.tensor(actual, dtype=torch.float32), expected.cpu(),
+            rtol=0.0, atol=0.02,
+        )
