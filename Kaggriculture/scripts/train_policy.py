@@ -1867,6 +1867,12 @@ def _persist_best_checkpoint(candidate: str | Path, best: str | Path) -> str:
     temporary_path = best_path.with_name(f".{best_path.name}.publish.tmp")
     try:
         shutil.copyfile(candidate_path, temporary_path)
+        best_path = validate_training_output_path(
+            best_path,
+            name="best checkpoint",
+            reject_protected_names=False,
+            reject_symlink_components=True,
+        )
         temporary_path.replace(best_path)
     except Exception:
         _cleanup_checkpoint(temporary_path)

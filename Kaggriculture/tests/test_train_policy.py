@@ -1375,6 +1375,36 @@ def test_ppo_promotion_publishes_current_metadata_to_output_and_best(tmp_path):
     }
 
 
+def test_best_checkpoint_persistence_rechecks_final_symlink_before_replace(
+    tmp_path, monkeypatch,
+):
+    from scripts import train_policy
+
+    candidate = tmp_path / "candidate.pt"
+    candidate.write_text("candidate\n", encoding="utf-8")
+    best = tmp_path / "best.pt"
+    target = tmp_path / "existing-best.pt"
+    target.write_text("existing\n", encoding="utf-8")
+    real_validator = train_policy.validate_training_output_path
+    calls = 0
+
+    def race_validator(path, **kwargs):
+        nonlocal calls
+        calls += 1
+        result = real_validator(path, **kwargs)
+        if calls == 1:
+            best.symlink_to(target)
+        return result
+
+    monkeypatch.setattr(train_policy, "validate_training_output_path", race_validator)
+    with pytest.raises(ValueError, match="symlink"):
+        train_policy._persist_best_checkpoint(candidate, best)
+    assert calls == 2
+    assert best.is_symlink()
+    assert target.read_text(encoding="utf-8") == "existing\n"
+    assert not list(tmp_path.glob(".best.pt.publish.tmp"))
+
+
 def test_ppo_registry_only_promotion_persists_loadable_best(tmp_path):
     from scripts.train_policy import PPOConfig, run_ppo_training
 

@@ -28,6 +28,7 @@ from kagriculture_agent.model import (
     MODEL_VERSION,
     validate_model_shape,
 )
+from scripts.output_paths import validate_training_output_path
 
 FORMAT_VERSION = 1
 QUANTIZATION = "int8-per-row"
@@ -207,9 +208,12 @@ def _load_checkpoint_safely(torch: Any, checkpoint_path: str | Path) -> Any:
 
 def write_artifact(artifact: dict[str, Any], artifact_path: str | Path) -> None:
     """Atomically publish an artifact without following an existing symlink."""
-    destination = Path(artifact_path)
-    if destination.is_symlink():
-        raise ValueError(f"refusing to overwrite symlink destination: {destination}")
+    destination = validate_training_output_path(
+        artifact_path,
+        name="artifact path",
+        reject_protected_names=True,
+        reject_symlink_components=True,
+    )
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary_name: str | None = None
     try:
@@ -220,6 +224,12 @@ def write_artifact(artifact: dict[str, Any], artifact_path: str | Path) -> None:
             handle.write(_canonical_bytes(artifact) + b"\n")
             handle.flush()
             os.fsync(handle.fileno())
+        destination = validate_training_output_path(
+            destination,
+            name="artifact path",
+            reject_protected_names=True,
+            reject_symlink_components=True,
+        )
         os.replace(temporary_name, destination)
         temporary_name = None
     finally:

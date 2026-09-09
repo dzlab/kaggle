@@ -232,6 +232,45 @@ def test_artifact_writer_rejects_symlink_destination_and_writes_atomically(tmp_p
     assert not list(tmp_path.glob(".new.json.*.tmp"))
 
 
+def test_artifact_writer_rejects_symlinked_parent(tmp_path):
+    from scripts.export_policy import write_artifact
+
+    target_parent = tmp_path / "safe-parent"
+    target_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(target_parent, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        write_artifact(_artifact(), linked_parent / "policy.json")
+    assert not (target_parent / "policy.json").exists()
+
+
+def test_artifact_writer_rechecks_final_symlink_before_publication(tmp_path, monkeypatch):
+    from scripts import export_policy
+
+    destination = tmp_path / "policy.json"
+    target = tmp_path / "existing.json"
+    target.write_text("existing\n", encoding="utf-8")
+    real_validator = export_policy.validate_training_output_path
+    calls = 0
+
+    def race_validator(path, **kwargs):
+        nonlocal calls
+        calls += 1
+        result = real_validator(path, **kwargs)
+        if calls == 1:
+            destination.symlink_to(target)
+        return result
+
+    monkeypatch.setattr(export_policy, "validate_training_output_path", race_validator)
+    with pytest.raises(ValueError, match="symlink"):
+        export_policy.write_artifact(_artifact(), destination)
+    assert calls == 2
+    assert destination.is_symlink()
+    assert target.read_text(encoding="utf-8") == "existing\n"
+    assert not list(tmp_path.glob(".policy.json.*.tmp"))
+
+
 def test_checkpoint_loader_requires_weights_only_support():
     from scripts.export_policy import _load_checkpoint_safely
 

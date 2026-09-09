@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 PRODUCTION_DIRECTORY_NAMES = frozenset({
@@ -35,8 +36,19 @@ def resolve_output_path(value: str | Path, *, name: str = "output") -> Path:
 
 def validate_training_output_path(
     value: str | Path, *, name: str = "output", reject_protected_names: bool = False,
+    reject_symlink_components: bool = False,
 ) -> Path:
     """Return a resolved training output path unless it targets production."""
+    if reject_symlink_components:
+        if not isinstance(value, (str, Path)) or not str(value).strip():
+            raise ValueError(f"{name} must be a nonempty path")
+        raw = Path(value).expanduser()
+        lexical = Path(os.path.abspath(raw))
+        current = Path(lexical.anchor)
+        for component in lexical.parts[1:]:
+            current /= component
+            if current.is_symlink():
+                raise ValueError(f"{name} must not contain symlink components")
     candidate = resolve_output_path(value, name=name)
     if any(part.lower() in PRODUCTION_DIRECTORY_NAMES for part in candidate.parts):
         raise ValueError(f"{name} may not be nested under a production path")
