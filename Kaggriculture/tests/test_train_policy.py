@@ -1665,12 +1665,13 @@ def test_behavior_cloning_smoke_writes_checkpoint_metadata(tmp_path):
     assert checkpoint["metrics"]["behavior_clone_updates"] == 1
 
 
-def test_reduced_behavior_clone_records_effective_budget_and_actual_updates(tmp_path):
+def test_reduced_behavior_clone_records_effective_budget_and_resume_validates_it(tmp_path):
     pytest.importorskip("torch")
     from scripts import train_policy
 
     input_path = tmp_path / "transitions.jsonl"
     output_path = tmp_path / "policy.pt"
+    resumed_output_path = tmp_path / "resumed-policy.pt"
     input_path.write_text(
         "\n".join(json.dumps(row) for row in [_transition(done=False), _transition(done=True)]) + "\n",
         encoding="utf-8",
@@ -1679,8 +1680,8 @@ def test_reduced_behavior_clone_records_effective_budget_and_actual_updates(tmp_
     metadata = train_policy.train_behavior_clone(
         input_path=input_path,
         output_path=output_path,
-        steps=4,
-        behavior_clone_steps=4,
+        steps=8,
+        behavior_clone_steps=8,
         batch_size=2,
         seed=7,
         device="cpu",
@@ -1688,10 +1689,61 @@ def test_reduced_behavior_clone_records_effective_budget_and_actual_updates(tmp_
     )
 
     checkpoint = pytest.importorskip("torch").load(output_path, map_location="cpu", weights_only=True)
-    assert metadata["behavior_clone_steps"] == 1
-    assert metadata["behavior_clone_updates"] == 1
-    assert checkpoint["configuration"]["behavior_clone_steps"] == 1
-    assert checkpoint["metrics"]["behavior_clone_updates"] == 1
+    assert metadata["behavior_clone_steps"] == 2
+    assert metadata["behavior_clone_updates"] == 2
+    assert checkpoint["configuration"]["behavior_clone_steps"] == 2
+    assert checkpoint["metadata"]["behavior_clone_steps"] == 2
+    assert checkpoint["metrics"]["behavior_clone_updates"] == 2
+
+    resumed_metadata = train_policy.train_behavior_clone(
+        input_path=input_path,
+        output_path=resumed_output_path,
+        steps=8,
+        behavior_clone_steps=8,
+        batch_size=2,
+        seed=7,
+        device="cpu",
+        training_mode="reduced_behavior_clone_then_ppo",
+        resume_checkpoint=output_path,
+    )
+
+    assert resumed_metadata["behavior_clone_steps"] == 2
+    assert resumed_metadata["behavior_clone_updates"] == 2
+
+
+@pytest.mark.parametrize(
+    ("training_mode", "expected"),
+    [
+        ("behavior_clone_then_ppo", 8),
+        ("reduced_behavior_clone_then_ppo", 2),
+        ("pure_ppo", 0),
+    ],
+)
+def test_colab_wandb_config_records_effective_behavior_clone_steps(
+    tmp_path, monkeypatch, training_mode, expected,
+):
+    from scripts import train
+
+    captured = {}
+
+    class FakeTelemetry:
+        def __init__(self, *_args, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("scripts.telemetry.TrainingTelemetry", FakeTelemetry)
+    config = train.build_config(
+        run_directory=tmp_path,
+        device="cpu",
+        resolve_runtime_device=False,
+        training_steps=8,
+        training_mode=training_mode,
+        wandb_enabled=False,
+    )
+
+    train.initialize_telemetry(config)
+
+    assert config.behavior_clone_steps == expected
+    assert captured["wandb_config"]["behavior_clone_steps"] == expected
 
 
 def test_pure_ppo_skips_behavior_clone_and_starts_fresh_ppo(tmp_path, monkeypatch):

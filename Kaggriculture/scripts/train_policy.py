@@ -1688,11 +1688,14 @@ def _checkpoint_metadata(
     validate_model_shape(model_width, model_depth, source="checkpoint metadata")
     if type(behavior_clone_updates) is not int or behavior_clone_updates < 0:
         raise ValueError("checkpoint metadata behavior_clone_updates must be a nonnegative integer")
-    resolved_bc_steps = (
-        resolve_behavior_clone_steps(training_mode, 1)
-        if behavior_clone_steps is None
-        else resolve_behavior_clone_steps(training_mode, behavior_clone_steps)
-    )
+    if behavior_clone_steps is None:
+        effective_bc_steps = 0 if training_mode == "pure_ppo" else 1
+    else:
+        if type(behavior_clone_steps) is not int or behavior_clone_steps < 0:
+            raise ValueError(
+                "checkpoint metadata behavior_clone_steps must be a nonnegative integer"
+            )
+        effective_bc_steps = behavior_clone_steps
     model = CompactPolicyNet(hidden_width=model_width, depth=model_depth)
     return {
         "model_version": MODEL_VERSION,
@@ -1705,7 +1708,7 @@ def _checkpoint_metadata(
         "experiment_id": experiment_id,
         "feature_variant": feature_variant,
         "training_mode": training_mode,
-        "behavior_clone_steps": resolved_bc_steps,
+        "behavior_clone_steps": effective_bc_steps,
         "behavior_clone_updates": behavior_clone_updates,
         "model_width": model_width,
         "model_depth": model_depth,
@@ -1723,12 +1726,16 @@ def checkpoint_metadata(
     model_width: int = DEFAULT_MODEL_WIDTH,
     model_depth: int = DEFAULT_MODEL_DEPTH,
 ) -> dict[str, Any]:
+    if behavior_clone_steps is None:
+        configured_bc_steps = 0 if training_mode == "pure_ppo" else 1
+    else:
+        configured_bc_steps = behavior_clone_steps
     return _checkpoint_metadata(
         transition_count, config, device=device,
         experiment_id=experiment_id,
         feature_variant=feature_variant,
         training_mode=training_mode,
-        behavior_clone_steps=behavior_clone_steps,
+        behavior_clone_steps=resolve_behavior_clone_steps(training_mode, configured_bc_steps),
         behavior_clone_updates=behavior_clone_updates,
         model_width=model_width,
         model_depth=model_depth,

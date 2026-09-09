@@ -35,6 +35,7 @@ from kagriculture_agent.model import (
 from scripts.telemetry import record_validation_report
 from scripts.train_policy import (
     TrainingContract,
+    resolve_behavior_clone_steps,
     validate_training_checkpoint,
 )
 from scripts.training_identity import (
@@ -108,6 +109,7 @@ class ColabConfig:
     league_checkpoint_probability: float = DEFAULT_OPPONENT_PROBABILITIES["checkpoint"]
     model_width: int = DEFAULT_MODEL_WIDTH
     model_depth: int = DEFAULT_MODEL_DEPTH
+    behavior_clone_steps: int = 25
 
     @property
     def league_probabilities(self) -> dict[str, float]:
@@ -446,6 +448,9 @@ def build_config(
     ):
         if type(value) is not int or value < 1:
             raise ValueError(f"{name} must be a positive integer")
+    effective_behavior_clone_steps = resolve_behavior_clone_steps(
+        training_mode, training_steps,
+    )
     if type(collection_seed_count) is not int or collection_seed_count < 1:
         raise ValueError("collection_seed_count must be a positive integer")
     if evaluation_timeout is not None and (
@@ -544,6 +549,7 @@ def build_config(
         weights["checkpoint"],
         model_width,
         model_depth,
+        effective_behavior_clone_steps,
     )
 
 
@@ -855,7 +861,7 @@ def initialize_telemetry(config: ColabConfig) -> Any | None:
             "candidate_tag": config.candidate_tag,
             "ppo_target_steps": config.ppo_target_steps,
             "training_steps": config.training_steps,
-            "behavior_clone_steps": config.training_steps,
+            "behavior_clone_steps": config.behavior_clone_steps,
             "model_width": config.model_width,
             "model_depth": config.model_depth,
             "parameter_count": model_parameter_count(
@@ -1284,6 +1290,9 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
                     "checkpoint": str(config.stage_checkpoint_path),
                     "artifact": str(config.stage_artifact_path),
                     "behavior_clone_updates": training_metadata.get("behavior_clone_updates"),
+                    "behavior_clone_steps": training_metadata.get(
+                        "behavior_clone_steps", config.behavior_clone_steps,
+                    ),
                     "ppo_updates": training_metadata.get("ppo_updates"),
                     "parameter_count": training_metadata.get("parameter_count"),
                     "ppo_steps": config.ppo_target_steps,
