@@ -140,9 +140,11 @@ def normalize_planner_state(state: Any) -> dict[str, Any]:
     market = _mapping(source.get("market"))
     tiles = source.get("tiles", farm.get("tiles", []))
     hands = _hand_counts(farm.get("hands", source.get("hands", {})))
-    seeds = source.get("seeds", private.get("seeds", farm.get("seeds")))
-    if not isinstance(seeds, Mapping) or not seeds:
-        seeds = hands
+    seeds = source.get("seeds")
+    if not isinstance(seeds, Mapping):
+        seeds = private.get("seeds")
+    if not isinstance(seeds, Mapping):
+        seeds = farm.get("seeds")
     inventory = source.get("inventory")
     if not isinstance(inventory, Mapping) or not inventory:
         # Canonical engine observations expose shed stock separately from
@@ -1159,6 +1161,20 @@ def _worker_quantity(state: Mapping[str, Any], worker_index: int, item: str) -> 
     return _safe_quantity(inventory.get(item, 0)) if isinstance(inventory, Mapping) else 0
 
 
+def _worker_carried_quantity(state: Mapping[str, Any], worker_index: int) -> int | float:
+    inventories = _mapping(state.get("private")).get("inventories")
+    if not isinstance(inventories, Sequence) or isinstance(inventories, (str, bytes)):
+        return 0
+    if not 0 <= worker_index < len(inventories):
+        return 0
+    inventory = inventories[worker_index]
+    if isinstance(inventory, Mapping):
+        return sum(_safe_quantity(quantity) for quantity in inventory.values())
+    if isinstance(inventory, Sequence) and not isinstance(inventory, (str, bytes)):
+        return sum(1 for item in inventory if isinstance(item, str))
+    return 0
+
+
 def _shed_quantity(state: Mapping[str, Any], item: str) -> int | float:
     private = _mapping(state.get("private"))
     shed = private.get("shed", state.get("shed", {}))
@@ -1203,7 +1219,7 @@ def _task_turn_budget(task: Task, worker: tuple[int, str, Position | None], stat
                 return travel + 2  # PLACE, then same-tile FEED.
             if shed_has_wheat:
                 return min(
-                    (distance(start, point) + 1 + distance(point, target) + 1
+                    (distance(start, point) + 1 + distance(point, target) + 2
                      for point in access),
                     default=10**9,
                 )
@@ -1312,6 +1328,7 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
     helper_exists = any(info[1] != "FARMER" for info in infos)
     reserved_basic = next((info for info in infos if info[1] != "FARMER"), infos[0])
     available = {info[0] for info in infos}
+    reusable_after_reservation_fallback: set[int] = set()
     assignments: list[WorkerAssignment] = []
     remaining = list(tasks)
 
@@ -1339,12 +1356,16 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
         if task.kind in _BASIC_NEEDS and reserved_basic[0] in available:
             candidates = [info for info in candidates if info[0] == reserved_basic[0]] or candidates
         elif task.kind not in _BASIC_NEEDS and reserved_basic[0] in available and any(item.kind in _BASIC_NEEDS for item in remaining):
-            candidates = [info for info in candidates if info[0] != reserved_basic[0]]
+            non_reserved = [info for info in candidates if info[0] != reserved_basic[0]]
+            if candidates and not non_reserved and len(infos) == 1:
+                reusable_after_reservation_fallback.add(reserved_basic[0])
+            candidates = non_reserved or candidates
         target = _target_position(task.target)
         if not candidates:
             return None
         return min(candidates, key=lambda info: (
             distance(info[2], target) if info[2] is not None and target is not None else inf,
+            0 if task.kind == "SHED" and _worker_carried_quantity(state, info[0]) > 0 else 1,
             info[0],
             info[2].y if info[2] is not None else inf,
             info[2].x if info[2] is not None else inf,
@@ -1354,7 +1375,8 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
         selected = choose(task)
         if selected is None:
             continue
-        available.remove(selected[0])
+        if selected[0] not in reusable_after_reservation_fallback:
+            available.remove(selected[0])
         remaining.remove(task)
         assignments.append(WorkerAssignment(
             worker_index=selected[0],
