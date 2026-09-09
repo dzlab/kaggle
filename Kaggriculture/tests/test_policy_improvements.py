@@ -2,6 +2,9 @@
 
 These cases deliberately use small engine-shaped mappings instead of helpers
 from other test modules, so each failure identifies a real policy contract.
+The private-helper cases are intentional: they exercise planner/policy
+decisions before engine execution, where public integration setup is not
+deterministic enough to isolate these regressions.
 """
 
 from kagriculture_agent.planner import (
@@ -56,7 +59,9 @@ def test_drop_carried_goods_preserves_inventory_when_shed_is_full(shed, carried)
 
 
 def test_day_27_does_not_plan_melon_purchase_or_planting():
-    state = _state(day=27, tiles=[[{"kind": "PLANT", "crop": "WHEAT", "needs_water": True}]],
+    tiles = [["EMPTY"] * 5 for _ in range(5)]
+    tiles[2][3] = {"kind": "PLANT", "crop": "WHEAT", "needs_water": True}
+    state = _state(day=27, tiles=tiles,
                    private={"seeds": {}, "shed": {}, "inventories": [{}]})
     plan = build_daily_plan(state)
     assert plan

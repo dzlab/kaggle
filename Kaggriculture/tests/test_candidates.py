@@ -5,7 +5,7 @@ import pytest
 from kagriculture_agent import candidates
 
 
-def test_artifact_candidate_policy_loads_once_and_returns_callable(monkeypatch, tmp_path):
+def test_artifact_candidate_policy_loads_artifact_once_for_reusable_callable(monkeypatch, tmp_path):
     artifact = tmp_path / "candidate.json"
     artifact.write_text("{}")
     calls = []
@@ -36,26 +36,6 @@ def test_artifact_candidate_policy_reports_invalid_artifact(monkeypatch, tmp_pat
 
     with pytest.raises(ValueError, match="candidate artifact is not valid: ValueError: invalid"):
         candidates.artifact_candidate_policy(artifact)
-
-
-def test_artifact_candidate_policy_loads_artifact_once_for_returned_callable(monkeypatch, tmp_path):
-    artifact = tmp_path / "candidate.json"
-    artifact.write_text("{}")
-    calls = []
-    class LoadedPolicy:
-        def act(self, observation):
-            return {"observation": observation}
-
-    monkeypatch.setattr(
-        candidates, "load_exported_policy",
-        lambda path: calls.append(path) or LoadedPolicy(),
-    )
-    policy = candidates.artifact_candidate_policy(artifact)
-    assert policy({"turn": 1}) == {"observation": {"turn": 1}}
-    assert policy({"turn": 2}) == {"observation": {"turn": 2}}
-    assert len(calls) == 1
-
-
 def test_returned_candidate_caches_same_runtime_failure_after_one_load(monkeypatch, tmp_path):
     artifact = tmp_path / "candidate.json"
     artifact.write_text("{}")
