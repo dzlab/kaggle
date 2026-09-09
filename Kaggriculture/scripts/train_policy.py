@@ -269,10 +269,10 @@ def _validate_configuration_shape(configuration: Any, *, source: str) -> None:
         # treat omitted fields as the production defaults while validating all
         # newly-created contracts strictly below.
         configuration.setdefault(field, default)
-    configuration.setdefault(
-        "behavior_clone_steps",
-        resolve_behavior_clone_steps(configuration["training_mode"], configuration.get("steps", 1)),
-    )
+    if "behavior_clone_steps" not in configuration:
+        configuration["behavior_clone_steps"] = resolve_behavior_clone_steps(
+            configuration["training_mode"], configuration.get("steps", 1),
+        )
     configuration.setdefault("model_width", DEFAULT_MODEL_WIDTH)
     configuration.setdefault("model_depth", DEFAULT_MODEL_DEPTH)
     missing = sorted(expected_fields - set(configuration))
@@ -325,6 +325,7 @@ def build_training_contract(
     feature_variant: str = "production_v1",
     training_mode: str = "behavior_clone_then_ppo",
     behavior_clone_steps: int | None = None,
+    effective_behavior_clone_steps: int | None = None,
     model_width: int = DEFAULT_MODEL_WIDTH,
     model_depth: int = DEFAULT_MODEL_DEPTH,
 ) -> TrainingContract:
@@ -351,6 +352,15 @@ def build_training_contract(
         type(behavior_clone_steps) is not int or behavior_clone_steps < 0
     ):
         raise ValueError("behavior_clone_steps must be a nonnegative integer")
+    if effective_behavior_clone_steps is not None and (
+        type(effective_behavior_clone_steps) is not int
+        or effective_behavior_clone_steps < 0
+    ):
+        raise ValueError("effective_behavior_clone_steps must be a nonnegative integer")
+    if behavior_clone_steps is not None and effective_behavior_clone_steps is not None:
+        raise ValueError(
+            "provide behavior_clone_steps or effective_behavior_clone_steps, not both"
+        )
     validate_model_shape(model_width, model_depth, source="requested")
     if type(offline_ppo_fallback) is not bool:
         raise ValueError("offline_ppo_fallback must be boolean")
@@ -365,9 +375,10 @@ def build_training_contract(
     configured_behavior_clone_steps = (
         normalized_steps if behavior_clone_steps is None else behavior_clone_steps
     )
-    effective_behavior_clone_steps = resolve_behavior_clone_steps(
-        training_mode, configured_behavior_clone_steps,
-    )
+    if effective_behavior_clone_steps is None:
+        effective_behavior_clone_steps = resolve_behavior_clone_steps(
+            training_mode, configured_behavior_clone_steps,
+        )
     input_identity = _trajectory_identity(input_path)
     transitions = _read_transitions(input_path)
     configuration = {
@@ -1727,15 +1738,15 @@ def checkpoint_metadata(
     model_depth: int = DEFAULT_MODEL_DEPTH,
 ) -> dict[str, Any]:
     if behavior_clone_steps is None:
-        configured_bc_steps = 0 if training_mode == "pure_ppo" else 1
+        effective_bc_steps = 0 if training_mode == "pure_ppo" else 1
     else:
-        configured_bc_steps = behavior_clone_steps
+        effective_bc_steps = behavior_clone_steps
     return _checkpoint_metadata(
         transition_count, config, device=device,
         experiment_id=experiment_id,
         feature_variant=feature_variant,
         training_mode=training_mode,
-        behavior_clone_steps=resolve_behavior_clone_steps(training_mode, configured_bc_steps),
+        behavior_clone_steps=effective_bc_steps,
         behavior_clone_updates=behavior_clone_updates,
         model_width=model_width,
         model_depth=model_depth,
@@ -2285,6 +2296,7 @@ def train_behavior_clone(
     feature_variant: str = "production_v1",
     training_mode: str = "behavior_clone_then_ppo",
     behavior_clone_steps: int | None = None,
+    effective_behavior_clone_steps: int | None = None,
     model_width: int = DEFAULT_MODEL_WIDTH,
     model_depth: int = DEFAULT_MODEL_DEPTH,
 ) -> dict[str, Any]:
@@ -2299,6 +2311,15 @@ def train_behavior_clone(
         type(behavior_clone_steps) is not int or behavior_clone_steps < 0
     ):
         raise ValueError("behavior_clone_steps must be a nonnegative integer")
+    if effective_behavior_clone_steps is not None and (
+        type(effective_behavior_clone_steps) is not int
+        or effective_behavior_clone_steps < 0
+    ):
+        raise ValueError("effective_behavior_clone_steps must be a nonnegative integer")
+    if behavior_clone_steps is not None and effective_behavior_clone_steps is not None:
+        raise ValueError(
+            "provide behavior_clone_steps or effective_behavior_clone_steps, not both"
+        )
     configured_behavior_clone_steps = (
         normalized_steps if behavior_clone_steps is None else behavior_clone_steps
     )
@@ -2325,7 +2346,11 @@ def train_behavior_clone(
         experiment_id=experiment_id,
         feature_variant=feature_variant,
         training_mode=training_mode,
-        behavior_clone_steps=configured_behavior_clone_steps,
+        behavior_clone_steps=(
+            configured_behavior_clone_steps
+            if effective_behavior_clone_steps is None else None
+        ),
+        effective_behavior_clone_steps=effective_behavior_clone_steps,
         model_width=model_width,
         model_depth=model_depth,
     )

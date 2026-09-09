@@ -1746,6 +1746,66 @@ def test_colab_wandb_config_records_effective_behavior_clone_steps(
     assert captured["wandb_config"]["behavior_clone_steps"] == expected
 
 
+def test_colab_resolves_behavior_clone_budget_once_and_propagates_effective_value(
+    tmp_path, monkeypatch,
+):
+    from scripts import train, train_policy
+
+    resolver_calls = []
+    real_resolver = train_policy.resolve_behavior_clone_steps
+
+    def observe_resolver(training_mode, configured_steps):
+        resolver_calls.append((training_mode, configured_steps))
+        return real_resolver(training_mode, configured_steps)
+
+    monkeypatch.setattr(train, "resolve_behavior_clone_steps", observe_resolver)
+    monkeypatch.setattr(train_policy, "resolve_behavior_clone_steps", observe_resolver)
+    config = train.build_config(
+        run_directory=tmp_path,
+        device="cpu",
+        resolve_runtime_device=False,
+        training_steps=8,
+        training_mode="reduced_behavior_clone_then_ppo",
+        wandb_enabled=False,
+    )
+    config.trajectory_path.parent.mkdir(parents=True, exist_ok=True)
+    config.trajectory_path.write_text("{}\n", encoding="utf-8")
+
+    contract = train_policy.build_training_contract(
+        input_path=config.trajectory_path,
+        steps=config.training_steps,
+        batch_size=config.training_batch_size,
+        device=config.device,
+        effective_behavior_clone_steps=config.behavior_clone_steps,
+    )
+
+    captured = {}
+
+    def fake_rollout(**_kwargs):
+        return None
+
+    def fake_train(**kwargs):
+        captured.update(kwargs)
+        return {"behavior_clone_steps": kwargs["effective_behavior_clone_steps"]}
+
+    monkeypatch.setattr(train_policy, "make_fresh_rollout_fn", fake_rollout)
+    monkeypatch.setattr(train_policy, "train_behavior_clone", fake_train)
+    monkeypatch.setattr("scripts.export_policy.export_checkpoint", lambda *_args, **_kwargs: None)
+
+    train.train_candidate(
+        config,
+        training_contract=contract,
+        resume_checkpoint=None,
+        allow_ppo_extension=False,
+        opponent_pool=None,
+        telemetry=None,
+    )
+
+    assert resolver_calls == [("reduced_behavior_clone_then_ppo", 8)]
+    assert contract.configuration["behavior_clone_steps"] == 2
+    assert captured["effective_behavior_clone_steps"] == 2
+
+
 def test_pure_ppo_skips_behavior_clone_and_starts_fresh_ppo(tmp_path, monkeypatch):
     pytest.importorskip("torch")
     from scripts import train_policy

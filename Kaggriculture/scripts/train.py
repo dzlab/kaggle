@@ -998,7 +998,7 @@ def train_candidate(
         experiment_id=config.experiment_id,
         feature_variant=config.feature_variant,
         training_mode=config.training_mode,
-        behavior_clone_steps=config.training_steps,
+        effective_behavior_clone_steps=config.behavior_clone_steps,
         model_width=config.model_width,
         model_depth=config.model_depth,
     )
@@ -1246,7 +1246,7 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
         experiment_id=config.experiment_id,
         feature_variant=config.feature_variant,
         training_mode=config.training_mode,
-        behavior_clone_steps=config.training_steps,
+        effective_behavior_clone_steps=config.behavior_clone_steps,
         model_width=config.model_width,
         model_depth=config.model_depth,
     )
