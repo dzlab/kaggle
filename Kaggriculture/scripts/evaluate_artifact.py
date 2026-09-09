@@ -43,6 +43,24 @@ QUICK_EVALUATION_TIMEOUT = 30.0
 DEFAULT_OPPONENTS = ("pass", "random", "starter")
 DEFAULT_SEATS = (0, 1)
 DEFAULT_OUTPUT = Path("reports/artifact-evaluation.json")
+DEFAULT_EXPERIMENT_ID = "orbit-policy-v1"
+FEATURE_VARIANTS = ("production_v1", "experimental_context_v1")
+TRAINING_MODES = (
+    "behavior_clone_then_ppo",
+    "pure_ppo",
+    "reduced_behavior_clone_then_ppo",
+)
+
+
+def _validate_training_identity(
+    experiment_id: Any, feature_variant: Any, training_mode: Any,
+) -> None:
+    if type(experiment_id) is not str or not experiment_id.strip():
+        raise ValueError("experiment_id must be a non-empty string")
+    if feature_variant not in FEATURE_VARIANTS:
+        raise ValueError(f"feature_variant must be one of: {', '.join(FEATURE_VARIANTS)}")
+    if training_mode not in TRAINING_MODES:
+        raise ValueError(f"training_mode must be one of: {', '.join(TRAINING_MODES)}")
 
 
 def _positive_int(value: str) -> int:
@@ -344,6 +362,9 @@ def evaluate(
     evaluation_timeout: float = DEFAULT_EVALUATION_TIMEOUT,
     game_runner: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
     quick: bool = False,
+    experiment_id: str = DEFAULT_EXPERIMENT_ID,
+    feature_variant: str = "production_v1",
+    training_mode: str = "behavior_clone_then_ppo",
 ) -> dict[str, Any]:
     """Evaluate current and artifact candidates on one identical matrix."""
     if quick:
@@ -362,6 +383,7 @@ def evaluate(
     if isinstance(evaluation_timeout, bool) or not isinstance(evaluation_timeout, Real) \
             or not math.isfinite(float(evaluation_timeout)) or float(evaluation_timeout) <= 0:
         raise ValueError("evaluation_timeout must be a positive finite number")
+    _validate_training_identity(experiment_id, feature_variant, training_mode)
     artifact_info = validate_artifact(artifact, identity)
     snapshot_directory, snapshot_info = _snapshot_artifact(artifact_info)
     try:
@@ -415,6 +437,9 @@ def evaluate(
             if "incomplete_matrix" not in decision["reasons"]:
                 decision["reasons"].append("incomplete_matrix")
         configuration = {
+            "experiment_id": experiment_id,
+            "feature_variant": feature_variant,
+            "training_mode": training_mode,
             "seeds": len(normalized_seeds),
             "start_seed": start_seed,
             "seed_values": normalized_seeds,
@@ -472,6 +497,9 @@ def build_report(result: Mapping[str, Any]) -> dict[str, Any]:
 
 def _configuration_from_args(args: argparse.Namespace) -> dict[str, Any]:
     return {
+        "experiment_id": args.experiment_id,
+        "feature_variant": args.feature_variant,
+        "training_mode": args.training_mode,
         "seeds": args.seeds,
         "start_seed": args.start_seed,
         "seed_values": seed_values(args.seeds, args.start_seed),
@@ -559,6 +587,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", required=True, type=Path)
     parser.add_argument("--identity", default="learned_artifact")
+    parser.add_argument("--experiment-id", default=DEFAULT_EXPERIMENT_ID)
+    parser.add_argument("--feature-variant", choices=FEATURE_VARIANTS, default="production_v1")
+    parser.add_argument("--training-mode", choices=TRAINING_MODES, default="behavior_clone_then_ppo")
     parser.add_argument("--seeds", type=_positive_int, default=DEFAULT_SEEDS)
     parser.add_argument("--start-seed", type=int, default=0)
     parser.add_argument("--steps", type=_positive_int, default=DEFAULT_STEPS)
@@ -583,6 +614,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("identity must be a non-empty string")
     if args.identity == CURRENT_CANDIDATE:
         parser.error("identity is reserved: current")
+    try:
+        _validate_training_identity(
+            args.experiment_id, args.feature_variant, args.training_mode,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.quick:
         if args.seeds == DEFAULT_SEEDS:
             args.seeds = 2
@@ -709,6 +746,9 @@ def main(argv: list[str] | None = None) -> int:
             min_valid_games=args.min_valid_games,
             evaluation_timeout=args.evaluation_timeout,
             quick=args.quick,
+            experiment_id=args.experiment_id,
+            feature_variant=args.feature_variant,
+            training_mode=args.training_mode,
         )
         report = build_report(result)
         write_report(output, report)

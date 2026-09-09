@@ -73,6 +73,53 @@ def test_parse_args_preserves_both_seats_and_quick_defaults(tmp_path):
         parse_args(["--artifact", str(tmp_path / "artifact.json"), "--seats", "0", "0"])
 
 
+def test_parse_args_accepts_and_validates_training_identity(tmp_path):
+    from scripts.evaluate_artifact import parse_args
+
+    args = parse_args([
+        "--artifact", str(tmp_path / "artifact.json"),
+        "--experiment-id", "orbit-context-test",
+        "--feature-variant", "experimental_context_v1",
+        "--training-mode", "reduced_behavior_clone_then_ppo",
+    ])
+
+    assert (args.experiment_id, args.feature_variant, args.training_mode) == (
+        "orbit-context-test", "experimental_context_v1", "reduced_behavior_clone_then_ppo",
+    )
+    with pytest.raises(SystemExit):
+        parse_args([
+            "--artifact", str(tmp_path / "artifact.json"),
+            "--feature-variant", "unknown",
+        ])
+
+
+def test_evaluate_configuration_contains_training_identity(tmp_path, monkeypatch):
+    from scripts import evaluate_artifact
+
+    artifact = _artifact(tmp_path / "artifact.json")
+    monkeypatch.setattr(evaluate_artifact, "load_exported_policy", lambda path: object())
+
+    def fake_game(request):
+        return _record(request["candidate"], request["opponent"], request["seed"], request["seat"])
+
+    result = evaluate_artifact.evaluate(
+        artifact=artifact, seeds=[3], opponents=["pass"], seats=[0, 1],
+        steps=4, workers=1, min_valid_games=1, game_runner=fake_game,
+        experiment_id="orbit-context-test",
+        feature_variant="experimental_context_v1",
+        training_mode="reduced_behavior_clone_then_ppo",
+    )
+
+    assert {
+        key: result["configuration"][key]
+        for key in ("experiment_id", "feature_variant", "training_mode")
+    } == {
+        "experiment_id": "orbit-context-test",
+        "feature_variant": "experimental_context_v1",
+        "training_mode": "reduced_behavior_clone_then_ppo",
+    }
+
+
 def test_validate_artifact_returns_identity_and_sha256(tmp_path, monkeypatch):
     from scripts import evaluate_artifact
 

@@ -656,6 +656,9 @@ def build_collection_command(config: ColabConfig) -> list[str]:
         "--workers", str(config.workers),
         "--output", str(trajectory_path),
         "--source-policy-identity", config.experiment_id,
+        "--experiment-id", config.experiment_id,
+        "--feature-variant", config.feature_variant,
+        "--training-mode", config.training_mode,
     ]
 
 
@@ -680,6 +683,9 @@ def build_evaluation_command(config: ColabConfig, *, phase: str) -> list[str]:
         sys.executable, str(EVALUATE_SCRIPT),
         "--artifact", str(config.stage_artifact_path),
         "--identity", config.candidate_tag,
+        "--experiment-id", config.experiment_id,
+        "--feature-variant", config.feature_variant,
+        "--training-mode", config.training_mode,
         "--seeds", str(len(seeds)),
         "--start-seed", str(seeds[0]),
         "--steps", str(steps),

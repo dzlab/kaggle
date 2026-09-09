@@ -1542,6 +1542,68 @@ def test_resume_rejects_a_checkpoint_from_another_experiment_identity(tmp_path):
     assert not output_path.exists()
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("feature_variant", "experimental_context_v1"),
+        ("training_mode", "reduced_behavior_clone_then_ppo"),
+    ],
+)
+def test_resume_rejects_a_checkpoint_with_mismatched_feature_or_training_identity(
+    tmp_path, field, value,
+):
+    pytest.importorskip("torch")
+    from scripts import train_policy
+
+    input_path = tmp_path / "transitions.jsonl"
+    resume_path = tmp_path / "resume.pt"
+    output_path = tmp_path / "continued.pt"
+    rows = [_transition(done=False), _transition(done=True, reward=math.tanh(0.3))]
+    input_path.write_text("\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n")
+    train_policy.train_behavior_clone(
+        input_path=input_path, output_path=resume_path, steps=1, batch_size=2,
+        device="cpu",
+    )
+
+    with pytest.raises(ValueError, match=field):
+        train_policy.train_behavior_clone(
+            input_path=input_path, output_path=output_path, steps=1, batch_size=2,
+            device="cpu", **{field: value}, resume_checkpoint=resume_path,
+        )
+    assert not output_path.exists()
+
+
+def test_fresh_rollout_passes_training_identity_to_native_collector(tmp_path, monkeypatch):
+    from scripts import train_policy
+
+    collected = []
+
+    def fake_collect(*, output, candidate_artifact, opponents, **kwargs):
+        collected.append(kwargs)
+        Path(output).write_text(json.dumps({"step": 1}) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr("scripts.collect_trajectories.collect", fake_collect)
+    artifact = tmp_path / "candidate.json"
+    artifact.write_text("artifact", encoding="utf-8")
+    rollout_fn = train_policy.make_fresh_rollout_fn(
+        run_directory=tmp_path, candidate_artifact=artifact,
+        seeds=[41], steps=4,
+        experiment_id="orbit-context-test",
+        feature_variant="experimental_context_v1",
+        training_mode="reduced_behavior_clone_then_ppo",
+    )
+
+    rollout_fn(
+        step=0, seed=41, opponent="pass", seat=0, checkpoint=None,
+        rollout_steps=3,
+    )
+
+    assert collected[0]["source_policy_identity"].startswith("artifact:")
+    assert collected[0]["experiment_id"] == "orbit-context-test"
+    assert collected[0]["feature_variant"] == "experimental_context_v1"
+    assert collected[0]["training_mode"] == "reduced_behavior_clone_then_ppo"
+
+
 def test_behavior_cloning_emits_loss_and_update_count_at_checkpoint_intervals(tmp_path):
     pytest.importorskip("torch")
     from scripts.train_policy import train_behavior_clone

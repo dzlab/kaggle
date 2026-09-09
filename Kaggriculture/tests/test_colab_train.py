@@ -350,10 +350,14 @@ def test_colab_workflow_builds_parameterized_commands(tmp_path, monkeypatch):
     assert collection[collection.index("--steps") + 1] == "48"
     assert collection[collection.index("--workers") + 1] == "3"
     assert collection[collection.index("--output") + 1] == str(tmp_path / "input.jsonl")
+    assert collection[collection.index("--source-policy-identity") + 1] == config.experiment_id
 
     development = colab_train.build_evaluation_command(config, phase="development")
     assert development[development.index("--artifact") + 1] == str(config.stage_artifact_path)
     assert development[development.index("--identity") + 1] == "ppo32"
+    assert development[development.index("--experiment-id") + 1] == config.experiment_id
+    assert development[development.index("--feature-variant") + 1] == config.feature_variant
+    assert development[development.index("--training-mode") + 1] == config.training_mode
     assert development[development.index("--seeds") + 1] == "2"
     assert development[development.index("--start-seed") + 1] == "10"
     assert development[development.index("--min-valid-games") + 1] == "4"

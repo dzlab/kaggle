@@ -31,6 +31,13 @@ from kagriculture_agent.trajectory import TRANSITION_SCHEMA_VERSION, Transition,
 COLLECTOR_OPPONENTS = ("pass", "random", "starter", "current")
 OPPONENTS = COLLECTOR_OPPONENTS
 DEFAULT_GAME_TIMEOUT_SECONDS = 120.0
+DEFAULT_EXPERIMENT_ID = "orbit-policy-v1"
+FEATURE_VARIANTS = ("production_v1", "experimental_context_v1")
+TRAINING_MODES = (
+    "behavior_clone_then_ppo",
+    "pure_ppo",
+    "reduced_behavior_clone_then_ppo",
+)
 
 
 class IsolatedGameTimeoutError(TimeoutError, RuntimeError):
@@ -161,7 +168,16 @@ def _run_game_isolated(
 def _manifest(
     *, seeds: Sequence[int], opponents: Sequence[str], seats: Sequence[int], steps: int,
     source_policy_identity: str,
+    experiment_id: str = DEFAULT_EXPERIMENT_ID,
+    feature_variant: str = "production_v1",
+    training_mode: str = "behavior_clone_then_ppo",
 ) -> dict[str, Any]:
+    if type(experiment_id) is not str or not experiment_id.strip():
+        raise ValueError("experiment_id must be a non-empty string")
+    if feature_variant not in FEATURE_VARIANTS:
+        raise ValueError(f"feature_variant must be one of: {', '.join(FEATURE_VARIANTS)}")
+    if training_mode not in TRAINING_MODES:
+        raise ValueError(f"training_mode must be one of: {', '.join(TRAINING_MODES)}")
     return {
         "schema_version": TRANSITION_SCHEMA_VERSION,
         "transition_schema_version": TRANSITION_SCHEMA_VERSION,
@@ -172,6 +188,9 @@ def _manifest(
         "seats": [int(seat) for seat in seats],
         "opponents": [str(opponent) for opponent in opponents],
         "source_policy_identity": source_policy_identity,
+        "experiment_id": experiment_id,
+        "feature_variant": feature_variant,
+        "training_mode": training_mode,
     }
 
 
@@ -331,6 +350,9 @@ def _publish_pair(
 def collect(
     *, seeds: Sequence[int], opponents: Sequence[str], seats: Sequence[int], steps: int,
     output: str | Path, source_policy_identity: str = "current",
+    experiment_id: str = DEFAULT_EXPERIMENT_ID,
+    feature_variant: str = "production_v1",
+    training_mode: str = "behavior_clone_then_ppo",
     game_timeout: float = DEFAULT_GAME_TIMEOUT_SECONDS,
     candidate_artifact: str | Path | None = None,
     candidate_identity: str | None = None,
@@ -354,6 +376,12 @@ def collect(
         raise ValueError("steps must be at least 2 to produce a transition")
     if not isinstance(source_policy_identity, str) or not source_policy_identity:
         raise ValueError("source_policy_identity must be a non-empty string")
+    if type(experiment_id) is not str or not experiment_id.strip():
+        raise ValueError("experiment_id must be a non-empty string")
+    if feature_variant not in FEATURE_VARIANTS:
+        raise ValueError(f"feature_variant must be one of: {', '.join(FEATURE_VARIANTS)}")
+    if training_mode not in TRAINING_MODES:
+        raise ValueError(f"training_mode must be one of: {', '.join(TRAINING_MODES)}")
     artifact_path = None
     if candidate_artifact is not None:
         artifact_path = Path(candidate_artifact).expanduser().resolve()
@@ -385,6 +413,9 @@ def collect(
         seats=normalized_seats,
         steps=steps,
         source_policy_identity=source_policy_identity,
+        experiment_id=experiment_id,
+        feature_variant=feature_variant,
+        training_mode=training_mode,
     )
     if no_progress_window:
         manifest["no_progress_window"] = no_progress_window
@@ -538,6 +569,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seats", nargs="+", type=int, choices=(0, 1), default=[0, 1])
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-policy-identity", default="current")
+    parser.add_argument("--experiment-id", default=DEFAULT_EXPERIMENT_ID)
+    parser.add_argument("--feature-variant", choices=FEATURE_VARIANTS, default="production_v1")
+    parser.add_argument("--training-mode", choices=TRAINING_MODES, default="behavior_clone_then_ppo")
     parser.add_argument("--candidate-artifact", type=Path, default=None)
     parser.add_argument("--candidate-identity", default=None)
     parser.add_argument("--workers", type=_positive_int, default=1)
@@ -566,6 +600,9 @@ def main(argv: list[str] | None = None) -> int:
         steps=args.steps,
         output=args.output,
         source_policy_identity=args.source_policy_identity,
+        experiment_id=args.experiment_id,
+        feature_variant=args.feature_variant,
+        training_mode=args.training_mode,
         candidate_artifact=args.candidate_artifact,
         candidate_identity=args.candidate_identity,
         workers=args.workers,
