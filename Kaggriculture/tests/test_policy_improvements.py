@@ -44,6 +44,32 @@ def _state(**values):
     }
 
 
+def _policy_observation_with_one_melon_seed():
+    board = [[None for _ in range(5)] for _ in range(5)]
+    return {
+        "player": 0,
+        "day": 1,
+        "hour": 0,
+        "farms": [{
+            "tiles": board,
+            "farmer": [0, 0],
+            "hands": [[1, 0]],
+            "money": 0,
+            "unlocked_quadrants": ["NW"],
+        }],
+        "private": {
+            "shed": {},
+            "seeds": {"MELON": 1},
+            "inventories": [{}, {}],
+        },
+        "market": {
+            "prices": {"MELON": 250},
+            "inventory": {"MELON": 10_000},
+        },
+        "town": {"unlocked_shops": []},
+    }
+
+
 def test_assign_tasks_uses_reserved_worker_for_only_one_fallback_task():
     state = _state(workers=_workers(("FARMER", Position(0, 0))),
                    private={"seeds": {}, "shed": {"WHEAT": 1}, "inventories": [{"GOOSE": 1}]})
@@ -71,6 +97,69 @@ def test_assign_tasks_routes_equal_deadlines_to_nearest_task_first():
 
     assert len(assignments) == 1
     assert assignments[0].task.target == Position(4, 1)
+
+
+def test_assign_tasks_routes_equal_priority_deadlines_before_task_kind():
+    state = _state(
+        day=2,
+        hour=0,
+        workers=_workers(("FARMER", Position(4, 4))),
+        private={"seeds": {}, "shed": {"WHEAT": 1}, "inventories": [{}]},
+    )
+    tasks = [
+        Task("FEED", Position(0, 0), 100, 2, 1, item="SHEEP"),
+        Task("WATER", Position(4, 3), 100, 2, 1, item="MELON"),
+    ]
+
+    assignments = assign_tasks(tasks, state["workers"], state)
+
+    assert len(assignments) == 1
+    assert assignments[0].task.kind == "WATER"
+
+
+def test_assign_tasks_keeps_higher_priority_maintenance_before_route_distance():
+    state = _state(
+        day=2,
+        hour=0,
+        workers=_workers(("FARMER", Position(4, 4))),
+        private={"seeds": {}, "shed": {"WHEAT": 1}, "inventories": [{}]},
+    )
+    tasks = [
+        Task("FEED", Position(0, 0), 101, 2, 1, item="SHEEP"),
+        Task("WATER", Position(4, 3), 100, 2, 1, item="MELON"),
+    ]
+
+    assignments = assign_tasks(tasks, state["workers"], state)
+
+    assert len(assignments) == 1
+    assert assignments[0].task.kind == "FEED"
+
+
+def test_assign_tasks_allocates_plant_tasks_within_available_seed_inventory():
+    state = _state(
+        workers=_workers(
+            ("FARMER", Position(0, 0)),
+            ("HAND", Position(1, 0)),
+        ),
+        private={"seeds": {"MELON": 1}, "shed": {}, "inventories": [{}, {}]},
+    )
+    tasks = [
+        Task("PLANT", Position(0, 0), 20, 1, 10, item="MELON"),
+        Task("PLANT", Position(1, 0), 20, 1, 10, item="MELON"),
+    ]
+
+    assignments = assign_tasks(tasks, state["workers"], state)
+
+    assert [(assignment.worker_index, assignment.task.target) for assignment in assignments] == [
+        (0, Position(0, 0)),
+    ]
+
+
+def test_policy_limits_same_turn_plant_commands_to_available_seeds():
+    action = Policy().act(_policy_observation_with_one_melon_seed())
+    commands = [action["farmer"], *action["hands"]]
+
+    assert sum(command == ["PLANT", "MELON"] for command in commands) == 1
 
 
 @__import__("pytest").mark.parametrize("shed,carried,expected", [
@@ -427,6 +516,38 @@ def test_basic_need_guard_keeps_hire_that_adds_deadline_capacity():
     )
 
     assert guarded == [["HIRE"]]
+
+
+@__import__("pytest").mark.parametrize(
+    ("cash", "wheat", "expected"),
+    [(7, 30, True), (150, 30, True), (7, 0, False)],
+)
+def test_macro_proposes_affordable_hire_for_due_basic_need_capacity(cash, wheat, expected):
+    tiles = [["EMPTY"] * 10 for _ in range(10)]
+    for x, y in ((1, 0), (2, 0), (3, 0), (4, 0), (2, 1), (4, 1)):
+        tiles[y][x] = {
+            "kind": "PLANT",
+            "crop": "WHEAT",
+            "watered_today": False,
+        }
+    tiles[0][0] = {"kind": "PASTURE"}
+    state = _state(
+        day=1,
+        hour=0,
+        board_size=10,
+        tiles=tiles,
+        cash=cash,
+        workers=_workers(("FARMER", Position(4, 4))),
+        private={
+            "seeds": {},
+            "shed": {"WHEAT": wheat, "SHEEP": 1},
+            "inventories": [{}],
+        },
+    )
+
+    macro = build_autonomous_macro_plan(state)
+
+    assert (["HIRE"] in macro["market_intents"]) is expected
 
 
 def test_learned_policy_liquidates_shed_inventory_in_terminal_window(monkeypatch):

@@ -3657,6 +3657,34 @@ def test_apply_variant_skips_empty_market_order():
     assert result["market"] == []
 
 
+@pytest.mark.parametrize(
+    "order",
+    [
+        ["BOGUS"],
+        ["BUY_PRODUCT"],
+        ["BUY_PRODUCT", "WHEAT", 0],
+    ],
+)
+def test_apply_variant_preserves_nonempty_malformed_market_order_as_framework_error(order):
+    from scripts.evaluate import apply_variant, replay_record
+
+    replay = _strict_two_turn_replay()
+    observation = replay["steps"][0][0]["observation"]
+
+    result = apply_variant(
+        {"farmer": ["PASS"], "hands": [], "market": [order]},
+        observation,
+        "mixed",
+        configuration=replay["configuration"],
+    )
+    replay["steps"][0][0]["action"] = result
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert result["market"] == [order]
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+
+
 def test_conservative_variant_preserves_mandatory_wheat_and_fertilizer_orders():
     from scripts.evaluate import apply_variant
 

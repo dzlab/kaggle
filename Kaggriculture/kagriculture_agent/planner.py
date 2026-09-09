@@ -809,6 +809,42 @@ def due_basic_need_tasks(state: Any, day: int | None = None,
     ]
 
 
+def _due_needs_exceed_single_worker_capacity(
+    state: Mapping[str, Any], tasks: Sequence[Task], day: int, hour: int,
+) -> bool:
+    """Estimate whether the deterministic due-needs route fits this day."""
+    workers = list(_get(state, "workers", ()) or ())
+    if len(workers) != 1 or not tasks:
+        return False
+    try:
+        board_size = max(1, int(_get(state, "board_size", 1)))
+    except (TypeError, ValueError, OverflowError):
+        board_size = 1
+    worker = _worker_info(workers[0], 0)
+    current = worker[2]
+    remaining = list(tasks)
+    required_turns = 0
+    while remaining:
+        def route_key(task: Task) -> tuple[Any, ...]:
+            base = _task_sort_key(task, day)
+            target = _target_position(task.target)
+            route_distance = (
+                distance(current, target)
+                if current is not None and target is not None else inf
+            )
+            return (*base[:4], route_distance, base[5], base[4])
+
+        task = min(remaining, key=route_key)
+        required_turns += _task_turn_budget(
+            task, (worker[0], worker[1], current), state, board_size,
+        )
+        if required_turns > 24 - hour:
+            return True
+        current = _target_position(task.target)
+        remaining.remove(task)
+    return False
+
+
 def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
                                 strategy: StrategySpec | None = None) -> dict[str, Any]:
     """Choose a live portfolio and executable macro intents from observations.
@@ -869,7 +905,8 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
     cash = _state_cash(normalized)
     intents: list[list[Any]] = []
     tasks: list[Task] = []
-    deadline_needs = _has_basic_need_deadline(normalized, day, strategy)
+    due_needs = due_basic_need_tasks(normalized, day, strategy)
+    deadline_needs = bool(due_needs)
     _compatible_target, structure_target = (
         _compatible_structure(normalized, animal) if animal else (None, None)
     )
@@ -934,12 +971,6 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
         if 0 <= land_index < len(LAND_ORDER) and cash >= float(LAND_PRICES[land_index]) + reserve:
             intents.append(["BUY_LAND"])
 
-        hands = farm.get("hands", ())
-        hand_count = len(hands) if isinstance(hands, Sequence) and not isinstance(hands, (str, bytes)) else 0
-        hires_today = _safe_quantity(farm.get("hires_today", 0))
-        if hour == 0 and hand_count < 2 and hires_today == 0 and cash >= 100.0 + reserve:
-            intents.append(["HIRE"])
-
         compatible, empty = (
             _compatible_structure(normalized, animal) if animal else (None, None)
         )
@@ -983,6 +1014,48 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
               and not _placed_animal_count(normalized)):
             kind = "BUILD_PASTURE" if ANIMALS[animal]["structure"] == "PASTURE" else "BUILD_COOP"
             tasks.append(Task(kind, empty, 96, day, 1.0))
+
+        hands = farm.get("hands", ())
+        hand_count = len(hands) if isinstance(hands, Sequence) and not isinstance(hands, (str, bytes)) else 0
+        hires_today = _safe_quantity(farm.get("hires_today", 0))
+        highest_due_priority = max((task.priority for task in due_needs), default=inf)
+        preempting_tasks = [
+            task for task in tasks
+            if task.deadline is not None
+            and task.deadline <= day
+            and task.priority > highest_due_priority
+        ]
+        deadline_capacity_hire = (
+            hand_count == 0
+            and _due_needs_exceed_single_worker_capacity(
+                normalized, [*due_needs, *preempting_tasks], day, hour,
+            )
+        )
+        hire_cost = _intent_purchase_cost((["HIRE"],), normalized)
+        planned_feed_intents = [
+            intent for intent in intents
+            if len(intent) >= 3
+            and intent[0] == "BUY_PRODUCT"
+            and intent[1] == "WHEAT"
+        ]
+        unfunded_required_feed, cash_after_required_feed = _feed_purchase_needed(
+            normalized, day, planning_animal_counts, planned_feed_intents,
+            cash, wheat_price,
+            strategy.reserve_wheat if strategy is not None else 0,
+        )
+        can_fund_deadline_hire = (
+            unfunded_required_feed == 0
+            and cash_after_required_feed >= hire_cost
+        )
+        if hand_count < 2 and hires_today == 0:
+            if deadline_capacity_hire and can_fund_deadline_hire:
+                # Required capacity uses the actual next-hire cost and keeps
+                # the established solvency reserve. Place it before optional
+                # purchases so those intents remain valid but cannot crowd it
+                # out before the worker is created.
+                intents.insert(0, ["HIRE"])
+            elif hour == 0 and cash >= 100.0 + reserve:
+                intents.append(["HIRE"])
     if day == season_days - 2 and deadline_needs and hour == 0:
         hands = farm.get("hands", ())
         hand_count = len(hands) if isinstance(hands, Sequence) and not isinstance(hands, (str, bytes)) else 0
@@ -1428,9 +1501,22 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
             ),
             default=inf,
         )
-        return (*base[:4], base[5], route_distance, base[4])
+        return (*base[:4], route_distance, base[5], base[4])
 
     tasks.sort(key=assignment_sort_key)
+    seed_inventory = state.get("seeds", {})
+    seed_inventory = seed_inventory if isinstance(seed_inventory, Mapping) else {}
+    allocated_seeds: dict[str, int] = {}
+    seed_bounded_tasks = []
+    for task in tasks:
+        if task.kind == "PLANT":
+            crop = str(task.item or "").upper()
+            allocated = allocated_seeds.get(crop, 0)
+            if allocated >= _safe_quantity(seed_inventory.get(crop, 0)):
+                continue
+            allocated_seeds[crop] = allocated + 1
+        seed_bounded_tasks.append(task)
+    tasks = seed_bounded_tasks
 
     farmer = next((info for info in infos if info[1] == "FARMER"), None)
     logistics_pending = any(task.kind in _SHED_WORK for task in tasks)

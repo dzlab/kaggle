@@ -2106,7 +2106,8 @@ def _observed_unit_price(item: str, observation: Mapping[str, Any], inventory: f
 
 
 def _sanitize_market_orders(orders: Sequence[Sequence[Any]], observation: Mapping[str, Any],
-                            configuration: Mapping[str, Any] | None = None) -> list[list[Any]]:
+                            configuration: Mapping[str, Any] | None = None, *,
+                            preserve_malformed: bool = False) -> list[list[Any]]:
     """Apply the engine's per-unit market rules to a postprocessed action."""
     money = _cash(observation)
     shed = dict(_mapping(_mapping(observation.get("private")).get("shed")))
@@ -2128,6 +2129,8 @@ def _sanitize_market_orders(orders: Sequence[Sequence[Any]], observation: Mappin
             break
         order = list(raw_order)
         if not _valid_market_order_schema(order, observation):
+            if preserve_malformed and order:
+                sanitized.append(order)
             continue
         operation = order[0]
         if operation == "HIRE":
@@ -3528,11 +3531,15 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
 
 
 def _sanitize_action(action: Mapping[str, Any], observation: Mapping[str, Any], fallback: Mapping[str, Any],
-                     configuration: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                     configuration: Mapping[str, Any] | None = None, *,
+                     preserve_malformed_market: bool = False) -> dict[str, Any]:
     result = {
         "farmer": list(action.get("farmer", ())) if isinstance(action.get("farmer", ()), Sequence) else [],
         "hands": [list(command) for command in action.get("hands", ())] if isinstance(action.get("hands", ()), Sequence) else [],
-        "market": _sanitize_market_orders(_market_orders(action), observation, configuration),
+        "market": _sanitize_market_orders(
+            _market_orders(action), observation, configuration,
+            preserve_malformed=preserve_malformed_market,
+        ),
     }
     fallback_farmer = list(fallback.get("farmer", ["PASS"]))
     if not _unit_command_valid_for_state(result["farmer"], observation, 0, configuration):
@@ -3635,7 +3642,7 @@ def _preserve_variant_market_capacity(orders: Sequence[Sequence[Any]], observati
     result: list[list[Any]] = []
     for raw_order in orders:
         order = list(raw_order)
-        if order and order[0] == "BUY_SEED":
+        if _valid_market_order_schema(order, observation) and order[0] == "BUY_SEED":
             quantity = min(int(_number(order[2]) or 1), int(seed_budget // float(CROPS[seed_item]["seed"])))
             if quantity <= 0:
                 continue
@@ -3682,11 +3689,20 @@ def _apply_ablations(action: Mapping[str, Any], observation: Mapping[str, Any], 
     if not ablations.get("market_batch_sizing", True):
         result["market"] = result["market"][:1]
     if not ablations.get("shop_adaptation", True):
-        result["market"] = [order for order in result["market"] if order[0] != "BUY_PRODUCT"]
+        result["market"] = [
+            order for order in result["market"]
+            if not _valid_market_order_schema(order, observation) or order[0] != "BUY_PRODUCT"
+        ]
     if not ablations.get("land_purchase", True):
-        result["market"] = [order for order in result["market"] if order[0] != "BUY_LAND"]
+        result["market"] = [
+            order for order in result["market"]
+            if not _valid_market_order_schema(order, observation) or order[0] != "BUY_LAND"
+        ]
     if not ablations.get("animals", True):
-        result["market"] = [order for order in result["market"] if order[0] != "BUY_ANIMAL"]
+        result["market"] = [
+            order for order in result["market"]
+            if not _valid_market_order_schema(order, observation) or order[0] != "BUY_ANIMAL"
+        ]
         for key in ("farmer", "hands"):
             commands = result[key] if key == "farmer" else result[key]
             if key == "farmer":
@@ -3707,37 +3723,43 @@ def apply_variant(action: Mapping[str, Any], observation: Mapping[str, Any], var
                   ablations: Mapping[str, bool] | None = None,
                   configuration: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Apply a named, legality-preserving strategy adjustment at the agent boundary."""
+    market_orders = [order for order in _market_orders(action) if order]
     result = {"farmer": list(action.get("farmer", ["PASS"])), "hands": [list(command) for command in action.get("hands", ())],
-              "market": [
-                  order for order in _market_orders(action)
-                  if _valid_market_order_schema(order, observation)
-              ]}
+              "market": market_orders}
     seeds = _private_seeds(observation)
     if variant == "conservative":
-        terminal_sales = [
+        malformed = [
             order for order in result["market"]
+            if not _valid_market_order_schema(order, observation)
+        ]
+        valid_market = [
+            order for order in result["market"]
+            if _valid_market_order_schema(order, observation)
+        ]
+        terminal_sales = [
+            order for order in valid_market
             if order[0] == "SELL"
         ] if (
             _number(observation.get("day")) == season_days - 1
             and (_number(observation.get("hour")) or 0) >= 22
         ) else []
         if terminal_sales:
-            result["market"] = terminal_sales
+            result["market"] = terminal_sales + malformed
         else:
             deadline_hires = [
-                order for order in result["market"]
+                order for order in valid_market
                 if order == ["HIRE"] and _has_basic_need_deadline(observation)
             ]
             mandatory = [
-                order for order in result["market"]
+                order for order in valid_market
                 if order[0] == "BUY_PRODUCT" and order[1] in {"WHEAT", "FERTILIZER"}
             ]
             mandatory = deadline_hires + mandatory
             discretionary = [
-                order for order in result["market"]
+                order for order in valid_market
                 if order[0] not in {"BUY_ANIMAL", "BUY_LAND", "BUY_PRODUCT"}
             ][:max(0, 1 - len(mandatory))]
-            result["market"] = mandatory + discretionary
+            result["market"] = mandatory + discretionary + malformed
     elif variant == "melon-heavy":
         if result["farmer"][:1] == ["PLANT"] and len(result["farmer"]) > 1 and result["farmer"][1] == "WHEAT" and _number(seeds.get("MELON")):
             result["farmer"][1] = "MELON"
@@ -3745,10 +3767,13 @@ def apply_variant(action: Mapping[str, Any], observation: Mapping[str, Any], var
             result["market"], observation, seed_item="MELON",
         )
         for order in result["market"]:
-            if order[0] == "BUY_SEED":
+            if _valid_market_order_schema(order, observation) and order[0] == "BUY_SEED":
                 order[1] = "MELON"
                 break
-        if not any(order[0] == "BUY_SEED" for order in result["market"]) and not _number(seeds.get("MELON")) and _cash(observation) >= CROPS["MELON"]["seed"]:
+        if not any(
+            _valid_market_order_schema(order, observation) and order[0] == "BUY_SEED"
+            for order in result["market"]
+        ) and not _number(seeds.get("MELON")) and _cash(observation) >= CROPS["MELON"]["seed"]:
             result["market"].append(["BUY_SEED", "MELON", 1])
     elif variant == "demand-reactive":
         # The production policy already reacts to live market/shop demand.
@@ -3765,7 +3790,7 @@ def apply_variant(action: Mapping[str, Any], observation: Mapping[str, Any], var
         # FEED misses.
         if target and _animal_units_owned(observation) < 2:
             for order in result["market"]:
-                if order[0] == "BUY_SEED":
+                if _valid_market_order_schema(order, observation) and order[0] == "BUY_SEED":
                     order[:] = ["BUY_ANIMAL", target, 1]
                     break
             else:
@@ -3774,7 +3799,10 @@ def apply_variant(action: Mapping[str, Any], observation: Mapping[str, Any], var
         raise ValueError(f"unsupported variant: {variant}")
     result["market"] = _prioritize_safety_market_orders(result["market"])
     adjusted = _apply_ablations(result, observation, ablations or _DEFAULT_ABLATIONS)
-    return _sanitize_action(adjusted, observation, action, configuration)
+    return _sanitize_action(
+        adjusted, observation, action, configuration,
+        preserve_malformed_market=True,
+    )
 
 
 class VariantPolicy:
