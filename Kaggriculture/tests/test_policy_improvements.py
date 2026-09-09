@@ -32,10 +32,11 @@ def test_assign_tasks_falls_back_to_reserved_worker_when_only_farmer():
     state = _state(workers=_workers(("FARMER", Position(0, 0))),
                    private={"seeds": {}, "shed": {"WHEAT": 1}, "inventories": [{"GOOSE": 1}]})
     tasks = [Task("ANIMAL", Position(0, 1), 100, 1, 1, item="GOOSE"),
-             Task("WATER", Position(4, 3), 100, 1, 1, item="WHEAT")]
+             Task("WATER", Position(4, 3), 100, 1, 1, item="WHEAT"),
+             Task("SHED", Position(1, 1), 75, None, 1)]
     assignments = assign_tasks(tasks, state["workers"], state)
     assert [(assignment.worker_index, assignment.task.kind) for assignment in assignments] == [
-        (0, "ANIMAL"), (0, "WATER"),
+        (0, "ANIMAL"), (0, "WATER"), (0, "SHED"),
     ]
 
 

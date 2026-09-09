@@ -54,3 +54,26 @@ def test_artifact_candidate_policy_loads_artifact_once_for_returned_callable(mon
     assert policy({"turn": 1}) == {"observation": {"turn": 1}}
     assert policy({"turn": 2}) == {"observation": {"turn": 2}}
     assert len(calls) == 1
+
+
+def test_returned_candidate_caches_same_runtime_failure_after_one_load(monkeypatch, tmp_path):
+    artifact = tmp_path / "candidate.json"
+    artifact.write_text("{}")
+    calls = []
+
+    class FailingPolicy:
+        def act(self, observation):
+            raise RuntimeError("inference failed")
+
+    monkeypatch.setattr(
+        candidates, "load_exported_policy",
+        lambda path: calls.append(path) or FailingPolicy(),
+    )
+    policy = candidates.artifact_candidate_policy(artifact)
+    failures = []
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="inference failed") as error:
+            policy({"turn": 1})
+        failures.append(str(error.value))
+    assert failures == ["inference failed", "inference failed"]
+    assert len(calls) == 1
