@@ -84,6 +84,7 @@ def parse_observation(obs: Any) -> dict[str, Any]:
         "private": _mapping_or_empty(source.get("private")),
         "market": _mapping_or_empty(source.get("market")),
         "town": _mapping_or_empty(source.get("town")),
+        "configuration": _mapping_or_empty(source.get("configuration")),
     }
 
 

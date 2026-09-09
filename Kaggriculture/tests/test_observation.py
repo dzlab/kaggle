@@ -45,6 +45,15 @@ def test_parse_observation_selects_active_player_and_preserves_nw_only_board():
     assert parsed["farm"]["tiles"][9][9] == "SECOND_PLAYER"
 
 
+def test_parse_observation_preserves_configuration_mapping():
+    obs = make_observation()
+    obs["configuration"] = {"shedCapacity": 2}
+
+    parsed = parse_observation(obs)
+
+    assert parsed["configuration"] == {"shedCapacity": 2}
+
+
 def test_locked_tiles_are_retained_by_tile_iteration():
     farm = make_observation()["farms"][0]
 

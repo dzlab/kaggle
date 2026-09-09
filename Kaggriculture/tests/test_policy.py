@@ -912,6 +912,17 @@ def test_terminal_cleanup_does_not_mix_carried_pickup_or_drop_with_sales():
     assert action["market"] == []
 
 
+def test_policy_terminal_cleanup_honors_configured_shed_capacity():
+    obs = observation(day=29, hour=22, hands=[[2, 2]],
+                      inventories=[[], ["MELON", "MELON"]],
+                      shed={"CARROT": 1}, seeds={})
+    obs["configuration"] = {"shedCapacity": 2}
+
+    action = policy_module.Policy().act(obs)
+
+    assert action["hands"][0] == ["PLACE", "MELON", 1]
+
+
 def test_replan_preserves_carried_feed_when_another_assignment_finishes():
     board = [[None for _ in range(10)] for _ in range(10)]
     board[0][5] = {
