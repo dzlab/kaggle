@@ -45,6 +45,7 @@ from kagriculture_agent.observation import is_shed_adjacent  # noqa: E402
 from kagriculture_agent.planner import _has_basic_need_deadline  # noqa: E402
 from kagriculture_agent.policy import Policy  # noqa: E402
 from scripts.run_local import OPPONENTS, _deterministic_random_agent  # noqa: E402
+from scripts.output_paths import atomic_write_text  # noqa: E402
 from scripts.evaluation_metrics import (  # noqa: E402
     bradley_terry_summary as _league_elo_summary,
     summarize_by_opponent as _summarize_by_opponent,
@@ -824,6 +825,7 @@ def _matrix_completeness(
     )
     return {
         "expected": [list(coordinate) for coordinate in expected],
+        "observed": [list(coordinate) for coordinate in sorted(observed, key=lambda key: tuple(str(value) for value in key))],
         "expected_count": len(expected),
         "observed_count": sum(observed.values()) + invalid_records,
         "missing": [list(coordinate) for coordinate in missing],
@@ -4804,11 +4806,12 @@ def write_result_document(path: str | Path, document: Mapping[str, Any], *, reco
                           ablation_records: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
                           holdout_records: Sequence[Mapping[str, Any]] | None = None,
                           baseline_records: Sequence[Mapping[str, Any]] | None = None,
-                          holdout_baseline_records: Sequence[Mapping[str, Any]] | None = None) -> Path:
+    holdout_baseline_records: Sequence[Mapping[str, Any]] | None = None) -> Path:
     """Write the report and deterministic compact replay-record sidecar."""
     report_path = Path(path)
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    report_payload = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ) + "\n"
     sidecar = report_path.with_name(f"{report_path.stem}.replays.json")
     sidecar_records = [{"ablation": "baseline", **dict(record)} for record in records]
     sidecar_records.extend(
@@ -4831,8 +4834,12 @@ def write_result_document(path: str | Path, document: Mapping[str, Any], *, reco
         str(record.get("seed", "")), str(record.get("seat", "")),
         json.dumps(record, sort_keys=True, separators=(",", ":")),
     ))
-    sidecar.write_text(json.dumps({"schema_version": 1, "records": sidecar_records}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
-    return sidecar
+    sidecar_payload = json.dumps(
+        {"schema_version": 1, "records": sidecar_records},
+        sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ) + "\n"
+    atomic_write_text(report_path, report_payload, name="evaluation report path")
+    return atomic_write_text(sidecar, sidecar_payload, name="evaluation sidecar path")
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1460,6 +1460,35 @@ def test_sidecar_sort_order_includes_seat(tmp_path):
     assert [record["seat"] for record in ordered] == [0, 1]
 
 
+def test_write_result_document_rejects_non_finite_json_before_publication(tmp_path):
+    from scripts.evaluate import write_result_document
+
+    output = tmp_path / "evaluation.json"
+    with pytest.raises(ValueError, match="Out of range|finite|JSON"):
+        write_result_document(output, {"metric": float("nan")}, records=[])
+
+    assert not output.exists()
+    assert not output.with_name("evaluation.replays.json").exists()
+
+
+def test_write_result_document_rejects_protected_and_symlinked_destinations(tmp_path):
+    from scripts.evaluate import write_result_document
+
+    with pytest.raises(ValueError, match="production|protected"):
+        write_result_document(tmp_path / "model.json", {}, records=[])
+    with pytest.raises(ValueError, match="production"):
+        write_result_document(tmp_path / "models" / "evaluation.json", {}, records=[])
+
+    target = tmp_path / "target.json"
+    target.write_text("keep\n", encoding="utf-8")
+    link = tmp_path / "evaluation.json"
+    link.symlink_to(target)
+    with pytest.raises(ValueError, match="symlink"):
+        write_result_document(link, {}, records=[])
+
+    assert target.read_text(encoding="utf-8") == "keep\n"
+
+
 def test_malformed_successful_worker_output_is_normalized(monkeypatch):
     import scripts.evaluate as evaluate
 
@@ -4760,6 +4789,9 @@ def test_result_document_exposes_per_opponent_metrics_and_promotion_evidence():
     evidence = document["promotion_evidence"]["melon"]
     assert evidence["status"] == "baseline"
     assert evidence["matrix_complete"] is True
+    assert evidence["matrix_completeness"]["observed"] == [
+        ["pass", 1, 0], ["pass", 1, 1], ["random", 1, 0], ["random", 1, 1],
+    ]
     assert evidence["metrics_by_opponent"] == metrics
 
 

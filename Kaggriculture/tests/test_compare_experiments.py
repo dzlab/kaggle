@@ -7,6 +7,7 @@ def _report(*, seeds=(1,), win_rate=0.5, elo=1000.0, bank=0.0, safety=0.0):
     expected = [["hard", seed, seat] for seed in seeds for seat in (0, 1)]
     matrix = {
         "expected": expected,
+        "observed": expected,
         "expected_count": len(expected),
         "observed_count": len(expected),
         "missing": [], "duplicate": [], "extra": [], "invalid_records": 0,
@@ -84,3 +85,79 @@ def test_compare_cli_writes_json_and_markdown(tmp_path):
     ]) == 0
     assert json.loads(output_json.read_text(encoding="utf-8"))["deltas"][0]["win_rate_delta"] == pytest.approx(0.25)
     assert output_markdown.read_text(encoding="utf-8").startswith("# Experiment comparison")
+
+
+def test_compare_reports_requires_complete_exact_observed_evidence(tmp_path):
+    from scripts.compare_experiments import compare_reports
+
+    first = _report()
+    incomplete = _report()
+    del incomplete["promotion_evidence"]["candidate"]["matrix_completeness"]["observed"]
+    missing = _report()
+    missing["promotion_evidence"]["candidate"]["matrix_completeness"]["observed"] = [["hard", 1, 0]]
+
+    first_path = tmp_path / "first.json"
+    incomplete_path = tmp_path / "incomplete.json"
+    missing_path = tmp_path / "missing.json"
+    first_path.write_text(json.dumps(first), encoding="utf-8")
+    incomplete_path.write_text(json.dumps(incomplete), encoding="utf-8")
+    missing_path.write_text(json.dumps(missing), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="evidence|observed"):
+        compare_reports([first_path, incomplete_path])
+    with pytest.raises(ValueError, match="matrix|observed"):
+        compare_reports([first_path, missing_path])
+
+
+@pytest.mark.parametrize("observed", [
+    [["hard", 1, 0], ["hard", 1, 0], ["hard", 1, 1]],
+    [["hard", 1, 0], ["hard", 1, 1], ["other", 1, 0]],
+])
+def test_compare_reports_rejects_duplicate_or_extra_observed_coordinates(tmp_path, observed):
+    from scripts.compare_experiments import compare_reports
+
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text(json.dumps(_report()), encoding="utf-8")
+    invalid = _report()
+    invalid["promotion_evidence"]["candidate"]["matrix_completeness"]["observed"] = observed
+    invalid["promotion_evidence"]["candidate"]["matrix_completeness"]["observed_count"] = len(observed)
+    second.write_text(json.dumps(invalid), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="matrix|observed"):
+        compare_reports([first, second])
+
+
+def test_compare_reports_rejects_non_finite_metrics_and_json_constants(tmp_path):
+    from scripts.compare_experiments import compare_reports
+
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text(json.dumps(_report()), encoding="utf-8")
+    second.write_text(json.dumps(_report()).replace("0.5", "NaN", 1), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="finite|JSON"):
+        compare_reports([first, second])
+
+
+def test_compare_cli_rejects_protected_and_symlinked_outputs(tmp_path):
+    from scripts.compare_experiments import main
+
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text(json.dumps(_report()), encoding="utf-8")
+    second.write_text(json.dumps(_report(win_rate=0.75)), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="production|protected"):
+        main([
+            str(first), str(second), "--json-output", str(tmp_path / "model.json"),
+        ])
+
+    target = tmp_path / "target.md"
+    target.write_text("keep\n", encoding="utf-8")
+    link = tmp_path / "link.md"
+    link.symlink_to(target)
+    with pytest.raises(ValueError, match="symlink"):
+        main([
+            str(first), str(second), "--markdown-output", str(link),
+        ])

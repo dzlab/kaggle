@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from scripts.output_paths import atomic_write_text
+
 
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"JSON contains non-finite constant {value}")
 
 
 def _manifest(report: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -22,6 +29,25 @@ def _manifest(report: Mapping[str, Any]) -> Mapping[str, Any]:
     if not isinstance(manifest, Mapping):
         raise ValueError("report is missing a reproducibility manifest for matrix comparison")
     return manifest
+
+
+def _coordinate(value: Any, *, label: str) -> tuple[str, int, int]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or len(value) != 3:
+        raise ValueError(f"{label} matrix coordinates are invalid")
+    opponent, seed, seat = value
+    if (
+        type(opponent) is not str or not opponent
+        or type(seed) is not int
+        or type(seat) is not int or seat not in (0, 1)
+    ):
+        raise ValueError(f"{label} matrix coordinates are invalid")
+    return opponent, seed, seat
+
+
+def _coordinate_list(value: Any, *, label: str) -> list[tuple[str, int, int]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError(f"{label} matrix coordinates are missing")
+    return [_coordinate(item, label=label) for item in value]
 
 
 def _matrix_signature(report: Mapping[str, Any]) -> dict[str, Any]:
@@ -64,6 +90,88 @@ def _matrix_signature(report: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _candidate_evidence(report: Mapping[str, Any], candidate: str) -> Mapping[str, Any]:
+    evidence = _mapping(report.get("promotion_evidence")).get(candidate)
+    if isinstance(evidence, Mapping):
+        return evidence
+    decisions = _mapping(report.get("promotion_decisions")).get(candidate)
+    if isinstance(decisions, Mapping):
+        return decisions
+    raise ValueError(f"report is missing complete promotion evidence for candidate {candidate}")
+
+
+def _validate_matrix_evidence(
+    evidence: Mapping[str, Any], signature: Mapping[str, Any], *, candidate: str,
+) -> None:
+    matrix = evidence.get("matrix_completeness")
+    if not isinstance(matrix, Mapping):
+        raise ValueError(f"report is missing complete matrix evidence for candidate {candidate}")
+    expected = _coordinate_list(matrix.get("expected"), label="expected")
+    observed = _coordinate_list(matrix.get("observed"), label="observed")
+    coordinates = [tuple(value) for value in signature["coordinates"]]
+    if sorted(expected) != sorted(coordinates):
+        raise ValueError(f"report matrix evidence is incompatible with its manifest for candidate {candidate}")
+    if sorted(observed) != sorted(coordinates) or len(set(observed)) != len(observed):
+        raise ValueError(f"report matrix evidence has incomplete observed coordinates for candidate {candidate}")
+    matrix_complete = evidence.get("matrix_complete")
+    if matrix_complete is None:
+        matrix_complete = (
+            matrix.get("expected_count") == len(coordinates)
+            and matrix.get("observed_count") == len(coordinates)
+            and all(matrix.get(key) == [] for key in ("missing", "duplicate", "extra"))
+            and matrix.get("invalid_records") == 0
+        )
+    if matrix_complete is not True:
+        raise ValueError(f"report matrix evidence is incomplete for candidate {candidate}")
+    if matrix.get("expected_count") != len(coordinates) or matrix.get("observed_count") != len(coordinates):
+        raise ValueError(f"report matrix evidence has inconsistent counts for candidate {candidate}")
+    for key in ("missing", "duplicate", "extra"):
+        values = matrix.get(key)
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes)) or values:
+            raise ValueError(f"report matrix evidence is incomplete for candidate {candidate}")
+    if matrix.get("invalid_records") != 0:
+        raise ValueError(f"report matrix evidence is incomplete for candidate {candidate}")
+
+
+def _validate_finite_values(value: Any, *, label: str) -> None:
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return
+    if isinstance(value, (int, float)):
+        try:
+            finite = math.isfinite(float(value))
+        except OverflowError:
+            finite = False
+        if not finite:
+            raise ValueError(f"{label} must contain only finite numeric metrics")
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _validate_finite_values(item, label=f"{label}.{key}")
+        return
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        for index, item in enumerate(value):
+            _validate_finite_values(item, label=f"{label}[{index}]")
+
+
+def _validate_report_evidence(report: Mapping[str, Any], metrics: Mapping[str, Any], signature: Mapping[str, Any]) -> None:
+    for candidate, opponent_metrics in metrics.items():
+        if not isinstance(candidate, str) or not isinstance(opponent_metrics, Mapping):
+            raise ValueError("report metrics must be keyed by candidate and opponent")
+        evidence = _candidate_evidence(report, candidate)
+        _validate_matrix_evidence(evidence, signature, candidate=candidate)
+        _validate_finite_values(opponent_metrics, label=f"metrics_by_opponent.{candidate}")
+        _validate_finite_values(evidence, label=f"promotion_evidence.{candidate}")
+        expected_opponents = set(signature["opponents"])
+        if set(opponent_metrics) != expected_opponents:
+            raise ValueError(f"report metrics are incomplete for candidate {candidate}")
+
+    holdout = report.get("holdout")
+    if isinstance(holdout, Mapping):
+        holdout_signature = _matrix_signature(holdout)
+        holdout_metrics = _candidate_metrics(holdout)
+        _validate_report_evidence(holdout, holdout_metrics, holdout_signature)
+
+
 def _candidate_metrics(report: Mapping[str, Any]) -> Mapping[str, Any]:
     metrics = report.get("metrics_by_opponent")
     if isinstance(metrics, Mapping):
@@ -103,16 +211,19 @@ def _number(value: Any) -> float | None:
         return None
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
-    return result
+    return result if math.isfinite(result) else None
 
 
 def _metric(summary: Mapping[str, Any], *keys: str) -> float | None:
     for key in keys:
+        if key not in summary or summary.get(key) is None:
+            continue
         value = _number(summary.get(key))
-        if value is not None:
-            return value
+        if value is None:
+            raise ValueError(f"metric {key} must be a finite number")
+        return value
     return None
 
 
@@ -142,8 +253,11 @@ def compare_reports(report_paths: Sequence[str | Path]) -> dict[str, Any]:
     reports = []
     for path in paths:
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            value = json.loads(
+                path.read_text(encoding="utf-8"),
+                parse_constant=_reject_json_constant,
+            )
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
             raise ValueError(f"cannot load report {path}: {exc}") from exc
         if not isinstance(value, Mapping):
             raise ValueError(f"report {path} must contain a JSON object")
@@ -154,6 +268,8 @@ def compare_reports(report_paths: Sequence[str | Path]) -> dict[str, Any]:
         raise ValueError("reports use an incompatible evaluation matrix")
 
     metric_views = [_candidate_metrics(report) for report in reports]
+    for report, metrics, signature in zip(reports, metric_views, signatures):
+        _validate_report_evidence(report, metrics, signature)
     base_candidates = list(metric_views[0])
     rows: list[dict[str, Any]] = []
     for report_index in range(1, len(reports)):
@@ -235,13 +351,11 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
     markdown = render_markdown(comparison)
-    encoded = json.dumps(comparison, sort_keys=True, indent=2) + "\n"
+    encoded = json.dumps(comparison, sort_keys=True, indent=2, allow_nan=False) + "\n"
     if args.json_output:
-        args.json_output.parent.mkdir(parents=True, exist_ok=True)
-        args.json_output.write_text(encoded, encoding="utf-8")
+        atomic_write_text(args.json_output, encoded, name="comparison JSON output path")
     if args.markdown_output:
-        args.markdown_output.parent.mkdir(parents=True, exist_ok=True)
-        args.markdown_output.write_text(markdown, encoding="utf-8")
+        atomic_write_text(args.markdown_output, markdown, name="comparison Markdown output path")
     if not args.json_output and not args.markdown_output:
         sys.stdout.write(encoded)
         sys.stdout.write(markdown)

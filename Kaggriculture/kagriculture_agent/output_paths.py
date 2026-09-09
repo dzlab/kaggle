@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 
 PRODUCTION_DIRECTORY_NAMES = frozenset({
@@ -59,3 +60,49 @@ def validate_training_output_path(
     if candidate.name.lower() in protected_names:
         raise ValueError(f"{name} may not target a production artifact or checkpoint")
     return candidate
+
+
+def _fsync_parent_directory(path: str | Path) -> None:
+    """Durably flush a directory after atomically publishing a child entry."""
+    directory = Path(path)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(directory, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def atomic_write_text(
+    value: str | Path,
+    text: str,
+    *,
+    name: str = "output",
+) -> Path:
+    """Validate and atomically publish UTF-8 text without following symlinks."""
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    path = validate_training_output_path(
+        value, name=name, reject_protected_names=True, reject_symlink_components=True,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path = validate_training_output_path(
+        path, name=name, reject_protected_names=True, reject_symlink_components=True,
+    )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        path = validate_training_output_path(
+            path, name=name, reject_protected_names=True, reject_symlink_components=True,
+        )
+        os.replace(temporary_path, path)
+        _fsync_parent_directory(path.parent)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return path
