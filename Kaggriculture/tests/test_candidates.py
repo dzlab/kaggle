@@ -35,3 +35,17 @@ def test_artifact_candidate_policy_reports_invalid_artifact(monkeypatch, tmp_pat
 
     with pytest.raises(ValueError, match="candidate artifact is not valid: ValueError: invalid"):
         candidates.artifact_candidate_policy(artifact)
+
+
+def test_artifact_candidate_policy_caches_one_load_failure(monkeypatch, tmp_path):
+    artifact = tmp_path / "broken.json"
+    artifact.write_text("bad")
+    calls = []
+    monkeypatch.setattr(
+        candidates, "load_exported_policy",
+        lambda path: calls.append(path) or (_ for _ in ()).throw(ValueError("bad")),
+    )
+    for _ in range(2):
+        with pytest.raises(ValueError, match="candidate artifact is not valid"):
+            candidates.artifact_candidate_policy(artifact)
+    assert len(calls) == 1
