@@ -893,6 +893,28 @@ def _remove_pickup_sale_conflicts(market: Sequence[Sequence[Any]], commands: Map
     )]
 
 
+def _bound_pickup_commands(
+    state: Any, commands: Mapping[int, Sequence[Any]],
+) -> dict[int, list[Any]]:
+    """Keep assembled PICKUP commands within each shed item's quantity."""
+    remaining = _counts(_shed(state))
+    bounded: dict[int, list[Any]] = {}
+    for worker_index in sorted(commands):
+        command = list(commands[worker_index])
+        if len(command) < 2 or command[0] != "PICKUP":
+            bounded[worker_index] = command
+            continue
+        item = str(command[1]).upper()
+        requested = _whole(command[2], 1) if len(command) >= 3 else 1
+        quantity = min(requested, remaining.get(item, 0))
+        if quantity <= 0:
+            bounded[worker_index] = [PASS]
+            continue
+        bounded[worker_index] = ["PICKUP", item, quantity]
+        remaining[item] -= quantity
+    return bounded
+
+
 def _market_order_direction(order: Any) -> tuple[str, str] | None:
     if not isinstance(order, Sequence) or isinstance(order, (str, bytes)) or len(order) < 2:
         return None
@@ -1350,6 +1372,7 @@ class Policy:
                 )
                 if drop is not None:
                     commands[worker["index"]] = _unit_command(drop)
+        commands = _bound_pickup_commands(state, commands)
         farmer = commands.get(0, [PASS])
         market_plan = build_daily_plan(_state_for_planner(state), self.memory, strategy_spec)
         market_plan.extend(macro.get("market_intents", ()))
