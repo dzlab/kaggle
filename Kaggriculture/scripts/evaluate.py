@@ -46,6 +46,12 @@ from kagriculture_agent.planner import _has_basic_need_deadline  # noqa: E402
 from kagriculture_agent.policy import Policy  # noqa: E402
 from scripts.run_local import OPPONENTS, _deterministic_random_agent  # noqa: E402
 from scripts.evaluation_metrics import bradley_terry_summary as _league_elo_summary  # noqa: E402
+from scripts.training_identity import (  # noqa: E402
+    DEFAULT_EXPERIMENT_ID,
+    FEATURE_VARIANTS,
+    TRAINING_MODES,
+    validate_training_identity,
+)
 
 
 VARIANTS = ("conservative", "mixed", "melon-heavy", "demand-reactive", "animal-heavy")
@@ -100,13 +106,6 @@ _STRICT_NUMERIC_FIELDS = frozenset({
 })
 _STRICT_QUANTITY_MAPPING_FIELDS = frozenset({"inventory", "prices", "shed", "seeds"})
 _BASELINE_CONVENTION = "the first configured candidate is the baseline for promotion decisions"
-DEFAULT_EXPERIMENT_ID = "orbit-policy-v1"
-FEATURE_VARIANTS = ("production_v1", "experimental_context_v1")
-TRAINING_MODES = (
-    "behavior_clone_then_ppo",
-    "pure_ppo",
-    "reduced_behavior_clone_then_ppo",
-)
 
 
 def _manifest_candidate_metadata(candidate: str, *, selection_path: str = "candidate") -> dict[str, Any]:
@@ -4088,12 +4087,7 @@ def build_manifest(*, candidates: Sequence[str], opponents: Sequence[str], seeds
         "training_mode": training_mode,
     }
     if any(value is not None for value in identity.values()):
-        if type(experiment_id) is not str or not experiment_id.strip():
-            raise ValueError("experiment_id must be a non-empty string")
-        if feature_variant not in FEATURE_VARIANTS:
-            raise ValueError(f"feature_variant must be one of: {', '.join(FEATURE_VARIANTS)}")
-        if training_mode not in TRAINING_MODES:
-            raise ValueError(f"training_mode must be one of: {', '.join(TRAINING_MODES)}")
+        validate_training_identity(experiment_id, feature_variant, training_mode)
         manifest.update(identity)
     return manifest
 

@@ -350,7 +350,7 @@ def test_colab_workflow_builds_parameterized_commands(tmp_path, monkeypatch):
     assert collection[collection.index("--steps") + 1] == "48"
     assert collection[collection.index("--workers") + 1] == "3"
     assert collection[collection.index("--output") + 1] == str(tmp_path / "input.jsonl")
-    assert collection[collection.index("--source-policy-identity") + 1] == config.experiment_id
+    assert collection[collection.index("--source-policy-identity") + 1] == "current"
 
     development = colab_train.build_evaluation_command(config, phase="development")
     assert development[development.index("--artifact") + 1] == str(config.stage_artifact_path)
@@ -497,6 +497,9 @@ def _complete_colab_evaluation_report(config, *, phase):
     return {
         "schema_version": 1,
         "configuration": {
+            "experiment_id": config.experiment_id,
+            "feature_variant": config.feature_variant,
+            "training_mode": config.training_mode,
             "seed_values": list(seeds),
             "opponents": list(opponents),
             "seats": list(seats),
@@ -510,6 +513,96 @@ def _complete_colab_evaluation_report(config, *, phase):
         "matrix_completeness": completeness,
         "decision": {"status": "promote"},
     }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("experiment_id", "different-experiment"),
+        ("feature_variant", "production_v1"),
+        ("training_mode", "pure_ppo"),
+    ],
+)
+def test_run_evaluation_rejects_mismatched_identity_without_rewriting_report(
+    tmp_path, monkeypatch, field, value,
+):
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        experiment_id="requested-experiment",
+        feature_variant="experimental_context_v1",
+        training_mode="reduced_behavior_clone_then_ppo",
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+    report = _complete_colab_evaluation_report(config, phase="development")
+    report["configuration"][field] = value
+    report_path = config.development_report_path
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, sort_keys=True), encoding="utf-8")
+    original_report = report_path.read_bytes()
+
+    def fake_run(command, *, check):
+        report_path.write_bytes(original_report)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(colab_train, "run_command", fake_run)
+
+    with pytest.raises(ValueError, match=field):
+        colab_train._run_evaluation(
+            config, phase="development", command=("fake-evaluator",),
+            report_path=report_path,
+        )
+
+    assert report_path.read_bytes() == original_report
+
+
+def test_fresh_rollout_does_not_rewrite_published_manifest(tmp_path, monkeypatch):
+    from scripts import train_policy
+
+    artifact = tmp_path / "candidate.json"
+    artifact.write_text("artifact", encoding="utf-8")
+
+    def fake_collect(*, output, candidate_artifact, **kwargs):
+        manifest_path = Path(output).with_suffix(".manifest.json")
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "source_policy_identity": kwargs["source_policy_identity"],
+            "experiment_id": kwargs["experiment_id"],
+            "feature_variant": kwargs["feature_variant"],
+            "training_mode": kwargs["training_mode"],
+        }
+        with manifest_path.open("w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, sort_keys=True)
+        Path(output).write_text(json.dumps({"step": 1}) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr("scripts.collect_trajectories.collect", fake_collect)
+    original_write_text = Path.write_text
+
+    def reject_manifest_rewrite(self, data, *args, **kwargs):
+        if self.name.endswith(".manifest.json"):
+            raise AssertionError("published rollout manifest was rewritten")
+        return original_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", reject_manifest_rewrite)
+    rollout_fn = train_policy.make_fresh_rollout_fn(
+        run_directory=tmp_path, candidate_artifact=artifact,
+        seeds=[41], steps=4,
+        experiment_id="orbit-context-test",
+        feature_variant="experimental_context_v1",
+        training_mode="reduced_behavior_clone_then_ppo",
+    )
+
+    rollout_fn(
+        step=0, seed=41, opponent="pass", seat=0, checkpoint=None,
+        rollout_steps=3,
+    )
+
+    manifest = json.loads(
+        (tmp_path / "ppo-step-00000.manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["source_policy_identity"].startswith("artifact:")
 
 
 def test_evaluation_report_rejects_self_declared_malformed_matrix(tmp_path, monkeypatch):

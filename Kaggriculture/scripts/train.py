@@ -26,11 +26,13 @@ from kagriculture_agent.checkpoints import CheckpointError, read_checkpoint
 from kagriculture_agent.model import resolve_device
 from scripts.telemetry import record_validation_report
 from scripts.train_policy import (
+    TrainingContract,
+    validate_training_checkpoint,
+)
+from scripts.training_identity import (
     DEFAULT_EXPERIMENT_ID,
     FEATURE_VARIANTS,
     TRAINING_MODES,
-    TrainingContract,
-    validate_training_checkpoint,
 )
 
 COLLECT_SCRIPT = Path(__file__).with_name("collect_trajectories.py")
@@ -655,7 +657,7 @@ def build_collection_command(config: ColabConfig) -> list[str]:
         "--seats", *(str(seat) for seat in config.collection_seats),
         "--workers", str(config.workers),
         "--output", str(trajectory_path),
-        "--source-policy-identity", config.experiment_id,
+        "--source-policy-identity", "current",
         "--experiment-id", config.experiment_id,
         "--feature-variant", config.feature_variant,
         "--training-mode", config.training_mode,
@@ -986,25 +988,33 @@ def _identity_fields(config: ColabConfig) -> dict[str, str]:
     }
 
 
-def _annotate_json_document(path: Path, config: ColabConfig) -> dict[str, Any] | None:
-    """Attach the immutable experiment identity to an existing JSON document."""
-    if not path.is_file():
-        return None
-    document = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(document, dict):
-        raise ValueError(f"identity document must be an object: {path}")
-    document.update(_identity_fields(config))
+def _validate_identity_document(
+    document: Mapping[str, Any], config: ColabConfig, *, path: Path,
+    require_configuration: bool = False,
+) -> None:
+    """Validate identity already written by the document's atomic producer."""
+    expected = _identity_fields(config)
+    for field, value in expected.items():
+        if field in document and document[field] != value:
+            raise ValueError(
+                f"{path} {field} does not match requested experiment identity"
+            )
     configuration = document.get("configuration")
-    if isinstance(configuration, Mapping):
-        document["configuration"] = {**configuration, **_identity_fields(config)}
+    if require_configuration and not isinstance(configuration, Mapping):
+        raise ValueError(f"{path} configuration is missing experiment identity")
     manifest = document.get("manifest")
-    if isinstance(manifest, Mapping):
-        document["manifest"] = {**manifest, **_identity_fields(config)}
-    path.write_text(
-        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n",
-        encoding="utf-8",
-    )
-    return document
+    for label, nested in (("configuration", configuration), ("manifest", manifest)):
+        if nested is None:
+            continue
+        if not isinstance(nested, Mapping):
+            raise ValueError(f"{path} {label} must be an object")
+        for field, value in expected.items():
+            if field in nested and nested[field] != value:
+                raise ValueError(
+                    f"{path} {label}.{field} does not match requested experiment identity"
+                )
+            if label == "configuration" and require_configuration and field not in nested:
+                raise ValueError(f"{path} configuration.{field} is missing experiment identity")
 
 
 def _invalidate_evaluation_report(path: Path) -> None:
@@ -1026,13 +1036,9 @@ def _run_evaluation(
     if not report_path.exists() or report_path.stat().st_mtime_ns < started_ns:
         raise RuntimeError(f"{phase} evaluator did not write a fresh report: {report_path}")
     report = _read_evaluation_report(report_path)
-    _annotate_json_document(report_path, config)
-    configuration = report.get("configuration")
-    if isinstance(configuration, Mapping):
-        report["configuration"] = {**configuration, **_identity_fields(config)}
-    manifest = report.get("manifest")
-    if isinstance(manifest, Mapping):
-        report["manifest"] = {**manifest, **_identity_fields(config)}
+    if not isinstance(report, Mapping):
+        raise ValueError(f"{report_path} must contain an object")
+    _validate_identity_document(report, config, path=report_path, require_configuration=True)
     return completed, report
 
 
@@ -1103,9 +1109,6 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
         mount_drive(config)
     config.run_directory.mkdir(parents=True, exist_ok=True)
     run_command(commands[0], check=True)
-    _annotate_json_document(
-        config.trajectory_path.with_suffix(".manifest.json"), config,
-    )
 
     from scripts import train_policy
 

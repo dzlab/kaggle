@@ -40,16 +40,17 @@ from kagriculture_agent.model import (
     set_training_seed,
 )
 from kagriculture_agent.reward_shaping import shaped_transition_reward, should_bootstrap_truncate
+from scripts.training_identity import (
+    DEFAULT_EXPERIMENT_ID,
+    FEATURE_VARIANTS,
+    TRAINING_MODES,
+    validate_experiment_id,
+    validate_feature_variant,
+    validate_training_mode,
+)
 
 PROMOTION_MATCH_SIZE = 100
 LOG_RATIO_CLAMP = 20.0
-DEFAULT_EXPERIMENT_ID = "orbit-policy-v1"
-FEATURE_VARIANTS = ("production_v1", "experimental_context_v1")
-TRAINING_MODES = (
-    "behavior_clone_then_ppo",
-    "pure_ppo",
-    "reduced_behavior_clone_then_ppo",
-)
 # PPO starts from a behavior-cloned policy and uses a small trust-region step.
 # The BC optimizer state is cleared before this phase; this rate keeps the first
 # on-policy update below the default target-KL gate on the compact network.
@@ -160,24 +161,15 @@ _PPO_OPTIONAL_RESUME_METRIC_FIELDS = {"shaping_count", "truncation_count"}
 
 
 def _validate_experiment_id(value: Any, *, source: str) -> None:
-    if type(value) is not str or not value.strip():
-        raise ValueError(f"{source} configuration experiment_id must be a non-empty string")
+    validate_experiment_id(value, source=f"{source} configuration")
 
 
 def _validate_feature_variant(value: Any, *, source: str) -> None:
-    if value not in FEATURE_VARIANTS:
-        choices = ", ".join(FEATURE_VARIANTS)
-        raise ValueError(
-            f"{source} configuration feature_variant must be one of: {choices}"
-        )
+    validate_feature_variant(value, source=f"{source} configuration")
 
 
 def _validate_training_mode(value: Any, *, source: str) -> None:
-    if value not in TRAINING_MODES:
-        choices = ", ".join(TRAINING_MODES)
-        raise ValueError(
-            f"{source} configuration training_mode must be one of: {choices}"
-        )
+    validate_training_mode(value, source=f"{source} configuration")
 
 
 def _validate_content_identity(value: Any, *, source: str, label: str) -> None:
@@ -2038,20 +2030,6 @@ def make_fresh_rollout_fn(
             no_progress_window=no_progress_window,
             resolved_margin=resolved_margin,
         )
-        manifest_path = output.with_suffix(".manifest.json")
-        if manifest_path.is_file():
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if not isinstance(manifest, dict):
-                raise ValueError("rollout manifest must be an object")
-            manifest.update({
-                "experiment_id": experiment_id,
-                "feature_variant": feature_variant,
-                "training_mode": training_mode,
-            })
-            manifest_path.write_text(
-                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
-                encoding="utf-8",
-            )
         return [
             json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
             if line.strip()
