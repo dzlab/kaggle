@@ -13,8 +13,13 @@ import importlib
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 from typing import Any
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from kagriculture_agent.model_topology import compact_policy_parameter_count
 from scripts.output_paths import validate_training_output_path

@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -73,6 +74,36 @@ def test_dry_run_expansion_only_estimates_isolated_experiments():
     assert report["experiments"][0]["parameter_estimate"] == 578_596
     assert "checkpoint" not in json.dumps(report).lower()
     assert "models/" not in json.dumps(report).lower()
+
+
+@pytest.mark.parametrize("arguments", [
+    ["--help"],
+    [
+        "--ladder",
+        json.dumps({"widths": [8], "depths": [1], "ppo_budgets": [1], "seeds": [3]}),
+        "--dry-run",
+    ],
+])
+def test_direct_file_ladder_cli_bootstraps_project_root(arguments):
+    project_root = Path(__file__).resolve().parents[1]
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    completed = subprocess.run(
+        [sys.executable, str(project_root / "scripts" / "benchmark_training_ladder.py"), *arguments],
+        cwd=project_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    if arguments == ["--help"]:
+        assert "usage:" in completed.stdout
+    else:
+        report = json.loads(completed.stdout)
+        assert report["dry_run"] is True
+        assert report["experiment_count"] == 1
 
 
 @pytest.mark.parametrize("width,depth", [(128, 4), (128, 8), (256, 4), (256, 8)])
