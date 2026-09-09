@@ -122,6 +122,24 @@ def test_training_telemetry_initializes_wandb_and_logs_metrics(tmp_path):
     assert fake_wandb.run.finish_calls == 1
 
 
+def test_wandb_config_preserves_experiment_identity(tmp_path):
+    fake_wandb = FakeWandb()
+    TrainingTelemetry(
+        tmp_path / "metrics.jsonl", enable_wandb=True, wandb_module=fake_wandb,
+        wandb_config={
+            "experiment_id": "orbit-context-test",
+            "feature_variant": "experimental_context_v1",
+            "training_mode": "reduced_behavior_clone_then_ppo",
+        },
+    )
+
+    assert fake_wandb.init_calls[0]["config"] == {
+        "experiment_id": "orbit-context-test",
+        "feature_variant": "experimental_context_v1",
+        "training_mode": "reduced_behavior_clone_then_ppo",
+    }
+
+
 def test_wandb_initialization_failure_warns_but_local_logging_continues(tmp_path, caplog):
     fake_wandb = FakeWandb(init_error=RuntimeError("login unavailable"))
     telemetry = TrainingTelemetry(
@@ -309,6 +327,9 @@ def test_record_validation_report_emits_raw_games_and_flattened_candidate_summar
 
     record_validation_report(
         telemetry, report, phase="development", checkpoint=12, candidate_tag="ppo16",
+        experiment_id="orbit-context-test",
+        feature_variant="experimental_context_v1",
+        training_mode="reduced_behavior_clone_then_ppo",
     )
 
     events = load_metrics(tmp_path / "metrics.jsonl")
@@ -321,6 +342,9 @@ def test_record_validation_report_emits_raw_games_and_flattened_candidate_summar
     assert games[0]["checkpoint"] == 12
     assert games[0]["candidate_tag"] == "ppo16"
     assert games[0]["candidate"] == "current"
+    assert games[0]["experiment_id"] == "orbit-context-test"
+    assert games[0]["feature_variant"] == "experimental_context_v1"
+    assert games[0]["training_mode"] == "reduced_behavior_clone_then_ppo"
     assert games[0]["bank_differential"] == 25.0
     assert games[0]["terminal_inventory_value"] == 40.0
 

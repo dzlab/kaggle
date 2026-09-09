@@ -1484,6 +1484,64 @@ def test_behavior_cloning_smoke_writes_checkpoint_metadata(tmp_path):
     assert checkpoint["metrics"]["behavior_clone_updates"] == 1
 
 
+def test_training_contract_and_checkpoint_metadata_include_experiment_identity(tmp_path):
+    pytest.importorskip("torch")
+    from scripts import train_policy
+
+    input_path = tmp_path / "transitions.jsonl"
+    output_path = tmp_path / "policy.pt"
+    rows = [_transition(done=False), _transition(done=True, reward=math.tanh(0.3))]
+    input_path.write_text("\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n")
+
+    contract = train_policy.build_training_contract(
+        input_path=input_path, steps=1, batch_size=2, device="cpu",
+        experiment_id="orbit-context-test",
+        feature_variant="experimental_context_v1",
+        training_mode="reduced_behavior_clone_then_ppo",
+    )
+    assert contract.configuration["experiment_id"] == "orbit-context-test"
+    assert contract.configuration["feature_variant"] == "experimental_context_v1"
+    assert contract.configuration["training_mode"] == "reduced_behavior_clone_then_ppo"
+
+    metadata = train_policy.train_behavior_clone(
+        input_path=input_path, output_path=output_path, steps=1, batch_size=2,
+        device="cpu", experiment_id="orbit-context-test",
+        feature_variant="experimental_context_v1",
+        training_mode="reduced_behavior_clone_then_ppo",
+    )
+    assert {
+        key: metadata[key]
+        for key in ("experiment_id", "feature_variant", "training_mode")
+    } == {
+        "experiment_id": "orbit-context-test",
+        "feature_variant": "experimental_context_v1",
+        "training_mode": "reduced_behavior_clone_then_ppo",
+    }
+
+
+def test_resume_rejects_a_checkpoint_from_another_experiment_identity(tmp_path):
+    pytest.importorskip("torch")
+    from scripts import train_policy
+
+    input_path = tmp_path / "transitions.jsonl"
+    resume_path = tmp_path / "resume.pt"
+    output_path = tmp_path / "continued.pt"
+    rows = [_transition(done=False), _transition(done=True, reward=math.tanh(0.3))]
+    input_path.write_text("\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n")
+    train_policy.train_behavior_clone(
+        input_path=input_path, output_path=resume_path, steps=1, batch_size=2,
+        device="cpu", experiment_id="experiment-a",
+    )
+
+    with pytest.raises(ValueError, match="experiment_id"):
+        train_policy.train_behavior_clone(
+            input_path=input_path, output_path=output_path, steps=1, batch_size=2,
+            device="cpu", experiment_id="experiment-b",
+            resume_checkpoint=resume_path,
+        )
+    assert not output_path.exists()
+
+
 def test_behavior_cloning_emits_loss_and_update_count_at_checkpoint_intervals(tmp_path):
     pytest.importorskip("torch")
     from scripts.train_policy import train_behavior_clone

@@ -43,6 +43,13 @@ from kagriculture_agent.reward_shaping import shaped_transition_reward, should_b
 
 PROMOTION_MATCH_SIZE = 100
 LOG_RATIO_CLAMP = 20.0
+DEFAULT_EXPERIMENT_ID = "orbit-policy-v1"
+FEATURE_VARIANTS = ("production_v1", "experimental_context_v1")
+TRAINING_MODES = (
+    "behavior_clone_then_ppo",
+    "pure_ppo",
+    "reduced_behavior_clone_then_ppo",
+)
 # PPO starts from a behavior-cloned policy and uses a small trust-region step.
 # The BC optimizer state is cleared before this phase; this rate keeps the first
 # on-policy update below the default target-KL gate on the compact network.
@@ -120,6 +127,9 @@ class TrainingContract:
 
 
 _RESUME_CONFIGURATION_FIELDS = (
+    "experiment_id",
+    "feature_variant",
+    "training_mode",
     "input_trajectory",
     "steps",
     "batch_size",
@@ -147,6 +157,27 @@ _PPO_RESUME_METRIC_FIELDS = {
     "promotion", "completed_steps",
 }
 _PPO_OPTIONAL_RESUME_METRIC_FIELDS = {"shaping_count", "truncation_count"}
+
+
+def _validate_experiment_id(value: Any, *, source: str) -> None:
+    if type(value) is not str or not value.strip():
+        raise ValueError(f"{source} configuration experiment_id must be a non-empty string")
+
+
+def _validate_feature_variant(value: Any, *, source: str) -> None:
+    if value not in FEATURE_VARIANTS:
+        choices = ", ".join(FEATURE_VARIANTS)
+        raise ValueError(
+            f"{source} configuration feature_variant must be one of: {choices}"
+        )
+
+
+def _validate_training_mode(value: Any, *, source: str) -> None:
+    if value not in TRAINING_MODES:
+        choices = ", ".join(TRAINING_MODES)
+        raise ValueError(
+            f"{source} configuration training_mode must be one of: {choices}"
+        )
 
 
 def _validate_content_identity(value: Any, *, source: str, label: str) -> None:
@@ -208,6 +239,15 @@ def _validate_configuration_shape(configuration: Any, *, source: str) -> None:
     expected_fields = set(_RESUME_CONFIGURATION_FIELDS) | _RUNTIME_CONFIGURATION_FIELDS
     if type(configuration) is not dict:
         raise ValueError(f"{source} configuration must be an object")
+    for field, default in (
+        ("experiment_id", DEFAULT_EXPERIMENT_ID),
+        ("feature_variant", FEATURE_VARIANTS[0]),
+        ("training_mode", TRAINING_MODES[0]),
+    ):
+        # Older checkpoints and test fixtures predate the identity contract;
+        # treat omitted fields as the production defaults while validating all
+        # newly-created contracts strictly below.
+        configuration.setdefault(field, default)
     missing = sorted(expected_fields - set(configuration))
     unexpected = sorted(set(configuration) - expected_fields)
     if missing:
@@ -228,6 +268,9 @@ def _validate_configuration_shape(configuration: Any, *, source: str) -> None:
             )
     if type(configuration["seed"]) is not int:
         raise ValueError(f"{source} configuration seed must be an integer")
+    _validate_experiment_id(configuration["experiment_id"], source=source)
+    _validate_feature_variant(configuration["feature_variant"], source=source)
+    _validate_training_mode(configuration["training_mode"], source=source)
     if type(configuration["device"]) is not str or not configuration["device"]:
         raise ValueError(f"{source} configuration device must be a nonempty string")
     if type(configuration["offline_ppo_fallback"]) is not bool:
@@ -244,6 +287,9 @@ def build_training_contract(
     prior_checkpoint: str | Path | None = None,
     offline_ppo_fallback: bool = False, resolved_device: Any | None = None,
     ppo_config: PPOConfig | None = None,
+    experiment_id: str = DEFAULT_EXPERIMENT_ID,
+    feature_variant: str = "production_v1",
+    training_mode: str = "behavior_clone_then_ppo",
 ) -> TrainingContract:
     """Build the canonical input/configuration contract used by training and resume.
 
@@ -266,6 +312,9 @@ def build_training_contract(
         raise ValueError("checkpoint_interval must be a positive integer")
     if type(offline_ppo_fallback) is not bool:
         raise ValueError("offline_ppo_fallback must be boolean")
+    _validate_experiment_id(experiment_id, source="requested")
+    _validate_feature_variant(feature_variant, source="requested")
+    _validate_training_mode(training_mode, source="requested")
     if ppo_config is not None and not isinstance(ppo_config, PPOConfig):
         raise ValueError("ppo_config must be a PPOConfig or None")
     resolved = resolve_device(device) if resolved_device is None else resolved_device
@@ -274,6 +323,9 @@ def build_training_contract(
     input_identity = _trajectory_identity(input_path)
     transitions = _read_transitions(input_path)
     configuration = {
+        "experiment_id": experiment_id,
+        "feature_variant": feature_variant,
+        "training_mode": training_mode,
         "input_trajectory": input_identity,
         "steps": normalized_steps,
         "batch_size": normalized_batch_size,
@@ -1502,7 +1554,13 @@ def run_ppo_training(
 
 def _checkpoint_metadata(
     transition_count: int, config: PPOConfig | None = None, *, device: Any = "cpu",
+    experiment_id: str = DEFAULT_EXPERIMENT_ID,
+    feature_variant: str = "production_v1",
+    training_mode: str = "behavior_clone_then_ppo",
 ) -> dict[str, Any]:
+    _validate_experiment_id(experiment_id, source="checkpoint metadata")
+    _validate_feature_variant(feature_variant, source="checkpoint metadata")
+    _validate_training_mode(training_mode, source="checkpoint metadata")
     return {
         "model_version": MODEL_VERSION,
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
@@ -1511,13 +1569,24 @@ def _checkpoint_metadata(
         "transition_count": int(transition_count),
         "ppo_config": asdict(config or PPOConfig()),
         "device": str(device),
+        "experiment_id": experiment_id,
+        "feature_variant": feature_variant,
+        "training_mode": training_mode,
     }
 
 
 def checkpoint_metadata(
     transition_count: int, config: PPOConfig | None = None, *, device: Any = "cpu",
+    experiment_id: str = DEFAULT_EXPERIMENT_ID,
+    feature_variant: str = "production_v1",
+    training_mode: str = "behavior_clone_then_ppo",
 ) -> dict[str, Any]:
-    return _checkpoint_metadata(transition_count, config, device=device)
+    return _checkpoint_metadata(
+        transition_count, config, device=device,
+        experiment_id=experiment_id,
+        feature_variant=feature_variant,
+        training_mode=training_mode,
+    )
 
 
 def _candidate_won(result: Any) -> bool:
@@ -1807,13 +1876,19 @@ def _validate_resume_payload(
         )
     if type(metadata.get("device")) is not str or not metadata["device"]:
         raise ValueError("resume checkpoint metadata device must be a nonempty string")
+    saved_configuration = payload["configuration"]
+    for field in ("experiment_id", "feature_variant", "training_mode"):
+        if field in metadata and metadata[field] != saved_configuration[field]:
+            raise ValueError(
+                f"resume checkpoint metadata {field} does not match saved configuration"
+            )
     if "ppo_steps" in metadata:
         metadata_ppo_steps = metadata["ppo_steps"]
         if type(metadata_ppo_steps) is not int or metadata_ppo_steps < 0:
             raise ValueError(
                 "resume checkpoint metadata ppo_steps must be a nonnegative integer"
             )
-        saved_ppo_steps = payload["configuration"]["ppo_steps"]
+        saved_ppo_steps = saved_configuration["ppo_steps"]
         if metadata_ppo_steps != saved_ppo_steps:
             raise ValueError(
                 "resume checkpoint metadata ppo_steps does not match saved configuration"
@@ -1846,6 +1921,9 @@ def make_fresh_rollout_fn(
     seeds: Sequence[int], steps: int, workers: int = 1,
     game_timeout: float = 120.0, candidate_identity: str | None = None,
     no_progress_window: int = 0, resolved_margin: float = 0.0,
+    experiment_id: str = DEFAULT_EXPERIMENT_ID,
+    feature_variant: str = "production_v1",
+    training_mode: str = "behavior_clone_then_ppo",
 ) -> Any:
     """Build a collector-backed callback for one fresh PPO rollout per step.
 
@@ -1871,6 +1949,9 @@ def make_fresh_rollout_fn(
         raise FileNotFoundError(f"candidate artifact does not exist: {artifact}")
     if candidate_artifact_callback is not None and not callable(candidate_artifact_callback):
         raise TypeError("candidate_artifact_callback must be callable")
+    _validate_experiment_id(experiment_id, source="rollout")
+    _validate_feature_variant(feature_variant, source="rollout")
+    _validate_training_mode(training_mode, source="rollout")
     if type(steps) is not int or steps < 2:
         raise ValueError("steps must be at least 2 to produce a transition")
     if type(no_progress_window) is not int or no_progress_window < 0:
@@ -1954,6 +2035,20 @@ def make_fresh_rollout_fn(
             no_progress_window=no_progress_window,
             resolved_margin=resolved_margin,
         )
+        manifest_path = output.with_suffix(".manifest.json")
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("rollout manifest must be an object")
+            manifest.update({
+                "experiment_id": experiment_id,
+                "feature_variant": feature_variant,
+                "training_mode": training_mode,
+            })
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
         return [
             json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
             if line.strip()
@@ -1977,6 +2072,9 @@ def train_behavior_clone(
     checkpoint_registry: dict[str, Any] | None = None,
     candidate_artifact: str | Path | None = None,
     telemetry_callback: Any | None = None,
+    experiment_id: str = DEFAULT_EXPERIMENT_ID,
+    feature_variant: str = "production_v1",
+    training_mode: str = "behavior_clone_then_ppo",
 ) -> dict[str, Any]:
     """Run complete behavior-cloning epochs, optional PPO, and checkpoint."""
     if type(allow_ppo_extension) is not bool:
@@ -2005,6 +2103,9 @@ def train_behavior_clone(
         offline_ppo_fallback=offline_ppo_fallback,
         resolved_device=resolved_device,
         ppo_config=ppo_config,
+        experiment_id=experiment_id,
+        feature_variant=feature_variant,
+        training_mode=training_mode,
     )
     configuration = contract.configuration
     transitions = _read_transitions(input_path)
@@ -2050,6 +2151,9 @@ def train_behavior_clone(
         raise
     metadata = _checkpoint_metadata(
         len(transitions), ppo_config, device=resolved_device,
+        experiment_id=experiment_id,
+        feature_variant=feature_variant,
+        training_mode=training_mode,
     )
     metadata["ppo_steps"] = int(ppo_steps)
     metadata["behavior_clone_epochs"] = epochs

@@ -100,6 +100,13 @@ _STRICT_NUMERIC_FIELDS = frozenset({
 })
 _STRICT_QUANTITY_MAPPING_FIELDS = frozenset({"inventory", "prices", "shed", "seeds"})
 _BASELINE_CONVENTION = "the first configured candidate is the baseline for promotion decisions"
+DEFAULT_EXPERIMENT_ID = "orbit-policy-v1"
+FEATURE_VARIANTS = ("production_v1", "experimental_context_v1")
+TRAINING_MODES = (
+    "behavior_clone_then_ppo",
+    "pure_ppo",
+    "reduced_behavior_clone_then_ppo",
+)
 
 
 def _manifest_candidate_metadata(candidate: str, *, selection_path: str = "candidate") -> dict[str, Any]:
@@ -260,6 +267,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--opponents", nargs="+", choices=OPPONENTS, default=["pass", "random", "starter"])
     parser.add_argument("--steps", type=_positive_int, default=720)
     parser.add_argument("--output", type=Path, default=Path("reports/evaluation.json"))
+    parser.add_argument("--experiment-id", default=DEFAULT_EXPERIMENT_ID)
+    parser.add_argument("--feature-variant", choices=FEATURE_VARIANTS, default="production_v1")
+    parser.add_argument("--training-mode", choices=TRAINING_MODES, default="behavior_clone_then_ppo")
     parser.add_argument("--seats", nargs="+", type=int, choices=(0, 1), default=[0, 1],
                         help="candidate seats to evaluate (0 and 1 are supported)")
     parser.add_argument("--variant", action="append", dest="single_variants", choices=VARIANTS)
@@ -307,6 +317,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ablation", action="append", type=parse_ablation, default=[], metavar="COMPONENT=on|off")
     parser.add_argument("--quick", action="store_true", help="use a small default batch suitable for local tests")
     args = parser.parse_args(argv)
+    if type(args.experiment_id) is not str or not args.experiment_id.strip():
+        parser.error("experiment_id must be a non-empty string")
     if args.variants is not None and args.candidates is not None:
         parser.error("--variants and --candidates are separate modes; supply only one")
     if args.candidates is not None:
@@ -4049,9 +4061,11 @@ def _normalized_command(command: Sequence[str] | None) -> list[str]:
 
 def build_manifest(*, candidates: Sequence[str], opponents: Sequence[str], seeds: Sequence[int],
                    steps: int, seats: Sequence[int], command: Sequence[str] | None = None,
-                   selection_path: str = "candidate") -> dict[str, Any]:
+                   selection_path: str = "candidate", experiment_id: str | None = None,
+                   feature_variant: str | None = None,
+                   training_mode: str | None = None) -> dict[str, Any]:
     """Return the JSON-compatible, versioned reproducibility manifest."""
-    return {
+    manifest = {
         "schema_version": 3,
         "engine_version": str(ENGINE_VERSION),
         "steps": int(steps),
@@ -4068,6 +4082,20 @@ def build_manifest(*, candidates: Sequence[str], opponents: Sequence[str], seeds
         "python_version": ".".join(map(str, sys.version_info[:3])),
         "command": _normalized_command(command),
     }
+    identity = {
+        "experiment_id": experiment_id,
+        "feature_variant": feature_variant,
+        "training_mode": training_mode,
+    }
+    if any(value is not None for value in identity.values()):
+        if type(experiment_id) is not str or not experiment_id.strip():
+            raise ValueError("experiment_id must be a non-empty string")
+        if feature_variant not in FEATURE_VARIANTS:
+            raise ValueError(f"feature_variant must be one of: {', '.join(FEATURE_VARIANTS)}")
+        if training_mode not in TRAINING_MODES:
+            raise ValueError(f"training_mode must be one of: {', '.join(TRAINING_MODES)}")
+        manifest.update(identity)
+    return manifest
 
 
 def _config_seed_values(config: Mapping[str, Any]) -> list[int]:
@@ -4201,6 +4229,9 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
         candidates=variants, opponents=opponents, seeds=seed_values,
         steps=config.get("steps", 720), seats=seats, command=command,
         selection_path="candidate" if config.get("candidates") is not None else "legacy_variant",
+        experiment_id=config.get("experiment_id"),
+        feature_variant=config.get("feature_variant"),
+        training_mode=config.get("training_mode"),
     )
     holdout_document = None
     development_selected_default = _select_default(
@@ -4258,6 +4289,9 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
             candidates=variants, opponents=opponents, seeds=holdout_seed_values,
             steps=config.get("steps", 720), seats=seats, command=command,
             selection_path="candidate" if config.get("candidates") is not None else "legacy_variant",
+            experiment_id=config.get("experiment_id"),
+            feature_variant=config.get("feature_variant"),
+            training_mode=config.get("training_mode"),
         )
         holdout_document = {
             "manifest": holdout_manifest,
@@ -4385,6 +4419,9 @@ def main(argv: list[str] | None = None) -> int:
     output = args.output if args.output.is_absolute() else PROJECT_ROOT / args.output
     sidecar = output.with_name(f"{output.stem}.replays.json")
     config = {
+        "experiment_id": args.experiment_id,
+        "feature_variant": args.feature_variant,
+        "training_mode": args.training_mode,
         "seeds": args.seeds,
         "start_seed": args.start_seed,
         "seed_values": seeds,

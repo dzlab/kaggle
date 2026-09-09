@@ -255,6 +255,26 @@ def test_build_manifest_is_schema_v3_json_compatible_and_normalized():
     json.dumps(manifest, allow_nan=False)
 
 
+def test_build_manifest_carries_experiment_identity():
+    from scripts.evaluate import build_manifest
+
+    manifest = build_manifest(
+        candidates=["current"], opponents=["pass"], seeds=[3], steps=720,
+        seats=[0, 1], experiment_id="orbit-context-test",
+        feature_variant="experimental_context_v1",
+        training_mode="reduced_behavior_clone_then_ppo",
+    )
+
+    assert {
+        key: manifest[key]
+        for key in ("experiment_id", "feature_variant", "training_mode")
+    } == {
+        "experiment_id": "orbit-context-test",
+        "feature_variant": "experimental_context_v1",
+        "training_mode": "reduced_behavior_clone_then_ppo",
+    }
+
+
 def test_build_manifest_includes_learned_v1_artifact_metadata(monkeypatch, tmp_path):
     artifact_path = tmp_path / "learned_v1.json"
     artifact_path.write_text(json.dumps(_valid_learned_artifact()), encoding="utf-8")

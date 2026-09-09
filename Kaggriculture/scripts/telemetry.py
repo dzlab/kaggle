@@ -14,6 +14,13 @@ from typing import Any
 DEFAULT_WEAVE_PROJECT = "dzlab/kaggriculture"
 DEFAULT_WANDB_ENTITY = "dzlab"
 DEFAULT_WANDB_PROJECT = "kaggriculture"
+DEFAULT_EXPERIMENT_ID = "orbit-policy-v1"
+FEATURE_VARIANTS = ("production_v1", "experimental_context_v1")
+TRAINING_MODES = (
+    "behavior_clone_then_ppo",
+    "pure_ppo",
+    "reduced_behavior_clone_then_ppo",
+)
 
 
 class TrainingTelemetry:
@@ -411,6 +418,9 @@ def record_validation_report(
     phase: str,
     checkpoint: Any,
     candidate_tag: str,
+    experiment_id: str = DEFAULT_EXPERIMENT_ID,
+    feature_variant: str = "production_v1",
+    training_mode: str = "behavior_clone_then_ppo",
 ) -> None:
     """Emit per-game and flattened per-candidate validation telemetry.
 
@@ -420,6 +430,12 @@ def record_validation_report(
     """
     if not isinstance(report, Mapping):
         return
+    if type(experiment_id) is not str or not experiment_id.strip():
+        raise ValueError("experiment_id must be a non-empty string")
+    if feature_variant not in FEATURE_VARIANTS:
+        raise ValueError(f"feature_variant must be one of: {', '.join(FEATURE_VARIANTS)}")
+    if training_mode not in TRAINING_MODES:
+        raise ValueError(f"training_mode must be one of: {', '.join(TRAINING_MODES)}")
 
     record_event = getattr(telemetry, "record", telemetry)
 
@@ -433,6 +449,9 @@ def record_validation_report(
         "phase": _json_safe(phase),
         "checkpoint": _json_safe(checkpoint),
         "candidate_tag": _json_safe(candidate_tag),
+        "experiment_id": experiment_id,
+        "feature_variant": feature_variant,
+        "training_mode": training_mode,
     }
 
     summary_events: list[dict[str, Any]] = []

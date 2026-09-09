@@ -160,6 +160,45 @@ def test_default_wandb_run_name_describes_training_configuration(tmp_path):
     )
 
 
+def test_colab_config_exposes_validated_experiment_identity(tmp_path, monkeypatch):
+    from scripts import train
+
+    monkeypatch.setattr(train, "resolve_device", lambda value: "cpu")
+    args = train.parse_args([
+        "--run-directory", str(tmp_path),
+        "--experiment-id", "orbit-context-test",
+        "--feature-variant", "experimental_context_v1",
+        "--training-mode", "reduced_behavior_clone_then_ppo",
+        "--dry-run",
+    ])
+    config = train.config_from_args(args)
+
+    assert (config.experiment_id, config.feature_variant, config.training_mode) == (
+        "orbit-context-test",
+        "experimental_context_v1",
+        "reduced_behavior_clone_then_ppo",
+    )
+
+    defaults = train.config_from_args(train.parse_args(["--dry-run"]))
+    assert (defaults.experiment_id, defaults.feature_variant, defaults.training_mode) == (
+        "orbit-policy-v1", "production_v1", "behavior_clone_then_ppo",
+    )
+
+
+@pytest.mark.parametrize(
+    "flag,value",
+    [
+        ("--feature-variant", "unknown"),
+        ("--training-mode", "unknown"),
+    ],
+)
+def test_colab_cli_rejects_unknown_experiment_variants_and_modes(flag, value):
+    from scripts import train
+
+    with pytest.raises(SystemExit):
+        train.parse_args([flag, value, "--dry-run"])
+
+
 def test_wandb_run_name_cli_option_overrides_dynamic_default(tmp_path):
     from scripts import colab_train
 

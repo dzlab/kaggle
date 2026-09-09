@@ -26,6 +26,9 @@ from kagriculture_agent.checkpoints import CheckpointError, read_checkpoint
 from kagriculture_agent.model import resolve_device
 from scripts.telemetry import record_validation_report
 from scripts.train_policy import (
+    DEFAULT_EXPERIMENT_ID,
+    FEATURE_VARIANTS,
+    TRAINING_MODES,
     TrainingContract,
     validate_training_checkpoint,
 )
@@ -82,6 +85,9 @@ class ColabConfig:
     smoke_steps: int = 96
     plot: bool = False
     plot_path: Path | None = None
+    experiment_id: str = DEFAULT_EXPERIMENT_ID
+    feature_variant: str = "production_v1"
+    training_mode: str = "behavior_clone_then_ppo"
 
     @property
     def candidate_tag(self) -> str:
@@ -361,12 +367,25 @@ def build_config(
     smoke_steps: int = 96,
     plot: bool = False,
     plot_path: str | Path | None = None,
+    experiment_id: str = DEFAULT_EXPERIMENT_ID,
+    feature_variant: str = "production_v1",
+    training_mode: str = "behavior_clone_then_ppo",
     resolve_runtime_device: bool = True,
 ) -> ColabConfig:
     if type(workers) is not int or workers < 1:
         raise ValueError("workers must be a positive integer")
     if type(ppo_target_steps) is not int or ppo_target_steps < 0:
         raise ValueError("ppo_target_steps must be a nonnegative integer")
+    if type(experiment_id) is not str or not experiment_id.strip():
+        raise ValueError("experiment_id must be a non-empty string")
+    if feature_variant not in FEATURE_VARIANTS:
+        raise ValueError(
+            f"feature_variant must be one of: {', '.join(FEATURE_VARIANTS)}"
+        )
+    if training_mode not in TRAINING_MODES:
+        raise ValueError(
+            f"training_mode must be one of: {', '.join(TRAINING_MODES)}"
+        )
     for name, value in (
         ("training_steps", training_steps),
         ("training_batch_size", training_batch_size),
@@ -465,6 +484,9 @@ def build_config(
         smoke_steps,
         plot,
         _absolute_path(plot_path) if plot_path is not None else None,
+        experiment_id,
+        feature_variant,
+        training_mode,
     )
 
 
@@ -501,6 +523,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--workers", type=_positive_int, default=2)
     parser.add_argument("--ppo-target-steps", type=_nonnegative_int, default=16)
+    parser.add_argument("--experiment-id", default=DEFAULT_EXPERIMENT_ID)
+    parser.add_argument("--feature-variant", choices=FEATURE_VARIANTS, default="production_v1")
+    parser.add_argument("--training-mode", choices=TRAINING_MODES, default="behavior_clone_then_ppo")
     parser.add_argument("--training-steps", type=_positive_int, default=25)
     parser.add_argument("--training-batch-size", type=_positive_int, default=256)
     parser.add_argument("--training-seed", type=int, default=7)
@@ -567,6 +592,9 @@ def config_from_args(args: argparse.Namespace) -> ColabConfig:
         device=args.device,
         workers=args.workers,
         ppo_target_steps=args.ppo_target_steps,
+        experiment_id=args.experiment_id,
+        feature_variant=args.feature_variant,
+        training_mode=args.training_mode,
         training_steps=args.training_steps,
         training_batch_size=args.training_batch_size,
         training_seed=args.training_seed,
@@ -627,6 +655,7 @@ def build_collection_command(config: ColabConfig) -> list[str]:
         "--seats", *(str(seat) for seat in config.collection_seats),
         "--workers", str(config.workers),
         "--output", str(trajectory_path),
+        "--source-policy-identity", config.experiment_id,
     ]
 
 
@@ -729,6 +758,9 @@ def initialize_telemetry(config: ColabConfig) -> Any | None:
         wandb_entity=config.wandb_entity or DEFAULT_WANDB_ENTITY,
         wandb_run_name=config.wandb_run_name or default_wandb_run_name(config),
         wandb_config={
+            "experiment_id": config.experiment_id,
+            "feature_variant": config.feature_variant,
+            "training_mode": config.training_mode,
             "candidate_tag": config.candidate_tag,
             "ppo_target_steps": config.ppo_target_steps,
             "training_steps": config.training_steps,
@@ -808,12 +840,15 @@ def train_candidate(
         seeds=config.rollout_seed_values,
         steps=config.rollout_steps,
         workers=config.workers,
+        experiment_id=config.experiment_id,
+        feature_variant=config.feature_variant,
+        training_mode=config.training_mode,
     )
 
     def record_training_event(event: str, metrics: Mapping[str, Any] | None = None, **values: Any) -> None:
         if telemetry is not None:
             telemetry(
-                event, metrics, candidate_tag=config.candidate_tag,
+                event, metrics, **_identity_fields(config), candidate_tag=config.candidate_tag,
                 ppo_target_steps=config.ppo_target_steps, **values,
             )
 
@@ -834,6 +869,9 @@ def train_candidate(
         offline_ppo_fallback=config.training_offline_ppo_fallback,
         candidate_artifact=config.stage_artifact_path,
         telemetry_callback=record_training_event if telemetry is not None else None,
+        experiment_id=config.experiment_id,
+        feature_variant=config.feature_variant,
+        training_mode=config.training_mode,
     )
     export_checkpoint(config.stage_checkpoint_path, config.stage_artifact_path)
     return metadata
@@ -934,6 +972,35 @@ def _read_evaluation_report(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _identity_fields(config: ColabConfig) -> dict[str, str]:
+    return {
+        "experiment_id": config.experiment_id,
+        "feature_variant": config.feature_variant,
+        "training_mode": config.training_mode,
+    }
+
+
+def _annotate_json_document(path: Path, config: ColabConfig) -> dict[str, Any] | None:
+    """Attach the immutable experiment identity to an existing JSON document."""
+    if not path.is_file():
+        return None
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise ValueError(f"identity document must be an object: {path}")
+    document.update(_identity_fields(config))
+    configuration = document.get("configuration")
+    if isinstance(configuration, Mapping):
+        document["configuration"] = {**configuration, **_identity_fields(config)}
+    manifest = document.get("manifest")
+    if isinstance(manifest, Mapping):
+        document["manifest"] = {**manifest, **_identity_fields(config)}
+    path.write_text(
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    return document
+
+
 def _invalidate_evaluation_report(path: Path) -> None:
     """Remove a prior report so it cannot satisfy a later evaluation gate."""
     path.unlink(missing_ok=True)
@@ -952,7 +1019,15 @@ def _run_evaluation(
         )
     if not report_path.exists() or report_path.stat().st_mtime_ns < started_ns:
         raise RuntimeError(f"{phase} evaluator did not write a fresh report: {report_path}")
-    return completed, _read_evaluation_report(report_path)
+    report = _read_evaluation_report(report_path)
+    _annotate_json_document(report_path, config)
+    configuration = report.get("configuration")
+    if isinstance(configuration, Mapping):
+        report["configuration"] = {**configuration, **_identity_fields(config)}
+    manifest = report.get("manifest")
+    if isinstance(manifest, Mapping):
+        report["manifest"] = {**manifest, **_identity_fields(config)}
+    return completed, report
 
 
 def smoke_test_artifact(config: ColabConfig) -> None:
@@ -1022,6 +1097,9 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
         mount_drive(config)
     config.run_directory.mkdir(parents=True, exist_ok=True)
     run_command(commands[0], check=True)
+    _annotate_json_document(
+        config.trajectory_path.with_suffix(".manifest.json"), config,
+    )
 
     from scripts import train_policy
 
@@ -1035,6 +1113,9 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
         checkpoint_interval=config.training_checkpoint_interval,
         prior_checkpoint=config.training_prior_checkpoint,
         offline_ppo_fallback=config.training_offline_ppo_fallback,
+        experiment_id=config.experiment_id,
+        feature_variant=config.feature_variant,
+        training_mode=config.training_mode,
     )
     compatible = compatible_prior_checkpoints(config, training_contract=training_contract)
     opponent_pool = train_policy.OpponentPool(previous_checkpoints=compatible)
@@ -1063,6 +1144,7 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
             telemetry(
                 "training_complete",
                 {
+                    **_identity_fields(config),
                     "candidate": config.candidate_tag,
                     "checkpoint": str(config.stage_checkpoint_path),
                     "artifact": str(config.stage_artifact_path),
@@ -1092,6 +1174,7 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
             record_validation_report(
                 telemetry, development_report, phase="development",
                 checkpoint=config.stage_artifact_path, candidate_tag=config.candidate_tag,
+                **_identity_fields(config),
             )
         development_decision = development_report.get("decision", {})
         development_complete = (
@@ -1125,6 +1208,7 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
                 record_validation_report(
                     telemetry, holdout_report, phase="holdout",
                     checkpoint=config.stage_artifact_path, candidate_tag=config.candidate_tag,
+                    **_identity_fields(config),
                 )
             holdout_decision = holdout_report.get("decision", {})
             holdout_complete = (
