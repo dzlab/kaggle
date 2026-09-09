@@ -17,6 +17,7 @@ LEARNED_V1 = "learned_v1"
 LEARNED_V1_ARTIFACT_ENV = "KAGRICULTURE_LEARNED_V1_ARTIFACT"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LEARNED_V1_ARTIFACT = PROJECT_ROOT / "models" / "learned_v1.json"
+_LEARNED_V1_ARTIFACT_CACHE: dict[Path, tuple[Any | None, ValueError | None]] = {}
 
 
 def learned_v1_artifact_path() -> Path:
@@ -28,14 +29,30 @@ def learned_v1_artifact_path() -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
-def _validated_learned_v1_artifact_path() -> Path:
+def _load_validated_learned_v1_artifact() -> tuple[Path, Any]:
     path = learned_v1_artifact_path()
+    cached = _LEARNED_V1_ARTIFACT_CACHE.get(path)
+    if cached is not None:
+        learned_model, error = cached
+        if error is not None:
+            raise error
+        return path, learned_model
     if not path.exists():
-        raise ValueError(f"{LEARNED_V1} artifact does not exist: {path}")
+        error = ValueError(f"{LEARNED_V1} artifact does not exist: {path}")
+        _LEARNED_V1_ARTIFACT_CACHE[path] = (None, error)
+        raise error
     try:
-        load_exported_policy(path)
+        learned_model = load_exported_policy(path)
     except Exception as exc:
-        raise ValueError(f"{LEARNED_V1} artifact is not valid: {type(exc).__name__}: {exc}") from exc
+        error = ValueError(f"{LEARNED_V1} artifact is not valid: {type(exc).__name__}: {exc}")
+        _LEARNED_V1_ARTIFACT_CACHE[path] = (None, error)
+        raise error from exc
+    _LEARNED_V1_ARTIFACT_CACHE[path] = (learned_model, None)
+    return path, learned_model
+
+
+def _validated_learned_v1_artifact_path() -> Path:
+    path, _ = _load_validated_learned_v1_artifact()
     return path
 
 
@@ -82,7 +99,8 @@ def candidate_metadata(name: str) -> dict[str, Any]:
 def candidate_policy(name: str) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
     """Return a fresh stateful route policy's observation callable."""
     if name == LEARNED_V1:
-        policy = Policy(strategy="current", learned_model=str(_validated_learned_v1_artifact_path()))
+        _, learned_model = _load_validated_learned_v1_artifact()
+        policy = Policy(strategy="current", learned_model=learned_model)
     elif name in BASE_CANDIDATES:
         policy = Policy(strategy=name)
     else:
@@ -116,6 +134,7 @@ def artifact_candidate_policy(path: str | Path) -> Callable[[Mapping[str, Any]],
         def act(observation: Mapping[str, Any]) -> dict[str, Any]:
             return policy.act(observation)
 
+        act.__self__ = policy  # type: ignore[attr-defined]
         return act
     except Exception as exc:
         raise ValueError(

@@ -18,6 +18,7 @@ import sys
 import ctypes
 import ctypes.util
 import threading
+import time
 from array import array
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -874,9 +875,39 @@ class LearnedPolicy:
     def __init__(self, model_path: str | Path | Any = None, *, timeout_seconds: float = 0.25) -> None:
         self.model_path = model_path
         self.timeout_seconds = max(0.01, _number(timeout_seconds, 0.25))
-        self.diagnostics: dict[str, Any] = {"status": "disabled" if model_path is None else "unloaded"}
-        self._model: Any = None
-        self._loaded = False
+        loaded_object = model_path is not None and not isinstance(model_path, (str, Path))
+        self._model: Any = model_path if loaded_object else None
+        self._loaded = loaded_object
+        self._load_state = "loaded" if loaded_object else "unloaded"
+        self._inference_disabled = False
+        self._last_episode_turn: int | None = None
+        self.diagnostics: dict[str, Any] = {
+            "status": "disabled" if model_path is None else self._load_state,
+            "load_state": self._load_state,
+        }
+
+    @property
+    def load_state(self) -> str:
+        """Return the terminal artifact-load state for diagnostics and tests."""
+        return self._load_state
+
+    def _observe_episode(self, state: Any) -> None:
+        """Re-enable inference when the observation clock starts a new episode."""
+        turn = int(_number(_get(state, "day"))) * 24 + int(_number(_get(state, "hour")))
+        if self._last_episode_turn is not None and turn < self._last_episode_turn:
+            self._inference_disabled = False
+        self._last_episode_turn = turn
+
+    def _load_failure_diagnostic(self, error: Any) -> dict[str, Any]:
+        status = "missing_model" if isinstance(error, FileNotFoundError) or error == "FileNotFoundError" else "load_error"
+        diagnostic = {
+            "status": status,
+            "load_state": "failed",
+            "error": error if isinstance(error, str) else type(error).__name__,
+        }
+        if isinstance(self.model_path, (str, Path)):
+            diagnostic["path"] = str(Path(self.model_path))
+        return diagnostic
 
     def _load(self) -> Any:
         if self.model_path is None:
@@ -909,8 +940,17 @@ class LearnedPolicy:
 
     def propose(self, state: Any, features: Any) -> PolicyProposal:
         if self.model_path is None:
-            self.diagnostics = {"status": "disabled"}
+            self.diagnostics = {"status": "disabled", "load_state": self._load_state}
             return _empty()
+        self._observe_episode(state)
+        if self._inference_disabled:
+            return _empty()
+        if self._load_state == "failed":
+            return _empty()
+        # Preserve the established direct test hook that marks a fixture as
+        # loaded by assigning ``_loaded`` and ``_model``.
+        if self._loaded and self._load_state == "unloaded":
+            self._load_state = "loaded"
         if not self._loaded:
             # Exported dependency-free models are already validated by the
             # candidate factory.  Keep their inference in-process: spawning a
@@ -930,18 +970,16 @@ class LearnedPolicy:
             else:
                 ok, loaded = _run_with_timeout(self._load, self.timeout_seconds)
             if not ok:
-                status = "slow_model" if isinstance(loaded, TimeoutError) else (
-                    "missing_model"
-                    if isinstance(loaded, FileNotFoundError) or loaded == "FileNotFoundError"
-                    else "load_error"
-                )
-                self.diagnostics = {"status": status, "error": type(loaded).__name__}
+                self._load_state = "failed"
+                self.diagnostics = self._load_failure_diagnostic(loaded)
                 return _empty()
             self._model = loaded
             self._loaded = True
+            self._load_state = "loaded"
         if self._model is None:
-            self.diagnostics = {"status": "incompatible_model"}
+            self.diagnostics = {"status": "incompatible_model", "load_state": self._load_state}
             return _empty()
+        started = time.monotonic()
         if isinstance(self._model, DependencyFreePolicy):
             try:
                 output = self._invoke(self._model, state, features)
@@ -952,15 +990,42 @@ class LearnedPolicy:
             ok, output = _run_with_timeout(
                 lambda: self._invoke(self._model, state, features), self.timeout_seconds,
             )
+        elapsed = time.monotonic() - started
+        if elapsed > self.timeout_seconds:
+            self._inference_disabled = True
+            self.diagnostics = {
+                "status": "slow_model",
+                "inference_status": "slow_inference",
+                "load_state": self._load_state,
+                "inference_seconds": elapsed,
+                "budget_seconds": self.timeout_seconds,
+                "learned_overrides_enabled": False,
+            }
+            return _empty()
         if not ok:
-            status = "slow_model" if isinstance(output, TimeoutError) else "inference_error"
-            self.diagnostics = {"status": status, "error": type(output).__name__}
+            self.diagnostics = {
+                "status": "inference_error",
+                "load_state": self._load_state,
+                "error": output if isinstance(output, str) else type(output).__name__,
+                "inference_seconds": elapsed,
+            }
             return _empty()
         proposal = _coerce_proposal(output)
         if proposal is None:
-            self.diagnostics = {"status": "incompatible_model"}
+            self.diagnostics = {
+                "status": "incompatible_model",
+                "load_state": self._load_state,
+                "inference_seconds": elapsed,
+            }
             return _empty()
-        self.diagnostics = {"status": "ok", "model_version": proposal.model_version}
+        self.diagnostics = {
+            "status": "ok",
+            "load_state": self._load_state,
+            "model_version": proposal.model_version,
+            "inference_seconds": elapsed,
+            "budget_seconds": self.timeout_seconds,
+            "learned_overrides_enabled": True,
+        }
         return proposal
 
 

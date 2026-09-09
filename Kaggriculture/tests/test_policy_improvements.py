@@ -21,6 +21,11 @@ from kagriculture_agent.policy import (
     _drop_carried_goods,
     worker_action,
 )
+from kagriculture_agent.learned_policy import (
+    DependencyFreePolicy,
+    LearnedPolicy,
+    PolicyProposal,
+)
 from kagriculture_agent.strategy import StrategySpec
 from kagriculture_agent.types import Position, Task, WorkerAssignment
 
@@ -402,3 +407,79 @@ def test_learned_policy_liquidates_shed_inventory_in_terminal_window(monkeypatch
     learned = learned_policy.act(state)
     assert ["SELL", "CARROT", 1] in deterministic["market"]
     assert ["SELL", "CARROT", 1] in learned["market"]
+
+
+def test_learned_policy_caches_terminal_path_load_failure_with_safe_diagnostic(monkeypatch, tmp_path):
+    path = tmp_path / "private-model.json"
+    policy = LearnedPolicy(path)
+    calls = []
+
+    def fail_load():
+        calls.append(path)
+        raise ValueError("secret artifact contents")
+
+    monkeypatch.setattr(policy, "_load", fail_load)
+
+    assert policy.propose({}, object()).workers == ()
+    first_diagnostic = dict(policy.diagnostics)
+    assert policy.propose({}, object()).workers == ()
+
+    assert calls == [path]
+    assert policy.load_state == "failed"
+    assert first_diagnostic == policy.diagnostics
+    assert policy.diagnostics == {
+        "status": "load_error",
+        "load_state": "failed",
+        "path": str(path),
+        "error": "ValueError",
+    }
+    assert "secret artifact contents" not in repr(policy.diagnostics)
+
+
+def test_learned_policy_fast_inference_records_latency_and_stays_enabled(monkeypatch):
+    import kagriculture_agent.learned_policy as runtime
+
+    model = object.__new__(DependencyFreePolicy)
+    monkeypatch.setattr(
+        DependencyFreePolicy,
+        "propose",
+        lambda self, state, features: PolicyProposal((), (), 1.0, "learned_v1"),
+    )
+    ticks = iter((10.0, 10.01))
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: next(ticks))
+    policy = LearnedPolicy(model, timeout_seconds=0.05)
+
+    proposal = policy.propose(_state(), object())
+
+    assert proposal.model_version == "learned_v1"
+    assert policy.load_state == "loaded"
+    assert policy.diagnostics["status"] == "ok"
+    assert policy.diagnostics["inference_seconds"] == __import__("pytest").approx(0.01)
+
+
+def test_learned_policy_slow_inference_falls_back_and_disables_episode(monkeypatch):
+    import kagriculture_agent.learned_policy as runtime
+
+    model = object.__new__(DependencyFreePolicy)
+    calls = []
+
+    def propose(self, state, features):
+        calls.append(state)
+        return PolicyProposal((), (("BUY_PRODUCT", "WHEAT", 1),), 1.0, "learned_v1")
+
+    monkeypatch.setattr(DependencyFreePolicy, "propose", propose)
+    ticks = iter((20.0, 20.06))
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: next(ticks))
+    policy = LearnedPolicy(model, timeout_seconds=0.05)
+
+    first = policy.propose(_state(day=3, hour=1), object())
+    second = policy.propose(_state(day=3, hour=2), object())
+
+    assert first == PolicyProposal((), (), 0.0, "none")
+    assert second == first
+    assert len(calls) == 1
+    assert policy.diagnostics["status"] == "slow_model"
+    assert policy.diagnostics["inference_status"] == "slow_inference"
+    assert policy.diagnostics["inference_seconds"] == __import__("pytest").approx(0.06)
+    assert policy.diagnostics["budget_seconds"] == 0.05
+    assert policy.diagnostics["learned_overrides_enabled"] is False

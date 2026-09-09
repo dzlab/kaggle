@@ -36,6 +36,51 @@ def test_artifact_candidate_policy_reports_invalid_artifact(monkeypatch, tmp_pat
 
     with pytest.raises(ValueError, match="candidate artifact is not valid: ValueError: invalid"):
         candidates.artifact_candidate_policy(artifact)
+
+
+def test_candidate_lifecycle_reuses_one_loaded_artifact_and_exposes_policy_hook(monkeypatch, tmp_path):
+    artifact = tmp_path / "learned-v1.json"
+    artifact.write_text("{}")
+    calls = []
+    loaded = object()
+    monkeypatch.setenv(candidates.LEARNED_V1_ARTIFACT_ENV, str(artifact))
+    monkeypatch.setattr(candidates, "learned_v1_artifact_path", lambda: artifact)
+    monkeypatch.setattr(
+        candidates,
+        "load_exported_policy",
+        lambda path: calls.append(Path(path)) or loaded,
+    )
+
+    assert candidates._learned_v1_available()
+    metadata = candidates.candidate_metadata(candidates.LEARNED_V1)
+    candidate = candidates.candidate_policy(candidates.LEARNED_V1)
+
+    assert calls == [artifact]
+    assert metadata["model_identity"] == candidates.LEARNED_V1
+    assert candidate.__self__.learned_policy.model_path is loaded
+
+
+def test_candidate_lifecycle_reuses_invalid_artifact_load_failure(monkeypatch, tmp_path):
+    artifact = tmp_path / "invalid.json"
+    artifact.write_text("invalid")
+    calls = []
+    monkeypatch.setenv(candidates.LEARNED_V1_ARTIFACT_ENV, str(artifact))
+    monkeypatch.setattr(candidates, "learned_v1_artifact_path", lambda: artifact)
+
+    def fail(path):
+        calls.append(Path(path))
+        raise ValueError("invalid")
+
+    monkeypatch.setattr(candidates, "load_exported_policy", fail)
+
+    assert not candidates._learned_v1_available()
+    with pytest.raises(ValueError, match="artifact is not valid"):
+        candidates.candidate_metadata(candidates.LEARNED_V1)
+    with pytest.raises(ValueError, match="artifact is not valid"):
+        candidates.candidate_policy(candidates.LEARNED_V1)
+    assert calls == [artifact]
+
+
 def test_returned_candidate_propagates_runtime_failure_and_reuses_one_loaded_artifact(monkeypatch, tmp_path):
     artifact = tmp_path / "candidate.json"
     artifact.write_text("{}")
