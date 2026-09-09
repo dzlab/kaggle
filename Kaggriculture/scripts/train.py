@@ -51,6 +51,10 @@ from scripts.training_identity import (
 COLLECT_SCRIPT = Path(__file__).with_name("collect_trajectories.py")
 EVALUATE_SCRIPT = Path(__file__).with_name("evaluate_artifact.py")
 RUN_LOCAL_SCRIPT = Path(__file__).with_name("run_local.py")
+DEFAULT_RUN_DIRECTORY = Path("/content/drive/MyDrive/kagriculture-training")
+PROTECTED_TRAINING_DIRECTORY_NAMES = frozenset({
+    "report", "reports", "submission", "submissions",
+})
 
 
 def _absolute_path(value: str | Path, *, resolve_symlinks: bool = True) -> Path:
@@ -58,6 +62,141 @@ def _absolute_path(value: str | Path, *, resolve_symlinks: bool = True) -> Path:
     if not path.is_absolute():
         path = PROJECT_ROOT / path
     return path.resolve() if resolve_symlinks else path.absolute()
+
+
+def _matrix_seed_list(value: Any, *, name: str) -> list[int]:
+    if type(value) is not list or not value:
+        raise ValueError(f"matrix shared.{name} must be a non-empty list")
+    if any(type(seed) is not int for seed in value):
+        raise ValueError(f"matrix shared.{name} must contain integers")
+    if len(set(value)) != len(value):
+        raise ValueError(f"matrix shared.{name} must not contain duplicates")
+    return list(value)
+
+
+def load_experiment_matrix(path: str | Path) -> dict[str, Any]:
+    """Load and validate the reproducible Colab experiment matrix."""
+    matrix_path = _absolute_path(path)
+    try:
+        document = json.loads(matrix_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"experiment matrix does not exist: {matrix_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"experiment matrix is not valid JSON: {matrix_path}") from exc
+    if type(document) is not dict or document.get("schema_version") != 1:
+        raise ValueError("experiment matrix schema_version must be 1")
+
+    shared = document.get("shared")
+    if type(shared) is not dict:
+        raise ValueError("experiment matrix shared must be an object")
+    for field in ("collection_seeds", "development_seeds", "holdout_seeds", "training_seeds"):
+        shared[field] = _matrix_seed_list(shared.get(field), name=field)
+    if "rollout_seeds" in shared:
+        shared["rollout_seeds"] = _matrix_seed_list(shared["rollout_seeds"], name="rollout_seeds")
+    if set(shared["development_seeds"]) & set(shared["holdout_seeds"]):
+        raise ValueError("matrix development_seeds and holdout_seeds must be disjoint")
+    if shared["collection_seeds"] != list(
+        range(shared["collection_seeds"][0], shared["collection_seeds"][0] + len(shared["collection_seeds"]))
+    ):
+        raise ValueError("matrix collection_seeds must be contiguous")
+    if shared.get("run_root") is not None and type(shared["run_root"]) is not str:
+        raise ValueError("matrix shared.run_root must be a string")
+    for field in ("development_seats", "holdout_seats"):
+        seats = shared.get(field, [0, 1])
+        if type(seats) is not list or seats != [0, 1]:
+            raise ValueError(f"matrix shared.{field} must be [0, 1]")
+    for field in ("collection_seats", "rollout_seeds"):
+        if field == "rollout_seeds":
+            continue
+        seats = shared.get(field, [0, 1])
+        if type(seats) is not list or seats != [0, 1]:
+            raise ValueError(f"matrix shared.{field} must be [0, 1]")
+
+    experiments = document.get("experiments")
+    if type(experiments) is not dict or not experiments:
+        raise ValueError("experiment matrix experiments must be a non-empty object")
+    for name, entry in experiments.items():
+        if type(name) is not str or not name:
+            raise ValueError("experiment matrix experiment names must be non-empty strings")
+        if type(entry) is not dict:
+            raise ValueError(f"matrix experiment {name} must be an object")
+        for field in ("experiment_id", "feature_variant", "training_mode", "run_directory"):
+            if type(entry.get(field)) is not str or not entry[field].strip():
+                raise ValueError(f"matrix experiment {name}.{field} must be a non-empty string")
+        validate_training_identity(
+            entry["experiment_id"], entry["feature_variant"], entry["training_mode"],
+            source=f"matrix experiment {name}",
+        )
+        for field, minimum in (("bc_steps", 0), ("ppo_steps", 1)):
+            value = entry.get(field)
+            if type(value) is not int or value < minimum:
+                raise ValueError(f"matrix experiment {name}.{field} must be at least {minimum}")
+        probabilities = entry.get("league_probabilities")
+        if probabilities is not None:
+            if type(probabilities) is not dict or set(probabilities) != set(DEFAULT_OPPONENT_PROBABILITIES):
+                raise ValueError(
+                    f"matrix experiment {name}.league_probabilities must define all league opponents"
+                )
+            LeagueSampler(probabilities=probabilities)
+    return document
+
+
+def _matrix_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    matrix_path = getattr(args, "experiment_config", None)
+    experiment_name = getattr(args, "experiment", None)
+    if matrix_path is None and experiment_name is None:
+        return {}
+    if matrix_path is None or experiment_name is None:
+        raise ValueError("--experiment-config and --experiment must be supplied together")
+    matrix = load_experiment_matrix(matrix_path)
+    experiments = matrix["experiments"]
+    if experiment_name not in experiments:
+        choices = ", ".join(experiments)
+        raise ValueError(f"unknown matrix experiment {experiment_name!r}; choose from: {choices}")
+    shared = matrix["shared"]
+    entry = experiments[experiment_name]
+    training_seed = args.training_seed
+    if training_seed not in shared["training_seeds"]:
+        raise ValueError(
+            "training_seed must be one of "
+            + ", ".join(str(seed) for seed in shared["training_seeds"])
+        )
+    run_directory = args.run_directory
+    if run_directory == DEFAULT_RUN_DIRECTORY:
+        run_root = Path(shared.get("run_root", DEFAULT_RUN_DIRECTORY))
+        run_directory = run_root / entry["run_directory"]
+    probabilities = entry.get("league_probabilities", {})
+    return {
+        "run_directory": run_directory,
+        "ppo_target_steps": entry["ppo_steps"],
+        "experiment_id": args.experiment_id or entry["experiment_id"],
+        "feature_variant": args.feature_variant or entry["feature_variant"],
+        "training_mode": args.training_mode or entry["training_mode"],
+        "training_steps": entry["bc_steps"],
+        "training_batch_size": shared.get("training_batch_size", args.training_batch_size),
+        "collection_seed_values": tuple(shared["collection_seeds"]),
+        "collection_seed_count": len(shared["collection_seeds"]),
+        "collection_start_seed": shared["collection_seeds"][0],
+        "collection_steps": shared.get("collection_steps", args.collection_steps),
+        "collection_opponents": tuple(shared.get("collection_opponents", args.collection_opponents)),
+        "collection_seats": tuple(shared.get("collection_seats", [0, 1])),
+        "rollout_seed_values": tuple(shared.get("rollout_seeds", args.rollout_seeds)),
+        "rollout_steps": shared.get("rollout_steps", args.rollout_steps),
+        "development_seeds": tuple(shared["development_seeds"]),
+        "development_opponents": tuple(shared.get("development_opponents", args.development_opponents)),
+        "development_steps": shared.get("development_steps", args.development_steps),
+        "development_seats": tuple(shared.get("development_seats", [0, 1])),
+        "holdout_seeds": tuple(shared["holdout_seeds"]),
+        "holdout_opponents": tuple(shared.get("holdout_opponents", args.holdout_opponents)),
+        "holdout_steps": shared.get("holdout_steps", args.holdout_steps),
+        "holdout_seats": tuple(shared.get("holdout_seats", [0, 1])),
+        "training_seed": training_seed,
+        "league_current_probability": probabilities.get("current"),
+        "league_mixed_probability": probabilities.get("mixed"),
+        "league_random_probability": probabilities.get("random"),
+        "league_starter_probability": probabilities.get("starter"),
+        "league_checkpoint_probability": probabilities.get("checkpoint"),
+    }
 
 
 @dataclass(frozen=True)
@@ -368,7 +507,7 @@ def select_resume_checkpoint(
 
 
 def build_config(
-    *, run_directory: str | Path = "/content/drive/MyDrive/kagriculture-training",
+    *, run_directory: str | Path = DEFAULT_RUN_DIRECTORY,
     device: str = "auto", workers: int = 2,
     development_seeds: tuple[int, ...] = (0, 1, 2, 3),
     holdout_seeds: tuple[int, ...] = (100, 101),
@@ -461,7 +600,6 @@ def build_config(
         raise ValueError("training_action_mask must be boolean")
     validate_model_shape(model_width, model_depth, source="training")
     for name, value in (
-        ("training_steps", training_steps),
         ("training_batch_size", training_batch_size),
         ("training_checkpoint_interval", training_checkpoint_interval),
         ("collection_steps", collection_steps),
@@ -472,6 +610,8 @@ def build_config(
     ):
         if type(value) is not int or value < 1:
             raise ValueError(f"{name} must be a positive integer")
+    if type(training_steps) is not int or training_steps < 0:
+        raise ValueError("training_steps must be a nonnegative integer")
     effective_behavior_clone_steps = resolve_behavior_clone_steps(
         training_mode, training_steps,
     )
@@ -522,8 +662,13 @@ def build_config(
             raise ValueError(f"{name} must contain supported opponents")
     resolved = str(resolve_device(device)) if resolve_runtime_device else device
     run_path = validate_training_output_path(
-        _absolute_path(run_directory, resolve_symlinks=False), name="run directory",
+        _absolute_path(run_directory, resolve_symlinks=False),
+        name="run directory", reject_protected_names=True,
     )
+    if any(part.lower() in PROTECTED_TRAINING_DIRECTORY_NAMES for part in run_path.parts):
+        raise ValueError(
+            "run directory may not be nested under protected reporting or submission paths"
+        )
     resolved_plot_path = (
         validate_training_output_path(
             _absolute_path(plot_path, resolve_symlinks=False), name="plot path",
@@ -630,14 +775,16 @@ def _path_or_none(value: str) -> Path | None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-directory", type=Path, default=Path("/content/drive/MyDrive/kagriculture-training"))
+    parser.add_argument("--run-directory", type=Path, default=DEFAULT_RUN_DIRECTORY)
     parser.add_argument("--trajectory-path", type=Path, default=None)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--workers", type=_positive_int, default=2)
     parser.add_argument("--ppo-target-steps", type=_nonnegative_int, default=16)
-    parser.add_argument("--experiment-id", default=DEFAULT_EXPERIMENT_ID)
-    parser.add_argument("--feature-variant", choices=FEATURE_VARIANTS, default="production_v1")
-    parser.add_argument("--training-mode", choices=TRAINING_MODES, default="behavior_clone_then_ppo")
+    parser.add_argument("--experiment-config", type=Path, default=None)
+    parser.add_argument("--experiment", default=None)
+    parser.add_argument("--experiment-id", default=None)
+    parser.add_argument("--feature-variant", choices=FEATURE_VARIANTS, default=None)
+    parser.add_argument("--training-mode", choices=TRAINING_MODES, default=None)
     parser.add_argument(
         "--action-representation", choices=ACTION_REPRESENTATIONS,
         default=DEFAULT_ACTION_REPRESENTATION,
@@ -656,7 +803,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--league-random-probability", type=_nonnegative_float, default=None)
     parser.add_argument("--league-starter-probability", type=_nonnegative_float, default=None)
     parser.add_argument("--league-checkpoint-probability", type=_nonnegative_float, default=None)
-    parser.add_argument("--training-steps", type=_positive_int, default=25)
+    parser.add_argument("--training-steps", type=_nonnegative_int, default=25)
     parser.add_argument("--training-batch-size", type=_positive_int, default=256)
     parser.add_argument("--training-seed", type=int, default=7)
     parser.add_argument("--training-checkpoint-interval", type=_positive_int, default=25)
@@ -716,15 +863,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def config_from_args(args: argparse.Namespace) -> ColabConfig:
     """Build a validated workflow configuration from parsed CLI arguments."""
+    matrix = _matrix_kwargs(args)
     return build_config(
-        run_directory=args.run_directory,
+        run_directory=matrix.get("run_directory", args.run_directory),
         trajectory_path=args.trajectory_path,
         device=args.device,
         workers=args.workers,
-        ppo_target_steps=args.ppo_target_steps,
-        experiment_id=args.experiment_id,
-        feature_variant=args.feature_variant,
-        training_mode=args.training_mode,
+        ppo_target_steps=matrix.get("ppo_target_steps", args.ppo_target_steps),
+        experiment_id=matrix.get("experiment_id", args.experiment_id or DEFAULT_EXPERIMENT_ID),
+        feature_variant=matrix.get("feature_variant", args.feature_variant or "production_v1"),
+        training_mode=matrix.get("training_mode", args.training_mode or "behavior_clone_then_ppo"),
         action_representation=args.action_representation,
         training_action_mask=args.training_action_mask,
         model_width=args.model_width,
@@ -734,32 +882,33 @@ def config_from_args(args: argparse.Namespace) -> ColabConfig:
         resolved_margin=args.resolved_margin,
         league_checkpoints=tuple(args.league_checkpoints),
         league_checkpoint_window=args.league_checkpoint_window,
-        league_current_probability=args.league_current_probability,
-        league_mixed_probability=args.league_mixed_probability,
-        league_random_probability=args.league_random_probability,
-        league_starter_probability=args.league_starter_probability,
-        league_checkpoint_probability=args.league_checkpoint_probability,
-        training_steps=args.training_steps,
-        training_batch_size=args.training_batch_size,
-        training_seed=args.training_seed,
+        league_current_probability=matrix.get("league_current_probability", args.league_current_probability),
+        league_mixed_probability=matrix.get("league_mixed_probability", args.league_mixed_probability),
+        league_random_probability=matrix.get("league_random_probability", args.league_random_probability),
+        league_starter_probability=matrix.get("league_starter_probability", args.league_starter_probability),
+        league_checkpoint_probability=matrix.get("league_checkpoint_probability", args.league_checkpoint_probability),
+        training_steps=matrix.get("training_steps", args.training_steps),
+        training_batch_size=matrix.get("training_batch_size", args.training_batch_size),
+        training_seed=matrix.get("training_seed", args.training_seed),
         training_checkpoint_interval=args.training_checkpoint_interval,
         training_prior_checkpoint=args.training_prior_checkpoint,
         training_offline_ppo_fallback=args.training_offline_ppo_fallback,
-        collection_seed_count=args.collection_seeds,
-        collection_start_seed=args.collection_start_seed,
-        collection_steps=args.collection_steps,
-        collection_opponents=tuple(args.collection_opponents),
-        collection_seats=tuple(args.collection_seats),
-        rollout_seed_values=tuple(args.rollout_seeds),
-        rollout_steps=args.rollout_steps,
-        development_seeds=tuple(args.development_seeds),
-        development_opponents=tuple(args.development_opponents),
-        development_steps=args.development_steps,
-        development_seats=tuple(args.development_seats),
-        holdout_seeds=tuple(args.holdout_seeds),
-        holdout_opponents=tuple(args.holdout_opponents),
-        holdout_steps=args.holdout_steps,
-        holdout_seats=tuple(args.holdout_seats),
+        collection_seed_values=matrix.get("collection_seed_values"),
+        collection_seed_count=matrix.get("collection_seed_count", args.collection_seeds),
+        collection_start_seed=matrix.get("collection_start_seed", args.collection_start_seed),
+        collection_steps=matrix.get("collection_steps", args.collection_steps),
+        collection_opponents=matrix.get("collection_opponents", tuple(args.collection_opponents)),
+        collection_seats=matrix.get("collection_seats", tuple(args.collection_seats)),
+        rollout_seed_values=matrix.get("rollout_seed_values", tuple(args.rollout_seeds)),
+        rollout_steps=matrix.get("rollout_steps", args.rollout_steps),
+        development_seeds=matrix.get("development_seeds", tuple(args.development_seeds)),
+        development_opponents=matrix.get("development_opponents", tuple(args.development_opponents)),
+        development_steps=matrix.get("development_steps", args.development_steps),
+        development_seats=matrix.get("development_seats", tuple(args.development_seats)),
+        holdout_seeds=matrix.get("holdout_seeds", tuple(args.holdout_seeds)),
+        holdout_opponents=matrix.get("holdout_opponents", tuple(args.holdout_opponents)),
+        holdout_steps=matrix.get("holdout_steps", args.holdout_steps),
+        holdout_seats=matrix.get("holdout_seats", tuple(args.holdout_seats)),
         evaluation_timeout=args.evaluation_timeout,
         resume=args.resume,
         mount_drive=args.mount_drive,

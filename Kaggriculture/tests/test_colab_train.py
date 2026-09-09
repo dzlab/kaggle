@@ -43,47 +43,24 @@ def test_colab_notebook_is_a_small_setup_and_helper_launch_wrapper():
 
     required_flags = (
         "--mount-drive",
-        "--run-directory",
-        "--ppo-target-steps",
-        "--training-steps",
-        "--training-batch-size",
+        "--experiment-config",
+        "--experiment",
         "--training-seed",
-        "--training-checkpoint-interval",
-        "--training-prior-checkpoint",
-        "--no-training-offline-ppo-fallback",
-        "--collection-seeds",
-        "--collection-start-seed",
-        "--collection-steps",
-        "--collection-opponents",
-        "--collection-seats",
-        "--rollout-seeds",
-        "--rollout-steps",
-        "--development-seeds",
-        "--development-opponents",
-        "--development-steps",
-        "--development-seats",
-        "--holdout-seeds",
-        "--holdout-opponents",
-        "--holdout-steps",
-        "--holdout-seats",
-        "--workers",
         "--device",
-        "--wandb-project",
-        "--wandb-entity",
-        "--smoke-opponent",
-        "--smoke-seed",
-        "--smoke-steps",
-        "--plot",
+        "--wandb",
     )
     assert "scripts/train.py" in launch_source
     assert all(flag in launch_source for flag in required_flags)
     assert "--wandb-run-name" not in launch_source
     assert "--no-wandb" not in launch_source
+    assert "WANDB_API_KEY" not in launch_source
 
-    workflow_references = ("scripts/train.py", *required_flags)
     setup_source = "\n".join(code_cells[:2])
-    assert all(setup_source.count(reference) == 0 for reference in workflow_references)
-    assert all(code.count(reference) == 1 for reference in workflow_references)
+    assert "scripts/train.py" not in setup_source
+    assert "--experiment-config" not in setup_source
+    assert launch_source.count("--experiment-config") == 1
+    assert launch_source.count("--experiment ") == 1
+    assert launch_source.count("--training-seed") == 1
     assert "pip" not in clone_source
     assert "git" not in install_source
 
@@ -103,6 +80,96 @@ def test_colab_notebook_is_a_small_setup_and_helper_launch_wrapper():
         "load_metrics",
     )
     assert not any(marker in code for marker in old_inline_orchestration_markers)
+
+
+def test_colab_matrix_has_reproducible_variants_and_shared_matrices():
+    from scripts import train
+
+    matrix = train.load_experiment_matrix(
+        Path(__file__).parents[1] / "configs" / "colab-orbit-experiment.json"
+    )
+
+    assert set(matrix["experiments"]) == {
+        "baseline_bc_ppo",
+        "longer_bc_ppo",
+        "extended_bc_ppo",
+        "league_bc_ppo",
+        "pure_ppo",
+        "reduced_bc_ppo",
+        "experimental_context_league",
+    }
+    assert matrix["shared"]["training_seeds"] == [7, 11, 19]
+    assert matrix["shared"]["collection_seeds"] == list(range(8))
+    assert matrix["shared"]["development_seeds"] == list(range(50))
+    assert matrix["shared"]["holdout_seeds"] == list(range(100, 150))
+    assert matrix["shared"]["development_seats"] == [0, 1]
+    assert matrix["shared"]["holdout_seats"] == [0, 1]
+    assert matrix["experiments"]["baseline_bc_ppo"]["bc_steps"] == 25
+    assert matrix["experiments"]["baseline_bc_ppo"]["ppo_steps"] == 16
+    assert matrix["experiments"]["longer_bc_ppo"]["bc_steps"] == 250
+    assert matrix["experiments"]["longer_bc_ppo"]["ppo_steps"] == 128
+    assert matrix["experiments"]["extended_bc_ppo"]["bc_steps"] == 1000
+    assert matrix["experiments"]["extended_bc_ppo"]["ppo_steps"] == 512
+    assert matrix["experiments"]["pure_ppo"]["bc_steps"] == 0
+    assert matrix["experiments"]["pure_ppo"]["ppo_steps"] == 128
+
+
+def test_matrix_config_applies_entry_budget_and_shared_seed_configuration(tmp_path):
+    from scripts import train
+
+    config = train.config_from_args(train.parse_args([
+        "--experiment-config",
+        str(Path(__file__).parents[1] / "configs" / "colab-orbit-experiment.json"),
+        "--experiment",
+        "longer_bc_ppo",
+        "--training-seed",
+        "11",
+        "--no-mount-drive",
+        "--no-wandb",
+        "--run-directory",
+        str(tmp_path),
+        "--dry-run",
+    ]))
+
+    assert config.run_directory == tmp_path.resolve()
+    assert config.training_seed == 11
+    assert config.training_steps == 250
+    assert config.behavior_clone_steps == 250
+    assert config.ppo_target_steps == 128
+    assert config.collection_seed_values == tuple(range(8))
+    assert config.development_seeds == tuple(range(50))
+    assert config.holdout_seeds == tuple(range(100, 150))
+    assert config.development_seats == (0, 1)
+    assert config.holdout_seats == (0, 1)
+
+
+def test_matrix_config_rejects_training_seed_outside_shared_seed_set():
+    from scripts import train
+
+    args = train.parse_args([
+        "--experiment-config",
+        str(Path(__file__).parents[1] / "configs" / "colab-orbit-experiment.json"),
+        "--experiment",
+        "baseline_bc_ppo",
+        "--training-seed",
+        "13",
+        "--dry-run",
+    ])
+
+    with pytest.raises(ValueError, match="training_seed must be one of"):
+        train.config_from_args(args)
+
+
+@pytest.mark.parametrize("directory_name", ["reports", "submissions"])
+def test_matrix_config_rejects_protected_reporting_and_submission_directories(tmp_path, directory_name):
+    from scripts import train
+
+    with pytest.raises(ValueError, match="protected|production"):
+        train.build_config(
+            run_directory=tmp_path / directory_name / "baseline",
+            resolve_runtime_device=False,
+            device="cpu",
+        )
 
 
 def test_colab_notebook_executable_cells_are_valid_python():

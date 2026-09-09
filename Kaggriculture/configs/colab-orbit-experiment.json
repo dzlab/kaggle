@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "shared": {
+    "run_root": "/content/drive/MyDrive/kagriculture-orbit-experiments",
+    "training_seeds": [7, 11, 19],
+    "collection_seeds": [0, 1, 2, 3, 4, 5, 6, 7],
+    "rollout_seeds": [0, 1, 2, 3],
+    "development_seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49],
+    "holdout_seeds": [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149],
+    "training_batch_size": 256,
+    "collection_steps": 96,
+    "rollout_steps": 97,
+    "development_steps": 96,
+    "holdout_steps": 96,
+    "collection_opponents": ["pass", "random", "starter"],
+    "development_opponents": ["pass", "random", "starter"],
+    "holdout_opponents": ["pass", "random", "starter"],
+    "collection_seats": [0, 1],
+    "development_seats": [0, 1],
+    "holdout_seats": [0, 1]
+  },
+  "experiments": {
+    "baseline_bc_ppo": {
+      "run_directory": "baseline_bc_ppo",
+      "experiment_id": "baseline_bc_ppo",
+      "feature_variant": "production_v1",
+      "training_mode": "behavior_clone_then_ppo",
+      "bc_steps": 25,
+      "ppo_steps": 16,
+      "league_probabilities": {"current": 1.0, "mixed": 0.0, "random": 0.0, "starter": 0.0, "checkpoint": 0.0}
+    },
+    "longer_bc_ppo": {
+      "run_directory": "longer_bc_ppo",
+      "experiment_id": "longer_bc_ppo",
+      "feature_variant": "production_v1",
+      "training_mode": "behavior_clone_then_ppo",
+      "bc_steps": 250,
+      "ppo_steps": 128,
+      "league_probabilities": {"current": 1.0, "mixed": 0.0, "random": 0.0, "starter": 0.0, "checkpoint": 0.0}
+    },
+    "extended_bc_ppo": {
+      "run_directory": "extended_bc_ppo",
+      "experiment_id": "extended_bc_ppo",
+      "feature_variant": "production_v1",
+      "training_mode": "behavior_clone_then_ppo",
+      "bc_steps": 1000,
+      "ppo_steps": 512,
+      "league_probabilities": {"current": 1.0, "mixed": 0.0, "random": 0.0, "starter": 0.0, "checkpoint": 0.0}
+    },
+    "league_bc_ppo": {
+      "run_directory": "league_bc_ppo",
+      "experiment_id": "league_bc_ppo",
+      "feature_variant": "production_v1",
+      "training_mode": "behavior_clone_then_ppo",
+      "bc_steps": 250,
+      "ppo_steps": 128,
+      "league_probabilities": {"current": 0.4, "mixed": 0.15, "random": 0.1, "starter": 0.1, "checkpoint": 0.25}
+    },
+    "pure_ppo": {
+      "run_directory": "pure_ppo",
+      "experiment_id": "pure_ppo",
+      "feature_variant": "production_v1",
+      "training_mode": "pure_ppo",
+      "bc_steps": 0,
+      "ppo_steps": 128,
+      "league_probabilities": {"current": 1.0, "mixed": 0.0, "random": 0.0, "starter": 0.0, "checkpoint": 0.0}
+    },
+    "reduced_bc_ppo": {
+      "run_directory": "reduced_bc_ppo",
+      "experiment_id": "reduced_bc_ppo",
+      "feature_variant": "production_v1",
+      "training_mode": "reduced_behavior_clone_then_ppo",
+      "bc_steps": 250,
+      "ppo_steps": 128,
+      "league_probabilities": {"current": 1.0, "mixed": 0.0, "random": 0.0, "starter": 0.0, "checkpoint": 0.0}
+    },
+    "experimental_context_league": {
+      "run_directory": "experimental_context_league",
+      "experiment_id": "experimental_context_league",
+      "feature_variant": "experimental_context_v1",
+      "training_mode": "behavior_clone_then_ppo",
+      "bc_steps": 250,
+      "ppo_steps": 128,
+      "league_probabilities": {"current": 0.4, "mixed": 0.15, "random": 0.1, "starter": 0.1, "checkpoint": 0.25}
+    }
+  }
+}

@@ -269,9 +269,52 @@ workflow; for example, run `uv sync`, `uv run pytest -q`, or
 
 ## Colab training
 
-Open `notebooks/colab_gpu.ipynb` and run its three setup/launch cells. For a
-direct launch, run `scripts/train.py` with the workflow parameters you
-want to keep explicit:
+Open `notebooks/colab_gpu.ipynb` and run its three setup/launch cells. The
+notebook loads the `WANDB_API_KEY` Colab secret and delegates all training
+logic to `scripts/train.py`. The reproducible matrix is in
+`configs/colab-orbit-experiment.json`; select one entry and one of the shared
+training seeds `7`, `11`, or `19`:
+
+```bash
+python scripts/train.py \
+  --experiment-config configs/colab-orbit-experiment.json \
+  --experiment baseline_bc_ppo --training-seed 7 \
+  --mount-drive --device auto --wandb
+```
+
+For a fresh run, use a new Drive directory, experiment ID, and W&B name:
+
+```bash
+python scripts/train.py \
+  --experiment-config configs/colab-orbit-experiment.json \
+  --experiment baseline_bc_ppo --training-seed 7 \
+  --run-directory /content/drive/MyDrive/kagriculture-orbit-experiments/baseline-20260909-a \
+  --experiment-id baseline-20260909-a --wandb-run-name baseline-20260909-a \
+  --mount-drive --device auto --wandb
+```
+
+To resume that run from its Drive checkpoint, preserve the same directory,
+experiment ID, and W&B name, and point `--resume` at the checkpoint:
+
+```bash
+python scripts/train.py \
+  --experiment-config configs/colab-orbit-experiment.json \
+  --experiment baseline_bc_ppo --training-seed 7 \
+  --run-directory /content/drive/MyDrive/kagriculture-orbit-experiments/baseline-20260909-a \
+  --experiment-id baseline-20260909-a --wandb-run-name baseline-20260909-a \
+  --resume /content/drive/MyDrive/kagriculture-orbit-experiments/baseline-20260909-a/policy.pt \
+  --mount-drive --device auto --wandb
+```
+
+The JSON matrix keeps collection, development, and holdout seeds fixed and
+disjoint, evaluates both seats, and keeps each experiment in its own output
+directory. Training output must remain outside production `models/`, generic
+`checkpoints/`, `reports/`, and submission paths; the training path validator
+rejects protected locations. Omitting `--wandb-run-name` is safe: the CLI
+derives a unique configuration-aware UTC name.
+
+For a direct launch without the matrix, run `scripts/train.py` with the
+workflow parameters you want to keep explicit:
 
 ```bash
 python scripts/train.py \
