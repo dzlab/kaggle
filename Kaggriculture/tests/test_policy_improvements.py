@@ -8,12 +8,15 @@ deterministic enough to isolate these regressions.
 """
 
 from kagriculture_agent.planner import (
+    _portfolio_scenarios,
     _task_turn_budget,
     assign_tasks,
+    build_autonomous_macro_plan,
     build_daily_plan,
     normalize_planner_state,
 )
 from kagriculture_agent.policy import Policy, _assignment_valid, _drop_carried_goods
+from kagriculture_agent.strategy import StrategySpec
 from kagriculture_agent.types import Position, Task
 
 
@@ -73,12 +76,81 @@ def test_drop_carried_goods_honors_configured_shed_capacity():
 def test_day_27_does_not_plan_melon_purchase_or_planting():
     tiles = [["EMPTY"] * 5 for _ in range(5)]
     tiles[2][3] = {"kind": "PLANT", "crop": "WHEAT", "needs_water": True}
-    state = _state(day=27, tiles=tiles,
-                   private={"seeds": {}, "shed": {}, "inventories": [{}]})
+    state = _state(
+        day=27,
+        tiles=tiles,
+        private={"seeds": {"MELON": 1}, "shed": {}, "inventories": [{}]},
+    )
     plan = build_daily_plan(state)
     assert plan
     assert any(task.kind == "WATER" and task.item == "WHEAT" for task in plan)
     assert all(task.item != "MELON" or task.kind not in {"BUY_SEED", "PLANT"} for task in plan)
+
+    no_seed_state = _state(
+        day=27,
+        tiles=[["EMPTY"] * 5 for _ in range(5)],
+        private={"seeds": {}, "shed": {}, "inventories": [{}]},
+        cash=1_000,
+    )
+    melon_only = StrategySpec("melon-only", ("MELON",), (), 10, 0, 0)
+    macro = build_autonomous_macro_plan(no_seed_state, strategy=melon_only)
+    assert macro["scenario_count"] == 0
+    assert ["BUY_SEED", "MELON", 1] not in macro["market_intents"]
+    assert not any(task.kind == "PLANT" and task.item == "MELON" for task in macro["tasks"])
+
+
+@__import__("pytest").mark.parametrize("crop", ["WHEAT", "CARROT"])
+def test_day_27_keeps_short_horizon_crops_available(crop):
+    state = _state(
+        day=27,
+        private={"seeds": {crop: 1}, "shed": {}, "inventories": [{}]},
+        cash=1_000,
+    )
+    crop_only = StrategySpec(f"{crop.lower()}-only", (crop,), (), 10, 0, 0)
+
+    assert {scenario["crop"] for scenario in _portfolio_scenarios(state, 27, crop_only)} == {crop}
+    assert any(task.kind == "PLANT" and task.item == crop
+               for task in build_daily_plan(state, strategy=crop_only))
+
+    state["private"]["seeds"] = {}
+    macro = build_autonomous_macro_plan(state, strategy=crop_only)
+    assert ["BUY_SEED", crop, 1] in macro["market_intents"]
+    assert any(task.kind == "PLANT" and task.item == crop for task in macro["tasks"])
+
+
+def test_late_animal_horizon_includes_structure_build_and_placement_turns():
+    goose_only = StrategySpec("goose-only", (), ("GOOSE",), 0, 1, 0)
+
+    def macro(day):
+        return build_autonomous_macro_plan(
+            _state(
+                day=day,
+                tiles=[["EMPTY"] * 5 for _ in range(5)],
+                private={"seeds": {}, "shed": {"WHEAT": 7}, "inventories": [{}]},
+                cash=5_000,
+            ),
+            strategy=goose_only,
+        )
+
+    last_productive = macro(23)
+    assert ["BUY_ANIMAL", "GOOSE", 1] in last_productive["market_intents"]
+    assert any(task.kind == "BUILD_COOP" for task in last_productive["tasks"])
+
+    too_late = macro(24)
+    assert ["BUY_ANIMAL", "GOOSE", 1] not in too_late["market_intents"]
+    assert not any(task.kind in {"ANIMAL", "BUILD_COOP"} for task in too_late["tasks"])
+
+
+def test_late_daily_animal_and_structure_tasks_are_rejected():
+    state = _state(
+        day=25,
+        desired_animals=[{"species": "GOOSE", "position": [0, 0], "owned": False}],
+        structures=[{"kind": "COOP", "position": [1, 0], "built": False}],
+    )
+
+    plan = build_daily_plan(state)
+
+    assert not any(task.kind in {"ANIMAL", "STRUCTURE"} for task in plan)
 
 
 def test_shed_assignment_prefers_worker_with_inventory():
