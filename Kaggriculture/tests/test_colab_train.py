@@ -185,6 +185,34 @@ def test_colab_config_exposes_validated_experiment_identity(tmp_path, monkeypatc
     )
 
 
+def test_build_config_delegates_identity_validation_to_canonical_validator(
+    tmp_path, monkeypatch,
+):
+    from scripts import train
+
+    calls = []
+    monkeypatch.setattr(train, "resolve_device", lambda value: "cpu")
+    monkeypatch.setattr(
+        train, "validate_training_identity",
+        lambda experiment_id, feature_variant, training_mode: calls.append(
+            (experiment_id, feature_variant, training_mode)
+        ),
+    )
+
+    train.build_config(
+        run_directory=tmp_path,
+        device="cpu",
+        mount_drive=False,
+        experiment_id="orbit-context-test",
+        feature_variant="experimental_context_v1",
+        training_mode="reduced_behavior_clone_then_ppo",
+    )
+
+    assert calls == [
+        ("orbit-context-test", "experimental_context_v1", "reduced_behavior_clone_then_ppo"),
+    ]
+
+
 @pytest.mark.parametrize(
     "flag,value",
     [

@@ -33,6 +33,7 @@ from scripts.training_identity import (
     DEFAULT_EXPERIMENT_ID,
     FEATURE_VARIANTS,
     TRAINING_MODES,
+    validate_training_identity,
 )
 
 COLLECT_SCRIPT = Path(__file__).with_name("collect_trajectories.py")
@@ -378,16 +379,7 @@ def build_config(
         raise ValueError("workers must be a positive integer")
     if type(ppo_target_steps) is not int or ppo_target_steps < 0:
         raise ValueError("ppo_target_steps must be a nonnegative integer")
-    if type(experiment_id) is not str or not experiment_id.strip():
-        raise ValueError("experiment_id must be a non-empty string")
-    if feature_variant not in FEATURE_VARIANTS:
-        raise ValueError(
-            f"feature_variant must be one of: {', '.join(FEATURE_VARIANTS)}"
-        )
-    if training_mode not in TRAINING_MODES:
-        raise ValueError(
-            f"training_mode must be one of: {', '.join(TRAINING_MODES)}"
-        )
+    validate_training_identity(experiment_id, feature_variant, training_mode)
     for name, value in (
         ("training_steps", training_steps),
         ("training_batch_size", training_batch_size),
