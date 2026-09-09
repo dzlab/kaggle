@@ -12,6 +12,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from pickle import UnpicklingError
 from stat import S_ISREG
@@ -113,6 +114,17 @@ class ColabConfig:
     @property
     def smoke_replay_path(self) -> Path:
         return self.run_directory / "candidate-smoke.json"
+
+
+def default_wandb_run_name(
+    config: ColabConfig, *, timestamp: datetime | None = None,
+) -> str:
+    """Build a unique, configuration-aware default W&B experiment name."""
+    run_timestamp = (timestamp or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    return (
+        f"kaggriculture-{config.candidate_tag}-bc{config.training_steps}"
+        f"-seed{config.training_seed}-{run_timestamp:%Y%m%d-%H%M%S}"
+    )
 
 
 @dataclass(frozen=True)
@@ -529,7 +541,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-wandb", dest="wandb", action="store_false")
     parser.add_argument("--wandb-project", default=None)
     parser.add_argument("--wandb-entity", default=None)
-    parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument(
+        "--wandb-run-name", default=None,
+        help="Explicit W&B experiment name; otherwise derive one from the run configuration.",
+    )
     parser.add_argument("--smoke-opponent", choices=("pass", "random", "starter"), default="pass")
     parser.add_argument("--smoke-seed", type=int, default=0)
     parser.add_argument("--smoke-steps", type=_positive_int, default=96)
@@ -712,7 +727,7 @@ def initialize_telemetry(config: ColabConfig) -> Any | None:
         enable_wandb=config.wandb_enabled,
         wandb_project=config.wandb_project or DEFAULT_WANDB_PROJECT,
         wandb_entity=config.wandb_entity or DEFAULT_WANDB_ENTITY,
-        wandb_run_name=config.wandb_run_name or f"{config.candidate_tag}-gpu",
+        wandb_run_name=config.wandb_run_name or default_wandb_run_name(config),
         wandb_config={
             "candidate_tag": config.candidate_tag,
             "ppo_target_steps": config.ppo_target_steps,

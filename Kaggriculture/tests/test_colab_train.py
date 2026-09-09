@@ -3,6 +3,7 @@ import hashlib
 import json
 import importlib
 import os
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -69,7 +70,6 @@ def test_colab_notebook_is_a_small_setup_and_helper_launch_wrapper():
         "--device",
         "--wandb-project",
         "--wandb-entity",
-        "--wandb-run-name",
         "--smoke-opponent",
         "--smoke-seed",
         "--smoke-steps",
@@ -77,6 +77,7 @@ def test_colab_notebook_is_a_small_setup_and_helper_launch_wrapper():
     )
     assert "scripts/train.py" in launch_source
     assert all(flag in launch_source for flag in required_flags)
+    assert "--wandb-run-name" not in launch_source
     assert "--no-wandb" not in launch_source
 
     workflow_references = ("scripts/train.py", *required_flags)
@@ -140,6 +141,37 @@ def test_colab_config_resolves_device_and_rejects_seed_overlap(monkeypatch, tmp_
     assert config.workers == 2
     with pytest.raises(ValueError, match="overlap"):
         colab_train.build_config(development_seeds=(1,), holdout_seeds=(1,))
+
+
+def test_default_wandb_run_name_describes_training_configuration(tmp_path):
+    from scripts import colab_train
+
+    config = colab_train.build_config(
+        run_directory=tmp_path,
+        ppo_target_steps=16,
+        training_steps=25,
+        training_seed=7,
+        device="cpu",
+    )
+    timestamp = datetime(2026, 9, 9, 0, 43, 46, tzinfo=timezone.utc)
+
+    assert colab_train.default_wandb_run_name(config, timestamp=timestamp) == (
+        "kaggriculture-ppo16-bc25-seed7-20260909-004346"
+    )
+
+
+def test_wandb_run_name_cli_option_overrides_dynamic_default(tmp_path):
+    from scripts import colab_train
+
+    args = colab_train.parse_args([
+        "--run-directory", str(tmp_path),
+        "--wandb-run-name", "manual-experiment-name",
+        "--dry-run",
+    ])
+
+    config = colab_train.config_from_args(args)
+
+    assert config.wandb_run_name == "manual-experiment-name"
 
 
 def test_build_training_contract_records_requested_training_identity_and_options(monkeypatch, tmp_path):
