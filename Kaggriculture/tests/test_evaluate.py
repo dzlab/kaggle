@@ -4729,3 +4729,55 @@ def test_worker_rejects_framework_error_inconsistent_with_reasons():
     error = _worker_record_error(record, variant="mixed", opponent="pass", seed=4, seat=1)
 
     assert error and "framework_error" in error
+
+
+def test_result_document_exposes_per_opponent_metrics_and_promotion_evidence():
+    from scripts.evaluate import build_result_document
+
+    records = []
+    for opponent, differential in (("pass", 10), ("random", 2)):
+        for seat in (0, 1):
+            records.append(_metric_record(
+                seat=seat, seed=1, opponent=opponent, outcome="win", differential=differential,
+            ))
+
+    document = build_result_document(
+        config={
+            "candidates": ["melon"], "opponents": ["pass", "random"],
+            "seed_values": [1], "seats": [0, 1], "min_valid_games": 1,
+        },
+        records=records,
+    )
+
+    metrics = document["metrics_by_opponent"]["melon"]
+    assert set(metrics) == {"pass", "random"}
+    assert metrics["pass"]["wins"] == 2
+    assert metrics["pass"]["valid"] == 2
+    assert metrics["pass"]["seat_balanced_win_rate"] == 1.0
+    assert metrics["pass"]["mean_bank_differential"] == 10.0
+    assert metrics["pass"]["framework_errors"] == 0
+    assert "elo_uncertainty" in metrics["pass"]
+    evidence = document["promotion_evidence"]["melon"]
+    assert evidence["status"] == "baseline"
+    assert evidence["matrix_complete"] is True
+    assert evidence["metrics_by_opponent"] == metrics
+
+
+def test_incomplete_matrix_is_recorded_as_non_promotable_evidence():
+    from scripts.evaluate import build_result_document
+
+    records = [
+        _metric_record(seat=0, seed=1, opponent="pass", outcome="win", differential=10),
+    ]
+    document = build_result_document(
+        config={
+            "candidates": ["melon"], "opponents": ["pass"],
+            "seed_values": [1], "seats": [0, 1], "min_valid_games": 1,
+        },
+        records=records,
+    )
+
+    evidence = document["promotion_evidence"]["melon"]
+    assert evidence["status"] == "discard"
+    assert "missing_expected_matrix_records" in evidence["reasons"]
+    assert evidence["matrix_complete"] is False

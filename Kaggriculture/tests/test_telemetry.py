@@ -43,6 +43,7 @@ class FakeWandbRun:
         self.log_error = log_error
         self.finish_error = finish_error
         self.logs = []
+        self.summary = {}
         self.finish_calls = 0
         self.url = "https://wandb.ai/dzlab/kaggriculture/runs/test"
 
@@ -487,3 +488,71 @@ def test_record_validation_report_ignores_malformed_optional_numeric_fields(tmp_
     assert summary["wins"] == 1
     assert summary["wilson_win_rate_lower"] is None
     assert summary["wilson_win_rate_upper"] is None
+
+
+def _validated_report():
+    records = [
+        {"candidate": "candidate", "opponent": "hard", "seed": 1, "seat": seat,
+         "outcome": "win", "bank_differential": 10.0, "framework_error": False}
+        for seat in (0, 1)
+    ]
+    matrix = {
+        "expected": [["hard", 1, 0], ["hard", 1, 1]],
+        "expected_count": 2, "observed_count": 2,
+        "missing": [], "duplicate": [], "extra": [], "invalid_records": 0,
+    }
+    summary = {
+        "record_count": 2, "paired_games": 1, "wins": 2, "losses": 0, "ties": 0,
+        "seat_balanced_win_rate": 1.0, "mean_paired_bank_differential": 10.0,
+        "wilson_win_rate": {"lower": 0.2, "upper": 1.0},
+        "elo": {"ratings": {"candidate": 1050.0}, "games": {"candidate": 1}},
+    }
+    return {
+        "records": {"candidate": records}, "summaries": {"candidate": summary},
+        "matrix_completeness": {"candidate": matrix},
+        "promotion_decisions": {"candidate": {"status": "promote", "reasons": []}},
+        "metrics_by_opponent": {"candidate": {"hard": {
+            "seat_balanced_win_rate": 1.0, "elo_rating": 1050.0,
+            "mean_bank_differential": 10.0, "safety_failure_rate": 0.0,
+        }}},
+        "promotion_evidence": {"candidate": {
+            "status": "promote", "matrix_complete": True,
+            "matrix_completeness": matrix,
+        }},
+    }
+
+
+def test_wandb_receives_only_validated_summary_fields(tmp_path):
+    fake_wandb = FakeWandb()
+    telemetry = TrainingTelemetry(
+        tmp_path / "metrics.jsonl", enable_wandb=True, wandb_module=fake_wandb,
+    )
+
+    record_validation_report(
+        telemetry, _validated_report(), phase="development", checkpoint=12, candidate_tag="ppo16",
+    )
+
+    remote_events = [entry["telemetry/event"] for entry in fake_wandb.run.logs]
+    assert "validation_game" not in remote_events
+    assert "validation_summary" in remote_events
+    assert fake_wandb.run.summary["development_status"] == "promote"
+    assert fake_wandb.run.summary["development_win_rate"] == 1.0
+    assert fake_wandb.run.summary["development_elo"] == 1050.0
+    assert fake_wandb.run.summary["promoted"] is True
+
+
+def test_incomplete_validation_report_stays_local_and_does_not_update_wandb(tmp_path):
+    fake_wandb = FakeWandb()
+    telemetry = TrainingTelemetry(
+        tmp_path / "metrics.jsonl", enable_wandb=True, wandb_module=fake_wandb,
+    )
+    report = _validated_report()
+    report["promotion_evidence"]["candidate"]["matrix_complete"] = False
+
+    record_validation_report(
+        telemetry, report, phase="development", checkpoint=12, candidate_tag="ppo16",
+    )
+
+    assert load_metrics(tmp_path / "metrics.jsonl")
+    assert fake_wandb.run.logs == []
+    assert fake_wandb.run.summary == {}

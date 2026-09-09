@@ -161,6 +161,224 @@ def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _record_bank(record: Mapping[str, Any]) -> float | None:
+    value = record.get("bank_differential")
+    if value is None and record.get("final_bank") is not None and record.get("opponent_final_bank") is not None:
+        try:
+            value = float(record["final_bank"]) - float(record["opponent_final_bank"])
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(float(value)):
+        return None
+    return float(value)
+
+
+def _metric_record_state(record: Mapping[str, Any]) -> tuple[bool, bool, bool, bool, bool]:
+    """Return valid, framework-error, invalid, timeout, and no-progress flags."""
+    if not isinstance(record, Mapping):
+        return False, False, True, False, False
+    reason = str(record.get("termination_reason") or "").strip().lower().replace("-", "_")
+    reasons = record.get("framework_error_reasons", ())
+    reason_names = {
+        str(value).strip().lower().replace("-", "_")
+        for value in reasons
+    } if isinstance(reasons, Sequence) and not isinstance(reasons, (str, bytes)) else set()
+    framework_error = bool(record.get("framework_error")) or record.get("outcome") == "framework_error"
+    timeout = bool(record.get("timeout")) or bool(record.get("timed_out")) or bool(record.get("time_limit_ending"))
+    timeout = timeout or reason in {"timeout", "time_limit", "time_limit_ending"} or "timeout" in reason_names
+    no_progress = bool(record.get("no_progress")) or bool(record.get("no_progress_truncation"))
+    no_progress = no_progress or (
+        bool(record.get("bootstrap_truncated")) and (
+            reason == "no_progress" or bool(record.get("no_progress_steps"))
+        )
+    )
+    no_progress = no_progress or reason == "no_progress" or "no_progress" in reason_names
+    invalid = bool(record.get("invalid")) or bool(record.get("invalid_game"))
+    valid = (
+        not framework_error
+        and not invalid
+        and type(record.get("seat")) is int
+        and record["seat"] in (0, 1)
+        and record.get("outcome") in {"win", "loss", "tie"}
+        and _record_bank(record) is not None
+    )
+    if not framework_error and not valid:
+        invalid = True
+    return valid, framework_error, invalid, timeout, no_progress
+
+
+def _rating_uncertainty(games: Mapping[str, int], *, available: bool, confidence: float = 0.95) -> dict[str, float | None]:
+    if not available:
+        return {player: None for player in games}
+    z = NormalDist().inv_cdf(0.5 + confidence / 2.0)
+    scale = 400.0 / math.log(10.0)
+    return {
+        player: float(z * scale / math.sqrt(max(1, count)))
+        for player, count in games.items()
+    }
+
+
+def summarize_by_opponent(
+    records: Sequence[Mapping[str, Any]], *, min_rating_games: int = 2,
+) -> dict[str, dict[str, Any]]:
+    """Return stable paired metrics keyed by opponent.
+
+    Counts are taken over raw game records while win rate, bank differential,
+    and ratings use complete two-seat seed pairs.  Framework failures never
+    contribute to valid outcomes; explicit non-framework malformed records are
+    counted as invalid.
+    """
+    if isinstance(records, (str, bytes)) or not isinstance(records, Sequence):
+        raise ValueError("records must be a sequence of mappings")
+    if type(min_rating_games) is not int or min_rating_games < 1:
+        raise ValueError("min_rating_games must be a positive integer")
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise ValueError("each match record must be a mapping")
+        opponent = record.get("opponent")
+        if not isinstance(opponent, str) or not opponent:
+            raise ValueError("opponent must be a non-empty string")
+        grouped.setdefault(opponent, []).append(record)
+
+    summaries: dict[str, dict[str, Any]] = {}
+    score_by_outcome = {"win": 1.0, "tie": 0.5, "loss": 0.0}
+    for opponent, opponent_records in grouped.items():
+        valid_records = []
+        framework_errors = invalid = timeouts = no_progress = 0
+        for record in opponent_records:
+            valid, framework_error, invalid_record, timeout, stalled = _metric_record_state(record)
+            valid_records.append(record) if valid else None
+            framework_errors += int(framework_error)
+            invalid += int(invalid_record and not framework_error)
+            timeouts += int(timeout)
+            no_progress += int(stalled)
+
+        buckets: dict[tuple[str, int], dict[int, list[Mapping[str, Any]]]] = {}
+        for record in valid_records:
+            candidate = record.get("candidate", record.get("variant"))
+            seed = record.get("seed")
+            if not isinstance(candidate, str) or not candidate or type(seed) is not int:
+                continue
+            buckets.setdefault((candidate, seed), {0: [], 1: []})[record["seat"]].append(record)
+
+        pairs: list[tuple[str, Mapping[str, Any], Mapping[str, Any]]] = []
+        for (candidate, _seed), seats in sorted(buckets.items(), key=lambda item: (item[0][0], item[0][1])):
+            if len(seats[0]) == 1 and len(seats[1]) == 1:
+                pairs.append((candidate, seats[0][0], seats[1][0]))
+
+        pair_scores: list[float] = []
+        pair_banks: list[float] = []
+        rating_matches: list[tuple[str, str, float]] = []
+        wins = losses = ties = 0
+        for candidate, first, second in pairs:
+            score = (score_by_outcome[first["outcome"]] + score_by_outcome[second["outcome"]]) / 2.0
+            pair_scores.append(score)
+            pair_banks.append((_record_bank(first) + _record_bank(second)) / 2.0)  # type: ignore[operator]
+            for record in (first, second):
+                outcome = record["outcome"]
+                wins += int(outcome == "win")
+                losses += int(outcome == "loss")
+                ties += int(outcome == "tie")
+            if candidate != opponent:
+                rating_matches.append((candidate, opponent, score))
+
+        binary_scores = [score for score in pair_scores if score in (0.0, 1.0)]
+        wilson = (
+            wilson_interval(sum(score == 1.0 for score in binary_scores), len(binary_scores))
+            if len(binary_scores) == len(pair_scores) else None
+        )
+        rating = bradley_terry_summary(rating_matches, min_games=min_rating_games)
+        candidate_names = sorted({candidate for candidate, _first, _second in pairs})
+        candidate = candidate_names[0] if len(candidate_names) == 1 else None
+        candidate_rating = rating["ratings"].get(candidate) if candidate else None
+        candidate_uncertainty = rating["uncertainty"].get(candidate) if candidate else None
+        safety_denominator = len(opponent_records) or 1
+        summaries[opponent] = {
+            "record_count": len(opponent_records),
+            "valid": len(valid_records),
+            "valid_count": len(valid_records),
+            "valid_games": len(valid_records),
+            "paired_games": len(pairs),
+            "wins": wins,
+            "losses": losses,
+            "ties": ties,
+            "seat_balanced_win_rate": sum(pair_scores) / len(pair_scores) if pair_scores else None,
+            "wilson_win_rate": wilson,
+            "wilson_interval": wilson,
+            "mean_bank_differential": sum(pair_banks) / len(pair_banks) if pair_banks else None,
+            "mean_paired_bank_differential": sum(pair_banks) / len(pair_banks) if pair_banks else None,
+            "lower_tail_bank_differential": lower_tail(pair_banks),
+            "framework_errors": framework_errors,
+            "framework_error_count": framework_errors,
+            "invalid": invalid,
+            "invalid_count": invalid,
+            "timeouts": timeouts,
+            "timeout_count": timeouts,
+            "no_progress": no_progress,
+            "no_progress_truncations": no_progress,
+            "no_progress_count": no_progress,
+            "safety_failure_rate": (framework_errors + invalid + timeouts + no_progress) / safety_denominator,
+            "elo": rating,
+            "bradley_terry": rating,
+            "elo_rating": candidate_rating,
+            "elo_uncertainty": candidate_uncertainty,
+            "rating": candidate_rating,
+            "rating_uncertainty": candidate_uncertainty,
+            "rating_games": rating["games"].get(candidate, 0) if candidate else 0,
+            "rating_available": bool(rating["rating_available"] and candidate_rating is not None),
+        }
+    return summaries
+
+
+opponent_metrics = summarize_by_opponent
+
+
+def validate_matrix_coordinates(
+    records: Sequence[Mapping[str, Any]],
+    expected_matrix: Sequence[Sequence[Any]],
+) -> dict[str, Any]:
+    """Validate that records contain exactly one valid coordinate per matrix cell."""
+    if isinstance(records, (str, bytes)) or not isinstance(records, Sequence):
+        raise ValueError("matrix records must be a sequence")
+    if isinstance(expected_matrix, (str, bytes)) or not isinstance(expected_matrix, Sequence):
+        raise ValueError("matrix must be a sequence of coordinates")
+
+    def normalize(value: Any, label: str) -> tuple[str, int, int]:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or len(value) != 3:
+            raise ValueError(f"matrix {label} coordinates are invalid")
+        opponent, seed, seat = value
+        if type(opponent) is not str or not opponent or type(seed) is not int or type(seat) is not int or seat not in (0, 1):
+            raise ValueError(f"matrix {label} coordinates are invalid")
+        return opponent, seed, seat
+
+    expected = [normalize(value, "expected") for value in expected_matrix]
+    if len(set(expected)) != len(expected):
+        raise ValueError("matrix expected coordinates are duplicate")
+    observed = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise ValueError("matrix record coordinate is invalid")
+        observed.append(normalize((record.get("opponent"), record.get("seed"), record.get("seat")), "record"))
+    expected_set = set(expected)
+    observed_set = set(observed)
+    missing = sorted(expected_set - observed_set)
+    extra = sorted(observed_set - expected_set)
+    duplicates = sorted(coordinate for coordinate in observed_set if observed.count(coordinate) > 1)
+    if missing or extra or duplicates or len(observed) != len(expected):
+        raise ValueError(
+            "matrix coordinates are incompatible: "
+            f"missing={missing}, duplicate={duplicates}, extra={extra}"
+        )
+    return {
+        "expected": [list(value) for value in expected],
+        "observed": [list(value) for value in observed],
+        "expected_count": len(expected),
+        "observed_count": len(observed),
+        "complete": True,
+    }
+
+
 def _match(value: object) -> tuple[str, str, float]:
     if isinstance(value, Mapping):
         first = value.get("player_a", value.get("a"))
@@ -242,14 +460,26 @@ def bradley_terry_ratings(
     return {player: rating - offset for player, rating in ratings.items()}
 
 
-def bradley_terry_summary(matches: Iterable[object]) -> dict[str, Any]:
-    """Return ratings plus per-player game counts for a match table."""
+def bradley_terry_summary(
+    matches: Iterable[object], *, min_games: int = 2,
+) -> dict[str, Any]:
+    """Return ratings, counts, and conservative uncertainty for a match table."""
+    if type(min_games) is not int or min_games < 1:
+        raise ValueError("min_games must be a positive integer")
     parsed = _parse_matches(matches)
     games: dict[str, int] = {}
     for first, second, _score in parsed:
         games[first] = games.get(first, 0) + 1
         games[second] = games.get(second, 0) + 1
-    return {"ratings": bradley_terry_ratings(parsed), "games": games}
+    available = bool(parsed) and min(games.values(), default=0) >= min_games
+    uncertainty = _rating_uncertainty(games, available=available)
+    return {
+        "ratings": bradley_terry_ratings(parsed),
+        "games": games,
+        "uncertainty": uncertainty,
+        "rating_uncertainty": uncertainty,
+        "rating_available": available,
+    }
 
 
 elo_summary = bradley_terry_summary

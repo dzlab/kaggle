@@ -45,7 +45,10 @@ from kagriculture_agent.observation import is_shed_adjacent  # noqa: E402
 from kagriculture_agent.planner import _has_basic_need_deadline  # noqa: E402
 from kagriculture_agent.policy import Policy  # noqa: E402
 from scripts.run_local import OPPONENTS, _deterministic_random_agent  # noqa: E402
-from scripts.evaluation_metrics import bradley_terry_summary as _league_elo_summary  # noqa: E402
+from scripts.evaluation_metrics import (  # noqa: E402
+    bradley_terry_summary as _league_elo_summary,
+    summarize_by_opponent as _summarize_by_opponent,
+)
 from scripts.training_identity import (  # noqa: E402
     DEFAULT_EXPERIMENT_ID,
     FEATURE_VARIANTS,
@@ -4324,6 +4327,111 @@ def _candidate_metrics(records: Sequence[Mapping[str, Any]], candidates: Sequenc
     return summaries, decisions
 
 
+def _empty_opponent_metrics() -> dict[str, Any]:
+    """Return the stable zero-valued shape for a configured empty opponent cell."""
+    return {
+        "record_count": 0,
+        "valid": 0,
+        "valid_count": 0,
+        "valid_games": 0,
+        "paired_games": 0,
+        "wins": 0,
+        "losses": 0,
+        "ties": 0,
+        "seat_balanced_win_rate": None,
+        "wilson_win_rate": {"lower": None, "upper": None},
+        "wilson_interval": {"lower": None, "upper": None},
+        "mean_bank_differential": None,
+        "mean_paired_bank_differential": None,
+        "lower_tail_bank_differential": None,
+        "framework_errors": 0,
+        "framework_error_count": 0,
+        "invalid": 0,
+        "invalid_count": 0,
+        "timeouts": 0,
+        "timeout_count": 0,
+        "no_progress": 0,
+        "no_progress_truncations": 0,
+        "no_progress_count": 0,
+        "safety_failure_rate": 0.0,
+        "elo": {
+            "ratings": {}, "games": {}, "uncertainty": {},
+            "rating_uncertainty": {}, "rating_available": False,
+        },
+        "bradley_terry": {
+            "ratings": {}, "games": {}, "uncertainty": {},
+            "rating_uncertainty": {}, "rating_available": False,
+        },
+        "elo_rating": None,
+        "elo_uncertainty": None,
+        "rating": None,
+        "rating_uncertainty": None,
+        "rating_games": 0,
+        "rating_available": False,
+    }
+
+
+def _metrics_by_opponent(
+    records: Sequence[Mapping[str, Any]], candidates: Sequence[str], opponents: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    """Build stable candidate/opponent metrics while retaining empty matrix cells."""
+    result: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        candidate_records = _candidate_records(records, candidate)
+        calculated = _summarize_by_opponent(candidate_records)
+        result[candidate] = {
+            opponent: dict(calculated.get(opponent, _empty_opponent_metrics()))
+            for opponent in opponents
+        }
+    return result
+
+
+def _promotion_evidence(
+    summary: Mapping[str, Any], decision: Mapping[str, Any],
+    metrics: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return a JSON-safe projection used by promotion and comparison tooling."""
+    matrix = decision.get("matrix_completeness")
+    matrix = matrix if isinstance(matrix, Mapping) else None
+    matrix_complete = None
+    if matrix is not None:
+        matrix_complete = not any(
+            matrix.get(key) for key in ("missing", "duplicate", "extra", "invalid_records")
+        ) and matrix.get("observed_count") == matrix.get("expected_count")
+    counts = {
+        field: sum(int((opponent_metrics.get(field) or 0)) for opponent_metrics in metrics.values())
+        for field in ("valid", "framework_errors", "invalid", "timeouts", "no_progress")
+    }
+    safety_denominator = sum(int(opponent_metrics.get("record_count") or 0) for opponent_metrics in metrics.values())
+    return {
+        "status": decision.get("status"),
+        "reasons": (
+            list(decision.get("reasons", ()))
+            if isinstance(decision.get("reasons", ()), (list, tuple))
+            else ([] if decision.get("reasons") is None else [str(decision.get("reasons"))])
+        ),
+        "matrix_complete": matrix_complete,
+        "matrix_completeness": matrix,
+        "valid": counts["valid"],
+        "valid_games": counts["valid"],
+        "framework_errors": counts["framework_errors"],
+        "invalid": counts["invalid"],
+        "timeouts": counts["timeouts"],
+        "no_progress": counts["no_progress"],
+        "safety_failure_rate": (
+            (counts["framework_errors"] + counts["invalid"] + counts["timeouts"] + counts["no_progress"])
+            / safety_denominator if safety_denominator else 0.0
+        ),
+        "paired_games": summary.get("paired_games", 0),
+        "seat_balanced_win_rate": summary.get("seat_balanced_win_rate"),
+        "wilson_win_rate": summary.get("wilson_win_rate"),
+        "mean_bank_differential": summary.get("mean_paired_bank_differential"),
+        "lower_tail_bank_differential": summary.get("lower_tail_bank_differential"),
+        "elo": summary.get("elo"),
+        "metrics_by_opponent": {key: dict(value) for key, value in metrics.items()},
+    }
+
+
 def _normalized_report_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """Remove output-directory dependence from metadata while retaining names."""
     normalized = dict(config)
@@ -4512,6 +4620,14 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
         )
         for candidate in variants
     }
+    metrics_by_opponent = _metrics_by_opponent(records, variants, opponents)
+    promotion_evidence = {
+        candidate: _promotion_evidence(
+            paired_summaries[candidate], promotion_decisions[candidate],
+            metrics_by_opponent[candidate],
+        )
+        for candidate in variants
+    }
     seed_values = _config_seed_values(config)
     manifest = build_manifest(
         candidates=variants, opponents=opponents, seeds=seed_values,
@@ -4560,10 +4676,22 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
             )
             for candidate in variants
         }
+        holdout_metrics_by_opponent = _metrics_by_opponent(holdout_records, variants, opponents)
+        holdout_promotion_evidence = {
+            candidate: _promotion_evidence(
+                holdout_paired_summaries[candidate], holdout_promotion_decisions[candidate],
+                holdout_metrics_by_opponent[candidate],
+            )
+            for candidate in variants
+        }
         for candidate in variants:
             promotion_decisions[candidate] = {
                 **promotion_decisions.get(candidate, {}),
                 "holdout": holdout_promotion_decisions.get(candidate),
+            }
+            promotion_evidence[candidate] = {
+                **promotion_evidence[candidate],
+                "holdout": holdout_promotion_evidence[candidate],
             }
         selected_candidate = None if unavailable_candidates else _select_paired_candidate(
             variants, holdout_paired_summaries, promotion_decisions,
@@ -4586,6 +4714,8 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
             "results": holdout_results,
             "paired_summaries": holdout_paired_summaries,
             "promotion_decisions": holdout_promotion_decisions,
+            "metrics_by_opponent": holdout_metrics_by_opponent,
+            "promotion_evidence": holdout_promotion_evidence,
             "selected_candidate": selected_candidate,
         }
     ablations = {}
@@ -4651,6 +4781,8 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
         "results": results,
         "paired_summaries": paired_summaries,
         "promotion_decisions": promotion_decisions,
+        "metrics_by_opponent": metrics_by_opponent,
+        "promotion_evidence": promotion_evidence,
         "ablations": ablations,
     }
     if baseline_records is not None:
@@ -4663,6 +4795,8 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
         document["holdout_results"] = holdout_document["results"]
         document["holdout_paired_summaries"] = holdout_document["paired_summaries"]
         document["holdout_promotion_decisions"] = holdout_document["promotion_decisions"]
+        document["holdout_metrics_by_opponent"] = holdout_document["metrics_by_opponent"]
+        document["holdout_promotion_evidence"] = holdout_document["promotion_evidence"]
     return document
 
 

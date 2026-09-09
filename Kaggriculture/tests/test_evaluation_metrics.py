@@ -6,8 +6,10 @@ from scripts.evaluation_metrics import (
     bradley_terry_ratings,
     bradley_terry_summary,
     lower_tail,
+    summarize_by_opponent,
     paired_seed_summary,
     percentile,
+    validate_matrix_coordinates,
     wilson_interval,
 )
 
@@ -141,3 +143,63 @@ def test_metric_functions_reject_malformed_inputs(call):
 def test_paired_seed_summary_requires_nonempty_string_identifiers(record):
     with pytest.raises(ValueError):
         paired_seed_summary([record])
+
+
+def test_summarize_by_opponent_reports_stable_safety_and_strength_metrics():
+    records = [
+        _record(1, 0, "win", 10), _record(1, 1, "win", 12),
+        _record(2, 0, "loss", -20), _record(2, 1, "loss", -18),
+        {
+            **_record(3, 0, "tie", 0),
+            "framework_error": True,
+            "outcome": "framework_error",
+            "bank_differential": None,
+            "timeout": True,
+        },
+        {
+            **_record(3, 1, "tie", 0),
+            "framework_error": True,
+            "outcome": "framework_error",
+            "bank_differential": None,
+            "termination_reason": "no_progress",
+            "invalid": True,
+        },
+    ]
+
+    summary = summarize_by_opponent(records)["hard"]
+
+    assert summary["wins"] == 2
+    assert summary["losses"] == 2
+    assert summary["ties"] == 0
+    assert summary["valid"] == 4
+    assert summary["valid_games"] == 4
+    assert summary["paired_games"] == 2
+    assert summary["seat_balanced_win_rate"] == pytest.approx(0.5)
+    assert summary["wilson_win_rate"] is not None
+    assert summary["mean_bank_differential"] == pytest.approx(-4.0)
+    assert summary["lower_tail_bank_differential"] == pytest.approx(-17.5)
+    assert summary["framework_errors"] == 2
+    assert summary["invalid"] == 0
+    assert summary["timeouts"] == 1
+    assert summary["no_progress"] == 1
+    assert summary["elo_rating"] is not None
+    assert summary["elo_uncertainty"] is not None
+    assert summary["rating_games"] == 2
+
+
+def test_validate_matrix_coordinates_rejects_missing_duplicate_extra_and_invalid():
+    expected = [("hard", 1, 0), ("hard", 1, 1)]
+    complete = [
+        {"opponent": "hard", "seed": 1, "seat": 0},
+        {"opponent": "hard", "seed": 1, "seat": 1},
+    ]
+    assert validate_matrix_coordinates(complete, expected)["complete"] is True
+
+    for records in (
+        complete[:1],
+        [*complete, complete[0]],
+        [*complete, {"opponent": "easy", "seed": 1, "seat": 0}],
+        [*complete, {"opponent": "hard", "seed": True, "seat": 0}],
+    ):
+        with pytest.raises(ValueError, match="matrix"):
+            validate_matrix_coordinates(records, expected)

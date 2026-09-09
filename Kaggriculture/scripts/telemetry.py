@@ -6,7 +6,7 @@ import importlib
 import json
 import logging
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from statistics import mean, median
 from typing import Any
@@ -103,7 +103,10 @@ class TrainingTelemetry:
         self._logger.warning("%s: %s", message, exc)
         self._wandb_run = None
 
-    def record(self, event: str, metrics: Mapping[str, Any] | None = None, **values: Any) -> None:
+    def record(
+        self, event: str, metrics: Mapping[str, Any] | None = None, *, remote: bool = True,
+        **values: Any,
+    ) -> None:
         """Persist one event and best-effort mirror it to remote trackers."""
         if not isinstance(event, str) or not event:
             raise ValueError("telemetry event must be a nonempty string")
@@ -117,12 +120,12 @@ class TrainingTelemetry:
         with self.metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(encoded + "\n")
             handle.flush()
-        if self._weave_log_metrics is not None:
+        if remote and self._weave_log_metrics is not None:
             try:
                 self._weave_log_metrics(payload)
             except Exception as exc:
                 self._handle_weave_failure("Weave metric logging failed", exc)
-        if self._wandb_run is not None:
+        if remote and self._wandb_run is not None:
             try:
                 self._wandb_run.log({
                     "telemetry/event": event,
@@ -134,6 +137,18 @@ class TrainingTelemetry:
                 })
             except Exception as exc:
                 self._handle_wandb_failure("W&B metric logging failed", exc)
+
+    def update_wandb_summary(self, values: Mapping[str, Any]) -> None:
+        """Update run-level summary fields after validated evaluation evidence."""
+        if self._wandb_run is None:
+            return
+        summary = getattr(self._wandb_run, "summary", None)
+        if summary is None or not hasattr(summary, "update"):
+            return
+        try:
+            summary.update(_json_safe(dict(values)))
+        except Exception as exc:
+            self._handle_wandb_failure("W&B summary update failed", exc)
 
     @property
     def wandb_url(self) -> str | None:
@@ -507,6 +522,30 @@ def _flatten_matrix(matrix: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _validated_report_for_remote(report: Mapping[str, Any], candidates: Sequence[str]) -> bool:
+    """Return true only for reports with complete, explicitly validated matrices."""
+    if not candidates:
+        return False
+    summaries = report.get("summaries")
+    if not isinstance(summaries, Mapping):
+        summaries = report.get("paired_summaries")
+    metrics = report.get("metrics_by_opponent")
+    evidence = report.get("promotion_evidence")
+    if not isinstance(summaries, Mapping) or not isinstance(metrics, Mapping) or not isinstance(evidence, Mapping):
+        return False
+    for candidate in candidates:
+        candidate_evidence = _mapping_for(evidence, candidate)
+        if not candidate_evidence:
+            return False
+        if candidate_evidence.get("matrix_complete") is not True:
+            return False
+        matrix = _matrix_for(report, candidate)
+        flattened = _flatten_matrix(matrix)
+        if flattened.get("matrix_complete") is not True:
+            return False
+    return True
+
+
 def record_validation_report(
     telemetry: TrainingTelemetry,
     report: Mapping[str, Any] | None,
@@ -552,6 +591,14 @@ def record_validation_report(
         summaries = report.get("paired_summaries")
     summary_candidates = list(summaries.keys()) if isinstance(summaries, Mapping) else []
     candidates = list(dict.fromkeys([*grouped.keys(), *(str(value) for value in summary_candidates)]))
+    remote_validated = _validated_report_for_remote(report, candidates)
+
+    def emit(event: str, payload: Mapping[str, Any], *, remote: bool) -> None:
+        if isinstance(telemetry, TrainingTelemetry):
+            telemetry.record(event, payload, remote=remote)
+        else:
+            record_event(event, payload)
+
     common = {
         "phase": _json_safe(phase),
         "checkpoint": _json_safe(checkpoint),
@@ -575,7 +622,7 @@ def record_validation_report(
             }
             game.update(common)
             game["candidate"] = candidate
-            record_event("validation_game", game)
+            emit("validation_game", game, remote=False)
 
     for candidate in candidates:
         records = grouped.get(candidate, [])
@@ -666,6 +713,7 @@ def record_validation_report(
             reason_text = str(reasons)
         matrix = _flatten_matrix(_matrix_for(report, candidate))
         diagnostics = _canonical_diagnostics(report, candidate, records)
+        candidate_metrics = _mapping_for(report.get("metrics_by_opponent"), candidate)
         summary_shaping_count = _number_from((summary,), "shaping_count")
         if summary_shaping_count is not None:
             diagnostics["shaping_count"] = max(0, int(summary_shaping_count))
@@ -703,6 +751,11 @@ def record_validation_report(
             **diagnostics,
             "safety_regression": False,
             "promotion_safe": True,
+            "metrics_by_opponent": {
+                str(opponent): _json_safe(dict(opponent_summary))
+                for opponent, opponent_summary in candidate_metrics.items()
+                if isinstance(opponent_summary, Mapping)
+            },
         }
         summary_events.append(event)
 
@@ -725,7 +778,21 @@ def record_validation_report(
                 report, candidate=str(event["candidate"]),
             )
             event["promotion_safe"] = not event["safety_regression"]
-        record_event("validation_summary", event)
+        emit("validation_summary", event, remote=remote_validated)
+        if remote_validated and isinstance(telemetry, TrainingTelemetry):
+            prefix = str(phase)
+            existing_summary = getattr(telemetry._wandb_run, "summary", {})
+            existing_promoted = (
+                bool(existing_summary.get("promoted", False))
+                if isinstance(existing_summary, Mapping) else False
+            )
+            telemetry.update_wandb_summary({
+                f"{prefix}_status": event.get("decision_status"),
+                f"{prefix}_win_rate": event.get("win_rate"),
+                f"{prefix}_elo": event.get("elo_rating"),
+                "promoted": bool(event.get("decision_status") == "promote")
+                or existing_promoted,
+            })
 
         records = grouped.get(str(event.get("candidate")), [])
         for dimension in ("opponent", "seat"):
@@ -743,4 +810,4 @@ def record_validation_report(
                         dimension_value=value,
                     ),
                 }
-                record_event("validation_breakdown", breakdown)
+                emit("validation_breakdown", breakdown, remote=remote_validated)
