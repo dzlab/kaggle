@@ -33,6 +33,7 @@ from scripts.training_identity import (
     TRAINING_MODES,
     validate_training_identity,
 )
+from scripts.output_paths import validate_training_output_path
 
 COLLECTOR_OPPONENTS = ("pass", "random", "starter", "current")
 OPPONENTS = COLLECTOR_OPPONENTS
@@ -474,7 +475,9 @@ def collect(
         [], no_progress_window=no_progress_window, resolved_margin=resolved_margin,
     )
 
-    destination = Path(output)
+    destination = validate_training_output_path(
+        output, name="trajectory output",
+    )
     destination.parent.mkdir(parents=True, exist_ok=True)
     run_id = uuid.uuid4().hex
     manifest = _manifest(

@@ -30,7 +30,7 @@ def test_ladder_parser_expands_stable_seeded_configurations_and_estimates_budget
     assert experiments[0]["width"] == 16
     assert experiments[0]["depth"] == 1
     assert experiments[0]["ppo_steps"] == 100
-    assert experiments[0]["parameter_estimate"] > 0
+    assert experiments[0]["parameter_estimate"] == 4_756
     assert experiments[0]["rollout_budget"] == 19_200
     assert experiments == expand_ladder(ladder)
 
@@ -70,8 +70,17 @@ def test_dry_run_expansion_only_estimates_isolated_experiments():
 
     assert report["dry_run"] is True
     assert report["experiments"][0]["width"] == 128
+    assert report["experiments"][0]["parameter_estimate"] == 578_596
     assert "checkpoint" not in json.dumps(report).lower()
     assert "models/" not in json.dumps(report).lower()
+
+
+@pytest.mark.parametrize("width,depth", [(128, 4), (128, 8), (256, 4), (256, 8)])
+def test_ladder_parameter_estimate_matches_compact_policy_topology(width, depth):
+    from kagriculture_agent.model import model_parameter_count_for_shape
+    from scripts.benchmark_training_ladder import estimate_parameter_count
+
+    assert estimate_parameter_count(width, depth) == model_parameter_count_for_shape(width, depth)
 
 
 def test_ladder_rejects_production_artifact_and_checkpoint_paths(tmp_path):

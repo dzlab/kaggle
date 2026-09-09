@@ -120,6 +120,37 @@ def test_collect_rejects_non_string_opponents_before_coercion(tmp_path, bad_oppo
         collect(seeds=[0], opponents=[bad_opponent], seats=[0], steps=4, output=tmp_path / "bad.jsonl")
 
 
+@pytest.mark.parametrize("production_directory", ["models", "artifacts", "checkpoints"])
+def test_collect_rejects_trajectory_output_under_production_directory(
+    tmp_path, production_directory,
+):
+    from scripts.collect_trajectories import collect
+
+    with pytest.raises(ValueError, match="production"):
+        collect(
+            seeds=[0], opponents=["pass"], seats=[0], steps=4,
+            output=tmp_path / production_directory / "trajectories.jsonl",
+        )
+
+
+@pytest.mark.parametrize("production_directory", ["models", "artifacts", "checkpoints"])
+def test_collect_rejects_trajectory_output_through_production_symlink(
+    tmp_path, production_directory,
+):
+    from scripts.collect_trajectories import collect
+
+    production_root = tmp_path / production_directory
+    production_root.mkdir()
+    symlink_root = tmp_path / "isolated-output"
+    symlink_root.symlink_to(production_root, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="production"):
+        collect(
+            seeds=[0], opponents=["pass"], seats=[0], steps=4,
+            output=symlink_root / "trajectories.jsonl",
+        )
+
+
 def test_isolated_game_timeout_becomes_diagnostic_runtime_error(monkeypatch, tmp_path):
     from scripts import collect_trajectories
 

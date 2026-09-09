@@ -504,10 +504,12 @@ def build_config(
         validate_training_output_path(_absolute_path(plot_path), name="plot path")
         if plot_path is not None else None
     )
-    input_path = (
-        _absolute_path(trajectory_path)
-        if trajectory_path is not None else run_path / "bootstrap-trajectories.jsonl"
-    )
+    if trajectory_path is None:
+        input_path = run_path / "bootstrap-trajectories.jsonl"
+    else:
+        input_path = validate_training_output_path(
+            _absolute_path(trajectory_path), name="trajectory path",
+        )
     return ColabConfig(
         run_path, resolved, workers, development, holdout,
         _absolute_path(resume) if resume is not None else None,

@@ -901,6 +901,44 @@ def test_build_config_rejects_symlinked_run_directory_into_production(tmp_path, 
         )
 
 
+@pytest.mark.parametrize("production_directory", ["models", "artifacts", "checkpoints"])
+def test_build_config_rejects_explicit_trajectory_path_under_production(
+    tmp_path, monkeypatch, production_directory,
+):
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+
+    with pytest.raises(ValueError, match="production"):
+        colab_train.build_config(
+            run_directory=tmp_path / "safe-run",
+            trajectory_path=tmp_path / production_directory / "trajectories.jsonl",
+            device="cpu",
+            mount_drive=False,
+        )
+
+
+@pytest.mark.parametrize("production_directory", ["models", "artifacts", "checkpoints"])
+def test_build_config_rejects_explicit_trajectory_path_through_symlink(
+    tmp_path, monkeypatch, production_directory,
+):
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    production_root = tmp_path / production_directory
+    production_root.mkdir()
+    symlink_root = tmp_path / "safe-input"
+    symlink_root.symlink_to(production_root, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="production"):
+        colab_train.build_config(
+            run_directory=tmp_path / "safe-run",
+            trajectory_path=symlink_root / "trajectories.jsonl",
+            device="cpu",
+            mount_drive=False,
+        )
+
+
 def test_run_workflow_rechecks_symlinked_run_directory_before_commands(tmp_path, monkeypatch):
     from dataclasses import replace
     from scripts import colab_train

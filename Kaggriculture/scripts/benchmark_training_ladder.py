@@ -28,8 +28,10 @@ MAX_SEEDS = 256
 MAX_EXPERIMENTS = 4096
 MAX_ROLLOUT_EPISODES = 100_000
 MAX_ROLLOUT_STEPS = 1_000_000
-DEFAULT_INPUT_SIZE = 64
-DEFAULT_OUTPUT_SIZE = 32
+_FEATURE_INPUT_SIZES = (23, 28, 14, 13)
+_WORKER_KIND_COUNT = 14
+_MARKET_ITEM_COUNT = 9
+_MARKET_QUANTITY_COUNT = 8
 
 
 def parse_ladder(value: str | Path | Mapping[str, Any]) -> dict[str, Any]:
@@ -127,19 +129,35 @@ def expand_ladder(ladder: Mapping[str, Any]) -> list[dict[str, Any]]:
 def estimate_parameter_count(
     width: int,
     depth: int,
-    *,
-    input_size: int = DEFAULT_INPUT_SIZE,
-    output_size: int = DEFAULT_OUTPUT_SIZE,
 ) -> int:
-    """Estimate dense MLP parameters for a fixed input/output interface."""
+    """Count parameters for the dependency-free CompactPolicyNet topology."""
     width = _model_width(width, "width", MAX_LADDER_WIDTH)
     depth = _positive_int(depth, "depth", MAX_LADDER_DEPTH)
-    input_size = _positive_int(input_size, "input_size")
-    output_size = _positive_int(output_size, "output_size")
-    input_layer = input_size * width + width
-    hidden_layers = max(0, depth - 1) * (width * width + width)
-    output_layer = width * output_size + output_size
-    return input_layer + hidden_layers + output_layer
+
+    def linear_parameters(input_size: int, output_size: int) -> int:
+        return input_size * output_size + output_size
+
+    count = sum(
+        linear_parameters(input_size, width)
+        for input_size in _FEATURE_INPUT_SIZES
+    )
+    count += 4 * width  # type embedding
+    for _ in range(depth):
+        # MultiheadAttention, attention projection/norm, and the 2x-width MLP/norm.
+        count += 3 * width * width + 3 * width
+        count += linear_parameters(width, width)
+        count += 2 * width
+        count += linear_parameters(width, 2 * width)
+        count += linear_parameters(2 * width, width)
+        count += 2 * width
+    count += linear_parameters(width, 2)
+    count += linear_parameters(width, _WORKER_KIND_COUNT)
+    count += linear_parameters(width, width) * 2
+    count += linear_parameters(width, _MARKET_ITEM_COUNT)
+    count += linear_parameters(width, _MARKET_QUANTITY_COUNT)
+    count += linear_parameters(width, 1)
+    count += linear_parameters(width, 2)  # training-only market head
+    return count
 
 
 def estimate_rollout_budget(ppo_steps: int, episodes: int, steps: int) -> int:
