@@ -1,4 +1,5 @@
 import hashlib
+from itertools import islice
 from pathlib import Path
 
 import pytest
@@ -86,6 +87,37 @@ def test_sample_matches_one_canonical_schedule_prefix_for_any_horizon(tmp_path):
 
     assert [sampler.sample(index, seed=73) for index in range(12)] == short
     assert long[:12] == short
+
+
+def test_large_lazy_schedule_preserves_exact_prefix_and_indexed_match(tmp_path):
+    checkpoints = tuple(
+        _checkpoint(tmp_path, f"checkpoint-{index}.pt", "default")
+        for index in range(3)
+    )
+    sampler = LeagueSampler(skill_bands={"default": SkillBand("default", checkpoints)})
+
+    expected = sampler.schedule(64, seed=11)
+    lazy = sampler.iter_schedule(1_000_000, seed=11)
+
+    assert not isinstance(lazy, list)
+    assert list(islice(lazy, 64)) == expected
+    assert next(lazy) == sampler.sample(64, seed=11)
+
+
+def test_default_indexed_match_does_not_replay_prior_prefix(tmp_path, monkeypatch):
+    checkpoint = _checkpoint(tmp_path, "checkpoint.pt", "default")
+    sampler = LeagueSampler(skill_bands={"default": SkillBand("default", (checkpoint,))})
+    original = sampler._opponent_at
+    calls = []
+
+    def counted(index, *, seed, cycle=None):
+        calls.append(index)
+        return original(index, seed=seed, cycle=cycle)
+
+    monkeypatch.setattr(sampler, "_opponent_at", counted)
+    sampler.sample(1_000_000, seed=11)
+
+    assert calls == [1_000_000]
 
 
 def test_checkpoint_sampling_is_uniform_within_selected_band(tmp_path):

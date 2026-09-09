@@ -597,6 +597,9 @@ class OpponentPool:
     def schedule(self, *, count: int, seed: int = 0) -> list[OpponentMatch]:
         return self.league_sampler.schedule(count, seed=seed)
 
+    def iter_schedule(self, *, count: int, seed: int = 0):
+        return self.league_sampler.iter_schedule(count, seed=seed)
+
 
 def should_promote(
     *, wins: int, games: int, threshold: float = 0.70,
@@ -1546,7 +1549,19 @@ def run_ppo_training(
     if rollout_fn is None and not offline_ppo_fallback:
         raise ValueError("rollout_fn is required for PPO unless offline_ppo_fallback is explicitly selected")
     pool = opponent_pool if opponent_pool is not None else OpponentPool()
-    schedule = pool.schedule(count=steps, seed=seed) if rollout_fn is not None else []
+    schedule = None
+    if rollout_fn is not None:
+        if hasattr(pool, "iter_schedule"):
+            schedule = iter(pool.iter_schedule(count=steps, seed=seed))
+        elif hasattr(pool, "sample"):
+            schedule = (
+                pool.sample(index, seed=seed)
+                for index in range(steps)
+            )
+        else:
+            schedule = iter(pool.schedule(count=steps, seed=seed))
+        for _ in range(start_step):
+            next(schedule)
     total_updates = initial_ppo_updates
     rollout_count = initial_rollout_count
     shaping_count = initial_shaping_count
@@ -1563,7 +1578,7 @@ def run_ppo_training(
         if rollout_fn is None:
             rollout = offline_rows[:config.rollout_steps]
         else:
-            match = schedule[step]
+            match = next(schedule)
             if isinstance(pool, OpponentPool) and match.opponent == "checkpoint" and (
                 match.checkpoint is None or not Path(match.checkpoint).is_file()
             ):

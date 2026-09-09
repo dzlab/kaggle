@@ -161,6 +161,10 @@ DEFAULT_OPPONENT_PROBABILITIES: dict[OpponentName, float] = {
     "checkpoint": 0.25,
 }
 DEFAULT_MIXED_OPPONENTS = ("current", "random", "starter")
+_DEFAULT_OPPONENT_CYCLE = (
+    ("current", 8), ("mixed", 3), ("random", 2),
+    ("starter", 2), ("checkpoint", 5),
+)
 
 
 def _validate_weights(values: Mapping[str, object], label: str) -> dict[str, float]:
@@ -280,8 +284,47 @@ class LeagueSampler:
             raise ValueError("mixed_opponents must contain non-empty strings")
         self.mixed_opponents = mixed
 
-    def _match_at(self, index: int, *, seed: int) -> OpponentMatch:
-        opponent = self._opponent_at(index, seed=seed)
+    def _canonical_cycle(self, seed: int) -> tuple[str, ...] | None:
+        if self.probabilities != DEFAULT_OPPONENT_PROBABILITIES:
+            return None
+        cycle = [
+            opponent
+            for opponent, count in _DEFAULT_OPPONENT_CYCLE
+            for _ in range(count)
+        ]
+        _rng(seed, 0, "opponent-sequence").shuffle(cycle)
+        return tuple(cycle)
+
+    def _opponent_at(
+        self, index: int, *, seed: int, cycle: tuple[str, ...] | None = None,
+    ) -> str:
+        """Return the canonical opponent at one sequence index in O(1) work."""
+        if cycle is None and self.probabilities == DEFAULT_OPPONENT_PROBABILITIES:
+            cycle = self._canonical_cycle(seed)
+        if cycle is not None:
+            return cycle[index % len(cycle)]
+        return _choose(_rng(seed, index, "opponent"), self.probabilities)
+
+    def _checkpoint_ordinal_before(
+        self, index: int, *, seed: int, cycle: tuple[str, ...] | None,
+    ) -> int:
+        if cycle is not None:
+            completed, remainder = divmod(index, len(cycle))
+            return (
+                completed * cycle.count("checkpoint")
+                + sum(opponent == "checkpoint" for opponent in cycle[:remainder])
+            )
+        return sum(
+            self._opponent_at(previous, seed=seed) == "checkpoint"
+            for previous in range(index)
+        )
+
+    def _match_at(
+        self, index: int, *, seed: int, cycle: tuple[str, ...] | None = None,
+        opponent: str | None = None, checkpoint_ordinal: int | None = None,
+    ) -> OpponentMatch:
+        if opponent is None:
+            opponent = self._opponent_at(index, seed=seed, cycle=cycle)
         seat = index % 2
         if opponent == "checkpoint":
             if not self.skill_bands:
@@ -304,10 +347,11 @@ class LeagueSampler:
                     "current", seat, fallback_reason="checkpoint_unavailable",
                 )
             if len(self.skill_bands) == 1 and band.name == "default":
-                checkpoint_index = sum(
-                    self._opponent_at(previous, seed=seed) == "checkpoint"
-                    for previous in range(index)
-                ) % len(available)
+                if checkpoint_ordinal is None:
+                    checkpoint_ordinal = self._checkpoint_ordinal_before(
+                        index, seed=seed, cycle=cycle,
+                    )
+                checkpoint_index = checkpoint_ordinal % len(available)
             else:
                 checkpoint_index = _rng(seed, index, "checkpoint").randrange(len(available))
             checkpoint = available[checkpoint_index]
@@ -330,28 +374,38 @@ class LeagueSampler:
             )
         return OpponentMatch(opponent, seat)  # type: ignore[arg-type]
 
-    def _opponent_at(self, index: int, *, seed: int) -> str:
-        """Return the one canonical opponent at a sequence index."""
-        if self.probabilities == DEFAULT_OPPONENT_PROBABILITIES:
-            cycle = [
-                opponent
-                for opponent, count in (
-                    ("current", 8), ("mixed", 3), ("random", 2),
-                    ("starter", 2), ("checkpoint", 5),
-                )
-                for _ in range(count)
-            ]
-            _rng(seed, 0, "opponent-sequence").shuffle(cycle)
-            return cycle[index % len(cycle)]
-        return _choose(_rng(seed, index, "opponent"), self.probabilities)
-
     def sample(self, index: int, *, seed: int = 0) -> OpponentMatch:
         """Return the canonical deterministic match at one sequence index."""
         if type(index) is not int or index < 0:
             raise ValueError("index must be a nonnegative integer")
         if type(seed) is not int:
             raise ValueError("seed must be an integer")
-        return self._match_at(index, seed=seed)
+        cycle = self._canonical_cycle(seed)
+        return self._match_at(index, seed=seed, cycle=cycle)
+
+    def iter_schedule(self, count: int, *, seed: int = 0):
+        """Lazily yield the canonical schedule without materializing a prefix."""
+        if type(count) is not int or count < 1:
+            raise ValueError("count must be a positive integer")
+        if type(seed) is not int:
+            raise ValueError("seed must be an integer")
+        cycle = self._canonical_cycle(seed)
+
+        def matches():
+            checkpoint_ordinal = 0
+            for index in range(count):
+                opponent = self._opponent_at(index, seed=seed, cycle=cycle)
+                yield self._match_at(
+                    index,
+                    seed=seed,
+                    cycle=cycle,
+                    opponent=opponent,
+                    checkpoint_ordinal=checkpoint_ordinal,
+                )
+                if opponent == "checkpoint":
+                    checkpoint_ordinal += 1
+
+        return matches()
 
     def schedule(self, count: int, *, seed: int = 0) -> list[OpponentMatch]:
         """Return exactly ``count`` weighted matches with alternating seats.
@@ -359,9 +413,7 @@ class LeagueSampler:
         This is the canonical materialization path used by both the PPO
         workflow and ``sample`` reconstruction.
         """
-        if type(count) is not int or count < 1:
-            raise ValueError("count must be a positive integer")
-        return [self._match_at(index, seed=seed) for index in range(count)]
+        return list(self.iter_schedule(count, seed=seed))
 
 
 def _resolve_sampler(
@@ -387,6 +439,18 @@ def sample_schedule(
     """Convenience wrapper around :class:`LeagueSampler.schedule`."""
     selected = _resolve_sampler(sampler, sampler_kwargs)
     return selected.schedule(count, seed=seed)
+
+
+def iter_schedule(
+    count: int,
+    *,
+    seed: int = 0,
+    sampler: LeagueSampler | None = None,
+    **sampler_kwargs: object,
+):
+    """Convenience wrapper around :meth:`LeagueSampler.iter_schedule`."""
+    selected = _resolve_sampler(sampler, sampler_kwargs)
+    return selected.iter_schedule(count, seed=seed)
 
 
 def sample_match(

@@ -849,6 +849,35 @@ def test_ppo_rollouts_call_callback_once_per_step_with_scheduled_match():
     assert metrics["rollout_count"] == 3
 
 
+def test_ppo_rollouts_consume_a_lazy_league_iterator():
+    from scripts.train_policy import OpponentMatch, PPOConfig, run_ppo_training
+
+    calls = []
+
+    class Pool:
+        def schedule(self, *, count, seed):
+            raise AssertionError("PPO must not eagerly materialize the league schedule")
+
+        def iter_schedule(self, *, count, seed):
+            calls.append(("iter_schedule", count, seed))
+            for index in range(count):
+                yield OpponentMatch("current", index % 2)
+
+    run_ppo_training(
+        network=None,
+        optimizer=None,
+        transitions=[],
+        ppo_steps=3,
+        config=PPOConfig(rollout_steps=5),
+        opponent_pool=Pool(),
+        rollout_fn=lambda **_kwargs: [_transition(done=True)],
+        seed=23,
+        update_fn=lambda **_kwargs: {"updates": 1, "early_stopped": False},
+    )
+
+    assert calls == [("iter_schedule", 3, 23)]
+
+
 def test_ppo_offline_fallback_is_explicit_and_reuses_collected_rollout():
     from scripts.train_policy import PPOConfig, run_ppo_training
 
