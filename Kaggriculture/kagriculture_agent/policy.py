@@ -838,15 +838,25 @@ def _fetch_required_item(state: Any, worker_index: int, task: Any, current: Posi
 def _drop_carried_goods(state: Any, worker_index: int, task: Any, current: Position,
                         *, force: bool = False) -> str | None:
     inventory = _inventory_for_worker(state, worker_index)
-    if not any(inventory.get(item, 0) > 0 for item in set(PRODUCTS) | set(ANIMALS)):
+    carried_items = tuple(PRODUCTS) + tuple(ANIMALS)
+    carried_total = sum(inventory.get(item, 0) for item in carried_items)
+    if carried_total <= 0:
         return None
     required = _required_worker_item(task, state)
     if not force and required is not None and inventory.get(required, 0) > 0:
         return None
+    shed_room = max(0, DEFAULT_SHED_CAPACITY - sum(_counts(_shed(state)).values()))
+    cleanup = "DROP" if carried_total <= shed_room else next((
+        f"PLACE {item} {min(inventory[item], shed_room)}"
+        for item in PRODUCTS
+        if inventory.get(item, 0) > 0 and shed_room > 0
+    ), None)
+    if cleanup is None:
+        return PASS if force else None
     access = _shed_access_target(state, current)
     if access is None:
         return None
-    return "DROP" if current == access else next_move(current, access)
+    return cleanup if current == access else next_move(current, access)
 
 
 def _has_carried_goods(state: Any) -> bool:

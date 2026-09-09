@@ -43,17 +43,18 @@ def test_assign_tasks_falls_back_to_reserved_worker_when_only_farmer():
     ]
 
 
-@__import__("pytest").mark.parametrize("shed,carried", [
-    ({"CARROT": 99}, [{"MELON": 2}]), ({"CARROT": 100}, [{"MELON": 1}]),
-    ({"CARROT": 99}, [{"MELON": 1, "EGG": 1}]),
-    ({"CARROT": 100}, [{"GOOSE": 1}]),
+@__import__("pytest").mark.parametrize("shed,carried,expected", [
+    ({"CARROT": 99}, [{"MELON": 2}], "PLACE MELON 1"),
+    ({"CARROT": 100}, [{"MELON": 1}], "PASS"),
+    ({"CARROT": 99}, [{"MELON": 1, "EGG": 1}], "PLACE MELON 1"),
+    ({"CARROT": 100}, [{"GOOSE": 1}], "PASS"),
 ])
-def test_drop_carried_goods_preserves_inventory_when_shed_is_full(shed, carried):
+def test_drop_carried_goods_is_capacity_safe_without_mutating_state(shed, carried, expected):
     state = _state(private={"shed": shed, "inventories": carried})
     shed_before = dict(state["private"]["shed"])
     inventory_before = dict(carried[0])
     action = _drop_carried_goods(state, 0, None, Position(1, 1), force=True)
-    assert action == "PASS"
+    assert action == expected
     assert state["private"]["shed"] == shed_before
     assert state["private"]["inventories"][0] == inventory_before
 
