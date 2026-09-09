@@ -1027,6 +1027,7 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
         ]
         deadline_capacity_hire = (
             hand_count == 0
+            and hour < 23
             and _due_needs_exceed_single_worker_capacity(
                 normalized, [*due_needs, *preempting_tasks], day, hour,
             )
@@ -1552,20 +1553,6 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
         )
 
     tasks.sort(key=assignment_sort_key)
-    seed_inventory = state.get("seeds", {})
-    seed_inventory = seed_inventory if isinstance(seed_inventory, Mapping) else {}
-    allocated_seeds: dict[str, int] = {}
-    seed_bounded_tasks = []
-    for task in tasks:
-        if task.kind == "PLANT":
-            crop = str(task.item or "").upper()
-            allocated = allocated_seeds.get(crop, 0)
-            if allocated >= _safe_quantity(seed_inventory.get(crop, 0)):
-                continue
-            allocated_seeds[crop] = allocated + 1
-        seed_bounded_tasks.append(task)
-    tasks = seed_bounded_tasks
-
     farmer = next((info for info in infos if info[1] == "FARMER"), None)
     logistics_pending = any(task.kind in _SHED_WORK for task in tasks)
     helper_exists = any(info[1] != "FARMER" for info in infos)
@@ -1573,8 +1560,11 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
     available = {info[0] for info in infos}
     assignments: list[WorkerAssignment] = []
     remaining = list(tasks)
+    seed_inventory = state.get("seeds", {})
+    seed_inventory = seed_inventory if isinstance(seed_inventory, Mapping) else {}
+    allocated_seeds: dict[str, int] = {}
 
-    def choose(task: Task) -> tuple[int, str, Position | None] | None:
+    def feasible_candidates(task: Task) -> list[tuple[int, str, Position | None]]:
         candidates = [
             info for info in infos
             if info[0] in available and _fits_same_day_deadline(task, info, state, board_size, day)
@@ -1591,6 +1581,47 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
                         for product in PRODUCTS
                     )
                 ]
+        return candidates
+
+    def feed_matching_size(feed_tasks: Sequence[Task], worker_ids: set[int]) -> int:
+        matched: dict[int, Task] = {}
+
+        def match(feed_task: Task, seen: set[int]) -> bool:
+            for candidate in feasible_candidates(feed_task):
+                worker_index = candidate[0]
+                if worker_index not in worker_ids or worker_index in seen:
+                    continue
+                seen.add(worker_index)
+                previous = matched.get(worker_index)
+                if previous is None or match(previous, seen):
+                    matched[worker_index] = feed_task
+                    return True
+            return False
+
+        return sum(match(feed_task, set()) for feed_task in feed_tasks)
+
+    def choose(task: Task) -> tuple[int, str, Position | None] | None:
+        candidates = feasible_candidates(task)
+        equal_due_feeds = [
+            other for other in remaining
+            if task.kind == "WATER"
+            and other is not task
+            and other.kind == "FEED"
+            and task.deadline is not None
+            and task.deadline <= day
+            and other.deadline == task.deadline
+            and other.priority == task.priority
+        ]
+        if equal_due_feeds and candidates:
+            feed_capacity = feed_matching_size(equal_due_feeds, available)
+            candidates = [
+                candidate for candidate in candidates
+                if feed_matching_size(
+                    equal_due_feeds, available - {candidate[0]},
+                ) == feed_capacity
+            ]
+            if not candidates:
+                return None
         non_farmer_available = any(
             info[0] in available
             and info[1] != "FARMER"
@@ -1624,9 +1655,17 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
         ))
 
     for task in tasks:
+        crop = str(task.item or "").upper()
+        if (
+            task.kind == "PLANT"
+            and allocated_seeds.get(crop, 0) >= _safe_quantity(seed_inventory.get(crop, 0))
+        ):
+            continue
         selected = choose(task)
         if selected is None:
             continue
+        if task.kind == "PLANT":
+            allocated_seeds[crop] = allocated_seeds.get(crop, 0) + 1
         available.remove(selected[0])
         remaining.remove(task)
         assignments.append(WorkerAssignment(

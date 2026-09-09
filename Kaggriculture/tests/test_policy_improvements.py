@@ -70,6 +70,38 @@ def _policy_observation_with_one_melon_seed():
     }
 
 
+def _policy_observation_with_two_fertilizer_tasks(quantity):
+    board = [[None for _ in range(10)] for _ in range(10)]
+    for x in (0, 1):
+        board[0][x] = {
+            "kind": "PLANT",
+            "crop": "WHEAT",
+            "watered_today": True,
+            "fertilized_until_day": -1,
+            "planted_day": 2,
+            "yield_units": 0,
+        }
+    return {
+        "player": 0,
+        "day": 2,
+        "hour": 23,
+        "farms": [{
+            "tiles": board,
+            "farmer": [5, 4],
+            "hands": [[4, 4]],
+            "money": 0,
+            "unlocked_quadrants": ["NW"],
+        }],
+        "private": {
+            "shed": {"FERTILIZER": quantity},
+            "seeds": {},
+            "inventories": [{}, {}],
+        },
+        "market": {"prices": {}, "inventory": {}},
+        "town": {"unlocked_shops": []},
+    }
+
+
 def test_assign_tasks_uses_reserved_worker_for_only_one_fallback_task():
     state = _state(workers=_workers(("FARMER", Position(0, 0))),
                    private={"seeds": {}, "shed": {"WHEAT": 1}, "inventories": [{"GOOSE": 1}]})
@@ -138,6 +170,51 @@ def test_assign_tasks_routes_equal_priority_deadlines_before_task_kind():
     assert assignments[0].task.kind == "WATER"
 
 
+def test_assign_tasks_preserves_only_feed_worker_when_water_has_another_candidate():
+    state = _state(
+        day=2,
+        hour=20,
+        workers=_workers(
+            ("FARMER", Position(2, 0)),
+            ("HAND", Position(0, 0)),
+        ),
+        private={"seeds": {}, "shed": {}, "inventories": [{}, {"WHEAT": 1}]},
+    )
+    tasks = [
+        Task("WATER", Position(0, 1), 100, 2, 1, item="MELON"),
+        Task("FEED", Position(0, 2), 100, 2, 1, item="SHEEP"),
+    ]
+
+    assignments = assign_tasks(tasks, state["workers"], state)
+
+    assert [(assignment.worker_index, assignment.task.kind) for assignment in assignments] == [
+        (0, "WATER"),
+        (1, "FEED"),
+    ]
+
+
+def test_assign_tasks_keeps_due_feed_when_workers_cannot_cover_all_due_needs():
+    state = _state(
+        day=16,
+        hour=1,
+        board_size=10,
+        workers=_workers(
+            ("FARMER", Position(4, 4)),
+            ("HAND", Position(5, 4)),
+        ),
+        private={"seeds": {}, "shed": {"WHEAT": 1}, "inventories": [{}, {}]},
+    )
+    tasks = [
+        Task("FEED", Position(0, 0), 100, 16, 1, item="SHEEP"),
+        Task("WATER", Position(7, 0), 100, 16, 1, item="MELON"),
+        Task("WATER", Position(8, 0), 100, 16, 1, item="MELON"),
+    ]
+
+    assignments = assign_tasks(tasks, state["workers"], state)
+
+    assert sorted(assignment.task.kind for assignment in assignments) == ["FEED", "WATER"]
+
+
 def test_assign_tasks_keeps_higher_priority_maintenance_before_route_distance():
     state = _state(
         day=2,
@@ -176,11 +253,38 @@ def test_assign_tasks_allocates_plant_tasks_within_available_seed_inventory():
     ]
 
 
+def test_assign_tasks_allocates_seed_only_after_plant_is_feasible():
+    state = _state(
+        day=1,
+        hour=22,
+        workers=_workers(("FARMER", Position(0, 0))),
+        private={"seeds": {"MELON": 1}, "shed": {}, "inventories": [{}]},
+    )
+    tasks = [
+        Task("PLANT", Position(1, 0), 30, 1, 10, item="MELON"),
+        Task("PLANT", Position(0, 0), 20, 1, 10, item="MELON"),
+    ]
+
+    assignments = assign_tasks(tasks, state["workers"], state)
+
+    assert [(assignment.worker_index, assignment.task.target) for assignment in assignments] == [
+        (0, Position(0, 0)),
+    ]
+
+
 def test_policy_limits_same_turn_plant_commands_to_available_seeds():
     action = Policy().act(_policy_observation_with_one_melon_seed())
     commands = [action["farmer"], *action["hands"]]
 
     assert sum(command == ["PLANT", "MELON"] for command in commands) == 1
+
+
+@__import__("pytest").mark.parametrize(("quantity", "expected"), [(1, 1), (2, 2)])
+def test_policy_limits_same_turn_pickups_to_available_shed_quantity(quantity, expected):
+    action = Policy().act(_policy_observation_with_two_fertilizer_tasks(quantity))
+    commands = [action["farmer"], *action["hands"]]
+
+    assert sum(command[:2] == ["PICKUP", "FERTILIZER"] for command in commands) == expected
 
 
 @__import__("pytest").mark.parametrize("shed,carried,expected", [
@@ -569,6 +673,34 @@ def test_macro_proposes_affordable_hire_for_due_basic_need_capacity(cash, wheat,
     macro = build_autonomous_macro_plan(state)
 
     assert (["HIRE"] in macro["market_intents"]) is expected
+
+
+def test_macro_does_not_hire_at_hour_23_for_current_day_capacity():
+    tiles = [["EMPTY"] * 10 for _ in range(10)]
+    for x, y in ((1, 0), (2, 0), (3, 0), (4, 0), (2, 1), (4, 1)):
+        tiles[y][x] = {
+            "kind": "PLANT",
+            "crop": "WHEAT",
+            "watered_today": False,
+        }
+    tiles[0][0] = {"kind": "PASTURE"}
+    state = _state(
+        day=1,
+        hour=23,
+        board_size=10,
+        tiles=tiles,
+        cash=150,
+        workers=_workers(("FARMER", Position(4, 4))),
+        private={
+            "seeds": {},
+            "shed": {"WHEAT": 30, "SHEEP": 1},
+            "inventories": [{}],
+        },
+    )
+
+    macro = build_autonomous_macro_plan(state)
+
+    assert ["HIRE"] not in macro["market_intents"]
 
 
 def test_learned_policy_liquidates_shed_inventory_in_terminal_window(monkeypatch):

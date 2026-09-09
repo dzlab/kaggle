@@ -3638,7 +3638,7 @@ def test_variants_and_ablations_change_only_legal_action_shapes():
     assert ablated_action == {"farmer": ["PASS"], "hands": [], "market": []}
 
 
-@pytest.mark.parametrize("order", [[], (), None])
+@pytest.mark.parametrize("order", [[], ()])
 def test_apply_variant_skips_empty_market_order(order):
     from scripts.evaluate import apply_variant
 
@@ -3661,6 +3661,7 @@ def test_apply_variant_skips_empty_market_order(order):
 @pytest.mark.parametrize(
     "order",
     [
+        None,
         "BOGUS",
         ["BOGUS"],
         ["BUY_PRODUCT"],

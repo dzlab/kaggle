@@ -2086,7 +2086,7 @@ def _cash(observation: Mapping[str, Any]) -> float:
 
 def _inert_market_order(order: Any) -> bool:
     """Return whether an entry contains no payload for schema validation."""
-    return order is None or (isinstance(order, Collection) and len(order) == 0)
+    return isinstance(order, Collection) and len(order) == 0
 
 
 def _copy_market_order(order: Any) -> Any:
