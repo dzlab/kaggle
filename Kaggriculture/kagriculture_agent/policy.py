@@ -845,7 +845,11 @@ def _drop_carried_goods(state: Any, worker_index: int, task: Any, current: Posit
     required = _required_worker_item(task, state)
     if not force and required is not None and inventory.get(required, 0) > 0:
         return None
-    shed_room = max(0, DEFAULT_SHED_CAPACITY - sum(_counts(_shed(state)).values()))
+    configuration = _mapping(_get(state, "configuration", {}))
+    shed_capacity = max(1, _whole(
+        _get(configuration, "shedCapacity"), DEFAULT_SHED_CAPACITY,
+    ))
+    shed_room = max(0, shed_capacity - sum(_counts(_shed(state)).values()))
     cleanup = "DROP" if carried_total <= shed_room else next((
         f"PLACE {item} {min(inventory[item], shed_room)}"
         for item in PRODUCTS

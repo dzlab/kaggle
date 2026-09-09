@@ -59,6 +59,17 @@ def test_drop_carried_goods_is_capacity_safe_without_mutating_state(shed, carrie
     assert state["private"]["inventories"][0] == inventory_before
 
 
+def test_drop_carried_goods_honors_configured_shed_capacity():
+    state = _state(
+        configuration={"shedCapacity": 2},
+        private={"shed": {"CARROT": 1}, "inventories": [{"MELON": 2}]},
+    )
+
+    action = _drop_carried_goods(state, 0, None, Position(1, 1), force=True)
+
+    assert action == "PLACE MELON 1"
+
+
 def test_day_27_does_not_plan_melon_purchase_or_planting():
     tiles = [["EMPTY"] * 5 for _ in range(5)]
     tiles[2][3] = {"kind": "PLANT", "crop": "WHEAT", "needs_water": True}
