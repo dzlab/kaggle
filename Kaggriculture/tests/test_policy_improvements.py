@@ -176,11 +176,11 @@ def test_late_animal_horizon_includes_structure_build_and_placement_turns():
             strategy=goose_only,
         )
 
-    last_productive = macro(23)
+    last_productive = macro(24)
     assert ["BUY_ANIMAL", "GOOSE", 1] in last_productive["market_intents"]
     assert any(task.kind == "BUILD_COOP" for task in last_productive["tasks"])
 
-    too_late = macro(24)
+    too_late = macro(25)
     assert ["BUY_ANIMAL", "GOOSE", 1] not in too_late["market_intents"]
     assert not any(task.kind in {"ANIMAL", "BUILD_COOP"} for task in too_late["tasks"])
 

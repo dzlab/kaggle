@@ -499,7 +499,7 @@ def _can_start_crop(crop: str, day: int) -> bool:
 def _can_start_animal(animal: str, day: int, action_turns: int) -> bool:
     rules = ANIMALS.get(animal)
     return bool(rules) and _can_produce_before_season_end(
-        rules["first_yield_day"], day + action_turns,
+        int(rules["first_yield_day"]) - 1, day + action_turns,
     )
 
 
