@@ -923,6 +923,25 @@ def test_policy_terminal_cleanup_honors_configured_shed_capacity():
     assert action["hands"][0] == ["PLACE", "MELON", 1]
 
 
+def test_terminal_cleanup_reserves_configured_shed_capacity_across_workers():
+    obs = observation(
+        day=29,
+        hour=22,
+        hands=[[2, 2]],
+        inventories=[["MELON"], ["CARROT"]],
+        shed={"WHEAT": 1},
+        seeds={},
+    )
+    obs["farms"][0]["farmer"] = [2, 2]
+    obs["configuration"] = {"shedCapacity": 2}
+
+    action = policy_module.Policy().act(obs)
+    worker_actions = [action["farmer"], *action["hands"]]
+
+    assert sum(command[0] in {"DROP", "PLACE"} for command in worker_actions) == 1
+    assert sum(command == ["PASS"] for command in worker_actions) == 1
+
+
 def test_replan_preserves_carried_feed_when_another_assignment_finishes():
     board = [[None for _ in range(10)] for _ in range(10)]
     board[0][5] = {

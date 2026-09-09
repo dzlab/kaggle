@@ -2108,6 +2108,10 @@ def _market_orders(action: Mapping[str, Any]) -> list[Any]:
     ]
 
 
+def _valid_market_container(value: Any) -> bool:
+    return isinstance(value, Sequence) and not isinstance(value, (str, bytes))
+
+
 def _observed_unit_price(item: str, observation: Mapping[str, Any], inventory: float, *, buying: bool,
                          configuration: Mapping[str, Any] | None = None,
                          force_model: bool = False) -> float:
@@ -3555,12 +3559,17 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
 def _sanitize_action(action: Mapping[str, Any], observation: Mapping[str, Any], fallback: Mapping[str, Any],
                      configuration: Mapping[str, Any] | None = None, *,
                      preserve_malformed_market: bool = False) -> dict[str, Any]:
+    raw_market = action.get("market", ())
     result = {
         "farmer": list(action.get("farmer", ())) if isinstance(action.get("farmer", ()), Sequence) else [],
         "hands": [list(command) for command in action.get("hands", ())] if isinstance(action.get("hands", ()), Sequence) else [],
-        "market": _sanitize_market_orders(
-            _market_orders(action), observation, configuration,
-            preserve_malformed=preserve_malformed_market,
+        "market": (
+            raw_market
+            if preserve_malformed_market and not _valid_market_container(raw_market)
+            else _sanitize_market_orders(
+                _market_orders(action), observation, configuration,
+                preserve_malformed=preserve_malformed_market,
+            )
         ),
     }
     fallback_farmer = list(fallback.get("farmer", ["PASS"]))
@@ -3752,6 +3761,11 @@ def apply_variant(action: Mapping[str, Any], observation: Mapping[str, Any], var
                   ablations: Mapping[str, bool] | None = None,
                   configuration: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Apply a named, legality-preserving strategy adjustment at the agent boundary."""
+    if not _valid_market_container(action.get("market", ())):
+        return _sanitize_action(
+            action, observation, action, configuration,
+            preserve_malformed_market=True,
+        )
     market_orders = _market_orders(action)
     result = {"farmer": list(action.get("farmer", ["PASS"])), "hands": [list(command) for command in action.get("hands", ())],
               "market": market_orders}
@@ -3863,6 +3877,11 @@ class VariantPolicy:
         configuration = _configuration if _configuration is not None else self.configuration
         if self.is_route_candidate:
             action = self._act(obs)
+            if not _valid_market_container(action.get("market", ())):
+                return _sanitize_action(
+                    action, obs, action, configuration,
+                    preserve_malformed_market=True,
+                )
             adjusted = _apply_ablations(action, obs, self.ablations)
             return _sanitize_action(adjusted, obs, action, configuration)
         return apply_variant(self._act(obs), obs, self.variant, self.ablations, configuration)

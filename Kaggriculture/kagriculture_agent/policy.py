@@ -848,7 +848,7 @@ def _fetch_required_item(state: Any, worker_index: int, task: Any, current: Posi
 
 
 def _drop_carried_goods(state: Any, worker_index: int, task: Any, current: Position,
-                        *, force: bool = False) -> str | None:
+                        *, force: bool = False, shed_room: int | None = None) -> str | None:
     inventory = _inventory_for_worker(state, worker_index)
     carried_items = tuple(PRODUCTS) + tuple(ANIMALS)
     carried_total = sum(inventory.get(item, 0) for item in carried_items)
@@ -857,11 +857,12 @@ def _drop_carried_goods(state: Any, worker_index: int, task: Any, current: Posit
     required = _required_worker_item(task, state)
     if not force and required is not None and inventory.get(required, 0) > 0:
         return None
-    configuration = _mapping(_get(state, "configuration", {}))
-    shed_capacity = max(1, _whole(
-        _get(configuration, "shedCapacity"), DEFAULT_SHED_CAPACITY,
-    ))
-    shed_room = max(0, shed_capacity - sum(_counts(_shed(state)).values()))
+    if shed_room is None:
+        configuration = _mapping(_get(state, "configuration", {}))
+        shed_capacity = max(1, _whole(
+            _get(configuration, "shedCapacity"), DEFAULT_SHED_CAPACITY,
+        ))
+        shed_room = max(0, shed_capacity - sum(_counts(_shed(state)).values()))
     cleanup = "DROP" if carried_total <= shed_room else next((
         f"PLACE {item} {min(inventory[item], shed_room)}"
         for item in PRODUCTS
@@ -1343,11 +1344,24 @@ class Policy:
         )
         if terminal_cleanup:
             commands = {}
+            configuration = _mapping(_get(state, "configuration", {}))
+            shed_capacity = max(1, _whole(
+                _get(configuration, "shedCapacity"), DEFAULT_SHED_CAPACITY,
+            ))
+            shed_room = max(0, shed_capacity - sum(_counts(_shed(state)).values()))
             for worker in workers:
                 drop = _drop_carried_goods(
                     state, worker["index"], None, worker["position"], force=True,
+                    shed_room=shed_room,
                 )
-                commands[worker["index"]] = _unit_command(drop or PASS)
+                command = _unit_command(drop or PASS)
+                commands[worker["index"]] = command
+                if command[0] == "DROP":
+                    inventory = _inventory_for_worker(state, worker["index"])
+                    shed_room -= sum(inventory.get(item, 0) for item in (*PRODUCTS, *ANIMALS))
+                elif command[0] == "PLACE" and len(command) >= 3:
+                    shed_room -= _whole(command[2])
+                shed_room = max(0, shed_room)
         elif learned_action is not None:
             by_worker = {assignment.worker_index: assignment for assignment in assignments}
             commands = {

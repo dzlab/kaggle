@@ -3688,6 +3688,45 @@ def test_apply_variant_preserves_nonempty_malformed_market_order_as_framework_er
     assert record["outcome"] == "framework_error"
 
 
+@pytest.mark.parametrize("market", [{}, 7, "BOGUS"])
+def test_apply_variant_preserves_malformed_top_level_market_as_framework_error(market):
+    from scripts.evaluate import apply_variant, replay_record
+
+    replay = _strict_two_turn_replay()
+    observation = replay["steps"][0][0]["observation"]
+    action = {"farmer": ["PASS"], "hands": [], "market": market}
+
+    result = apply_variant(
+        action,
+        observation,
+        "mixed",
+        configuration=replay["configuration"],
+    )
+    replay["steps"][0][0]["action"] = result
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert result["market"] == market
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+
+
+@pytest.mark.parametrize("market", [{}, 7])
+def test_route_candidate_preserves_malformed_top_level_market(market):
+    from scripts.evaluate import VariantPolicy
+
+    replay = _strict_two_turn_replay()
+    observation = replay["steps"][0][0]["observation"]
+    candidate = VariantPolicy(
+        "mixed",
+        route_candidate=True,
+        route_policy=lambda _observation: {
+            "farmer": ["PASS"], "hands": [], "market": market,
+        },
+    )
+
+    assert candidate(observation)["market"] == market
+
+
 def test_conservative_variant_preserves_mandatory_wheat_and_fertilizer_orders():
     from scripts.evaluate import apply_variant
 
