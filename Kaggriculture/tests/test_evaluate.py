@@ -3668,6 +3668,35 @@ def test_conservative_variant_preserves_mandatory_wheat_and_fertilizer_orders():
     ]
 
 
+def test_conservative_variant_preserves_terminal_liquidation_orders():
+    from scripts.evaluate import apply_variant
+
+    observation = {
+        "player": 0,
+        "day": 29,
+        "hour": 22,
+        "farms": [{"money": 200, "farmer": [0, 0], "hands": [], "tiles": [[None]]}],
+        "private": {
+            "seeds": {},
+            "shed": {"WHEAT": 20, "STRAWBERRY": 2},
+            "inventories": [{}],
+        },
+        "market": {
+            "prices": {"WHEAT": 25, "STRAWBERRY": 100},
+            "inventory": {"WHEAT": 10_000, "STRAWBERRY": 10_000},
+        },
+    }
+    action = {
+        "farmer": ["PASS"],
+        "hands": [],
+        "market": [["SELL", "WHEAT", 20], ["SELL", "STRAWBERRY", 2]],
+    }
+
+    result = apply_variant(action, observation, "conservative")
+
+    assert result["market"] == action["market"]
+
+
 def test_conservative_variant_keeps_deadline_hire_from_raw_engine_observation():
     from scripts.evaluate import apply_variant
 

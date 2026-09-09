@@ -1176,9 +1176,13 @@ class Policy:
                     kind in {"BUY_LAND", "BUY_ANIMAL", "HIRE", "BUY_SEED"}
                     or (kind == "BUY_PRODUCT" and item != "WHEAT")
                 )
+                deadline_capacity_hire = kind == "HIRE" and bool(due_tasks)
                 # A wheat order is itself the basic-need purchase and remains
                 # available even when an already-due FEED task has no slot.
-                if discretionary and (due_guard_blocked or cash_after < 0):
+                if discretionary and (
+                    cash_after < 0
+                    or (due_guard_blocked and not deadline_capacity_hire)
+                ):
                     guard_blocked = True
                     continue
                 if (

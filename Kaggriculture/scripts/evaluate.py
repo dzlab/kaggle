@@ -3711,20 +3711,30 @@ def apply_variant(action: Mapping[str, Any], observation: Mapping[str, Any], var
               "market": _market_orders(action)}
     seeds = _private_seeds(observation)
     if variant == "conservative":
-        deadline_hires = [
+        terminal_sales = [
             order for order in result["market"]
-            if order == ["HIRE"] and _has_basic_need_deadline(observation)
-        ]
-        mandatory = [
-            order for order in result["market"]
-            if order[0] == "BUY_PRODUCT" and order[1] in {"WHEAT", "FERTILIZER"}
-        ]
-        mandatory = deadline_hires + mandatory
-        discretionary = [
-            order for order in result["market"]
-            if order[0] not in {"BUY_ANIMAL", "BUY_LAND", "BUY_PRODUCT"}
-        ][:max(0, 1 - len(mandatory))]
-        result["market"] = mandatory + discretionary
+            if order[0] == "SELL"
+        ] if (
+            _number(observation.get("day")) == season_days - 1
+            and (_number(observation.get("hour")) or 0) >= 22
+        ) else []
+        if terminal_sales:
+            result["market"] = terminal_sales
+        else:
+            deadline_hires = [
+                order for order in result["market"]
+                if order == ["HIRE"] and _has_basic_need_deadline(observation)
+            ]
+            mandatory = [
+                order for order in result["market"]
+                if order[0] == "BUY_PRODUCT" and order[1] in {"WHEAT", "FERTILIZER"}
+            ]
+            mandatory = deadline_hires + mandatory
+            discretionary = [
+                order for order in result["market"]
+                if order[0] not in {"BUY_ANIMAL", "BUY_LAND", "BUY_PRODUCT"}
+            ][:max(0, 1 - len(mandatory))]
+            result["market"] = mandatory + discretionary
     elif variant == "melon-heavy":
         if result["farmer"][:1] == ["PLANT"] and len(result["farmer"]) > 1 and result["farmer"][1] == "WHEAT" and _number(seeds.get("MELON")):
             result["farmer"][1] = "MELON"

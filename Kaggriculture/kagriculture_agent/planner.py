@@ -1417,12 +1417,26 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
     if not infos:
         return []
 
+    def assignment_sort_key(task: Task) -> tuple[Any, ...]:
+        base = _task_sort_key(task, day)
+        target = _target_position(task.target)
+        route_distance = min(
+            (
+                distance(info[2], target)
+                for info in infos
+                if info[2] is not None and target is not None
+            ),
+            default=inf,
+        )
+        return (*base[:4], base[5], route_distance, base[4])
+
+    tasks.sort(key=assignment_sort_key)
+
     farmer = next((info for info in infos if info[1] == "FARMER"), None)
     logistics_pending = any(task.kind in _SHED_WORK for task in tasks)
     helper_exists = any(info[1] != "FARMER" for info in infos)
     reserved_basic = next((info for info in infos if info[1] != "FARMER"), infos[0])
     available = {info[0] for info in infos}
-    reusable_after_reservation_fallback: set[int] = set()
     assignments: list[WorkerAssignment] = []
     remaining = list(tasks)
 
@@ -1463,8 +1477,6 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
             candidates = [info for info in candidates if info[0] == reserved_basic[0]] or candidates
         elif task.kind not in _BASIC_NEEDS and reserved_basic[0] in available and any(item.kind in _BASIC_NEEDS for item in remaining):
             non_reserved = [info for info in candidates if info[0] != reserved_basic[0]]
-            if candidates and not non_reserved and len(infos) == 1:
-                reusable_after_reservation_fallback.add(reserved_basic[0])
             candidates = non_reserved or candidates
         target = _target_position(task.target)
         if not candidates:
@@ -1481,8 +1493,7 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
         selected = choose(task)
         if selected is None:
             continue
-        if selected[0] not in reusable_after_reservation_fallback:
-            available.remove(selected[0])
+        available.remove(selected[0])
         remaining.remove(task)
         assignments.append(WorkerAssignment(
             worker_index=selected[0],

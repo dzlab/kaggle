@@ -44,7 +44,7 @@ def _state(**values):
     }
 
 
-def test_assign_tasks_falls_back_to_reserved_worker_when_only_farmer():
+def test_assign_tasks_uses_reserved_worker_for_only_one_fallback_task():
     state = _state(workers=_workers(("FARMER", Position(0, 0))),
                    private={"seeds": {}, "shed": {"WHEAT": 1}, "inventories": [{"GOOSE": 1}]})
     tasks = [Task("ANIMAL", Position(0, 1), 100, 1, 1, item="GOOSE"),
@@ -52,8 +52,25 @@ def test_assign_tasks_falls_back_to_reserved_worker_when_only_farmer():
              Task("SHED", Position(1, 1), 75, None, 1)]
     assignments = assign_tasks(tasks, state["workers"], state)
     assert [(assignment.worker_index, assignment.task.kind) for assignment in assignments] == [
-        (0, "ANIMAL"), (0, "WATER"), (0, "SHED"),
+        (0, "ANIMAL"),
     ]
+
+
+def test_assign_tasks_routes_equal_deadlines_to_nearest_task_first():
+    state = _state(
+        day=2,
+        hour=15,
+        workers=_workers(("FARMER", Position(4, 0))),
+    )
+    tasks = [
+        Task("WATER", Position(0, 1), 100, 2, 1, item="MELON"),
+        Task("WATER", Position(4, 1), 100, 2, 1, item="MELON"),
+    ]
+
+    assignments = assign_tasks(tasks, state["workers"], state)
+
+    assert len(assignments) == 1
+    assert assignments[0].task.target == Position(4, 1)
 
 
 @__import__("pytest").mark.parametrize("shed,carried,expected", [
@@ -387,6 +404,29 @@ def test_basic_need_wheat_buy_survives_reversal_filter():
     assert discretionary_directions == set()
     assert ["BUY_PRODUCT", "WHEAT", 2] in protected_result
     assert ["BUY_PRODUCT", "WHEAT", 1] not in discretionary_result
+
+
+def test_basic_need_guard_keeps_hire_that_adds_deadline_capacity():
+    tiles = [["EMPTY"] * 5 for _ in range(5)]
+    tiles[0][0] = {
+        "kind": "PLANT",
+        "crop": "WHEAT",
+        "watered_today": False,
+    }
+    state = _state(
+        day=17,
+        hour=0,
+        tiles=tiles,
+        cash=5_089,
+        private={"seeds": {}, "shed": {}, "inventories": [{}]},
+    )
+    policy = Policy(strategy="current")
+
+    guarded, _protected_directions = policy._basic_need_guard(
+        state, [["HIRE"]], [], None,
+    )
+
+    assert guarded == [["HIRE"]]
 
 
 def test_learned_policy_liquidates_shed_inventory_in_terminal_window(monkeypatch):
