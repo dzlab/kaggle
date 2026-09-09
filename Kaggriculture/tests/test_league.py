@@ -52,6 +52,25 @@ def test_schedule_keeps_total_size_and_balances_seats(tmp_path):
     assert [match.seat for match in matches] == [index % 2 for index in range(17)]
 
 
+def test_sample_reconstructs_scheduled_default_band_checkpoint_matches(tmp_path):
+    checkpoints = tuple(
+        _checkpoint(tmp_path, f"checkpoint-{index}.pt", "default")
+        for index in range(3)
+    )
+    sampler = LeagueSampler(
+        probabilities={"checkpoint": 1.0},
+        skill_bands={"default": SkillBand("default", checkpoints)},
+    )
+
+    assert [
+        sampler.sample(index, seed=17)
+        for index in range(9)
+    ] == [
+        sampler.schedule(index + 1, seed=17)[index]
+        for index in range(9)
+    ]
+
+
 def test_checkpoint_sampling_is_uniform_within_selected_band(tmp_path):
     checkpoints = tuple(
         _checkpoint(tmp_path, f"checkpoint-{index}.pt", "hard")

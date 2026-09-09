@@ -432,6 +432,55 @@ def test_compatible_league_checkpoints_uses_validator_and_recent_window(tmp_path
     assert "Skipping missing league checkpoint" in capsys.readouterr().out
 
 
+def test_colab_workflow_records_auto_discovered_league_checkpoint_pool(tmp_path, monkeypatch):
+    from scripts import colab_train
+
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,), ppo_target_steps=1,
+    )
+    config.trajectory_path.write_text("{}\n", encoding="utf-8")
+    discovered = (
+        tmp_path / "round-0000" / "candidate.pt",
+        tmp_path / "round-0001" / "candidate.pt",
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        colab_train, "run_command",
+        lambda command, *, check, capture_output=False: SimpleNamespace(
+            returncode=0, stdout="", stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        colab_train, "compatible_prior_checkpoints",
+        lambda config, training_contract: list(discovered),
+    )
+    monkeypatch.setattr(
+        colab_train, "select_resume_checkpoint",
+        lambda candidates, *, training_contract: None,
+    )
+    monkeypatch.setattr(colab_train, "initialize_telemetry", lambda config: None)
+    monkeypatch.setattr(
+        colab_train, "train_candidate",
+        lambda config, **kwargs: captured.update(kwargs) or {},
+    )
+    monkeypatch.setattr(
+        colab_train, "_run_evaluation",
+        lambda *args, **kwargs: (
+            SimpleNamespace(returncode=0), {"decision": {"status": "discard"}},
+        ),
+    )
+    monkeypatch.setattr(colab_train, "evaluation_report_is_complete", lambda *args, **kwargs: True)
+    monkeypatch.setattr(colab_train, "smoke_test_artifact", lambda config: None)
+
+    colab_train.run_workflow(config)
+
+    assert captured["opponent_pool"].league_configuration["league_checkpoints"] == [
+        str(path) for path in discovered
+    ]
+
+
 def test_colab_workflow_builds_parameterized_commands(tmp_path, monkeypatch):
     from scripts import colab_train
 

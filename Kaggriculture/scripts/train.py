@@ -1217,7 +1217,10 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
         previous_checkpoints=compatible,
         checkpoint_window=config.league_checkpoint_window,
         probabilities=config.league_probabilities,
-        configured_checkpoints=config.league_checkpoints,
+        configured_checkpoints=(
+            config.league_checkpoints
+            if config.league_checkpoints else compatible
+        ),
     )
     resume_selection = select_resume_checkpoint(
         _checkpoint_candidates(config), training_contract=training_contract,

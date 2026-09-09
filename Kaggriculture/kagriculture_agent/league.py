@@ -263,45 +263,25 @@ class LeagueSampler:
         self.mixed_opponents = mixed
 
     def sample(self, index: int, *, seed: int = 0) -> OpponentMatch:
-        """Return the match for a stable ``(seed, index)`` coordinate."""
+        """Return a stable coordinate from the canonical weighted schedule.
+
+        ``schedule`` owns opponent and checkpoint materialization.  A single
+        sample is reconstructed from the one-shot schedule ending at its
+        requested coordinate, so it cannot drift from the schedule's
+        checkpoint-selection rules.
+        """
         if type(index) is not int or index < 0:
             raise ValueError("index must be a nonnegative integer")
         if type(seed) is not int:
             raise ValueError("seed must be an integer")
-        rng = _rng(seed, index, "opponent")
-        selected = _choose(rng, self.probabilities)
-        seat = index % 2
-        if selected == "checkpoint":
-            if not self.skill_bands:
-                return OpponentMatch("current", seat, fallback_reason="checkpoint_unavailable")
-            band_weights = {
-                name: weight * self.hard_opponent_weights.get(name, 1.0)
-                for name, weight in self.band_probabilities.items()
-            }
-            if sum(band_weights.values()) <= 0.0:
-                return OpponentMatch("current", seat, fallback_reason="checkpoint_band_unavailable")
-            band_name = _choose(_rng(seed, index, "skill-band"), band_weights)
-            band = next(band for band in self.skill_bands if band.name == band_name)
-            available = band.available_checkpoints
-            if not available:
-                return OpponentMatch("current", seat, fallback_reason="checkpoint_unavailable")
-            checkpoint = available[_rng(seed, index, "checkpoint").randrange(len(available))]
-            try:
-                identity = checkpoint.identity
-            except OSError:
-                return OpponentMatch("current", seat, fallback_reason="checkpoint_identity_unavailable")
-            return OpponentMatch(
-                "checkpoint", seat, checkpoint=checkpoint.path, skill_band=band.name,
-                checkpoint_identity=identity,
-            )
-        if selected == "mixed":
-            choices = self.mixed_opponents
-            mixed_opponent = choices[_rng(seed, index, "mixed").randrange(len(choices))]
-            return OpponentMatch("mixed", seat, mixed_opponent=mixed_opponent)
-        return OpponentMatch(selected, seat)  # type: ignore[arg-type]
+        return self.schedule(index + 1, seed=seed)[index]
 
     def schedule(self, count: int, *, seed: int = 0) -> list[OpponentMatch]:
-        """Return exactly ``count`` weighted matches with alternating seats."""
+        """Return exactly ``count`` weighted matches with alternating seats.
+
+        This is the canonical materialization path used by both the PPO
+        workflow and ``sample`` reconstruction.
+        """
         if type(count) is not int or count < 1:
             raise ValueError("count must be a positive integer")
         total = sum(self.probabilities.values())
