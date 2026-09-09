@@ -1058,7 +1058,7 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None,
                 species for species in allowed_animals
                 if ANIMALS.get(species, {}).get("structure") == structure_kind
             ]
-            if not candidates or any(_can_start_animal(species, day, 2) for species in candidates):
+            if candidates and any(_can_start_animal(species, day, 2) for species in candidates):
                 _add(plan, "STRUCTURE", position, 45, None, _get(structure_entity, "value", 1))
 
     animals = _get(state, "animals", ()) or ()
@@ -1082,7 +1082,7 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None,
                 species for species in allowed_animals
                 if ANIMALS.get(species, {}).get("structure") == structure_kind
             ]
-            if not candidates or any(_can_start_animal(species, day, 2) for species in candidates):
+            if candidates and any(_can_start_animal(species, day, 2) for species in candidates):
                 _add(plan, "STRUCTURE", _position(structure), 45, None, _get(structure, "value", 1))
     for animal in _get(state, "desired_animals", ()) or ():
         if not bool(_get(animal, "owned", False)):

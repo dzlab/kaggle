@@ -153,6 +153,25 @@ def test_late_daily_animal_and_structure_tasks_are_rejected():
     assert not any(task.kind in {"ANIMAL", "STRUCTURE"} for task in plan)
 
 
+@__import__("pytest").mark.parametrize(
+    ("animal", "expected"),
+    [("GOOSE", False), ("COW", True)],
+)
+def test_late_unbuilt_structure_requires_compatible_allowed_animal(animal, expected):
+    state = _state(
+        day=19,
+        structures=[{"kind": "PASTURE", "position": [1, 0], "built": False}],
+    )
+    strategy = StrategySpec(f"{animal.lower()}-only", (), (animal,), 0, 1, 0)
+
+    has_structure_task = any(
+        task.kind == "STRUCTURE"
+        for task in build_daily_plan(state, strategy=strategy)
+    )
+
+    assert has_structure_task is expected
+
+
 def test_shed_assignment_prefers_worker_with_inventory():
     workers = _workers(("FARMER", Position(0, 0)), ("WORKER", Position(0, 0)))
     task = Task("SHED", Position(1, 0), 1, None, 1)
