@@ -36,7 +36,7 @@ def test_artifact_candidate_policy_reports_invalid_artifact(monkeypatch, tmp_pat
 
     with pytest.raises(ValueError, match="candidate artifact is not valid: ValueError: invalid"):
         candidates.artifact_candidate_policy(artifact)
-def test_returned_candidate_caches_same_runtime_failure_after_one_load(monkeypatch, tmp_path):
+def test_returned_candidate_propagates_runtime_failure_and_reuses_one_loaded_artifact(monkeypatch, tmp_path):
     artifact = tmp_path / "candidate.json"
     artifact.write_text("{}")
     calls = []
