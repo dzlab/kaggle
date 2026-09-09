@@ -118,6 +118,50 @@ def test_day_27_keeps_short_horizon_crops_available(crop):
     assert any(task.kind == "PLANT" and task.item == crop for task in macro["tasks"])
 
 
+def test_day_28_rejects_new_crop_purchase_and_planting():
+    wheat_only = StrategySpec("wheat-only", ("WHEAT",), (), 10, 0, 0)
+    seeded = _state(
+        day=28,
+        private={"seeds": {"WHEAT": 1}, "shed": {}, "inventories": [{}]},
+        cash=1_000,
+    )
+    no_seed = _state(
+        day=28,
+        private={"seeds": {}, "shed": {}, "inventories": [{}]},
+        cash=1_000,
+    )
+
+    assert not any(
+        task.kind == "PLANT"
+        for task in build_daily_plan(seeded, strategy=wheat_only)
+    )
+    macro = build_autonomous_macro_plan(no_seed, strategy=wheat_only)
+    assert ["BUY_SEED", "WHEAT", 1] not in macro["market_intents"]
+    assert not any(task.kind == "PLANT" for task in macro["tasks"])
+
+
+def test_existing_late_season_crops_and_animals_keep_actionable_work():
+    tiles = [["EMPTY"] * 5 for _ in range(5)]
+    tiles[0][0] = {
+        "kind": "PLANT",
+        "crop": "WHEAT",
+        "planted_day": 20,
+        "yield_units": 1,
+        "needs_water": True,
+    }
+    tiles[0][1] = {
+        "kind": "COOP",
+        "animal": {"species": "GOOSE", "needs_feed": True, "needs_care": True},
+    }
+
+    plan = build_daily_plan(_state(day=29, tiles=tiles))
+
+    assert {("WATER", "WHEAT"), ("HARVEST", "WHEAT"),
+            ("FEED", "GOOSE"), ("CARE", "GOOSE")} <= {
+        (task.kind, task.item) for task in plan
+    }
+
+
 def test_late_animal_horizon_includes_structure_build_and_placement_turns():
     goose_only = StrategySpec("goose-only", (), ("GOOSE",), 0, 1, 0)
 
@@ -170,6 +214,29 @@ def test_late_unbuilt_structure_requires_compatible_allowed_animal(animal, expec
     )
 
     assert has_structure_task is expected
+
+
+def test_macro_rejects_unbuilt_structure_incompatible_with_allowed_animal():
+    pasture = {
+        "kind": "STRUCTURE",
+        "structure": {"kind": "PASTURE", "built": False},
+    }
+    state = _state(
+        day=19,
+        tiles=[[pasture] * 5 for _ in range(5)],
+        structures=[{"kind": "PASTURE", "position": [0, 0], "built": False}],
+        private={"seeds": {}, "shed": {"WHEAT": 11}, "inventories": [{}]},
+        cash=5_000,
+    )
+    goose_only = StrategySpec("goose-only", (), ("GOOSE",), 0, 1, 0)
+
+    macro = build_autonomous_macro_plan(state, strategy=goose_only)
+
+    assert ["BUY_ANIMAL", "GOOSE", 1] not in macro["market_intents"]
+    assert not any(
+        task.kind in {"STRUCTURE", "BUILD_COOP", "BUILD_PASTURE"}
+        for task in macro["tasks"]
+    )
 
 
 def test_shed_assignment_prefers_worker_with_inventory():
