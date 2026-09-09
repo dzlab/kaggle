@@ -24,12 +24,15 @@ from typing import Any
 
 from .constants import PRODUCTS
 from .features import (
+    EXPERIMENTAL_CONTEXT_FEATURE_SIZE,
+    EXPERIMENTAL_FEATURE_VARIANT,
     FEATURE_SCHEMA_VERSION,
     GLOBAL_TOKEN_SIZE,
     MARKET_TOKEN_SIZE,
     TILE_TOKEN_SIZE,
     WORKER_TOKEN_SIZE,
     FeatureBatch,
+    PRODUCTION_FEATURE_VARIANT,
 )
 from .model_topology import (
     ATTENTION_HEADS,
@@ -37,6 +40,11 @@ from .model_topology import (
     DEFAULT_MODEL_WIDTH,
     compact_policy_parameter_count,
     validate_topology_shape,
+)
+from scripts.training_identity import (
+    ACTION_REPRESENTATIONS,
+    DEFAULT_ACTION_REPRESENTATION,
+    validate_action_representation,
 )
 
 try:  # pragma: no cover - exercised only when the optional dependency exists
@@ -65,6 +73,14 @@ ACTION_VOCAB = {
     "market_items": tuple(sorted(PRODUCTS)),
     "market_quantities": (0, 1, 2, 4, 8, 16, 32, 64),
 }
+
+
+def validate_feature_variant(value: Any) -> str:
+    if value not in {PRODUCTION_FEATURE_VARIANT, EXPERIMENTAL_FEATURE_VARIANT}:
+        raise ValueError(
+            "feature variant must be one of: production_v1, experimental_context_v1"
+        )
+    return value
 
 
 def torch_available() -> bool:
@@ -114,7 +130,10 @@ def set_training_seed(seed: int) -> None:
             torch.use_deterministic_algorithms(True, warn_only=True)
 
 
-def _as_feature_list(feature_batch: FeatureBatch | Sequence[FeatureBatch]) -> list[FeatureBatch]:
+def _as_feature_list(
+    feature_batch: FeatureBatch | Sequence[FeatureBatch], *,
+    feature_variant: str | None = None,
+) -> list[FeatureBatch]:
     if isinstance(feature_batch, FeatureBatch):
         batches = [feature_batch]
     elif isinstance(feature_batch, Sequence) and not isinstance(feature_batch, (str, bytes)):
@@ -128,6 +147,10 @@ def _as_feature_list(feature_batch: FeatureBatch | Sequence[FeatureBatch]) -> li
             raise TypeError("all feature batches must be FeatureBatch instances")
         if features.schema_version != FEATURE_SCHEMA_VERSION:
             raise ValueError(f"unsupported feature schema version: {features.schema_version}")
+        if feature_variant is not None and features.feature_variant != feature_variant:
+            raise ValueError(
+                f"feature variant mismatch: expected {feature_variant}, got {features.feature_variant}"
+            )
     return batches
 
 
@@ -142,6 +165,16 @@ def feature_batch_to_tensors(
         "worker": th.tensor([batch.worker_tokens for batch in batches], dtype=th.float32, device=device),
         "market": th.tensor([batch.market_tokens for batch in batches], dtype=th.float32, device=device),
         "global": th.tensor([batch.global_tokens for batch in batches], dtype=th.float32, device=device),
+        "context": th.tensor(
+            [
+                batch.context_features
+                if batch.context_features
+                else (0.0,) * EXPERIMENTAL_CONTEXT_FEATURE_SIZE
+                for batch in batches
+            ],
+            dtype=th.float32,
+            device=device,
+        ),
     }
 
 
@@ -171,9 +204,14 @@ if nn is not None:
 
         def __init__(
             self, *, hidden_width: int = HIDDEN_WIDTH, depth: int = ATTENTION_BLOCKS,
+            feature_variant: str = PRODUCTION_FEATURE_VARIANT,
+            action_representation: str = DEFAULT_ACTION_REPRESENTATION,
         ) -> None:
             super().__init__()
             self.hidden_width, self.depth = validate_model_shape(hidden_width, depth)
+            self.feature_variant = validate_feature_variant(feature_variant)
+            validate_action_representation(action_representation, source="model")
+            self.action_representation = action_representation
             self.tile_projection = nn.Linear(TILE_TOKEN_SIZE, self.hidden_width)
             self.worker_projection = nn.Linear(WORKER_TOKEN_SIZE, self.hidden_width)
             self.market_projection = nn.Linear(MARKET_TOKEN_SIZE, self.hidden_width)
@@ -198,19 +236,28 @@ if nn is not None:
             # intent training is explicitly enabled.
             nn.init.zeros_(self.market_active_head.weight)
             nn.init.zeros_(self.market_active_head.bias)
+            if self.feature_variant == EXPERIMENTAL_FEATURE_VARIANT:
+                self.context_projection = nn.Linear(
+                    EXPERIMENTAL_CONTEXT_FEATURE_SIZE, self.hidden_width,
+                )
 
         @property
         def parameter_count(self) -> int:
             return model_parameter_count(self)
 
         def forward(self, feature_batch: FeatureBatch | Sequence[FeatureBatch]) -> dict[str, Any]:
-            tensors = feature_batch_to_tensors(feature_batch, device=next(self.parameters()).device)
+            batches = _as_feature_list(feature_batch, feature_variant=self.feature_variant)
+            tensors = feature_batch_to_tensors(batches, device=next(self.parameters()).device)
             batch_size = tensors["tile"].shape[0]
             tile_tokens = self.tile_projection(tensors["tile"]) + self.type_embedding.weight[0]
             worker_tokens = self.worker_projection(tensors["worker"]) + self.type_embedding.weight[1]
             market_tokens = self.market_projection(tensors["market"]) + self.type_embedding.weight[2]
             global_token = self.global_projection(tensors["global"]).view(batch_size, 1, self.hidden_width)
             global_token = global_token + self.type_embedding.weight[3]
+            if self.feature_variant == EXPERIMENTAL_FEATURE_VARIANT:
+                global_token = global_token + self.context_projection(tensors["context"]).view(
+                    batch_size, 1, self.hidden_width,
+                )
             tokens = torch.cat((tile_tokens, worker_tokens, market_tokens, global_token), dim=1)
             for block in self.blocks:
                 tokens = block(tokens)
@@ -255,7 +302,12 @@ def model_parameter_count(model: Any) -> int:
 
 def model_parameter_count_for_shape(
     hidden_width: int = DEFAULT_MODEL_WIDTH, depth: int = DEFAULT_MODEL_DEPTH,
+    *, feature_variant: str = PRODUCTION_FEATURE_VARIANT,
 ) -> int:
     """Count CompactPolicyNet parameters without constructing or initializing it."""
     validate_model_shape(hidden_width, depth, source="parameter count")
-    return compact_policy_parameter_count(hidden_width, depth)
+    validate_feature_variant(feature_variant)
+    count = compact_policy_parameter_count(hidden_width, depth)
+    if feature_variant == EXPERIMENTAL_FEATURE_VARIANT:
+        count += hidden_width * EXPERIMENTAL_CONTEXT_FEATURE_SIZE + hidden_width
+    return count

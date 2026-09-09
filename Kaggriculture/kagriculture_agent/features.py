@@ -17,18 +17,29 @@ production, terminal horizon, and strategy one-hot.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isfinite
 from typing import Any
 
 from .constants import ANIMALS, CROPS, MARKET_I0, PRICE_FLOOR, PRODUCTS, season_days, shed_capacity
 from .economics import market_price
+from .experimental_features import EXPERIMENTAL_FEATURE_VARIANT, extract_experimental_context
 from .observation import parse_observation
 from .routing import normalize_position
 from .strategy import market_sale_quotes, select_strategy
 from .types import Position
 
 FEATURE_SCHEMA_VERSION = 1
+PRODUCTION_FEATURE_VARIANT = "production_v1"
+EXPERIMENTAL_CONTEXT_FEATURE_NAMES = (
+    "recent_action_identity",
+    "recent_action_outcome",
+    "price_trend",
+    "demand_trend",
+    "recovery_slack",
+    "task_opportunity",
+)
+EXPERIMENTAL_CONTEXT_FEATURE_SIZE = 22 + len(EXPERIMENTAL_CONTEXT_FEATURE_NAMES) - 1
 # Every emitted numeric feature is clamped to this closed interval.  Ratios
 # use their natural denominator before clamping; one-hot and boolean fields
 # already lie in the same interval.
@@ -182,10 +193,24 @@ class FeatureBatch:
     global_tokens: tuple[float, ...]
     tile_positions: tuple[Position, ...]
     schema_version: int = FEATURE_SCHEMA_VERSION
+    feature_variant: str = PRODUCTION_FEATURE_VARIANT
+    context_features: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         if self.schema_version != FEATURE_SCHEMA_VERSION:
             raise ValueError(f"unsupported feature schema version: {self.schema_version}")
+        if self.feature_variant not in {PRODUCTION_FEATURE_VARIANT, EXPERIMENTAL_FEATURE_VARIANT}:
+            raise ValueError(f"unsupported feature variant: {self.feature_variant}")
+        if self.feature_variant == PRODUCTION_FEATURE_VARIANT and self.context_features:
+            raise ValueError("production feature batches cannot contain context features")
+        if self.feature_variant == EXPERIMENTAL_FEATURE_VARIANT and len(self.context_features) != EXPERIMENTAL_CONTEXT_FEATURE_SIZE:
+            raise ValueError("experimental context feature size mismatch")
+        if any(
+            not isinstance(value, (int, float)) or not isfinite(float(value))
+            or not FEATURE_VALUE_MIN <= float(value) <= FEATURE_VALUE_MAX
+            for value in self.context_features
+        ):
+            raise ValueError("context features must be finite values in [-1, 1]")
 
 
 def extract_features(state: Any, *, schema_version: int = FEATURE_SCHEMA_VERSION) -> FeatureBatch:
@@ -209,6 +234,33 @@ def extract_features(state: Any, *, schema_version: int = FEATURE_SCHEMA_VERSION
     market_tokens = tuple(_market_token(item, source) for item in sorted(PRODUCTS))
     global_tokens = _global_token(source, day, hour, len(workers))
     return FeatureBatch(tile_tokens, worker_tokens, market_tokens, global_tokens, positions)
+
+
+def extract_features_with_context(state: Any) -> FeatureBatch:
+    """Extract production tokens plus bounded, observation-only context."""
+    production = extract_features(state)
+    context = extract_experimental_context(state if isinstance(state, Mapping) else {})
+    identity = tuple(float(value) for value in context["recent_action_identity"])
+    scalars = tuple(
+        float(context[name])
+        for name in EXPERIMENTAL_CONTEXT_FEATURE_NAMES[1:]
+    )
+    return replace(
+        production,
+        feature_variant=EXPERIMENTAL_FEATURE_VARIANT,
+        context_features=identity + scalars,
+    )
+
+
+def extract_features_for_variant(state: Any, feature_variant: str = PRODUCTION_FEATURE_VARIANT) -> FeatureBatch:
+    """Select a named feature representation without changing production defaults."""
+    if feature_variant == PRODUCTION_FEATURE_VARIANT:
+        return extract_features(state)
+    if feature_variant == EXPERIMENTAL_FEATURE_VARIANT:
+        return extract_features_with_context(state)
+    raise ValueError(
+        "feature_variant must be one of: production_v1, experimental_context_v1"
+    )
 
 
 def _tile_token(position: Position, tile: Any, day: float) -> tuple[float, ...]:

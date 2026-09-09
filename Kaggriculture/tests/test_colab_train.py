@@ -240,6 +240,20 @@ def test_build_config_delegates_identity_validation_to_canonical_validator(
     ]
 
 
+def test_colab_cli_propagates_action_representation_and_training_mask(tmp_path, monkeypatch):
+    from scripts import train
+
+    monkeypatch.setattr(train, "resolve_device", lambda value: "cpu")
+    config = train.config_from_args(train.parse_args([
+        "--run-directory", str(tmp_path), "--no-mount-drive", "--no-wandb",
+        "--action-representation", "target_first_v1", "--training-action-mask",
+        "--dry-run",
+    ]))
+
+    assert config.action_representation == "target_first_v1"
+    assert config.training_action_mask is True
+
+
 @pytest.mark.parametrize(
     "flag,value",
     [

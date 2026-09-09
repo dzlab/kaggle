@@ -152,6 +152,22 @@ def test_parser_accepts_training_mode_bc_budget_and_model_shape():
     assert args.model_depth == 8
 
 
+def test_policy_cli_propagates_action_representation_and_mask_ablation():
+    from scripts.train_policy import _cli_training_options, _parser
+
+    args = _parser().parse_args([
+        "--input", "transitions.jsonl", "--output", "policy.pt",
+        "--action-representation", "target_first_v1",
+        "--training-action-mask",
+    ])
+
+    options = _cli_training_options(args)
+
+    assert args.action_representation == "target_first_v1"
+    assert options["action_representation"] == "target_first_v1"
+    assert options["ppo_config"].training_action_mask is True
+
+
 def test_policy_cli_propagates_reward_and_stall_ablations_into_ppo_config():
     from scripts.train_policy import PPOConfig, _cli_training_options, _parser
 

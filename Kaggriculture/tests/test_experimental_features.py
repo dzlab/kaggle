@@ -87,3 +87,27 @@ def test_experimental_variant_does_not_change_production_feature_schema():
     assert len(production.market_tokens) > 0
     assert all(len(token) == MARKET_TOKEN_SIZE for token in production.market_tokens)
     assert len(production.global_tokens) == GLOBAL_TOKEN_SIZE
+
+
+def test_experimental_context_ignores_private_and_nonfinite_public_values():
+    state = {
+        "history": [{"action": {"type": "SELL"}, "success": True}],
+        "price_history": [float("nan"), float("inf")],
+        "demand_history": [10**1000, -(10**1000)],
+        "recovery_slack": float("inf"),
+        "task_opportunity": float("nan"),
+        "private": {
+            "history": [{"action": {"type": "HARVEST"}, "success": True}],
+            "recovery_slack": 10**1000,
+        },
+    }
+
+    context = extract_experimental_context(state)
+
+    numeric = [
+        *context["recent_action_identity"],
+        context["recent_action_outcome"], context["price_trend"],
+        context["demand_trend"], context["recovery_slack"], context["task_opportunity"],
+    ]
+    assert all(math.isfinite(value) and -1.0 <= value <= 1.0 for value in numeric)
+    assert context["recent_action_identity"][0] == 0.0

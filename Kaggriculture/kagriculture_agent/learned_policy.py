@@ -32,7 +32,15 @@ except ImportError:  # pragma: no cover - exercised by the dependency-free smoke
     _np = None
 
 from .constants import ANIMALS, CROPS, PRODUCTS
-from .features import GLOBAL_TOKEN_SIZE, MARKET_TOKEN_SIZE, TILE_TOKEN_SIZE, WORKER_TOKEN_SIZE
+from .features import (
+    EXPERIMENTAL_CONTEXT_FEATURE_SIZE,
+    EXPERIMENTAL_FEATURE_VARIANT,
+    GLOBAL_TOKEN_SIZE,
+    MARKET_TOKEN_SIZE,
+    PRODUCTION_FEATURE_VARIANT,
+    TILE_TOKEN_SIZE,
+    WORKER_TOKEN_SIZE,
+)
 from .memory import PolicyMemory
 from .routing import is_locked_tile, normalize_position, route_to
 from .types import Position, Task, WorkerAssignment
@@ -87,7 +95,10 @@ def _validate_artifact_model_shape(hidden_width: Any, model_depth: Any) -> tuple
     return hidden_width, model_depth
 
 
-def _artifact_tensor_names(model_depth: int = _ARTIFACT_MODEL_DEPTH) -> tuple[str, ...]:
+def _artifact_tensor_names(
+    model_depth: int = _ARTIFACT_MODEL_DEPTH,
+    feature_variant: str = PRODUCTION_FEATURE_VARIANT,
+) -> tuple[str, ...]:
     names = [
         "tile_projection.weight", "tile_projection.bias",
         "worker_projection.weight", "worker_projection.bias",
@@ -114,12 +125,17 @@ def _artifact_tensor_names(model_depth: int = _ARTIFACT_MODEL_DEPTH) -> tuple[st
         "market_quantity_head.weight", "market_quantity_head.bias",
         "value_head.weight", "value_head.bias",
     ])
+    if feature_variant == EXPERIMENTAL_FEATURE_VARIANT:
+        names.extend(["context_projection.weight", "context_projection.bias"])
+    elif feature_variant != PRODUCTION_FEATURE_VARIANT:
+        raise ValueError("unsupported learned artifact feature_variant")
     return tuple(names)
 
 
 def artifact_tensor_shapes(
     hidden_width: int = _ARTIFACT_HIDDEN_WIDTH,
     model_depth: int = _ARTIFACT_MODEL_DEPTH,
+    feature_variant: str = PRODUCTION_FEATURE_VARIANT,
 ) -> dict[str, tuple[int, ...]]:
     """Return the exact state-dict shapes for a CompactPolicyNet topology."""
     hidden_width, model_depth = _validate_artifact_model_shape(hidden_width, model_depth)
@@ -167,6 +183,13 @@ def artifact_tensor_shapes(
         "value_head.weight": (1, hidden_width),
         "value_head.bias": (1,),
     })
+    if feature_variant == EXPERIMENTAL_FEATURE_VARIANT:
+        shapes.update({
+            "context_projection.weight": (hidden_width, EXPERIMENTAL_CONTEXT_FEATURE_SIZE),
+            "context_projection.bias": (hidden_width,),
+        })
+    elif feature_variant != PRODUCTION_FEATURE_VARIANT:
+        raise ValueError("unsupported learned artifact feature_variant")
     return shapes
 
 
@@ -249,6 +272,9 @@ def _validate_artifact(value: Any) -> dict[str, Any]:
         "hidden_width": hidden_width,
         "quantization": _ARTIFACT_QUANTIZATION,
     }
+    feature_variant = value.get("feature_variant", PRODUCTION_FEATURE_VARIANT)
+    if feature_variant not in {PRODUCTION_FEATURE_VARIANT, EXPERIMENTAL_FEATURE_VARIANT}:
+        raise ValueError("unsupported learned artifact feature_variant")
     for key, expected in expected_headers.items():
         actual = value.get(key)
         if type(actual) is not type(expected) or actual != expected:
@@ -264,13 +290,18 @@ def _validate_artifact(value: Any) -> dict[str, Any]:
     if not hmac.compare_digest(actual, checksum):
         raise ValueError("learned artifact checksum mismatch")
     weights = value.get("weights")
-    expected_names = set(_artifact_tensor_names(model_depth))
+    expected_names = set(_artifact_tensor_names(model_depth, feature_variant))
     if not isinstance(weights, Mapping) or set(weights) != expected_names:
         missing = sorted(expected_names - set(weights or ())) if isinstance(weights, Mapping) else sorted(expected_names)
         raise ValueError(f"learned artifact tensors mismatch; missing={missing}")
-    shapes = artifact_tensor_shapes(hidden_width, model_depth)
-    decoded = {name: _read_artifact_tensor(name, weights[name], shapes[name]) for name in _artifact_tensor_names(model_depth)}
-    return {"headers": dict(expected_headers), "action_vocab": value["action_vocab"], "weights": decoded}
+    shapes = artifact_tensor_shapes(hidden_width, model_depth, feature_variant)
+    decoded = {
+        name: _read_artifact_tensor(name, weights[name], shapes[name])
+        for name in _artifact_tensor_names(model_depth, feature_variant)
+    }
+    headers = dict(expected_headers)
+    headers["feature_variant"] = feature_variant
+    return {"headers": headers, "action_vocab": value["action_vocab"], "weights": decoded}
 
 
 def load_exported_policy(path: str | Path) -> "DependencyFreePolicy":
@@ -446,6 +477,9 @@ class DependencyFreePolicy:
         self.model_version = str(artifact["headers"]["model_version"])
         self._hidden_width = int(artifact["headers"]["hidden_width"])
         self._model_depth = int(artifact["headers"]["model_depth"])
+        self.feature_variant = artifact["headers"].get(
+            "feature_variant", PRODUCTION_FEATURE_VARIANT,
+        )
         self._weights = artifact["weights"]
         self._numpy_weights = (
             {name: _np.asarray(value, dtype=_np.float32) for name, value in self._weights.items()}
@@ -469,6 +503,11 @@ class DependencyFreePolicy:
             linear(features.market_tokens, "market_projection.weight", "market_projection.bias"),
             linear([features.global_tokens], "global_projection.weight", "global_projection.bias"),
         ), axis=0)
+        if self.feature_variant == EXPERIMENTAL_FEATURE_VARIANT:
+            context = _np.asarray([features.context_features], dtype=_np.float32)
+            tokens[-1:] += linear(
+                context, "context_projection.weight", "context_projection.bias",
+            )
         embedding = weights["type_embedding.weight"]
         offsets = (0, tile_count, tile_count + worker_count,
                    tile_count + worker_count + market_count, len(tokens))
@@ -544,6 +583,15 @@ class DependencyFreePolicy:
             + _linear(market, weights["market_projection.weight"], weights["market_projection.bias"])
             + _linear(global_token, weights["global_projection.weight"], weights["global_projection.bias"])
         )
+        if self.feature_variant == EXPERIMENTAL_FEATURE_VARIANT:
+            tokens[-1:] = [
+                [left + right for left, right in zip(tokens[-1], addition)]
+                for addition in _linear(
+                    [list(features.context_features)],
+                    weights["context_projection.weight"],
+                    weights["context_projection.bias"],
+                )
+            ]
         type_embedding = weights["type_embedding.weight"]
         offsets = [0, len(tile), len(tile) + len(worker), len(tile) + len(worker) + len(market), len(tokens)]
         for index, kind in enumerate((0, 1, 2, 3)):

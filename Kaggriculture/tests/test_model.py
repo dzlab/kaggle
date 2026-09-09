@@ -10,6 +10,7 @@ from kagriculture_agent.features import (
     TILE_TOKEN_SIZE,
     WORKER_TOKEN_SIZE,
     extract_features,
+    extract_features_with_context,
 )
 
 
@@ -112,6 +113,22 @@ def test_policy_network_forward_shapes_and_schema_validation():
             tile_positions=features.tile_positions,
             schema_version=FEATURE_SCHEMA_VERSION + 1,
         ))
+
+
+def test_experimental_context_is_opt_in_and_cannot_enter_production_network():
+    torch = pytest.importorskip("torch")
+    from kagriculture_agent.model import CompactPolicyNet
+
+    state = sample_state()
+    state["history"] = [{"action": {"type": "WATER"}, "success": True}]
+    experimental_features = extract_features_with_context(state)
+    experimental_network = CompactPolicyNet(feature_variant="experimental_context_v1")
+    outputs = experimental_network(experimental_features)
+
+    assert outputs["value"].shape == (1,)
+    assert all(torch.isfinite(tensor).all().item() for tensor in outputs.values())
+    with pytest.raises(ValueError, match="feature variant"):
+        CompactPolicyNet()(experimental_features)
 
 
 def test_policy_network_initialization_is_deterministic_with_seed():

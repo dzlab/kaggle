@@ -4,12 +4,15 @@ import pytest
 
 from kagriculture_agent.constants import MARKET_I0, PRODUCTS
 from kagriculture_agent.features import (
+    EXPERIMENTAL_CONTEXT_FEATURE_SIZE,
     FEATURE_SCHEMA_VERSION,
     GLOBAL_TOKEN_SIZE,
     MARKET_TOKEN_SIZE,
     TILE_TOKEN_SIZE,
     WORKER_TOKEN_SIZE,
     extract_features,
+    extract_features_for_variant,
+    extract_features_with_context,
 )
 from kagriculture_agent.types import Position
 
@@ -53,6 +56,30 @@ def test_features_have_fixed_documented_shapes_and_ordered_positions():
     assert len(features.market_tokens) == len(PRODUCTS)
     assert all(len(token) == MARKET_TOKEN_SIZE for token in features.market_tokens)
     assert len(features.global_tokens) == GLOBAL_TOKEN_SIZE
+
+
+def test_feature_variants_preserve_production_shape_and_add_bounded_context_only():
+    state = sample_state()
+    state.update({
+        "history": [{"action": {"type": "WATER"}, "success": True}],
+        "market": {**state["market"], "price_history": [10, 20]},
+        "recovery_slack": 10**100,
+        "task_opportunities": ["WATER", "HARVEST"],
+    })
+
+    production = extract_features_for_variant(state, "production_v1")
+    experimental = extract_features_with_context(state)
+
+    assert production == extract_features(state)
+    assert production.feature_variant == "production_v1"
+    assert production.context_features == ()
+    assert experimental.feature_variant == "experimental_context_v1"
+    assert len(experimental.context_features) == EXPERIMENTAL_CONTEXT_FEATURE_SIZE
+    assert experimental.tile_tokens == production.tile_tokens
+    assert experimental.worker_tokens == production.worker_tokens
+    assert experimental.market_tokens == production.market_tokens
+    assert experimental.global_tokens == production.global_tokens
+    assert all(-1.0 <= value <= 1.0 and value == value for value in experimental.context_features)
 
 
 def test_extraction_is_deterministic_and_does_not_mutate_state():

@@ -40,6 +40,8 @@ from scripts.train_policy import (
 )
 from scripts.output_paths import validate_training_output_path
 from scripts.training_identity import (
+    ACTION_REPRESENTATIONS,
+    DEFAULT_ACTION_REPRESENTATION,
     DEFAULT_EXPERIMENT_ID,
     FEATURE_VARIANTS,
     TRAINING_MODES,
@@ -101,6 +103,8 @@ class ColabConfig:
     experiment_id: str = DEFAULT_EXPERIMENT_ID
     feature_variant: str = "production_v1"
     training_mode: str = "behavior_clone_then_ppo"
+    action_representation: str = DEFAULT_ACTION_REPRESENTATION
+    training_action_mask: bool = False
     league_checkpoints: tuple[Path, ...] = ()
     league_checkpoint_window: int = 5
     league_current_probability: float = DEFAULT_OPPONENT_PROBABILITIES["current"]
@@ -406,6 +410,8 @@ def build_config(
     experiment_id: str = DEFAULT_EXPERIMENT_ID,
     feature_variant: str = "production_v1",
     training_mode: str = "behavior_clone_then_ppo",
+    action_representation: str = DEFAULT_ACTION_REPRESENTATION,
+    training_action_mask: bool = False,
     league_checkpoints: Sequence[str | Path] = (),
     league_checkpoint_window: int = 5,
     league_current_probability: float | None = None,
@@ -447,6 +453,12 @@ def build_config(
     }
     LeagueSampler(probabilities=weights)
     validate_training_identity(experiment_id, feature_variant, training_mode)
+    if action_representation not in ACTION_REPRESENTATIONS:
+        raise ValueError(
+            "action_representation must be one of: " + ", ".join(ACTION_REPRESENTATIONS)
+        )
+    if type(training_action_mask) is not bool:
+        raise ValueError("training_action_mask must be boolean")
     validate_model_shape(model_width, model_depth, source="training")
     for name, value in (
         ("training_steps", training_steps),
@@ -562,6 +574,8 @@ def build_config(
         experiment_id,
         feature_variant,
         training_mode,
+        action_representation,
+        training_action_mask,
         tuple(_absolute_path(path) for path in league_checkpoints),
         league_checkpoint_window,
         weights["current"],
@@ -624,6 +638,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--experiment-id", default=DEFAULT_EXPERIMENT_ID)
     parser.add_argument("--feature-variant", choices=FEATURE_VARIANTS, default="production_v1")
     parser.add_argument("--training-mode", choices=TRAINING_MODES, default="behavior_clone_then_ppo")
+    parser.add_argument(
+        "--action-representation", choices=ACTION_REPRESENTATIONS,
+        default=DEFAULT_ACTION_REPRESENTATION,
+    )
+    parser.add_argument("--training-action-mask", dest="training_action_mask", action="store_true", default=False)
+    parser.add_argument("--no-training-action-mask", dest="training_action_mask", action="store_false")
     parser.add_argument("--model-width", type=_positive_int, default=DEFAULT_MODEL_WIDTH)
     parser.add_argument("--model-depth", type=_positive_int, default=DEFAULT_MODEL_DEPTH)
     parser.add_argument("--potential-reward-coef", type=_nonnegative_float, default=0.0)
@@ -705,6 +725,8 @@ def config_from_args(args: argparse.Namespace) -> ColabConfig:
         experiment_id=args.experiment_id,
         feature_variant=args.feature_variant,
         training_mode=args.training_mode,
+        action_representation=args.action_representation,
+        training_action_mask=args.training_action_mask,
         model_width=args.model_width,
         model_depth=args.model_depth,
         potential_reward_coef=args.potential_reward_coef,
@@ -892,6 +914,8 @@ def initialize_telemetry(config: ColabConfig) -> Any | None:
             "experiment_id": config.experiment_id,
             "feature_variant": config.feature_variant,
             "training_mode": config.training_mode,
+            "action_representation": config.action_representation,
+            "training_action_mask": config.training_action_mask,
             "candidate_tag": config.candidate_tag,
             "ppo_target_steps": config.ppo_target_steps,
             "training_steps": config.training_steps,
@@ -903,6 +927,7 @@ def initialize_telemetry(config: ColabConfig) -> Any | None:
             "model_depth": config.model_depth,
             "parameter_count": model_parameter_count_for_shape(
                 config.model_width, config.model_depth,
+                feature_variant=config.feature_variant,
             ),
             "batch_size": config.training_batch_size,
             "seed": config.training_seed,
@@ -1030,6 +1055,8 @@ def train_candidate(
             potential_reward_coef=config.potential_reward_coef,
             no_progress_window=config.no_progress_window,
             resolved_margin=config.resolved_margin,
+            training_action_mask=config.training_action_mask,
+            action_representation=config.action_representation,
         ),
         device=config.device,
         checkpoint_interval=config.training_checkpoint_interval,
@@ -1044,6 +1071,7 @@ def train_candidate(
         experiment_id=config.experiment_id,
         feature_variant=config.feature_variant,
         training_mode=config.training_mode,
+        action_representation=config.action_representation,
         effective_behavior_clone_steps=config.behavior_clone_steps,
         model_width=config.model_width,
         model_depth=config.model_depth,
@@ -1301,6 +1329,8 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
             potential_reward_coef=config.potential_reward_coef,
             no_progress_window=config.no_progress_window,
             resolved_margin=config.resolved_margin,
+            training_action_mask=config.training_action_mask,
+            action_representation=config.action_representation,
         ),
         model_width=config.model_width,
         model_depth=config.model_depth,
