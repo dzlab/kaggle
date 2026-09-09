@@ -280,18 +280,32 @@ def test_sell_assignment_validates_carried_inventory():
     assert not _assignment_valid(empty, assignment)
 
 
-def test_feed_required_wheat_buy_survives_reversal_filter():
-    state = _state(day=0, hour=1, private={"shed": {}, "inventories": [{}]})
+def test_basic_need_wheat_buy_survives_reversal_filter():
+    state = _state(
+        day=28,
+        hour=1,
+        private={"seeds": {}, "shed": {}, "inventories": [{"GOOSE": 1}]},
+        market={"prices": {"WHEAT": 10}, "inventory": {}},
+    )
     protected = Policy(strategy="current")
-    protected.memory.market_history["WHEAT"] = [(0, "SELL")]
-    guarded = protected._basic_need_guard(state, [["BUY_PRODUCT", "WHEAT", 2]], [], None)
-    protected_result = protected._filter_market_direction(state, guarded, None)
+    protected.memory.market_history["WHEAT"] = [(28 * 24, "SELL")]
+    guarded, protected_directions = protected._basic_need_guard(
+        state, [["BUY_PRODUCT", "WHEAT", 2]], [], None,
+    )
+    protected_result = protected._filter_market_direction(
+        state, guarded, None, protected=protected_directions,
+    )
 
     discretionary = Policy(strategy="current")
-    discretionary.memory.market_history["WHEAT"] = [(0, "SELL")]
-    discretionary_result = discretionary._filter_market_direction(
-        state, [["BUY_PRODUCT", "WHEAT", 1]], None
+    discretionary.memory.market_history["WHEAT"] = [(28 * 24, "SELL")]
+    guarded, discretionary_directions = discretionary._basic_need_guard(
+        state, [["BUY_PRODUCT", "WHEAT", 1]], [], None,
     )
+    discretionary_result = discretionary._filter_market_direction(
+        state, guarded, None, protected=discretionary_directions,
+    )
+    assert protected_directions == {("WHEAT", "BUY_PRODUCT")}
+    assert discretionary_directions == set()
     assert ["BUY_PRODUCT", "WHEAT", 2] in protected_result
     assert ["BUY_PRODUCT", "WHEAT", 1] not in discretionary_result
 
@@ -303,7 +317,14 @@ def test_learned_policy_liquidates_shed_inventory_in_terminal_window(monkeypatch
     deterministic = Policy(strategy="current").act(state)
     learned_policy = Policy(strategy="current", learned_model="stub.json")
     monkeypatch.setattr(learned_policy.learned_policy, "model_path", "stub.json")
-    monkeypatch.setattr(learned_policy.learned_policy, "propose", lambda *_: PolicyProposal((), (), 1.0, "stub"))
+    monkeypatch.setattr(
+        learned_policy.learned_policy,
+        "propose",
+        lambda *_: (
+            learned_policy.learned_policy.diagnostics.update(status="ok")
+            or PolicyProposal((), (), 1.0, "stub")
+        ),
+    )
     learned = learned_policy.act(state)
     assert ["SELL", "CARROT", 1] in deterministic["market"]
     assert ["SELL", "CARROT", 1] in learned["market"]

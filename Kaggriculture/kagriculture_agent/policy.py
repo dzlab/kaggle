@@ -1091,7 +1091,7 @@ class Policy:
 
     def _basic_need_guard(self, state: Mapping[str, Any], market: Sequence[Sequence[Any]],
                           assignments: Sequence[WorkerAssignment],
-                          strategy: StrategySpec | None) -> list[list[Any]]:
+                          strategy: StrategySpec | None) -> tuple[list[list[Any]], set[tuple[str, str]]]:
         """Preserve feed solvency and due basic-need assignments."""
         normalized = _state_for_planner(state)
         day = _whole(_get(normalized, "day"))
@@ -1116,8 +1116,19 @@ class Policy:
             and len(order) >= 3
         )
         required_wheat = 0
+        protected_directions: set[tuple[str, str]] = set()
         due_guard_blocked = bool(due_tasks) and not due_assignments_valid
         guard_blocked = due_guard_blocked
+        available_shed_room = max(
+            0,
+            DEFAULT_SHED_CAPACITY
+            - sum(_counts(_shed(normalized)).values())
+            + sum(
+                min(_whole(order[2]), _counts(_shed(normalized)).get(str(order[1]).upper(), 0))
+                for order in market
+                if self._market_order_kind(order) == "SELL" and len(order) >= 3
+            ),
+        )
         for raw_order in market:
             order = list(raw_order)
             kind = self._market_order_kind(order)
@@ -1133,8 +1144,15 @@ class Policy:
                     normalized, day, projected_counts, candidate_intents,
                     _cash(normalized) + sale_proceeds, wheat_price, reserve_wheat,
                 )
+                needed_before, _ = _feed_purchase_needed(
+                    normalized, day, projected_counts, purchase_intents,
+                    _cash(normalized) + sale_proceeds, wheat_price, reserve_wheat,
+                )
                 required_wheat = max(required_wheat, needed)
                 item = str(order[1]).upper() if len(order) >= 2 else ""
+                quantity = _whole(order[2]) if len(order) >= 3 else 0
+                uses_shed_room = kind in {"BUY_PRODUCT", "BUY_ANIMAL"}
+                capacity_ok = not uses_shed_room or quantity <= available_shed_room
                 discretionary = (
                     kind in {"BUY_LAND", "BUY_ANIMAL", "HIRE", "BUY_SEED"}
                     or (kind == "BUY_PRODUCT" and item != "WHEAT")
@@ -1144,7 +1162,19 @@ class Policy:
                 if discretionary and (due_guard_blocked or cash_after < 0):
                     guard_blocked = True
                     continue
+                if (
+                    kind == "BUY_PRODUCT"
+                    and item == "WHEAT"
+                    and quantity > 0
+                    and needed_before > 0
+                    and needed == 0
+                    and cash_after >= 0
+                    and capacity_ok
+                ):
+                    protected_directions.add((item, kind))
                 purchase_intents.append(order)
+                if uses_shed_room:
+                    available_shed_room = max(0, available_shed_room - quantity)
             accepted.append(order)
         if not purchase_intents:
             required_wheat, cash_after = _feed_purchase_needed(
@@ -1154,7 +1184,7 @@ class Policy:
             guard_blocked = guard_blocked or cash_after < 0
         self.memory.diagnostics["reserved_wheat"] = int(required_wheat)
         self.memory.diagnostics["basic_need_guard"] = "blocked" if guard_blocked else "pass"
-        return accepted
+        return accepted, protected_directions
 
     @staticmethod
     def _market_order_kind(order: Any) -> str:
@@ -1166,16 +1196,18 @@ class Policy:
             return ""
 
     def _filter_market_direction(self, state: Mapping[str, Any], market: Sequence[Sequence[Any]],
-                                 strategy: StrategySpec | None) -> list[list[Any]]:
+                                 strategy: StrategySpec | None,
+                                 *, protected: set[tuple[str, str]] | None = None) -> list[list[Any]]:
         day = _whole(_get(state, "day"))
         hour = _whole(_get(state, "hour"))
         turn = day * 24 + hour
         terminal = day >= season_days - 1 and hour >= _terminal_liquidation_hour(strategy)
+        protected = protected or set()
         filtered = []
         current_directions: dict[str, str] = {}
         for order in market:
             direction = _market_order_direction(order)
-            if direction is not None and not market_order_allowed(
+            if direction is not None and direction not in protected and not market_order_allowed(
                 self.memory, item=direction[0], direction=direction[1],
                 turn=turn, terminal=terminal,
             ):
@@ -1316,18 +1348,17 @@ class Policy:
             # The model contributes intents; deterministic planning remains
             # responsible for feed, seed, and other safety-critical orders.
             market_plan.extend(learned_proposal.market_orders)
-            market = (
-                build_market_orders(state, market_plan, strategy_spec)
-                if not terminal_cleanup else []
-            )
-        else:
-            market = (
-                build_market_orders(state, market_plan, strategy_spec)
-                if not terminal_cleanup or (final_liquidation_window and not _has_carried_goods(state))
-                else []
-            )
-        market = self._basic_need_guard(state, market, assignments, strategy_spec)
-        market = self._filter_market_direction(state, market, strategy_spec)
+        market = (
+            build_market_orders(state, market_plan, strategy_spec)
+            if not terminal_cleanup or (final_liquidation_window and not _has_carried_goods(state))
+            else []
+        )
+        market, protected_directions = self._basic_need_guard(
+            state, market, assignments, strategy_spec,
+        )
+        market = self._filter_market_direction(
+            state, market, strategy_spec, protected=protected_directions,
+        )
         market = _remove_pickup_sale_conflicts(market, commands)
         self._record_market_direction(state, market)
         self.memory.sell_batches = [order for order in market if order[0] == "SELL"]
