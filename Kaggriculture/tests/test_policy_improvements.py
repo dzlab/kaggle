@@ -85,13 +85,19 @@ def test_sell_assignment_validates_carried_inventory():
 
 
 def test_feed_required_wheat_buy_survives_reversal_filter():
-    policy = Policy(strategy="current")
-    policy.memory.market_history["WHEAT"] = [(0, "SELL")]
     state = _state(day=0, hour=1, private={"shed": {}, "inventories": [{}]})
-    guarded = policy._basic_need_guard(state, [["BUY_PRODUCT", "WHEAT", 2]], [], None)
-    result = policy._filter_market_direction(state, guarded + [["SELL", "WHEAT", 1]], None)
-    assert ["BUY_PRODUCT", "WHEAT", 2] in result
-    assert ["SELL", "WHEAT", 1] not in result
+    protected = Policy(strategy="current")
+    protected.memory.market_history["WHEAT"] = [(0, "SELL")]
+    guarded = protected._basic_need_guard(state, [["BUY_PRODUCT", "WHEAT", 2]], [], None)
+    protected_result = protected._filter_market_direction(state, guarded, None)
+
+    discretionary = Policy(strategy="current")
+    discretionary.memory.market_history["WHEAT"] = [(0, "SELL")]
+    discretionary_result = discretionary._filter_market_direction(
+        state, [["BUY_PRODUCT", "WHEAT", 1]], None
+    )
+    assert ["BUY_PRODUCT", "WHEAT", 2] in protected_result
+    assert ["BUY_PRODUCT", "WHEAT", 1] not in discretionary_result
 
 
 def test_learned_policy_liquidates_shed_inventory_in_terminal_window(monkeypatch):
