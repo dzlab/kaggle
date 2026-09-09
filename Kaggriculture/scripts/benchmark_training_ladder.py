@@ -16,10 +16,8 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
-from scripts.output_paths import (
-    resolve_output_path,
-    validate_training_output_path,
-)
+from kagriculture_agent.model_topology import compact_policy_parameter_count
+from scripts.output_paths import validate_training_output_path
 
 MAX_LADDER_WIDTH = 4096
 MAX_LADDER_DEPTH = 64
@@ -28,10 +26,6 @@ MAX_SEEDS = 256
 MAX_EXPERIMENTS = 4096
 MAX_ROLLOUT_EPISODES = 100_000
 MAX_ROLLOUT_STEPS = 1_000_000
-_FEATURE_INPUT_SIZES = (23, 28, 14, 13)
-_WORKER_KIND_COUNT = 14
-_MARKET_ITEM_COUNT = 9
-_MARKET_QUANTITY_COUNT = 8
 
 
 def parse_ladder(value: str | Path | Mapping[str, Any]) -> dict[str, Any]:
@@ -130,34 +124,10 @@ def estimate_parameter_count(
     width: int,
     depth: int,
 ) -> int:
-    """Count parameters for the dependency-free CompactPolicyNet topology."""
+    """Return the authoritative CompactPolicyNet parameter count."""
     width = _model_width(width, "width", MAX_LADDER_WIDTH)
     depth = _positive_int(depth, "depth", MAX_LADDER_DEPTH)
-
-    def linear_parameters(input_size: int, output_size: int) -> int:
-        return input_size * output_size + output_size
-
-    count = sum(
-        linear_parameters(input_size, width)
-        for input_size in _FEATURE_INPUT_SIZES
-    )
-    count += 4 * width  # type embedding
-    for _ in range(depth):
-        # MultiheadAttention, attention projection/norm, and the 2x-width MLP/norm.
-        count += 3 * width * width + 3 * width
-        count += linear_parameters(width, width)
-        count += 2 * width
-        count += linear_parameters(width, 2 * width)
-        count += linear_parameters(2 * width, width)
-        count += 2 * width
-    count += linear_parameters(width, 2)
-    count += linear_parameters(width, _WORKER_KIND_COUNT)
-    count += linear_parameters(width, width) * 2
-    count += linear_parameters(width, _MARKET_ITEM_COUNT)
-    count += linear_parameters(width, _MARKET_QUANTITY_COUNT)
-    count += linear_parameters(width, 1)
-    count += linear_parameters(width, 2)  # training-only market head
-    return count
+    return compact_policy_parameter_count(width, depth)
 
 
 def estimate_rollout_budget(ppo_steps: int, episodes: int, steps: int) -> int:
@@ -244,16 +214,19 @@ def validate_report_path(path: str | Path, report_root: str | Path | None = None
 
     raw_path = Path(path).expanduser()
     if raw_path.is_absolute():
-        candidate = resolve_output_path(raw_path, name="report path")
+        candidate = validate_training_output_path(
+            raw_path, name="report path", reject_protected_names=True,
+        )
     elif raw_path.parts and raw_path.parts[0].lower() == root.name.lower():
-        candidate = resolve_output_path(Path.cwd() / raw_path, name="report path")
+        candidate = validate_training_output_path(
+            Path.cwd() / raw_path, name="report path", reject_protected_names=True,
+        )
     else:
-        candidate = resolve_output_path(root / raw_path, name="report path")
+        candidate = validate_training_output_path(
+            root / raw_path, name="report path", reject_protected_names=True,
+        )
     if candidate == root or root not in candidate.parents:
         raise ValueError("production/output path must remain inside the report root")
-    validate_training_output_path(
-        candidate, name="report path", reject_protected_names=True,
-    )
     if candidate.suffix.lower() not in {".json", ".jsonl"}:
         raise ValueError("report path must be JSON")
     return candidate
@@ -278,6 +251,9 @@ def write_report_atomically(
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        destination = validate_report_path(
+            destination, report_root=report_root,
+        )
         os.replace(temporary_name, destination)
     finally:
         if temporary_name is not None and Path(temporary_name).exists():

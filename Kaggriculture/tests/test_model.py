@@ -142,6 +142,19 @@ def test_policy_network_supports_opt_in_width_and_depth_and_reports_parameters()
     assert all(torch.isfinite(parameter).all().item() for parameter in network.parameters())
 
 
+@pytest.mark.parametrize("width,depth", [(128, 4), (256, 4), (128, 8)])
+def test_shared_parameter_estimator_matches_constructed_policy(width, depth):
+    pytest.importorskip("torch")
+    from kagriculture_agent.model import CompactPolicyNet
+    from kagriculture_agent.model_topology import compact_policy_parameter_count
+
+    network = CompactPolicyNet(hidden_width=width, depth=depth)
+
+    assert sum(parameter.numel() for parameter in network.parameters()) == (
+        compact_policy_parameter_count(width, depth)
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("hidden_width", 0), ("hidden_width", 3), ("depth", 0), ("depth", True)],

@@ -31,6 +31,13 @@ from .features import (
     WORKER_TOKEN_SIZE,
     FeatureBatch,
 )
+from .model_topology import (
+    ATTENTION_HEADS,
+    DEFAULT_MODEL_DEPTH,
+    DEFAULT_MODEL_WIDTH,
+    compact_policy_parameter_count,
+    validate_topology_shape,
+)
 
 try:  # pragma: no cover - exercised only when the optional dependency exists
     import torch
@@ -41,12 +48,9 @@ except ModuleNotFoundError:  # pragma: no cover - local test venv may omit torch
 
 
 MODEL_VERSION = "learned_v1"
-HIDDEN_WIDTH = 128
-ATTENTION_BLOCKS = 4
-ATTENTION_HEADS = 4
+HIDDEN_WIDTH = DEFAULT_MODEL_WIDTH
+ATTENTION_BLOCKS = DEFAULT_MODEL_DEPTH
 MLP_WIDTH = 256
-DEFAULT_MODEL_WIDTH = HIDDEN_WIDTH
-DEFAULT_MODEL_DEPTH = ATTENTION_BLOCKS
 FEATURE_INPUT_SIZES = {
     "tile": TILE_TOKEN_SIZE,
     "worker": WORKER_TOKEN_SIZE,
@@ -80,15 +84,7 @@ def validate_model_shape(
     hidden_width: Any, depth: Any, *, source: str = "model",
 ) -> tuple[int, int]:
     """Validate the opt-in model topology while preserving current defaults."""
-    if type(hidden_width) is not int or hidden_width < 1:
-        raise ValueError(f"{source} hidden_width must be a positive integer")
-    if hidden_width % ATTENTION_HEADS:
-        raise ValueError(
-            f"{source} hidden_width must be divisible by {ATTENTION_HEADS}"
-        )
-    if type(depth) is not int or depth < 1:
-        raise ValueError(f"{source} depth must be a positive integer")
-    return hidden_width, depth
+    return validate_topology_shape(hidden_width, depth, source=source)
 
 
 def resolve_device(requested: str = "auto") -> Any:
@@ -261,28 +257,5 @@ def model_parameter_count_for_shape(
     hidden_width: int = DEFAULT_MODEL_WIDTH, depth: int = DEFAULT_MODEL_DEPTH,
 ) -> int:
     """Count CompactPolicyNet parameters without constructing or initializing it."""
-    hidden_width, depth = validate_model_shape(hidden_width, depth, source="parameter count")
-
-    def linear_parameters(input_size: int, output_size: int) -> int:
-        return input_size * output_size + output_size
-
-    count = sum(
-        linear_parameters(input_size, hidden_width)
-        for input_size in FEATURE_INPUT_SIZES.values()
-    )
-    count += 4 * hidden_width  # type embedding
-    for _ in range(depth):
-        count += 3 * hidden_width * hidden_width + 3 * hidden_width
-        count += linear_parameters(hidden_width, hidden_width)
-        count += 2 * hidden_width  # attention LayerNorm
-        count += linear_parameters(hidden_width, 2 * hidden_width)
-        count += linear_parameters(2 * hidden_width, hidden_width)
-        count += 2 * hidden_width  # MLP LayerNorm
-    count += linear_parameters(hidden_width, 2)
-    count += linear_parameters(hidden_width, len(ACTION_VOCAB["worker_kinds"]))
-    count += linear_parameters(hidden_width, hidden_width) * 2
-    count += linear_parameters(hidden_width, len(ACTION_VOCAB["market_items"]))
-    count += linear_parameters(hidden_width, len(ACTION_VOCAB["market_quantities"]))
-    count += linear_parameters(hidden_width, 1)
-    count += linear_parameters(hidden_width, 2)  # training-only market head
-    return count
+    validate_model_shape(hidden_width, depth, source="parameter count")
+    return compact_policy_parameter_count(hidden_width, depth)

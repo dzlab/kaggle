@@ -50,11 +50,11 @@ EVALUATE_SCRIPT = Path(__file__).with_name("evaluate_artifact.py")
 RUN_LOCAL_SCRIPT = Path(__file__).with_name("run_local.py")
 
 
-def _absolute_path(value: str | Path) -> Path:
+def _absolute_path(value: str | Path, *, resolve_symlinks: bool = True) -> Path:
     path = Path(value).expanduser()
     if not path.is_absolute():
         path = PROJECT_ROOT / path
-    return path.resolve()
+    return path.resolve() if resolve_symlinks else path.absolute()
 
 
 @dataclass(frozen=True)
@@ -498,17 +498,19 @@ def build_config(
             raise ValueError(f"{name} must contain supported opponents")
     resolved = str(resolve_device(device)) if resolve_runtime_device else device
     run_path = validate_training_output_path(
-        _absolute_path(run_directory), name="run directory",
+        _absolute_path(run_directory, resolve_symlinks=False), name="run directory",
     )
     resolved_plot_path = (
-        validate_training_output_path(_absolute_path(plot_path), name="plot path")
+        validate_training_output_path(
+            _absolute_path(plot_path, resolve_symlinks=False), name="plot path",
+        )
         if plot_path is not None else None
     )
     if trajectory_path is None:
         input_path = run_path / "bootstrap-trajectories.jsonl"
     else:
         input_path = validate_training_output_path(
-            _absolute_path(trajectory_path), name="trajectory path",
+            _absolute_path(trajectory_path, resolve_symlinks=False), name="trajectory path",
         )
     return ColabConfig(
         run_path, resolved, workers, development, holdout,

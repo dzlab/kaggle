@@ -108,6 +108,21 @@ def test_checkpoint_round_trip_restores_complete_training_state_and_rng(tmp_path
     assert source_optimizer.state_dict()["state"].keys() == restored_optimizer.state_dict()["state"].keys()
 
 
+def test_checkpoint_atomic_writer_rejects_existing_final_symlink(tmp_path):
+    from kagriculture_agent.checkpoints import _atomic_write
+
+    target = tmp_path / "safe-checkpoint.pt"
+    target.write_bytes(b"existing")
+    destination = tmp_path / "checkpoint.pt"
+    destination.symlink_to(target)
+
+    with pytest.raises(ValueError, match="symlink"):
+        _atomic_write(destination, lambda handle: handle.write(b"replacement"))
+
+    assert destination.is_symlink()
+    assert target.read_bytes() == b"existing"
+
+
 def test_checkpoint_load_uses_restricted_weights_only_deserialization(
     tmp_path, monkeypatch,
 ):

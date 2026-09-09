@@ -20,6 +20,24 @@ from typing import Literal
 
 OpponentName = Literal["current", "mixed", "random", "starter", "checkpoint"]
 _OPPONENTS = frozenset({"current", "mixed", "random", "starter", "checkpoint"})
+OPPONENT_NAMES = _OPPONENTS
+
+
+def validate_league_composition(
+    value: Mapping[str, int], *, source: str = "league_composition",
+) -> dict[str, int]:
+    """Validate opponent-count provenance against the canonical league vocabulary."""
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{source} must be a mapping")
+    if any(
+        type(name) is not str or name not in OPPONENT_NAMES
+        or type(count) is not int or count < 0
+        for name, count in value.items()
+    ):
+        raise ValueError(
+            f"{source} must map allowed opponent names to nonnegative integers"
+        )
+    return dict(value)
 
 
 def _finite_weight(value: object, label: str) -> float:
@@ -262,19 +280,78 @@ class LeagueSampler:
             raise ValueError("mixed_opponents must contain non-empty strings")
         self.mixed_opponents = mixed
 
-    def sample(self, index: int, *, seed: int = 0) -> OpponentMatch:
-        """Return a stable coordinate from the canonical weighted schedule.
+    def _match_at(self, index: int, *, seed: int) -> OpponentMatch:
+        opponent = self._opponent_at(index, seed=seed)
+        seat = index % 2
+        if opponent == "checkpoint":
+            if not self.skill_bands:
+                return OpponentMatch(
+                    "current", seat, fallback_reason="checkpoint_unavailable",
+                )
+            band_weights = {
+                name: weight * self.hard_opponent_weights.get(name, 1.0)
+                for name, weight in self.band_probabilities.items()
+            }
+            if sum(band_weights.values()) <= 0.0:
+                return OpponentMatch(
+                    "current", seat, fallback_reason="checkpoint_band_unavailable",
+                )
+            band_name = _choose(_rng(seed, index, "skill-band"), band_weights)
+            band = next(band for band in self.skill_bands if band.name == band_name)
+            available = band.available_checkpoints
+            if not available:
+                return OpponentMatch(
+                    "current", seat, fallback_reason="checkpoint_unavailable",
+                )
+            if len(self.skill_bands) == 1 and band.name == "default":
+                checkpoint_index = sum(
+                    self._opponent_at(previous, seed=seed) == "checkpoint"
+                    for previous in range(index)
+                ) % len(available)
+            else:
+                checkpoint_index = _rng(seed, index, "checkpoint").randrange(len(available))
+            checkpoint = available[checkpoint_index]
+            try:
+                identity = checkpoint.identity
+            except OSError:
+                return OpponentMatch(
+                    "current", seat, fallback_reason="checkpoint_identity_unavailable",
+                )
+            return OpponentMatch(
+                "checkpoint", seat, checkpoint=checkpoint.path,
+                skill_band=band.name, checkpoint_identity=identity,
+            )
+        if opponent == "mixed":
+            mixed_opponent = self.mixed_opponents[
+                _rng(seed, index, "mixed").randrange(len(self.mixed_opponents))
+            ]
+            return OpponentMatch(
+                "mixed", seat, mixed_opponent=mixed_opponent,
+            )
+        return OpponentMatch(opponent, seat)  # type: ignore[arg-type]
 
-        ``schedule`` owns opponent and checkpoint materialization.  A single
-        sample is reconstructed from the one-shot schedule ending at its
-        requested coordinate, so it cannot drift from the schedule's
-        checkpoint-selection rules.
-        """
+    def _opponent_at(self, index: int, *, seed: int) -> str:
+        """Return the one canonical opponent at a sequence index."""
+        if self.probabilities == DEFAULT_OPPONENT_PROBABILITIES:
+            cycle = [
+                opponent
+                for opponent, count in (
+                    ("current", 8), ("mixed", 3), ("random", 2),
+                    ("starter", 2), ("checkpoint", 5),
+                )
+                for _ in range(count)
+            ]
+            _rng(seed, 0, "opponent-sequence").shuffle(cycle)
+            return cycle[index % len(cycle)]
+        return _choose(_rng(seed, index, "opponent"), self.probabilities)
+
+    def sample(self, index: int, *, seed: int = 0) -> OpponentMatch:
+        """Return the canonical deterministic match at one sequence index."""
         if type(index) is not int or index < 0:
             raise ValueError("index must be a nonnegative integer")
         if type(seed) is not int:
             raise ValueError("seed must be an integer")
-        return self.schedule(index + 1, seed=seed)[index]
+        return self._match_at(index, seed=seed)
 
     def schedule(self, count: int, *, seed: int = 0) -> list[OpponentMatch]:
         """Return exactly ``count`` weighted matches with alternating seats.
@@ -284,82 +361,7 @@ class LeagueSampler:
         """
         if type(count) is not int or count < 1:
             raise ValueError("count must be a positive integer")
-        total = sum(self.probabilities.values())
-        counts = {
-            opponent: int(count * weight / total)
-            for opponent, weight in self.probabilities.items()
-        }
-        missing = count - sum(counts.values())
-        remainders = sorted(
-            (
-                (count * weight / total - counts[opponent], opponent)
-                for opponent, weight in self.probabilities.items()
-            ),
-            key=lambda item: (-item[0], item[1]),
-        )
-        for _fraction, opponent in remainders[:missing]:
-            counts[opponent] += 1
-
-        selected: list[str] = []
-        for opponent in self.probabilities:
-            selected.extend([opponent] * counts[opponent])
-        _rng(seed, count, "schedule").shuffle(selected)
-
-        matches: list[OpponentMatch] = []
-        checkpoint_slot = 0
-        for index, opponent in enumerate(selected):
-            seat = index % 2
-            if opponent == "checkpoint":
-                if not self.skill_bands:
-                    matches.append(OpponentMatch(
-                        "current", seat, fallback_reason="checkpoint_unavailable",
-                    ))
-                    continue
-                band_weights = {
-                    name: weight * self.hard_opponent_weights.get(name, 1.0)
-                    for name, weight in self.band_probabilities.items()
-                }
-                if sum(band_weights.values()) <= 0.0:
-                    matches.append(OpponentMatch(
-                        "current", seat, fallback_reason="checkpoint_band_unavailable",
-                    ))
-                    continue
-                band_name = _choose(_rng(seed, index, "skill-band"), band_weights)
-                band = next(band for band in self.skill_bands if band.name == band_name)
-                available = band.available_checkpoints
-                if not available:
-                    matches.append(OpponentMatch(
-                        "current", seat, fallback_reason="checkpoint_unavailable",
-                    ))
-                    continue
-                if len(self.skill_bands) == 1 and band.name == "default":
-                    checkpoint = available[checkpoint_slot % len(available)]
-                    checkpoint_slot += 1
-                else:
-                    checkpoint = available[
-                        _rng(seed, index, "checkpoint").randrange(len(available))
-                    ]
-                try:
-                    identity = checkpoint.identity
-                except OSError:
-                    matches.append(OpponentMatch(
-                        "current", seat, fallback_reason="checkpoint_identity_unavailable",
-                    ))
-                    continue
-                matches.append(OpponentMatch(
-                    "checkpoint", seat, checkpoint=checkpoint.path,
-                    skill_band=band.name, checkpoint_identity=identity,
-                ))
-            elif opponent == "mixed":
-                mixed_opponent = self.mixed_opponents[
-                    _rng(seed, index, "mixed").randrange(len(self.mixed_opponents))
-                ]
-                matches.append(OpponentMatch(
-                    "mixed", seat, mixed_opponent=mixed_opponent,
-                ))
-            else:
-                matches.append(OpponentMatch(opponent, seat))  # type: ignore[arg-type]
-        return matches
+        return [self._match_at(index, seed=seed) for index in range(count)]
 
 
 def _resolve_sampler(

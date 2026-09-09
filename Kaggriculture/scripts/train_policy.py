@@ -34,6 +34,7 @@ from kagriculture_agent.league import (
     DEFAULT_OPPONENT_PROBABILITIES,
     LeagueSampler,
     OpponentMatch,
+    validate_league_composition,
 )
 from kagriculture_agent.model import (
     ACTION_VOCAB,
@@ -1507,16 +1508,9 @@ def run_ppo_training(
     if initial_league_composition is None:
         league_composition = dict(_PPO_LEAGUE_COMPOSITION_DEFAULT)
     else:
-        if not isinstance(initial_league_composition, Mapping):
-            raise ValueError("initial_league_composition must be a mapping")
-        if any(
-            type(name) is not str or not name
-            or type(count) is not int or count < 0
-            for name, count in initial_league_composition.items()
-        ):
-            raise ValueError(
-                "initial_league_composition must map names to nonnegative integers"
-            )
+        validate_league_composition(
+            initial_league_composition, source="initial_league_composition",
+        )
         league_composition = dict(_PPO_LEAGUE_COMPOSITION_DEFAULT)
         league_composition.update(initial_league_composition)
     if initial_league_checkpoint_identities is None:
@@ -2087,16 +2081,10 @@ def _validate_resume_payload(
                 raise ValueError(
                     f"resume checkpoint ppo_metrics {field} must be an object or null"
                 )
-        league_composition = ppo_metrics["league_composition"]
-        if type(league_composition) is not dict or any(
-            type(name) is not str or not name
-            or type(count) is not int or count < 0
-            for name, count in league_composition.items()
-        ):
-            raise ValueError(
-                "resume checkpoint ppo_metrics league_composition must map names to "
-                "nonnegative integers"
-            )
+        league_composition = validate_league_composition(
+            ppo_metrics["league_composition"],
+            source="resume checkpoint ppo_metrics league_composition",
+        )
         checkpoint_identities = ppo_metrics["league_checkpoint_identities"]
         if type(checkpoint_identities) is not list or any(
             type(identity) is not str or not identity

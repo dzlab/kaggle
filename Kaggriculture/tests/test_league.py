@@ -71,6 +71,23 @@ def test_sample_reconstructs_scheduled_default_band_checkpoint_matches(tmp_path)
     ]
 
 
+def test_sample_matches_one_canonical_schedule_prefix_for_any_horizon(tmp_path):
+    checkpoint = _checkpoint(tmp_path, "checkpoint.pt", "hard")
+    sampler = LeagueSampler(
+        probabilities={
+            "current": 0.2, "mixed": 0.2, "random": 0.2,
+            "starter": 0.2, "checkpoint": 0.2,
+        },
+        skill_bands={"hard": SkillBand("hard", (checkpoint,))},
+    )
+
+    short = sampler.schedule(12, seed=73)
+    long = sampler.schedule(40, seed=73)
+
+    assert [sampler.sample(index, seed=73) for index in range(12)] == short
+    assert long[:12] == short
+
+
 def test_checkpoint_sampling_is_uniform_within_selected_band(tmp_path):
     checkpoints = tuple(
         _checkpoint(tmp_path, f"checkpoint-{index}.pt", "hard")

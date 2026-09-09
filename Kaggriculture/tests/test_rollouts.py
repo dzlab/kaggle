@@ -185,3 +185,22 @@ def test_native_rollout_manifest_records_checkpoint_fallback_reason():
     )
 
     assert manifest["league"]["fallback_reason"] == "checkpoint_unavailable"
+
+
+@pytest.mark.parametrize(
+    "composition",
+    [
+        {"unknown": 1},
+        {1: 1},
+        {"current": True},
+        {"current": -1},
+    ],
+)
+def test_native_rollout_manifest_rejects_malformed_league_composition(composition):
+    from scripts.collect_trajectories import _manifest
+
+    with pytest.raises(ValueError, match="league_composition"):
+        _manifest(
+            seeds=[41], opponents=["pass"], seats=[1], steps=4,
+            source_policy_identity="candidate", league_composition=composition,
+        )

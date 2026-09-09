@@ -16,6 +16,7 @@ from typing import Any, BinaryIO
 from .constants import ENGINE_VERSION
 from .features import FEATURE_SCHEMA_VERSION
 from .model import ACTION_VOCAB, MODEL_VERSION, require_torch
+from .output_paths import validate_training_output_path
 
 CHECKPOINT_FORMAT_VERSION = 1
 _REQUIRED_PAYLOAD_FIELDS = (
@@ -143,7 +144,7 @@ def _validate_rng_state(state: Any) -> None:
 
 
 def _atomic_write(destination: str | Path, writer: Callable[[BinaryIO], None]) -> str:
-    path = Path(destination)
+    path = validate_training_output_path(destination, name="checkpoint path")
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
@@ -154,6 +155,7 @@ def _atomic_write(destination: str | Path, writer: Callable[[BinaryIO], None]) -
             writer(handle)
             handle.flush()
             os.fsync(handle.fileno())
+        path = validate_training_output_path(path, name="checkpoint path")
         os.replace(temporary_path, path)
         _fsync_parent_directory(path.parent)
     finally:
@@ -186,6 +188,7 @@ def save_checkpoint(
     metadata: Mapping[str, Any] | None = None,
 ) -> str:
     """Save a complete checkpoint by fsyncing a same-directory temp then replacing."""
+    validate_training_output_path(path, name="checkpoint path")
     th = require_torch()
     progress = {"epoch": epoch, "round": round_index, "cursor": cursor}
     if phase is not None:

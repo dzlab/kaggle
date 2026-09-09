@@ -24,6 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from kagriculture_agent.constants import ENGINE_VERSION
 from kagriculture_agent.features import FEATURE_SCHEMA_VERSION
+from kagriculture_agent.league import validate_league_composition
 from kagriculture_agent.rollouts import resolve_worker_count, run_rollouts
 from kagriculture_agent.reward_shaping import classify_progress, should_bootstrap_truncate
 from kagriculture_agent.trajectory import TRANSITION_SCHEMA_VERSION, Transition, transitions_from_replay
@@ -215,14 +216,7 @@ def _manifest(
             if value is not None and (type(value) is not str or not value):
                 raise ValueError(f"{name} must be a non-empty string when provided")
         if league_composition is not None:
-            if not isinstance(league_composition, Mapping):
-                raise ValueError("league_composition must be a mapping")
-            composition = dict(league_composition)
-            if any(
-                type(value) is not int or value < 0
-                for value in composition.values()
-            ):
-                raise ValueError("league_composition values must be nonnegative integers")
+            composition = validate_league_composition(league_composition)
         else:
             composition = None
         league = {
@@ -381,6 +375,12 @@ def _publish_pair(
     destination: Path, manifest_path: Path, run_id: str,
 ) -> None:
     """Publish a validated pair and roll back both paths if either replace fails."""
+    destination = validate_training_output_path(
+        destination, name="trajectory output",
+    )
+    manifest_path = validate_training_output_path(
+        manifest_path, name="trajectory manifest",
+    )
     output_backup = destination.parent / f".{destination.name}.{run_id}.bak"
     manifest_backup = manifest_path.parent / f".{manifest_path.name}.{run_id}.bak"
     output_backed_up = False

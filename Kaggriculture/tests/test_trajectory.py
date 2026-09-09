@@ -151,6 +151,22 @@ def test_collect_rejects_trajectory_output_through_production_symlink(
         )
 
 
+def test_collect_rejects_existing_final_symlink_output(tmp_path):
+    from scripts.collect_trajectories import collect
+
+    target = tmp_path / "safe-trajectories.jsonl"
+    target.write_text("existing\n", encoding="utf-8")
+    output = tmp_path / "trajectories.jsonl"
+    output.symlink_to(target)
+
+    with pytest.raises(ValueError, match="symlink"):
+        collect(
+            seeds=[0], opponents=["pass"], seats=[0], steps=4, output=output,
+        )
+
+    assert target.read_text(encoding="utf-8") == "existing\n"
+
+
 def test_isolated_game_timeout_becomes_diagnostic_runtime_error(monkeypatch, tmp_path):
     from scripts import collect_trajectories
 

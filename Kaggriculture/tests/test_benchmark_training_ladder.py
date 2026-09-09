@@ -183,6 +183,23 @@ def test_write_report_atomically_rejects_non_mapping_reports(tmp_path):
         )
 
 
+def test_write_report_atomically_rejects_existing_final_symlink(tmp_path):
+    from scripts.benchmark_training_ladder import write_report_atomically
+
+    report_root = tmp_path / "reports"
+    report_root.mkdir()
+    target = report_root / "safe.json"
+    target.write_text("existing\n", encoding="utf-8")
+    output = report_root / "report.json"
+    output.symlink_to(target)
+
+    with pytest.raises(ValueError, match="symlink"):
+        write_report_atomically({"ok": True}, output, report_root=report_root)
+
+    assert output.is_symlink()
+    assert target.read_text(encoding="utf-8") == "existing\n"
+
+
 def test_report_is_stable_and_written_atomically_only_when_requested(tmp_path):
     from scripts.benchmark_training_ladder import (
         build_report,
