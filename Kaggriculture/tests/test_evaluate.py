@@ -740,6 +740,33 @@ def test_replay_record_reads_top_level_stall_metadata():
     assert record["safety_regression"] is True
 
 
+@pytest.mark.parametrize(
+    ("location", "field", "value"),
+    [
+        ("replay", "termination_reason", 17),
+        ("info", "no_progress_steps", 1.5),
+        ("state", "safety_flags", ["ok", 3]),
+        ("state", "bootstrap_truncated", "true"),
+    ],
+)
+def test_replay_record_rejects_malformed_diagnostic_metadata(location, field, value):
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    if location == "replay":
+        replay[field] = value
+    elif location == "info":
+        replay["info"][field] = value
+    else:
+        replay["steps"][-1][0][field] = value
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["framework_error"] is True
+    assert record["outcome"] == "framework_error"
+    assert "malformed_replay" in record["framework_error_reasons"]
+
+
 def test_paired_seed_summary_confidence_interval_uses_paired_seeds():
     from scripts.evaluate import _wilson_interval, paired_seed_summary
 

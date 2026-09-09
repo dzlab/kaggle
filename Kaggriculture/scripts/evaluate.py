@@ -1775,21 +1775,22 @@ def _replay_diagnostics(
     configuration: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Extract game-level diagnostics without inventing transition outcomes."""
-    sources: list[Mapping[str, Any]] = [replay]
+    sources: list[tuple[str, Mapping[str, Any]]] = [("replay", replay)]
     replay_info = _mapping(replay.get("info"))
     replay_diagnostics = _mapping(replay.get("diagnostics"))
     if replay_info:
-        sources.append(replay_info)
+        sources.append(("replay.info", replay_info))
     if replay_diagnostics:
-        sources.append(replay_diagnostics)
-    for state in own_states:
-        sources.append(state)
+        sources.append(("replay.diagnostics", replay_diagnostics))
+    for index, state in enumerate(own_states):
+        source_name = f"state[{index}]"
+        sources.append((source_name, state))
         state_info = _mapping(state.get("info"))
         state_diagnostics = _mapping(state.get("diagnostics"))
         if state_info:
-            sources.append(state_info)
+            sources.append((f"{source_name}.info", state_info))
         if state_diagnostics:
-            sources.append(state_diagnostics)
+            sources.append((f"{source_name}.diagnostics", state_diagnostics))
 
     termination_reason = None
     bootstrap_truncated = False
@@ -1798,29 +1799,90 @@ def _replay_diagnostics(
     shaping_count = 0
     safety_flags: list[str] = []
     safety_regression = False
-    for source in sources:
-        raw_reason = source.get("termination_reason")
+    for source_name, source in sources:
+        if "termination_reason" in source:
+            raw_reason = source["termination_reason"]
+            if raw_reason is not None and (type(raw_reason) is not str or not raw_reason):
+                raise ValueError(
+                    f"{source_name}.termination_reason must be a non-empty string or null"
+                )
+        else:
+            raw_reason = None
         if raw_reason is not None and str(raw_reason):
             termination_reason = str(raw_reason)
-        if source.get("bootstrap_truncated") is True:
+        if "bootstrap_truncated" in source:
+            raw_bootstrap = source["bootstrap_truncated"]
+            if raw_bootstrap is not None and type(raw_bootstrap) is not bool:
+                raise ValueError(
+                    f"{source_name}.bootstrap_truncated must be boolean or null"
+                )
+        else:
+            raw_bootstrap = None
+        if raw_bootstrap is True:
             bootstrap_truncated = True
-        raw_steps = _number(source.get("no_progress_steps"))
+        if "no_progress_steps" in source:
+            raw_steps_value = source["no_progress_steps"]
+            if raw_steps_value is not None and (
+                type(raw_steps_value) is not int or raw_steps_value < 0
+            ):
+                raise ValueError(
+                    f"{source_name}.no_progress_steps must be a nonnegative integer or null"
+                )
+        else:
+            raw_steps_value = None
+        raw_steps = _number(raw_steps_value)
         if raw_steps is not None:
             no_progress_steps = max(no_progress_steps, max(0, int(raw_steps)))
-        if source.get("time_limit_ending") is True:
+        if "time_limit_ending" in source:
+            raw_time_limit = source["time_limit_ending"]
+            if raw_time_limit is not None and type(raw_time_limit) is not bool:
+                raise ValueError(
+                    f"{source_name}.time_limit_ending must be boolean or null"
+                )
+        else:
+            raw_time_limit = None
+        if raw_time_limit is True:
             time_limit_ending = True
-        raw_shaping = _number(source.get("shaping_count"))
+        if "shaping_count" in source:
+            raw_shaping_value = source["shaping_count"]
+            if raw_shaping_value is not None and (
+                type(raw_shaping_value) is not int or raw_shaping_value < 0
+            ):
+                raise ValueError(
+                    f"{source_name}.shaping_count must be a nonnegative integer or null"
+                )
+        else:
+            raw_shaping_value = None
+        raw_shaping = _number(raw_shaping_value)
         if raw_shaping is not None:
             shaping_count = max(shaping_count, max(0, int(raw_shaping)))
-        if source.get("safety_regression") is True:
+        if "safety_regression" in source:
+            raw_safety_regression = source["safety_regression"]
+            if raw_safety_regression is not None and type(raw_safety_regression) is not bool:
+                raise ValueError(
+                    f"{source_name}.safety_regression must be boolean or null"
+                )
+        else:
+            raw_safety_regression = None
+        if raw_safety_regression is True:
             safety_regression = True
-        raw_flags = source.get("safety_flags", ())
-        if isinstance(raw_flags, (list, tuple, set)):
-            for flag in raw_flags:
-                if isinstance(flag, str) and flag and flag not in safety_flags:
-                    safety_flags.append(flag)
-                    if "safety_regression" in flag.lower():
-                        safety_regression = True
+        if "safety_flags" in source:
+            raw_flags = source["safety_flags"]
+            if raw_flags is None or not isinstance(raw_flags, (list, tuple, set)):
+                raise ValueError(
+                    f"{source_name}.safety_flags must be a sequence of non-empty strings"
+                )
+            if any(type(flag) is not str or not flag for flag in raw_flags):
+                raise ValueError(
+                    f"{source_name}.safety_flags must be a sequence of non-empty strings"
+                )
+        else:
+            raw_flags = ()
+        for flag in raw_flags:
+            if flag not in safety_flags:
+                safety_flags.append(flag)
+                if "safety_regression" in flag.lower():
+                    safety_regression = True
 
     final_state = own_states[-1] if own_states else {}
     final_observation = _mapping(final_state.get("observation"))
@@ -1914,16 +1976,32 @@ def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, se
             )
         if not is_bootstrap:
             missed_needs += _missed_needs_at_boundary(pre, is_boundary, post, state, replay_configuration)
+    diagnostic_error = None
+    try:
+        diagnostics = _replay_diagnostics(replay, own_states, replay_configuration)
+    except ValueError as exc:
+        diagnostic_error = str(exc)
+        diagnostics = {
+            "termination_reason": "malformed_replay",
+            "bootstrap_truncated": False,
+            "no_progress_steps": 0,
+            "time_limit_ending": False,
+            "safety_flags": [],
+            "safety_regression": False,
+            "shaping_count": 0,
+        }
     diagnostic_record = {
-        "malformed_replay": framework_error or own_bank is None or other_bank is None,
+        "malformed_replay": (
+            framework_error or own_bank is None or other_bank is None
+            or diagnostic_error is not None
+        ),
         "missed_basic_needs": missed_needs,
         **market_metrics,
     }
     reasons = framework_error_reasons(diagnostic_record)
     if reasons:
         outcome, differential = "framework_error", 0.0
-    diagnostics = _replay_diagnostics(replay, own_states, replay_configuration)
-    return {
+    record = {
         "candidate": variant,
         "variant": variant,
         "opponent": opponent,
@@ -1946,6 +2024,9 @@ def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, se
         **market_metrics,
         **diagnostics,
     }
+    if diagnostic_error is not None:
+        record["error"] = diagnostic_error[:1000]
+    return record
 
 
 def replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, seed: int,
