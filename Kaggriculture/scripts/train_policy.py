@@ -42,6 +42,7 @@ from kagriculture_agent.model import (
     MODEL_VERSION,
     CompactPolicyNet,
     model_parameter_count,
+    model_parameter_count_for_shape,
     require_torch,
     resolve_device,
     set_training_seed,
@@ -1692,6 +1693,7 @@ def _checkpoint_metadata(
     behavior_clone_updates: int = 0,
     model_width: int = DEFAULT_MODEL_WIDTH,
     model_depth: int = DEFAULT_MODEL_DEPTH,
+    model: Any | None = None,
 ) -> dict[str, Any]:
     _validate_experiment_id(experiment_id, source="checkpoint metadata")
     _validate_feature_variant(feature_variant, source="checkpoint metadata")
@@ -1707,7 +1709,11 @@ def _checkpoint_metadata(
                 "checkpoint metadata behavior_clone_steps must be a nonnegative integer"
             )
         effective_bc_steps = behavior_clone_steps
-    model = CompactPolicyNet(hidden_width=model_width, depth=model_depth)
+    parameter_count = (
+        model_parameter_count(model)
+        if model is not None
+        else model_parameter_count_for_shape(model_width, model_depth)
+    )
     return {
         "model_version": MODEL_VERSION,
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
@@ -1723,7 +1729,7 @@ def _checkpoint_metadata(
         "behavior_clone_updates": behavior_clone_updates,
         "model_width": model_width,
         "model_depth": model_depth,
-        "parameter_count": model_parameter_count(model),
+        "parameter_count": parameter_count,
     }
 
 
@@ -2079,11 +2085,8 @@ def _validate_resume_payload(
                 )
     if "parameter_count" in metadata:
         parameter_count = metadata["parameter_count"]
-        expected_count = model_parameter_count(
-            CompactPolicyNet(
-                hidden_width=saved_configuration["model_width"],
-                depth=saved_configuration["model_depth"],
-            )
+        expected_count = model_parameter_count_for_shape(
+            saved_configuration["model_width"], saved_configuration["model_depth"],
         )
         if type(parameter_count) is not int or parameter_count != expected_count:
             raise ValueError("resume checkpoint metadata parameter_count is incompatible")
@@ -2418,6 +2421,7 @@ def train_behavior_clone(
         behavior_clone_updates=bc_updates,
         model_width=model_width,
         model_depth=model_depth,
+        model=network,
     )
     metadata["ppo_steps"] = int(ppo_steps)
     metadata["behavior_clone_epochs"] = epochs

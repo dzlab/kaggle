@@ -255,3 +255,34 @@ def model_parameter_count(model: Any) -> int:
     if not callable(parameters):
         raise TypeError("model must expose a parameters() method")
     return sum(int(parameter.numel()) for parameter in parameters())
+
+
+def model_parameter_count_for_shape(
+    hidden_width: int = DEFAULT_MODEL_WIDTH, depth: int = DEFAULT_MODEL_DEPTH,
+) -> int:
+    """Count CompactPolicyNet parameters without constructing or initializing it."""
+    hidden_width, depth = validate_model_shape(hidden_width, depth, source="parameter count")
+
+    def linear_parameters(input_size: int, output_size: int) -> int:
+        return input_size * output_size + output_size
+
+    count = sum(
+        linear_parameters(input_size, hidden_width)
+        for input_size in FEATURE_INPUT_SIZES.values()
+    )
+    count += 4 * hidden_width  # type embedding
+    for _ in range(depth):
+        count += 3 * hidden_width * hidden_width + 3 * hidden_width
+        count += linear_parameters(hidden_width, hidden_width)
+        count += 2 * hidden_width  # attention LayerNorm
+        count += linear_parameters(hidden_width, 2 * hidden_width)
+        count += linear_parameters(2 * hidden_width, hidden_width)
+        count += 2 * hidden_width  # MLP LayerNorm
+    count += linear_parameters(hidden_width, 2)
+    count += linear_parameters(hidden_width, len(ACTION_VOCAB["worker_kinds"]))
+    count += linear_parameters(hidden_width, hidden_width) * 2
+    count += linear_parameters(hidden_width, len(ACTION_VOCAB["market_items"]))
+    count += linear_parameters(hidden_width, len(ACTION_VOCAB["market_quantities"]))
+    count += linear_parameters(hidden_width, 1)
+    count += linear_parameters(hidden_width, 2)  # training-only market head
+    return count

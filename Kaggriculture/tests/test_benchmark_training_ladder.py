@@ -35,6 +35,15 @@ def test_ladder_parser_expands_stable_seeded_configurations_and_estimates_budget
     assert experiments == expand_ladder(ladder)
 
 
+def test_ladder_rejects_width_not_divisible_by_four():
+    from scripts.benchmark_training_ladder import parse_ladder
+
+    with pytest.raises(ValueError, match="width.*divisible by 4"):
+        parse_ladder(json.dumps({
+            "widths": [130], "depths": [4], "ppo_budgets": [16], "seeds": [7],
+        }))
+
+
 def test_orbit_policy_ladder_config_matches_task_matrix():
     from scripts.benchmark_training_ladder import parse_ladder
 

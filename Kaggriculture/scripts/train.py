@@ -27,8 +27,7 @@ from kagriculture_agent.league import DEFAULT_OPPONENT_PROBABILITIES, LeagueSamp
 from kagriculture_agent.model import (
     DEFAULT_MODEL_DEPTH,
     DEFAULT_MODEL_WIDTH,
-    CompactPolicyNet,
-    model_parameter_count,
+    model_parameter_count_for_shape,
     resolve_device,
     validate_model_shape,
 )
@@ -864,10 +863,8 @@ def initialize_telemetry(config: ColabConfig) -> Any | None:
             "behavior_clone_steps": config.behavior_clone_steps,
             "model_width": config.model_width,
             "model_depth": config.model_depth,
-            "parameter_count": model_parameter_count(
-                CompactPolicyNet(
-                    hidden_width=config.model_width, depth=config.model_depth,
-                )
+            "parameter_count": model_parameter_count_for_shape(
+                config.model_width, config.model_depth,
             ),
             "batch_size": config.training_batch_size,
             "seed": config.training_seed,

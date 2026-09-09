@@ -1711,6 +1711,32 @@ def test_reduced_behavior_clone_records_effective_budget_and_resume_validates_it
     assert resumed_metadata["behavior_clone_updates"] == 2
 
 
+def test_resume_without_updates_preserves_checkpoint_rng_state(tmp_path):
+    torch = pytest.importorskip("torch")
+    from scripts import train_policy
+
+    input_path = tmp_path / "transitions.jsonl"
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    resumed_path = tmp_path / "resumed.pt"
+    input_path.write_text(
+        json.dumps(_transition(done=False)) + "\n", encoding="utf-8",
+    )
+
+    train_policy.train_behavior_clone(
+        input_path=input_path, output_path=checkpoint_path, steps=1,
+        batch_size=1, seed=17, device="cpu",
+    )
+    source = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+
+    train_policy.train_behavior_clone(
+        input_path=input_path, output_path=resumed_path, steps=1,
+        batch_size=1, seed=17, device="cpu", resume_checkpoint=checkpoint_path,
+    )
+    resumed = torch.load(resumed_path, map_location="cpu", weights_only=True)
+
+    assert torch.equal(source["rng_state"]["torch"], resumed["rng_state"]["torch"])
+
+
 @pytest.mark.parametrize(
     ("training_mode", "expected"),
     [

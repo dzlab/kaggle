@@ -292,6 +292,7 @@ def test_exported_model_agrees_with_training_fixture_when_torch_is_available(tmp
 
     checkpoint = tmp_path / "policy.pt"
     artifact_path = tmp_path / "policy.json"
+    torch.manual_seed(0)
     network = CompactPolicyNet()
     metadata = {
         "model_version": "learned_v1", "feature_schema_version": 1,
@@ -323,6 +324,7 @@ def test_non_default_model_shape_round_trips_through_export_and_runtime(
 
     checkpoint = tmp_path / f"policy-{model_width}x{model_depth}.pt"
     artifact_path = tmp_path / f"policy-{model_width}x{model_depth}.json"
+    torch.manual_seed(0)
     network = CompactPolicyNet(hidden_width=model_width, depth=model_depth)
     metadata = {
         "model_version": "learned_v1", "feature_schema_version": 1,
@@ -337,7 +339,14 @@ def test_non_default_model_shape_round_trips_through_export_and_runtime(
     assert artifact["model_depth"] == model_depth
 
     runtime = load_exported_policy(artifact_path)
-    outputs = runtime.predict(extract_features({}))
+    features = extract_features({})
+    outputs = runtime.predict(features)
+    reference_state = network.state_dict()
     assert len(outputs["worker_act_logits"]) == 10
     assert len(outputs["worker_act_logits"][0]) == 2
-    assert all(value == pytest.approx(value) for value in outputs["worker_act_logits"][0])
+    assert runtime._weights["value_head.bias"] == pytest.approx(
+        reference_state["value_head.bias"].tolist(), abs=1e-6,
+    )
+    assert runtime._weights["tile_projection.weight"][0] == pytest.approx(
+        reference_state["tile_projection.weight"][0].tolist(), abs=1e-2,
+    )

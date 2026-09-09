@@ -55,7 +55,7 @@ def parse_ladder(value: str | Path | Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(value.get("ladder"), Mapping):
         value = value["ladder"]
 
-    widths = _positive_int_list(value.get("widths"), "widths", MAX_LADDER_WIDTH)
+    widths = _model_width_list(value.get("widths"), "widths", MAX_LADDER_WIDTH)
     depths = _positive_int_list(value.get("depths"), "depths", MAX_LADDER_DEPTH)
     budgets = _positive_int_list(
         value.get("ppo_budgets", value.get("ppo_steps")),
@@ -122,7 +122,7 @@ def estimate_parameter_count(
     output_size: int = DEFAULT_OUTPUT_SIZE,
 ) -> int:
     """Estimate dense MLP parameters for a fixed input/output interface."""
-    width = _positive_int(width, "width", MAX_LADDER_WIDTH)
+    width = _model_width(width, "width", MAX_LADDER_WIDTH)
     depth = _positive_int(depth, "depth", MAX_LADDER_DEPTH)
     input_size = _positive_int(input_size, "input_size")
     output_size = _positive_int(output_size, "output_size")
@@ -320,6 +320,22 @@ def _positive_int_list(value: Any, name: str, maximum: int) -> list[int]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or not value:
         raise ValueError(f"{name} must be a non-empty JSON array")
     result = [_positive_int(item, name, maximum) for item in value]
+    if len(set(result)) != len(result):
+        raise ValueError(f"{name} must not contain duplicates")
+    return result
+
+
+def _model_width(value: Any, name: str, maximum: int | None = None) -> int:
+    result = _positive_int(value, name, maximum)
+    if result % 4:
+        raise ValueError(f"{name} must be divisible by 4 for the attention architecture")
+    return result
+
+
+def _model_width_list(value: Any, name: str, maximum: int) -> list[int]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or not value:
+        raise ValueError(f"{name} must be a non-empty array")
+    result = [_model_width(item, name, maximum) for item in value]
     if len(set(result)) != len(result):
         raise ValueError(f"{name} must not contain duplicates")
     return result
