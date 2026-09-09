@@ -38,6 +38,7 @@ _RUNTIME_MODULES = (
     "__init__.py",
     "constants.py",
     "economics.py",
+    "experimental_features.py",
     "features.py",
     "learned_policy.py",
     "memory.py",

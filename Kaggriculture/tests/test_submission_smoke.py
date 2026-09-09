@@ -16,15 +16,16 @@ def test_submission_archive_contains_only_runtime_and_executes_without_site_pack
 
     manifest = build_submission_archive(PROJECT_ROOT, archive)
     build_submission_archive(PROJECT_ROOT, repeat)
-    smoke_test_archive(archive)
 
     with tarfile.open(archive, "r:gz") as tar:
         names = set(tar.getnames())
 
     assert "main.py" in names
     assert "kagriculture_agent/learned_policy.py" in names
+    assert "kagriculture_agent/experimental_features.py" in names
     assert manifest["runtime_dependencies"] == []
     assert all(not name.startswith(("tests/", "docs/", "scripts/", "reports/", "replays/")) for name in names)
+    smoke_test_archive(archive)
     assert archive.read_bytes() == repeat.read_bytes()
 
 
