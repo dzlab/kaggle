@@ -34,7 +34,9 @@ def test_assign_tasks_falls_back_to_reserved_worker_when_only_farmer():
     tasks = [Task("ANIMAL", Position(0, 1), 100, 1, 1, item="GOOSE"),
              Task("WATER", Position(4, 3), 100, 1, 1, item="WHEAT")]
     assignments = assign_tasks(tasks, state["workers"], state)
-    assert [assignment.task.kind for assignment in assignments] == ["ANIMAL", "WATER"]
+    assert [(assignment.worker_index, assignment.task.kind) for assignment in assignments] == [
+        (0, "ANIMAL"), (0, "WATER"),
+    ]
 
 
 @__import__("pytest").mark.parametrize("shed,carried", [
@@ -44,15 +46,20 @@ def test_assign_tasks_falls_back_to_reserved_worker_when_only_farmer():
 ])
 def test_drop_carried_goods_preserves_inventory_when_shed_is_full(shed, carried):
     state = _state(private={"shed": shed, "inventories": carried})
-    before = sum(state["private"]["shed"].values()) + sum(carried[0].values())
+    shed_before = dict(state["private"]["shed"])
+    inventory_before = dict(carried[0])
     action = _drop_carried_goods(state, 0, None, Position(1, 1), force=True)
-    assert action != "DROP"
-    assert before == sum(state["private"]["shed"].values()) + sum(carried[0].values())
+    assert action == "PASS"
+    assert state["private"]["shed"] == shed_before
+    assert state["private"]["inventories"][0] == inventory_before
 
 
 def test_day_27_does_not_plan_melon_purchase_or_planting():
-    state = _state(day=27, private={"seeds": {}, "shed": {}, "inventories": []})
+    state = _state(day=27, tiles=[[{"kind": "PLANT", "crop": "WHEAT", "needs_water": True}]],
+                   private={"seeds": {}, "shed": {}, "inventories": [{}]})
     plan = build_daily_plan(state)
+    assert plan
+    assert any(task.kind == "WATER" and task.item == "WHEAT" for task in plan)
     assert all(task.item != "MELON" or task.kind not in {"BUY_SEED", "PLANT"} for task in plan)
 
 
