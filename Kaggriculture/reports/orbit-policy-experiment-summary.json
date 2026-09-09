@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "report_type": "orbit_policy_experiment_summary",
+  "status": "pending",
+  "execution_status": "not_executed",
+  "generated_on": "2026-09-09",
+  "source": {
+    "experiment_config": "configs/colab-orbit-experiment.json",
+    "roadmap_task": "Task 8",
+    "comparison_tool": "scripts/compare_experiments.py"
+  },
+  "execution_note": "No Colab/GPU experiment outputs were available in this session. This report records the required evidence contract only; it contains no measured metrics and makes no promotion claim.",
+  "matrix": {
+    "shared": {
+      "training_seed_candidates": [7, 11, 19],
+      "collection_seeds": [0, 1, 2, 3, 4, 5, 6, 7],
+      "rollout_seeds": [0, 1, 2, 3],
+      "development_seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49],
+      "holdout_seeds": [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149],
+      "development_opponents": ["pass", "random", "starter"],
+      "holdout_opponents": ["pass", "random", "starter"],
+      "development_seats": [0, 1],
+      "holdout_seats": [0, 1],
+      "collection_steps": 96,
+      "rollout_steps": 97,
+      "development_steps": 96,
+      "holdout_steps": 96,
+      "training_batch_size": 256
+    },
+    "entries": [
+      {
+        "experiment_id": "baseline_bc_ppo",
+        "run_directory": "baseline_bc_ppo",
+        "feature_variant": "production_v1",
+        "training_mode": "behavior_clone_then_ppo",
+        "bc_steps": 25,
+        "ppo_steps": 16,
+        "league_probabilities": {"current": 1.0, "mixed": 0.0, "random": 0.0, "starter": 0.0, "checkpoint": 0.0},
+        "status": "not_executed",
+        "results": null
+      },
+      {
+        "experiment_id": "longer_bc_ppo",
+        "run_directory": "longer_bc_ppo",
+        "feature_variant": "production_v1",
+        "training_mode": "behavior_clone_then_ppo",
+        "bc_steps": 250,
+        "ppo_steps": 128,
+        "league_probabilities": {"current": 1.0, "mixed": 0.0, "random": 0.0, "starter": 0.0, "checkpoint": 0.0},
+        "status": "not_executed",
+        "results": null
+      },
+      {
+        "experiment_id": "extended_bc_ppo",
+        "run_directory": "extended_bc_ppo",
+        "feature_variant": "production_v1",
+        "training_mode": "behavior_clone_then_ppo",
+        "bc_steps": 1000,
+        "ppo_steps": 512,
+        "league_probabilities": {"current": 1.0, "mixed": 0.0, "random": 0.0, "starter": 0.0, "checkpoint": 0.0},
+        "status": "not_executed",
+        "results": null
+      },
+      {
+        "experiment_id": "league_bc_ppo",
+        "run_directory": "league_bc_ppo",
+        "feature_variant": "production_v1",
+        "training_mode": "behavior_clone_then_ppo",
+        "bc_steps": 250,
+        "ppo_steps": 128,
+        "league_probabilities": {"current": 0.4, "mixed": 0.15, "random": 0.1, "starter": 0.1, "checkpoint": 0.25},
+        "status": "not_executed",
+        "results": null
+      },
+      {
+        "experiment_id": "pure_ppo",
+        "run_directory": "pure_ppo",
+        "feature_variant": "production_v1",
+        "training_mode": "pure_ppo",
+        "bc_steps": 0,
+        "ppo_steps": 128,
+        "league_probabilities": {"current": 1.0, "mixed": 0.0, "random": 0.0, "starter": 0.0, "checkpoint": 0.0},
+        "status": "not_executed",
+        "results": null
+      },
+      {
+        "experiment_id": "reduced_bc_ppo",
+        "run_directory": "reduced_bc_ppo",
+        "feature_variant": "production_v1",
+        "training_mode": "reduced_behavior_clone_then_ppo",
+        "bc_steps": 250,
+        "ppo_steps": 128,
+        "league_probabilities": {"current": 1.0, "mixed": 0.0, "random": 0.0, "starter": 0.0, "checkpoint": 0.0},
+        "status": "not_executed",
+        "results": null
+      },
+      {
+        "experiment_id": "experimental_context_league",
+        "run_directory": "experimental_context_league",
+        "feature_variant": "experimental_context_v1",
+        "training_mode": "behavior_clone_then_ppo",
+        "bc_steps": 250,
+        "ppo_steps": 128,
+        "league_probabilities": {"current": 0.4, "mixed": 0.15, "random": 0.1, "starter": 0.1, "checkpoint": 0.25},
+        "status": "not_executed",
+        "results": null
+      }
+    ]
+  },
+  "required_artifacts": [
+    {"name": "run_manifest", "required_for": "every experiment", "contents": ["experiment identity", "training seed", "collection seeds", "development seeds", "holdout seeds", "opponent schedule", "training configuration"]},
+    {"name": "checkpoint_metadata", "required_for": "every evaluated checkpoint", "contents": ["artifact path", "sha256", "model version", "feature schema version", "engine version", "experiment identity"]},
+    {"name": "development_evaluation_report", "required_for": "every candidate before holdout", "contents": ["complete paired matrix", "per-opponent metrics", "safety counts", "promotion evidence"]},
+    {"name": "holdout_evaluation_report", "required_for": "development winners only", "contents": ["complete disjoint paired matrix", "per-opponent metrics", "safety counts", "promotion evidence"]},
+    {"name": "comparison_json_and_markdown", "required_for": "summary comparison", "contents": ["compatible matrix signature", "deltas versus baseline", "candidate decisions"]},
+    {"name": "training_telemetry", "required_for": "every executed experiment", "contents": ["local JSONL events", "W&B run location when enabled"]}
+  ],
+  "required_metrics": {
+    "strength": ["seat_balanced_win_rate", "elo_rating", "elo_uncertainty"],
+    "economics": ["mean_paired_bank_differential", "median_paired_bank_differential", "fifth_percentile_paired_bank_differential"],
+    "safety": ["framework_errors", "invalid", "timeouts", "no_progress", "missed_basic_needs", "safety_failure_rate"],
+    "completeness_and_compute": ["matrix_completeness", "valid_games", "training_steps", "rollout_count", "wall_clock_or_compute_budget"]
+  },
+  "gate_criteria": {
+    "execution": [
+      "Use a unique run directory outside production models/ and checkpoints/.",
+      "Verify the notebook branch/commit and required WANDB_API_KEY without printing its value.",
+      "Keep development seeds and holdout seeds disjoint."
+    ],
+    "development": [
+      "Every requested opponent, seed, and seat coordinate has exactly one valid record.",
+      "No missing, duplicate, extra, or malformed records.",
+      "Zero framework errors and zero missed basic-needs events.",
+      "No configured safety gate or lower-tail bank differential regression beyond its limit.",
+      "Candidate improves paired win rate and Elo over the current best before it can enter holdout."
+    ],
+    "holdout": [
+      "Run only for a development winner after the candidate and configuration are frozen.",
+      "Use the complete disjoint holdout matrix with both seat orders.",
+      "Pass the same completeness, framework-error, missed-needs, safety, and lower-tail bank gates.",
+      "Strictly improve the current best on the configured paired strength criteria."
+    ],
+    "promotion": [
+      "Promotion requires complete development and holdout evidence; training completion or lower BC loss is insufficient.",
+      "Record the promoted artifact SHA-256, model/feature/engine versions, exact command, and report path.",
+      "If any required result is absent, the candidate remains not promoted and production remains unchanged."
+    ]
+  },
+  "population_procedure": {
+    "comparison_command": "uv run python scripts/compare_experiments.py <baseline-report.json> <candidate-report.json> [<additional-report.json> ...] --json-output <comparison.json> --markdown-output <comparison.md>",
+    "update_rule": "After real Colab/GPU runs, retain the generated comparison outputs, replace each entry's results null with verified report references and measured values, set the entry status to executed, and change the top-level status only after all required evidence is reviewed.",
+    "promotion_rule": "Do not set promotion.status to promoted or promotion.candidate to a value unless the development and holdout gates above are satisfied by recorded results."
+  },
+  "promotion": {
+    "status": "not_promoted",
+    "candidate": null,
+    "reason": "not_executed"
+  }
+}
