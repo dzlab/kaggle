@@ -16,7 +16,7 @@ import random
 import subprocess
 import sys
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from numbers import Real
 from pathlib import Path
 from statistics import mean, median
@@ -494,7 +494,12 @@ def _market_metrics(states: Sequence[Mapping[str, Any]], *, churn_window: int = 
         step = int(raw_step) if raw_step is not None else index
         action = _mapping(state.get("action"))
         for order in _market_orders(action):
-            if not order or not isinstance(order[0], str):
+            if (
+                not isinstance(order, Sequence)
+                or isinstance(order, (str, bytes))
+                or not order
+                or not isinstance(order[0], str)
+            ):
                 continue
             # A quantity-bearing order is one submitted market order event.
             # The quantity remains part of the replay action, but does not
@@ -2079,11 +2084,28 @@ def _cash(observation: Mapping[str, Any]) -> float:
     return _number(_farm_observation(observation).get("money")) or 0.0
 
 
-def _market_orders(action: Mapping[str, Any]) -> list[list[Any]]:
+def _inert_market_order(order: Any) -> bool:
+    """Return whether an entry contains no payload for schema validation."""
+    return order is None or (isinstance(order, Collection) and len(order) == 0)
+
+
+def _copy_market_order(order: Any) -> Any:
+    return (
+        list(order)
+        if isinstance(order, Sequence) and not isinstance(order, (str, bytes))
+        else order
+    )
+
+
+def _market_orders(action: Mapping[str, Any]) -> list[Any]:
     orders = action.get("market", ())
     if not isinstance(orders, Sequence) or isinstance(orders, (str, bytes)):
         return []
-    return [list(order) for order in orders if isinstance(order, Sequence) and not isinstance(order, (str, bytes))]
+    return [
+        _copy_market_order(order)
+        for order in orders
+        if not _inert_market_order(order)
+    ]
 
 
 def _observed_unit_price(item: str, observation: Mapping[str, Any], inventory: float, *, buying: bool,
@@ -2105,9 +2127,9 @@ def _observed_unit_price(item: str, observation: Mapping[str, Any], inventory: f
         return observed or 0.0
 
 
-def _sanitize_market_orders(orders: Sequence[Sequence[Any]], observation: Mapping[str, Any],
+def _sanitize_market_orders(orders: Sequence[Any], observation: Mapping[str, Any],
                             configuration: Mapping[str, Any] | None = None, *,
-                            preserve_malformed: bool = False) -> list[list[Any]]:
+                            preserve_malformed: bool = False) -> list[Any]:
     """Apply the engine's per-unit market rules to a postprocessed action."""
     money = _cash(observation)
     shed = dict(_mapping(_mapping(observation.get("private")).get("shed")))
@@ -2123,15 +2145,15 @@ def _sanitize_market_orders(orders: Sequence[Sequence[Any]], observation: Mappin
     hire_mult = max(0, int(_config_value(configuration, "farmHandCostMult", 1)))
     raw_unlocked = farm.get("unlocked_quadrants", ())
     unlocked = list(raw_unlocked) if isinstance(raw_unlocked, Sequence) and not isinstance(raw_unlocked, (str, bytes)) else []
-    sanitized: list[list[Any]] = []
+    sanitized: list[Any] = []
     for raw_order in orders:
         if len(sanitized) >= order_limit:
             break
-        order = list(raw_order)
-        if not _valid_market_order_schema(order, observation):
-            if preserve_malformed and order:
-                sanitized.append(order)
+        if not _valid_market_order_schema(raw_order, observation):
+            if preserve_malformed and not _inert_market_order(raw_order):
+                sanitized.append(_copy_market_order(raw_order))
             continue
+        order = list(raw_order)
         operation = order[0]
         if operation == "HIRE":
             cost = float(_fib(hires_today) * hire_mult)
@@ -3627,22 +3649,25 @@ def _variant_market_spend(order: Sequence[Any], observation: Mapping[str, Any]) 
     return 0.0
 
 
-def _preserve_variant_market_capacity(orders: Sequence[Sequence[Any]], observation: Mapping[str, Any],
-                                      *, seed_item: str) -> list[list[Any]]:
+def _preserve_variant_market_capacity(orders: Sequence[Any], observation: Mapping[str, Any],
+                                      *, seed_item: str) -> list[Any]:
     """Keep the variant seed bias above the policy's worker cash reserve."""
     if not _has_complete_market_state(observation):
-        return [list(order) for order in orders]
+        return [_copy_market_order(order) for order in orders]
     reserve = max(100.0, float(CROPS[seed_item]["seed"])) + float(CROPS[seed_item]["seed"])
     non_seed_spend = sum(
         _variant_market_spend(order, observation)
         for order in orders
-        if order and order[0] != "BUY_SEED"
+        if _valid_market_order_schema(order, observation) and order[0] != "BUY_SEED"
     )
     seed_budget = max(0.0, _cash(observation) - non_seed_spend - reserve)
-    result: list[list[Any]] = []
+    result: list[Any] = []
     for raw_order in orders:
+        if not _valid_market_order_schema(raw_order, observation):
+            result.append(_copy_market_order(raw_order))
+            continue
         order = list(raw_order)
-        if _valid_market_order_schema(order, observation) and order[0] == "BUY_SEED":
+        if order[0] == "BUY_SEED":
             quantity = min(int(_number(order[2]) or 1), int(seed_budget // float(CROPS[seed_item]["seed"])))
             if quantity <= 0:
                 continue
@@ -3653,9 +3678,13 @@ def _preserve_variant_market_capacity(orders: Sequence[Sequence[Any]], observati
     return result
 
 
-def _prioritize_safety_market_orders(orders: Sequence[Sequence[Any]]) -> list[list[Any]]:
-    def order_priority(order: Sequence[Any]) -> int:
-        if not order:
+def _prioritize_safety_market_orders(orders: Sequence[Any]) -> list[Any]:
+    def order_priority(order: Any) -> int:
+        if (
+            not isinstance(order, Sequence)
+            or isinstance(order, (str, bytes))
+            or not order
+        ):
             return 3
         if order[0] == "HIRE":
             return 0
@@ -3665,7 +3694,7 @@ def _prioritize_safety_market_orders(orders: Sequence[Sequence[Any]]) -> list[li
             return 2
         return 3
 
-    return [list(order) for _index, order in sorted(
+    return [_copy_market_order(order) for _index, order in sorted(
         enumerate(orders), key=lambda item: (order_priority(item[1]), item[0])
     )]
 
@@ -3723,7 +3752,7 @@ def apply_variant(action: Mapping[str, Any], observation: Mapping[str, Any], var
                   ablations: Mapping[str, bool] | None = None,
                   configuration: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Apply a named, legality-preserving strategy adjustment at the agent boundary."""
-    market_orders = [order for order in _market_orders(action) if order]
+    market_orders = _market_orders(action)
     result = {"farmer": list(action.get("farmer", ["PASS"])), "hands": [list(command) for command in action.get("hands", ())],
               "market": market_orders}
     seeds = _private_seeds(observation)

@@ -99,6 +99,27 @@ def test_assign_tasks_routes_equal_deadlines_to_nearest_task_first():
     assert assignments[0].task.target == Position(4, 1)
 
 
+def test_assign_tasks_does_not_strand_far_due_need_behind_nearer_work():
+    state = _state(
+        day=8,
+        hour=16,
+        workers=_workers(
+            ("FARMER", Position(1, 2)),
+            ("HAND", Position(0, 2)),
+        ),
+    )
+    tasks = [
+        Task("WATER", Position(4, 0), 100, 8, 1, item="MELON"),
+        Task("WATER", Position(0, 3), 100, 8, 1, item="MELON"),
+        Task("WATER", Position(1, 3), 100, 8, 1, item="MELON"),
+        Task("WATER", Position(1, 4), 100, 8, 1, item="MELON"),
+    ]
+
+    assignments = assign_tasks(tasks, state["workers"], state)
+
+    assert Position(4, 0) in {assignment.task.target for assignment in assignments}
+
+
 def test_assign_tasks_routes_equal_priority_deadlines_before_task_kind():
     state = _state(
         day=2,

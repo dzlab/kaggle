@@ -1490,6 +1490,48 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
     if not infos:
         return []
 
+    try:
+        hour = min(23, max(0, int(_get(state, "hour", 0))))
+    except (TypeError, ValueError, OverflowError):
+        hour = 0
+    remaining_turns = 24 - hour
+    routing_tasks = tuple(tasks)
+
+    def due_water_cannot_wait(task: Task) -> bool:
+        if (
+            str(task.kind).upper() != "WATER"
+            or task.deadline is None
+            or task.deadline > day
+        ):
+            return False
+        if not any(
+            _task_turn_budget(task, info, state, board_size) <= remaining_turns
+            for info in infos
+        ):
+            return False
+        peers = [
+            other for other in routing_tasks
+            if other is not task
+            and str(other.kind).upper() == "WATER"
+            and other.deadline is not None
+            and other.deadline <= day
+            and other.priority == task.priority
+        ]
+        if not peers:
+            return False
+        return not any(
+            _task_turn_budget(peer, info, state, board_size)
+            + _task_turn_budget(
+                task,
+                (info[0], info[1], _target_position(peer.target)),
+                state,
+                board_size,
+            )
+            <= remaining_turns
+            for peer in peers
+            for info in infos
+        )
+
     def assignment_sort_key(task: Task) -> tuple[Any, ...]:
         base = _task_sort_key(task, day)
         target = _target_position(task.target)
@@ -1501,7 +1543,13 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
             ),
             default=inf,
         )
-        return (*base[:4], route_distance, base[5], base[4])
+        return (
+            *base[:4],
+            0 if due_water_cannot_wait(task) else 1,
+            route_distance,
+            base[5],
+            base[4],
+        )
 
     tasks.sort(key=assignment_sort_key)
     seed_inventory = state.get("seeds", {})
