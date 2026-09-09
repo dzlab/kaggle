@@ -390,6 +390,34 @@ def test_collector_cli_exposes_resolution_options_with_legacy_defaults():
     assert configured.resolved_margin == pytest.approx(125.5)
 
 
+def test_collection_manifest_records_ablation_and_termination_diagnostics(tmp_path, monkeypatch):
+    from kagriculture_agent.trajectory import Transition
+    from scripts import collect_trajectories
+
+    transition = Transition(
+        observation={}, action={}, next_observation={}, done=True, reward=0.0,
+        final_bank=1.0, opponent_final_bank=1.0,
+        safety_flags=("safety_regression",), termination_reason="time_limit",
+    )
+    monkeypatch.setattr(collect_trajectories, "_run_game_isolated", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        collect_trajectories, "transitions_from_replay", lambda *args, **kwargs: [transition],
+    )
+
+    output = tmp_path / "trajectory.jsonl"
+    manifest = collect_trajectories.collect(
+        seeds=[0], opponents=["pass"], seats=[0], steps=4, output=output,
+        potential_reward_coef=0.05, no_progress_window=24, resolved_margin=1000.0,
+    )
+
+    assert manifest["potential_reward_coef"] == pytest.approx(0.05)
+    assert manifest["no_progress_window"] == 24
+    assert manifest["resolved_margin"] == pytest.approx(1000.0)
+    assert manifest["termination_reasons"] == {"time_limit": 1}
+    assert manifest["time_limit_endings"] == 1
+    assert manifest["safety_regression_count"] == 1
+
+
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
 def test_collector_runs_all_supported_opponents_in_isolated_processes(tmp_path):
     from scripts import collect_trajectories

@@ -288,6 +288,65 @@ def _matrix_for(report: Mapping[str, Any], candidate: str) -> Mapping[str, Any]:
     return nested if isinstance(nested, Mapping) else {}
 
 
+def _diagnostic_summary(records: list[Mapping[str, Any]]) -> dict[str, Any]:
+    """Summarize termination, truncation, stall, and safety diagnostics."""
+    termination_reasons: dict[str, int] = {}
+    max_no_progress_steps = 0
+    bootstrap_truncated_count = 0
+    shaping_count = 0
+    time_limit_endings = 0
+    safety_regression_count = 0
+    for record in records:
+        reason = record.get("termination_reason")
+        if reason is not None and str(reason):
+            reason = str(reason)
+            termination_reasons[reason] = termination_reasons.get(reason, 0) + 1
+        if record.get("bootstrap_truncated") is True:
+            bootstrap_truncated_count += 1
+        raw_shaping_count = _finite_number(record.get("shaping_count"))
+        if raw_shaping_count is not None:
+            shaping_count += max(0, int(raw_shaping_count))
+        no_progress_steps = _finite_number(record.get("no_progress_steps"))
+        if no_progress_steps is not None:
+            max_no_progress_steps = max(max_no_progress_steps, max(0, int(no_progress_steps)))
+        normalized_reason = str(reason or "").strip().lower()
+        if record.get("time_limit_ending") is True or normalized_reason in {
+            "time_limit", "timeout", "time_limit_ending",
+        }:
+            time_limit_endings += 1
+        safety_flags = record.get("safety_flags", ())
+        has_safety_flag = isinstance(safety_flags, (list, tuple, set)) and any(
+            "safety_regression" in str(flag).lower() for flag in safety_flags
+        )
+        if record.get("safety_regression") is True or has_safety_flag:
+            safety_regression_count += 1
+    return {
+        "termination_reasons": termination_reasons,
+        "bootstrap_truncated_count": bootstrap_truncated_count,
+        "truncation_count": bootstrap_truncated_count,
+        "shaping_count": shaping_count,
+        "max_no_progress_steps": max_no_progress_steps,
+        "max_no_progress_streak": max_no_progress_steps,
+        "time_limit_endings": time_limit_endings,
+        "safety_regression_count": safety_regression_count,
+    }
+
+
+def validation_safety_regression(
+    report: Mapping[str, Any] | None, *, candidate: str,
+) -> bool:
+    """Return whether a candidate has a fail-closed safety regression."""
+    if not isinstance(report, Mapping):
+        return False
+    grouped = _candidate_records(report)
+    candidate_summary = _diagnostic_summary(grouped.get(str(candidate), []))
+    baseline_summary = _diagnostic_summary(grouped.get("current", []))
+    return (
+        candidate_summary["safety_regression_count"] > baseline_summary["safety_regression_count"]
+        or candidate_summary["time_limit_endings"] > baseline_summary["time_limit_endings"]
+    )
+
+
 def _breakdown_event(
     records: list[Mapping[str, Any]], *, dimension: str, dimension_value: Any,
 ) -> dict[str, Any]:
@@ -421,6 +480,9 @@ def record_validation_report(
     experiment_id: str = DEFAULT_EXPERIMENT_ID,
     feature_variant: str = "production_v1",
     training_mode: str = "behavior_clone_then_ppo",
+    potential_reward_coef: float = 0.0,
+    no_progress_window: int = 0,
+    resolved_margin: float = 0.0,
 ) -> None:
     """Emit per-game and flattened per-candidate validation telemetry.
 
@@ -431,6 +493,19 @@ def record_validation_report(
     if not isinstance(report, Mapping):
         return
     validate_training_identity(experiment_id, feature_variant, training_mode)
+    for name, value in (
+        ("potential_reward_coef", potential_reward_coef),
+        ("resolved_margin", resolved_margin),
+    ):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or value < 0
+        ):
+            raise ValueError(f"{name} must be a nonnegative finite number")
+    if type(no_progress_window) is not int or no_progress_window < 0:
+        raise ValueError("no_progress_window must be a nonnegative integer")
 
     record_event = getattr(telemetry, "record", telemetry)
 
@@ -447,6 +522,9 @@ def record_validation_report(
         "experiment_id": experiment_id,
         "feature_variant": feature_variant,
         "training_mode": training_mode,
+        "potential_reward_coef": float(potential_reward_coef),
+        "no_progress_window": no_progress_window,
+        "resolved_margin": float(resolved_margin),
     }
 
     summary_events: list[dict[str, Any]] = []
@@ -550,6 +628,10 @@ def record_validation_report(
         else:
             reason_text = str(reasons)
         matrix = _flatten_matrix(_matrix_for(report, candidate))
+        diagnostics = _diagnostic_summary(records)
+        summary_shaping_count = _number_from((summary,), "shaping_count")
+        if summary_shaping_count is not None:
+            diagnostics["shaping_count"] = max(0, int(summary_shaping_count))
         event = {
             **common,
             "candidate": candidate,
@@ -581,6 +663,9 @@ def record_validation_report(
             "decision_reasons": reason_text,
             "decision_reason_count": len(reasons) if isinstance(reasons, (list, tuple, set)) else int(bool(reason_text)),
             **matrix,
+            **diagnostics,
+            "safety_regression": False,
+            "promotion_safe": True,
         }
         summary_events.append(event)
 
@@ -599,6 +684,10 @@ def record_validation_report(
                     candidate_value - current_value
                     if candidate_value is not None and current_value is not None else None
                 )
+            event["safety_regression"] = validation_safety_regression(
+                report, candidate=str(event["candidate"]),
+            )
+            event["promotion_safe"] = not event["safety_regression"]
         record_event("validation_summary", event)
 
         records = grouped.get(str(event.get("candidate")), [])

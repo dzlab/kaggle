@@ -135,6 +135,68 @@ def test_parser_accepts_training_mode_bc_budget_and_model_shape():
     assert args.model_depth == 8
 
 
+def test_policy_cli_propagates_reward_and_stall_ablations_into_ppo_config():
+    from scripts.train_policy import PPOConfig, _cli_training_options, _parser
+
+    args = _parser().parse_args([
+        "--input", "transitions.jsonl", "--output", "policy.pt",
+        "--potential-reward-coef", "0.05",
+        "--no-progress-window", "24",
+        "--resolved-margin", "1000",
+        "--offline-ppo-fallback",
+    ])
+
+    options = _cli_training_options(args)
+    assert options["ppo_config"] == PPOConfig(
+        potential_reward_coef=0.05, no_progress_window=24, resolved_margin=1000.0,
+    )
+
+
+def test_rollout_batch_reports_termination_and_safety_diagnostics():
+    from scripts.train_policy import PPOConfig, build_rollout_batch
+
+    rows = [
+        {
+            **_transition(done=False, reward=0.0),
+            "bootstrap_truncated": True,
+            "termination_reason": "no_progress",
+            "no_progress_steps": 4,
+            "safety_flags": ["safety_regression"],
+        },
+        {
+            **_transition(done=True, reward=0.0),
+            "termination_reason": "time_limit",
+        },
+    ]
+
+    batch = build_rollout_batch(
+        rows,
+        config=PPOConfig(no_progress_window=4),
+        value_estimates=[0.1, 0.2],
+        bootstrap_values=[0.7, 0.0],
+    )
+
+    assert batch.dones == [False, True]
+    assert batch.bootstrap_truncated == [True, False]
+    assert batch.termination_reasons == {"no_progress": 1, "time_limit": 1}
+    assert batch.max_no_progress_steps == 4
+    assert batch.time_limit_endings == 1
+    assert batch.safety_regression_count == 1
+
+
+def test_promotion_safety_regression_is_fail_closed_even_when_reward_improves():
+    from scripts.train_policy import promotion_safety_regression
+
+    result = promotion_safety_regression(
+        candidate={"mean_bank_differential": 100.0, "safety_regression_count": 3},
+        baseline={"mean_bank_differential": 50.0, "safety_regression_count": 0},
+    )
+
+    assert result["safety_regression"] is True
+    assert result["promotion_safe"] is False
+    assert result["reason"] == "safety_regression"
+
+
 @pytest.mark.parametrize(
     ("mode", "configured", "expected"),
     [

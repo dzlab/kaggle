@@ -31,8 +31,9 @@ from kagriculture_agent.model import (
     resolve_device,
     validate_model_shape,
 )
-from scripts.telemetry import record_validation_report
+from scripts.telemetry import record_validation_report, validation_safety_regression
 from scripts.train_policy import (
+    PPOConfig,
     TrainingContract,
     resolve_behavior_clone_steps,
     validate_training_checkpoint,
@@ -110,6 +111,9 @@ class ColabConfig:
     model_width: int = DEFAULT_MODEL_WIDTH
     model_depth: int = DEFAULT_MODEL_DEPTH
     behavior_clone_steps: int = 25
+    potential_reward_coef: float = 0.0
+    no_progress_window: int = 0
+    resolved_margin: float = 0.0
 
     @property
     def league_probabilities(self) -> dict[str, float]:
@@ -411,6 +415,9 @@ def build_config(
     league_checkpoint_probability: float | None = None,
     model_width: int = DEFAULT_MODEL_WIDTH,
     model_depth: int = DEFAULT_MODEL_DEPTH,
+    potential_reward_coef: float = 0.0,
+    no_progress_window: int = 0,
+    resolved_margin: float = 0.0,
     resolve_runtime_device: bool = True,
 ) -> ColabConfig:
     if type(workers) is not int or workers < 1:
@@ -419,6 +426,11 @@ def build_config(
         raise ValueError("ppo_target_steps must be a nonnegative integer")
     if type(league_checkpoint_window) is not int or league_checkpoint_window < 0:
         raise ValueError("league_checkpoint_window must be a nonnegative integer")
+    PPOConfig(
+        potential_reward_coef=potential_reward_coef,
+        no_progress_window=no_progress_window,
+        resolved_margin=resolved_margin,
+    )
     if isinstance(league_checkpoints, (str, bytes)):
         raise ValueError("league_checkpoints must be a sequence of paths")
     weights = {
@@ -560,6 +572,9 @@ def build_config(
         model_width,
         model_depth,
         effective_behavior_clone_steps,
+        float(potential_reward_coef),
+        int(no_progress_window),
+        float(resolved_margin),
     )
 
 
@@ -611,6 +626,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--training-mode", choices=TRAINING_MODES, default="behavior_clone_then_ppo")
     parser.add_argument("--model-width", type=_positive_int, default=DEFAULT_MODEL_WIDTH)
     parser.add_argument("--model-depth", type=_positive_int, default=DEFAULT_MODEL_DEPTH)
+    parser.add_argument("--potential-reward-coef", type=_nonnegative_float, default=0.0)
+    parser.add_argument("--no-progress-window", type=_nonnegative_int, default=0)
+    parser.add_argument("--resolved-margin", type=_nonnegative_float, default=0.0)
     parser.add_argument("--league-checkpoints", type=Path, action="append", default=[])
     parser.add_argument("--league-checkpoint-window", type=_nonnegative_int, default=5)
     parser.add_argument("--league-current-probability", type=_nonnegative_float, default=None)
@@ -689,6 +707,9 @@ def config_from_args(args: argparse.Namespace) -> ColabConfig:
         training_mode=args.training_mode,
         model_width=args.model_width,
         model_depth=args.model_depth,
+        potential_reward_coef=args.potential_reward_coef,
+        no_progress_window=args.no_progress_window,
+        resolved_margin=args.resolved_margin,
         league_checkpoints=tuple(args.league_checkpoints),
         league_checkpoint_window=args.league_checkpoint_window,
         league_current_probability=args.league_current_probability,
@@ -760,6 +781,9 @@ def build_collection_command(config: ColabConfig) -> list[str]:
         "--experiment-id", config.experiment_id,
         "--feature-variant", config.feature_variant,
         "--training-mode", config.training_mode,
+        "--potential-reward-coef", str(config.potential_reward_coef),
+        "--no-progress-window", str(config.no_progress_window),
+        "--resolved-margin", str(config.resolved_margin),
     ]
 
 
@@ -872,6 +896,9 @@ def initialize_telemetry(config: ColabConfig) -> Any | None:
             "ppo_target_steps": config.ppo_target_steps,
             "training_steps": config.training_steps,
             "behavior_clone_steps": config.behavior_clone_steps,
+            "potential_reward_coef": config.potential_reward_coef,
+            "no_progress_window": config.no_progress_window,
+            "resolved_margin": config.resolved_margin,
             "model_width": config.model_width,
             "model_depth": config.model_depth,
             "parameter_count": model_parameter_count_for_shape(
@@ -976,6 +1003,9 @@ def train_candidate(
         experiment_id=config.experiment_id,
         feature_variant=config.feature_variant,
         training_mode=config.training_mode,
+        potential_reward_coef=config.potential_reward_coef,
+        no_progress_window=config.no_progress_window,
+        resolved_margin=config.resolved_margin,
         **(
             opponent_pool.league_configuration
             if hasattr(opponent_pool, "league_configuration") else {}
@@ -996,6 +1026,11 @@ def train_candidate(
         batch_size=config.training_batch_size,
         seed=config.training_seed,
         ppo_steps=config.ppo_target_steps,
+        ppo_config=PPOConfig(
+            potential_reward_coef=config.potential_reward_coef,
+            no_progress_window=config.no_progress_window,
+            resolved_margin=config.resolved_margin,
+        ),
         device=config.device,
         checkpoint_interval=config.training_checkpoint_interval,
         resume_checkpoint=resume_checkpoint,
@@ -1262,6 +1297,11 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
         feature_variant=config.feature_variant,
         training_mode=config.training_mode,
         effective_behavior_clone_steps=config.behavior_clone_steps,
+        ppo_config=PPOConfig(
+            potential_reward_coef=config.potential_reward_coef,
+            no_progress_window=config.no_progress_window,
+            resolved_margin=config.resolved_margin,
+        ),
         model_width=config.model_width,
         model_depth=config.model_depth,
     )
@@ -1296,6 +1336,8 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
         training_metadata: Mapping[str, Any] = (
             training_result if isinstance(training_result, Mapping) else {}
         )
+        ppo_metrics = training_metadata.get("ppo_metrics")
+        ppo_metrics = ppo_metrics if isinstance(ppo_metrics, Mapping) else {}
         if telemetry is not None:
             telemetry(
                 "training_complete",
@@ -1309,6 +1351,13 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
                         "behavior_clone_steps", config.behavior_clone_steps,
                     ),
                     "ppo_updates": training_metadata.get("ppo_updates"),
+                    "shaping_count": ppo_metrics.get("shaping_count", 0),
+                    "truncation_count": ppo_metrics.get("truncation_count", 0),
+                    "termination_reasons": ppo_metrics.get("termination_reasons", {}),
+                    "max_no_progress_steps": ppo_metrics.get("max_no_progress_steps", 0),
+                    "max_no_progress_streak": ppo_metrics.get("max_no_progress_steps", 0),
+                    "time_limit_endings": ppo_metrics.get("time_limit_endings", 0),
+                    "safety_regression_count": ppo_metrics.get("safety_regression_count", 0),
                     "parameter_count": training_metadata.get("parameter_count"),
                     "ppo_steps": config.ppo_target_steps,
                     "configuration": {
@@ -1316,6 +1365,9 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
                         "candidate_tag": config.candidate_tag,
                         "device": config.device,
                         "workers": config.workers,
+                        "potential_reward_coef": config.potential_reward_coef,
+                        "no_progress_window": config.no_progress_window,
+                        "resolved_margin": config.resolved_margin,
                         "development_seeds": list(config.development_seeds),
                         "development_opponents": list(config.development_opponents),
                         "development_seats": list(config.development_seats),
@@ -1334,6 +1386,9 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
             record_validation_report(
                 telemetry, development_report, phase="development",
                 checkpoint=config.stage_artifact_path, candidate_tag=config.candidate_tag,
+                potential_reward_coef=config.potential_reward_coef,
+                no_progress_window=config.no_progress_window,
+                resolved_margin=config.resolved_margin,
                 **_identity_fields(config),
             )
         development_decision = development_report.get("decision", {})
@@ -1347,11 +1402,19 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
             )
             and development_decision.get("status") in {"promote", "discard"}
         )
-        development_promoted = development_complete and development_decision.get("status") == "promote"
+        development_safety_regression = validation_safety_regression(
+            development_report, candidate=config.candidate_tag,
+        )
+        development_promoted = (
+            development_complete
+            and development_decision.get("status") == "promote"
+            and not development_safety_regression
+        )
         print("Development evaluator exit:", development_process.returncode)
         print("Development status:", development_decision.get("status"))
         if not development_promoted:
-            print("Development candidate discarded or incomplete; continue training, not promotion.")
+            reason = "; safety regression detected" if development_safety_regression else ""
+            print(f"Development candidate discarded or incomplete{reason}; continue training, not promotion.")
 
         holdout_complete: bool | None = None
         if development_promoted:
@@ -1368,6 +1431,9 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
                 record_validation_report(
                     telemetry, holdout_report, phase="holdout",
                     checkpoint=config.stage_artifact_path, candidate_tag=config.candidate_tag,
+                    potential_reward_coef=config.potential_reward_coef,
+                    no_progress_window=config.no_progress_window,
+                    resolved_margin=config.resolved_margin,
                     **_identity_fields(config),
                 )
             holdout_decision = holdout_report.get("decision", {})

@@ -536,6 +536,74 @@ def test_colab_workflow_builds_parameterized_commands(tmp_path, monkeypatch):
     assert smoke[smoke.index("--candidate-artifact") + 1] == str(config.stage_artifact_path)
 
 
+def test_colab_cli_propagates_reward_and_stall_ablations_to_config_and_collection(tmp_path):
+    from scripts import colab_train
+
+    args = colab_train.parse_args([
+        "--run-directory", str(tmp_path), "--device", "cpu",
+        "--potential-reward-coef", "0.05",
+        "--no-progress-window", "24",
+        "--resolved-margin", "1000",
+        "--dry-run",
+    ])
+    config = colab_train.config_from_args(args)
+    collection = colab_train.build_collection_command(config)
+
+    assert config.potential_reward_coef == pytest.approx(0.05)
+    assert config.no_progress_window == 24
+    assert config.resolved_margin == pytest.approx(1000.0)
+    for flag, expected in (
+        ("--potential-reward-coef", "0.05"),
+        ("--no-progress-window", "24"),
+        ("--resolved-margin", "1000.0"),
+    ):
+        assert collection[collection.index(flag) + 1] == expected
+
+
+def test_validation_telemetry_exposes_safety_regression_diagnostics():
+    from scripts.telemetry import record_validation_report
+
+    class Capture:
+        def __init__(self):
+            self.events = []
+
+        def record(self, event, payload):
+            self.events.append((event, payload))
+
+    telemetry = Capture()
+    report = {
+        "records": {
+            "current": [{
+                "outcome": "win", "bank_differential": 1.0,
+                "termination_reason": "resolved", "bootstrap_truncated": True,
+                "no_progress_steps": 2, "time_limit_ending": False,
+                "safety_regression": False,
+            }],
+            "candidate": [{
+                "outcome": "win", "bank_differential": 2.0,
+                "termination_reason": "no_progress", "bootstrap_truncated": True,
+                "no_progress_steps": 5, "time_limit_ending": True,
+                "safety_regression": True,
+            }],
+        },
+        "summaries": {},
+    }
+
+    record_validation_report(
+        telemetry, report, phase="development", checkpoint="candidate.json",
+        candidate_tag="candidate",
+    )
+
+    summaries = [payload for event, payload in telemetry.events if event == "validation_summary"]
+    candidate = next(payload for payload in summaries if payload["candidate"] == "candidate")
+    assert candidate["termination_reasons"] == {"no_progress": 1}
+    assert candidate["bootstrap_truncated_count"] == 1
+    assert candidate["max_no_progress_steps"] == 5
+    assert candidate["time_limit_endings"] == 1
+    assert candidate["safety_regression_count"] == 1
+    assert candidate["safety_regression"] is True
+
+
 def test_colab_relative_paths_are_stable_when_cwd_changes(tmp_path, monkeypatch):
     from scripts import colab_train
 

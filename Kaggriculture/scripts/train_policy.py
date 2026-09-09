@@ -208,7 +208,8 @@ _PPO_RESUME_METRIC_FIELDS = {
 }
 _PPO_OPTIONAL_RESUME_METRIC_FIELDS = {
     "shaping_count", "truncation_count", "league_composition",
-    "league_checkpoint_identities",
+    "league_checkpoint_identities", "termination_reasons", "max_no_progress_steps",
+    "time_limit_endings", "safety_regression_count",
 }
 _PPO_LEAGUE_COMPOSITION_DEFAULT = {
     "current": 0, "mixed": 0, "random": 0, "starter": 0, "checkpoint": 0,
@@ -511,6 +512,10 @@ class RolloutBatch:
     bootstrap_truncated: list[bool] = field(default_factory=list)
     shaping_count: int = 0
     truncation_count: int = 0
+    termination_reasons: dict[str, int] = field(default_factory=dict)
+    max_no_progress_steps: int = 0
+    time_limit_endings: int = 0
+    safety_regression_count: int = 0
 
 
 class OpponentPool:
@@ -607,6 +612,59 @@ def should_promote(
 ) -> bool:
     """Promote only after the fixed 100-game match exceeds 70% wins."""
     return games == match_size and games > 0 and (wins / games) > threshold
+
+
+def _diagnostic_counts(transitions: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    reasons: dict[str, int] = {}
+    max_no_progress_steps = 0
+    time_limit_endings = 0
+    safety_regression_count = 0
+    for transition in transitions:
+        reason = transition.get("termination_reason")
+        if isinstance(reason, str) and reason:
+            reasons[reason] = reasons.get(reason, 0) + 1
+        progress = transition.get("no_progress_steps")
+        if type(progress) is int and progress >= 0:
+            max_no_progress_steps = max(max_no_progress_steps, progress)
+        normalized_reason = str(reason or "").lower().replace("-", "_")
+        if transition.get("time_limit_ending") is True or normalized_reason in {
+            "time_limit", "timeout", "time_limit_ending",
+        }:
+            time_limit_endings += 1
+        flags = transition.get("safety_flags", ())
+        has_safety_flag = isinstance(flags, Sequence) and not isinstance(flags, (str, bytes)) and any(
+            "safety_regression" in str(flag).lower() for flag in flags
+        )
+        if transition.get("safety_regression") is True or has_safety_flag:
+            safety_regression_count += 1
+    return {
+        "termination_reasons": reasons,
+        "max_no_progress_steps": max_no_progress_steps,
+        "time_limit_endings": time_limit_endings,
+        "safety_regression_count": safety_regression_count,
+    }
+
+
+def promotion_safety_regression(
+    *, candidate: Mapping[str, Any], baseline: Mapping[str, Any], tolerance: int = 0,
+) -> dict[str, Any]:
+    """Fail closed when the candidate adds observable safety regressions."""
+    if type(tolerance) is not int or tolerance < 0:
+        raise ValueError("tolerance must be a nonnegative integer")
+    candidate_count = candidate.get("safety_regression_count", 0)
+    baseline_count = baseline.get("safety_regression_count", 0)
+    if type(candidate_count) is not int or candidate_count < 0:
+        raise ValueError("candidate safety_regression_count must be a nonnegative integer")
+    if type(baseline_count) is not int or baseline_count < 0:
+        raise ValueError("baseline safety_regression_count must be a nonnegative integer")
+    regressed = candidate_count > baseline_count + tolerance
+    return {
+        "safety_regression": regressed,
+        "promotion_safe": not regressed,
+        "reason": "safety_regression" if regressed else None,
+        "candidate_safety_regression_count": candidate_count,
+        "baseline_safety_regression_count": baseline_count,
+    }
 
 
 def terminal_bank_margin_reward(final_bank: Any, opponent_final_bank: Any) -> float:
@@ -981,6 +1039,7 @@ def build_rollout_batch(
     truncation_flags: list[bool] = []
     shaping_count = 0
     truncation_count = 0
+    diagnostics = _diagnostic_counts(rows)
     for transition in rows:
         if not isinstance(transition, Mapping):
             raise ValueError("each transition must be a mapping")
@@ -1038,6 +1097,10 @@ def build_rollout_batch(
         bootstrap_truncated=truncation_flags,
         shaping_count=shaping_count,
         truncation_count=truncation_count,
+        termination_reasons=diagnostics["termination_reasons"],
+        max_no_progress_steps=diagnostics["max_no_progress_steps"],
+        time_limit_endings=diagnostics["time_limit_endings"],
+        safety_regression_count=diagnostics["safety_regression_count"],
     )
 
 
@@ -1337,6 +1400,10 @@ def ppo_update(
         "learning_rate": _active_learning_rate(optimizer),
         "shaping_count": rollout.shaping_count,
         "truncation_count": rollout.truncation_count,
+        "termination_reasons": dict(rollout.termination_reasons),
+        "max_no_progress_steps": rollout.max_no_progress_steps,
+        "time_limit_endings": rollout.time_limit_endings,
+        "safety_regression_count": rollout.safety_regression_count,
     }
     size = max(1, int(batch_size or len(rows)))
     for epoch in range(config.ppo_epochs):
@@ -1480,6 +1547,10 @@ def run_ppo_training(
     initial_rollout_count: int = 0,
     initial_shaping_count: int = 0,
     initial_truncation_count: int = 0,
+    initial_termination_reasons: Mapping[str, int] | None = None,
+    initial_max_no_progress_steps: int = 0,
+    initial_time_limit_endings: int = 0,
+    initial_safety_regression_count: int = 0,
     initial_league_composition: Mapping[str, int] | None = None,
     initial_league_checkpoint_identities: Sequence[str] | None = None,
     progress_fn: Any | None = None,
@@ -1508,6 +1579,20 @@ def run_ppo_training(
         raise ValueError("initial_shaping_count must be a nonnegative integer")
     if type(initial_truncation_count) is not int or initial_truncation_count < 0:
         raise ValueError("initial_truncation_count must be a nonnegative integer")
+    if type(initial_max_no_progress_steps) is not int or initial_max_no_progress_steps < 0:
+        raise ValueError("initial_max_no_progress_steps must be a nonnegative integer")
+    if type(initial_time_limit_endings) is not int or initial_time_limit_endings < 0:
+        raise ValueError("initial_time_limit_endings must be a nonnegative integer")
+    if type(initial_safety_regression_count) is not int or initial_safety_regression_count < 0:
+        raise ValueError("initial_safety_regression_count must be a nonnegative integer")
+    termination_reasons = dict(initial_termination_reasons or {})
+    if any(
+        type(reason) is not str or not reason or type(count) is not int or count < 0
+        for reason, count in termination_reasons.items()
+    ):
+        raise ValueError(
+            "initial_termination_reasons must map nonempty strings to nonnegative integers"
+        )
     if initial_league_composition is None:
         league_composition = dict(_PPO_LEAGUE_COMPOSITION_DEFAULT)
     else:
@@ -1542,6 +1627,10 @@ def run_ppo_training(
             "completed_steps": 0,
             "shaping_count": initial_shaping_count,
             "truncation_count": initial_truncation_count,
+            "termination_reasons": dict(termination_reasons),
+            "max_no_progress_steps": initial_max_no_progress_steps,
+            "time_limit_endings": initial_time_limit_endings,
+            "safety_regression_count": initial_safety_regression_count,
             "league_composition": dict(league_composition),
             "league_checkpoint_identities": list(league_checkpoint_identities),
         }
@@ -1566,6 +1655,9 @@ def run_ppo_training(
     rollout_count = initial_rollout_count
     shaping_count = initial_shaping_count
     truncation_count = initial_truncation_count
+    max_no_progress_steps = initial_max_no_progress_steps
+    time_limit_endings = initial_time_limit_endings
+    safety_regression_count = initial_safety_regression_count
     last_metrics: dict[str, Any] | None = None
     offline_rows = list(transitions)
     if offline_ppo_fallback and not offline_rows:
@@ -1615,6 +1707,18 @@ def run_ppo_training(
                 rollout_kwargs["network"] = network
             if _accepts_keyword_argument(rollout_fn, "experiment_id"):
                 rollout_kwargs["experiment_id"] = experiment_id
+            if config.potential_reward_coef != 0.0 and _accepts_keyword_argument(
+                rollout_fn, "potential_reward_coef"
+            ):
+                rollout_kwargs["potential_reward_coef"] = config.potential_reward_coef
+            if config.no_progress_window != 0 and _accepts_keyword_argument(
+                rollout_fn, "no_progress_window"
+            ):
+                rollout_kwargs["no_progress_window"] = config.no_progress_window
+            if config.resolved_margin != 0.0 and _accepts_keyword_argument(
+                rollout_fn, "resolved_margin"
+            ):
+                rollout_kwargs["resolved_margin"] = config.resolved_margin
             rollout = rollout_fn(**rollout_kwargs)
             rollout_count += 1
             league_composition[match.opponent] += 1
@@ -1624,6 +1728,7 @@ def run_ppo_training(
             raise ValueError("rollout_fn must return a sequence of transitions")
         if not rollout:
             raise ValueError("PPO rollout produced no transitions")
+        rollout_diagnostics = _diagnostic_counts(rollout)
         update_kwargs = {
             "network": network,
             "optimizer": optimizer,
@@ -1640,9 +1745,23 @@ def run_ppo_training(
         if _accepts_keyword_argument(updater, "model_depth"):
             update_kwargs["model_depth"] = model_depth
         last_metrics = updater(**update_kwargs)
+        if not isinstance(last_metrics, Mapping):
+            raise ValueError("PPO update must return a metrics mapping")
+        last_metrics = dict(last_metrics)
+        last_metrics.setdefault("termination_reasons", rollout_diagnostics["termination_reasons"])
+        last_metrics.setdefault("max_no_progress_steps", rollout_diagnostics["max_no_progress_steps"])
+        last_metrics.setdefault("time_limit_endings", rollout_diagnostics["time_limit_endings"])
+        last_metrics.setdefault("safety_regression_count", rollout_diagnostics["safety_regression_count"])
         total_updates += int(last_metrics.get("updates", 0))
         shaping_count += int(last_metrics.get("shaping_count", 0))
         truncation_count += int(last_metrics.get("truncation_count", 0))
+        for reason, count in last_metrics["termination_reasons"].items():
+            termination_reasons[reason] = termination_reasons.get(reason, 0) + int(count)
+        max_no_progress_steps = max(
+            max_no_progress_steps, int(last_metrics["max_no_progress_steps"]),
+        )
+        time_limit_endings += int(last_metrics["time_limit_endings"])
+        safety_regression_count += int(last_metrics["safety_regression_count"])
         step_summary = {
             "ppo_updates": total_updates,
             "rollout_count": rollout_count,
@@ -1650,6 +1769,10 @@ def run_ppo_training(
             "last_metrics": last_metrics,
             "shaping_count": shaping_count,
             "truncation_count": truncation_count,
+            "termination_reasons": dict(termination_reasons),
+            "max_no_progress_steps": max_no_progress_steps,
+            "time_limit_endings": time_limit_endings,
+            "safety_regression_count": safety_regression_count,
             "promotion": None,
             "completed_steps": step + 1,
             "league_composition": dict(league_composition),
@@ -1684,8 +1807,16 @@ def run_ppo_training(
                 "clip_fraction", "explained_variance", "return_mean", "return_std",
                 "advantage_mean", "advantage_std", "gradient_norm", "parameter_norm",
                 "learning_rate", "shaping_count", "truncation_count",
+                "termination_reasons", "max_no_progress_steps", "time_limit_endings",
+                "safety_regression_count",
             ):
-                if name in last_metrics:
+                if name in last_metrics and (
+                    name not in {
+                        "termination_reasons", "max_no_progress_steps",
+                        "time_limit_endings", "safety_regression_count",
+                    }
+                    or last_metrics[name]
+                ):
                     telemetry_payload[name] = last_metrics[name]
             telemetry_callback("ppo", telemetry_payload)
         if progress_fn is not None:
@@ -1701,6 +1832,10 @@ def run_ppo_training(
         "completed_steps": steps,
         "shaping_count": shaping_count,
         "truncation_count": truncation_count,
+        "termination_reasons": dict(termination_reasons),
+        "max_no_progress_steps": max_no_progress_steps,
+        "time_limit_endings": time_limit_endings,
+        "safety_regression_count": safety_regression_count,
         "league_composition": dict(league_composition),
         "league_checkpoint_identities": list(league_checkpoint_identities),
     }
@@ -1759,13 +1894,17 @@ def _checkpoint_metadata(
         if model is not None
         else model_parameter_count_for_shape(model_width, model_depth)
     )
+    resolved_config = config or PPOConfig()
     return {
         "model_version": MODEL_VERSION,
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "action_vocab": {key: list(value) for key, value in ACTION_VOCAB.items()},
         "engine_version": ENGINE_VERSION,
         "transition_count": int(transition_count),
-        "ppo_config": asdict(config or PPOConfig()),
+        "ppo_config": asdict(resolved_config),
+        "potential_reward_coef": resolved_config.potential_reward_coef,
+        "no_progress_window": resolved_config.no_progress_window,
+        "resolved_margin": resolved_config.resolved_margin,
         "device": str(device),
         "experiment_id": experiment_id,
         "feature_variant": feature_variant,
@@ -2095,6 +2234,29 @@ def _validate_resume_payload(
                 raise ValueError(
                     f"resume checkpoint ppo_metrics {field} must be a nonnegative integer"
                 )
+        for field in (
+            "max_no_progress_steps", "time_limit_endings", "safety_regression_count",
+        ):
+            if field in ppo_metrics and (
+                type(ppo_metrics[field]) is not int or ppo_metrics[field] < 0
+            ):
+                raise ValueError(
+                    f"resume checkpoint ppo_metrics {field} must be a nonnegative integer"
+                )
+        if "termination_reasons" in ppo_metrics:
+            reasons = ppo_metrics["termination_reasons"]
+            if (
+                not isinstance(reasons, Mapping)
+                or any(
+                    type(reason) is not str or not reason
+                    or type(count) is not int or count < 0
+                    for reason, count in reasons.items()
+                )
+            ):
+                raise ValueError(
+                    "resume checkpoint ppo_metrics termination_reasons must map "
+                    "nonempty strings to nonnegative integers"
+                )
         if type(ppo_metrics["early_stopped"]) is not bool:
             raise ValueError("resume checkpoint ppo_metrics early_stopped must be boolean")
         for field in ("last_metrics", "promotion"):
@@ -2168,6 +2330,12 @@ def _validate_resume_payload(
             raise ValueError(
                 "resume checkpoint metadata ppo_steps does not match saved configuration"
             )
+    saved_ppo_config = saved_configuration.get("ppo_config", {})
+    for field in ("potential_reward_coef", "no_progress_window", "resolved_margin"):
+        if field in metadata and metadata[field] != saved_ppo_config.get(field):
+            raise ValueError(
+                f"resume checkpoint metadata {field} does not match saved configuration"
+            )
 
 
 def validate_training_checkpoint(
@@ -2195,6 +2363,7 @@ def make_fresh_rollout_fn(
     candidate_artifact_callback: Any | None = None,
     seeds: Sequence[int], steps: int, workers: int = 1,
     game_timeout: float = 120.0, candidate_identity: str | None = None,
+    potential_reward_coef: float = 0.0,
     no_progress_window: int = 0, resolved_margin: float = 0.0,
     league_probabilities: Mapping[str, object] | None = None,
     league_checkpoint_window: int | None = None,
@@ -2234,6 +2403,13 @@ def make_fresh_rollout_fn(
         raise ValueError("steps must be at least 2 to produce a transition")
     if type(no_progress_window) is not int or no_progress_window < 0:
         raise ValueError("no_progress_window must be a nonnegative integer")
+    if (
+        isinstance(potential_reward_coef, bool)
+        or not isinstance(potential_reward_coef, (int, float))
+        or not math.isfinite(float(potential_reward_coef))
+        or potential_reward_coef < 0
+    ):
+        raise ValueError("potential_reward_coef must be a nonnegative finite number")
     if (
         isinstance(resolved_margin, bool)
         or not isinstance(resolved_margin, (int, float))
@@ -2336,6 +2512,7 @@ def make_fresh_rollout_fn(
             league_checkpoint_window=league_checkpoint_window,
             league_checkpoints=configured_league_checkpoints,
             source_policy_identity=identity,
+            potential_reward_coef=float(potential_reward_coef),
             no_progress_window=no_progress_window,
             resolved_margin=resolved_margin,
         )
@@ -2440,6 +2617,10 @@ def train_behavior_clone(
     initial_rollout_count = 0
     initial_shaping_count = 0
     initial_truncation_count = 0
+    initial_termination_reasons: dict[str, int] = {}
+    initial_max_no_progress_steps = 0
+    initial_time_limit_endings = 0
+    initial_safety_regression_count = 0
     initial_league_composition = dict(_PPO_LEAGUE_COMPOSITION_DEFAULT)
     initial_league_checkpoint_identities: list[str] = []
     previous_ppo_metrics: dict[str, Any] | None = None
@@ -2459,6 +2640,18 @@ def train_behavior_clone(
             initial_rollout_count = previous_ppo_metrics.get("rollout_count", 0)
             initial_shaping_count = previous_ppo_metrics.get("shaping_count", 0)
             initial_truncation_count = previous_ppo_metrics.get("truncation_count", 0)
+            initial_termination_reasons = dict(
+                previous_ppo_metrics.get("termination_reasons", {})
+            )
+            initial_max_no_progress_steps = previous_ppo_metrics.get(
+                "max_no_progress_steps", 0,
+            )
+            initial_time_limit_endings = previous_ppo_metrics.get(
+                "time_limit_endings", 0,
+            )
+            initial_safety_regression_count = previous_ppo_metrics.get(
+                "safety_regression_count", 0,
+            )
             initial_league_composition = dict(
                 previous_ppo_metrics.get(
                     "league_composition", _PPO_LEAGUE_COMPOSITION_DEFAULT,
@@ -2712,6 +2905,10 @@ def train_behavior_clone(
             initial_rollout_count=initial_rollout_count,
             initial_shaping_count=initial_shaping_count,
             initial_truncation_count=initial_truncation_count,
+            initial_termination_reasons=initial_termination_reasons,
+            initial_max_no_progress_steps=initial_max_no_progress_steps,
+            initial_time_limit_endings=initial_time_limit_endings,
+            initial_safety_regression_count=initial_safety_regression_count,
             initial_league_composition=initial_league_composition,
             initial_league_checkpoint_identities=initial_league_checkpoint_identities,
             progress_fn=save_ppo_progress,
@@ -2785,6 +2982,11 @@ def _cli_training_options(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "offline_ppo_fallback": bool(args.offline_ppo_fallback),
         "allow_ppo_extension": bool(args.allow_ppo_extension),
+        "ppo_config": PPOConfig(
+            potential_reward_coef=args.potential_reward_coef,
+            no_progress_window=args.no_progress_window,
+            resolved_margin=args.resolved_margin,
+        ),
         "opponent_pool": OpponentPool(
             previous_checkpoints=args.league_checkpoints,
             checkpoint_window=args.league_checkpoint_window,
@@ -2810,6 +3012,9 @@ def _parser() -> argparse.ArgumentParser:
         help="allow a resumed checkpoint to increase its PPO training target",
     )
     parser.add_argument("--ppo-steps", type=_nonnegative_int, default=0)
+    parser.add_argument("--potential-reward-coef", type=_nonnegative_float, default=0.0)
+    parser.add_argument("--no-progress-window", type=_nonnegative_int, default=0)
+    parser.add_argument("--resolved-margin", type=_nonnegative_float, default=0.0)
     parser.add_argument("--prior-checkpoint", type=Path, default=None)
     parser.add_argument("--best-checkpoint", type=Path, default=None)
     parser.add_argument("--experiment-id", default=DEFAULT_EXPERIMENT_ID)
@@ -2848,6 +3053,7 @@ def main(argv: list[str] | None = None) -> int:
             resume_checkpoint=args.resume_checkpoint,
             allow_ppo_extension=options["allow_ppo_extension"],
             ppo_steps=args.ppo_steps,
+            ppo_config=options["ppo_config"],
             prior_checkpoint=args.prior_checkpoint,
             offline_ppo_fallback=options["offline_ppo_fallback"],
             best_checkpoint_path=args.best_checkpoint,

@@ -172,6 +172,9 @@ def _manifest(
     experiment_id: str = DEFAULT_EXPERIMENT_ID,
     feature_variant: str = "production_v1",
     training_mode: str = "behavior_clone_then_ppo",
+    potential_reward_coef: float = 0.0,
+    no_progress_window: int = 0,
+    resolved_margin: float = 0.0,
     league_round: int | None = None,
     league_seed: int | None = None,
     opponent_identity: str | None = None,
@@ -196,6 +199,9 @@ def _manifest(
         "experiment_id": experiment_id,
         "feature_variant": feature_variant,
         "training_mode": training_mode,
+        "potential_reward_coef": float(potential_reward_coef),
+        "no_progress_window": int(no_progress_window),
+        "resolved_margin": float(resolved_margin),
     }
     if (
         league_round is not None or league_seed is not None or opponent_identity is not None
@@ -346,6 +352,8 @@ def _validate_pair(
     reasons: dict[str, int] = {}
     truncated_count = 0
     max_no_progress = 0
+    time_limit_endings = 0
+    safety_regression_count = 0
     for record in records:
         reason = record.get("termination_reason")
         if reason is not None:
@@ -362,12 +370,30 @@ def _validate_pair(
             raise RuntimeError("trajectory no_progress_steps is invalid")
         if progress is not None:
             max_no_progress = max(max_no_progress, progress)
+        normalized_reason = str(reason or "").lower().replace("-", "_")
+        if normalized_reason in {"time_limit", "timeout", "time_limit_ending"}:
+            time_limit_endings += 1
+        flags = record.get("safety_flags", ())
+        if isinstance(flags, (list, tuple, set)) and any(
+            "safety_regression" in str(flag).lower() for flag in flags
+        ):
+            safety_regression_count += 1
     if "termination_reasons" in manifest and manifest["termination_reasons"] != reasons:
         raise RuntimeError("trajectory manifest termination reasons do not match content")
     if "bootstrap_truncated_count" in manifest and manifest["bootstrap_truncated_count"] != truncated_count:
         raise RuntimeError("trajectory manifest truncation count does not match content")
     if "max_no_progress_steps" in manifest and manifest["max_no_progress_steps"] != max_no_progress:
         raise RuntimeError("trajectory manifest progress count does not match content")
+    if manifest.get("truncation_count", truncated_count) != truncated_count:
+        raise RuntimeError("trajectory manifest truncation count does not match content")
+    if manifest.get("max_no_progress_streak", max_no_progress) != max_no_progress:
+        raise RuntimeError("trajectory manifest progress streak does not match content")
+    if manifest.get("shaping_count", 0) != 0:
+        raise RuntimeError("trajectory manifest shaping count is invalid")
+    if manifest.get("time_limit_endings", time_limit_endings) != time_limit_endings:
+        raise RuntimeError("trajectory manifest time-limit count does not match content")
+    if manifest.get("safety_regression_count", safety_regression_count) != safety_regression_count:
+        raise RuntimeError("trajectory manifest safety regression count does not match content")
 
 
 def _publish_pair(
@@ -426,6 +452,7 @@ def collect(
     opponent_artifact: str | Path | None = None,
     opponent_checkpoint_identity: str | None = None,
     workers: int | None = 1,
+    potential_reward_coef: float = 0.0,
     no_progress_window: int = 0,
     resolved_margin: float = 0.0,
     league_round: int | None = None,
@@ -474,6 +501,13 @@ def collect(
     _resolve_collection_transitions(
         [], no_progress_window=no_progress_window, resolved_margin=resolved_margin,
     )
+    if (
+        isinstance(potential_reward_coef, bool)
+        or not isinstance(potential_reward_coef, (int, float))
+        or not math.isfinite(float(potential_reward_coef))
+        or potential_reward_coef < 0
+    ):
+        raise ValueError("potential_reward_coef must be a nonnegative finite number")
 
     destination = validate_training_output_path(
         output, name="trajectory output",
@@ -489,6 +523,9 @@ def collect(
         experiment_id=experiment_id,
         feature_variant=feature_variant,
         training_mode=training_mode,
+        potential_reward_coef=potential_reward_coef,
+        no_progress_window=no_progress_window,
+        resolved_margin=resolved_margin,
         league_round=league_round,
         league_seed=league_seed,
         opponent_identity=opponent_identity,
@@ -534,6 +571,8 @@ def collect(
     termination_reasons: dict[str, int] = {}
     bootstrap_truncated_count = 0
     max_no_progress_steps = 0
+    time_limit_endings = 0
+    safety_regression_count = 0
     try:
         trajectory_temp = tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", dir=destination.parent,
@@ -604,6 +643,14 @@ def collect(
                             max_no_progress_steps = max(
                                 max_no_progress_steps, transition.no_progress_steps,
                             )
+                        reason = (transition.termination_reason or "").lower().replace("-", "_")
+                        if reason in {"time_limit", "timeout", "time_limit_ending"}:
+                            time_limit_endings += 1
+                        if any(
+                            "safety_regression" in str(flag).lower()
+                            for flag in transition.safety_flags
+                        ):
+                            safety_regression_count += 1
                         serialized = transition.to_json() + "\n"
                         trajectory_temp.write(serialized)
                         trajectory_hash.update(serialized.encode("utf-8"))
@@ -614,12 +661,14 @@ def collect(
                     )
             manifest["transition_count"] = transition_count
             manifest["trajectory_sha256"] = trajectory_hash.hexdigest()
-            if termination_reasons:
-                manifest["termination_reasons"] = termination_reasons
-            if bootstrap_truncated_count:
-                manifest["bootstrap_truncated_count"] = bootstrap_truncated_count
-            if max_no_progress_steps:
-                manifest["max_no_progress_steps"] = max_no_progress_steps
+            manifest["termination_reasons"] = termination_reasons
+            manifest["bootstrap_truncated_count"] = bootstrap_truncated_count
+            manifest["truncation_count"] = bootstrap_truncated_count
+            manifest["max_no_progress_steps"] = max_no_progress_steps
+            manifest["max_no_progress_streak"] = max_no_progress_steps
+            manifest["shaping_count"] = 0
+            manifest["time_limit_endings"] = time_limit_endings
+            manifest["safety_regression_count"] = safety_regression_count
             manifest_temp.write(
                 json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
             )
@@ -658,6 +707,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate-identity", default=None)
     parser.add_argument("--workers", type=_positive_int, default=1)
     parser.add_argument(
+        "--potential-reward-coef", type=_nonnegative_float, default=0.0,
+        help="potential-based reward shaping coefficient used by PPO",
+    )
+    parser.add_argument(
         "--no-progress-window", type=_nonnegative_int, default=0,
         help="bootstrap-truncate after this many consecutive no-progress transitions",
     )
@@ -689,6 +742,7 @@ def main(argv: list[str] | None = None) -> int:
         candidate_identity=args.candidate_identity,
         workers=args.workers,
         game_timeout=args.game_timeout,
+        potential_reward_coef=args.potential_reward_coef,
         no_progress_window=args.no_progress_window,
         resolved_margin=args.resolved_margin,
     )
