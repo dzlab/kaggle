@@ -3708,7 +3708,10 @@ def apply_variant(action: Mapping[str, Any], observation: Mapping[str, Any], var
                   configuration: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Apply a named, legality-preserving strategy adjustment at the agent boundary."""
     result = {"farmer": list(action.get("farmer", ["PASS"])), "hands": [list(command) for command in action.get("hands", ())],
-              "market": _market_orders(action)}
+              "market": [
+                  order for order in _market_orders(action)
+                  if _valid_market_order_schema(order, observation)
+              ]}
     seeds = _private_seeds(observation)
     if variant == "conservative":
         terminal_sales = [

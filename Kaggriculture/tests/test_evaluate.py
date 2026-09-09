@@ -3638,6 +3638,25 @@ def test_variants_and_ablations_change_only_legal_action_shapes():
     assert ablated_action == {"farmer": ["PASS"], "hands": [], "market": []}
 
 
+def test_apply_variant_skips_empty_market_order():
+    from scripts.evaluate import apply_variant
+
+    observation = {
+        "player": 0,
+        "farms": [{"money": 100, "farmer": [0, 0], "hands": [], "tiles": [[None]]}],
+        "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+        "market": {"prices": {}, "inventory": {}},
+    }
+
+    result = apply_variant(
+        {"farmer": ["PASS"], "hands": [], "market": [[]]},
+        observation,
+        "conservative",
+    )
+
+    assert result["market"] == []
+
+
 def test_conservative_variant_preserves_mandatory_wheat_and_fertilizer_orders():
     from scripts.evaluate import apply_variant
 
