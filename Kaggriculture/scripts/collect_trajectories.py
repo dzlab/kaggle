@@ -175,6 +175,9 @@ def _manifest(
     opponent_identity: str | None = None,
     checkpoint_identity: str | None = None,
     league_composition: Mapping[str, int] | None = None,
+    league_probabilities: Mapping[str, object] | None = None,
+    league_checkpoint_window: int | None = None,
+    league_checkpoints: Sequence[str | Path] | None = None,
 ) -> dict[str, Any]:
     validate_training_identity(experiment_id, feature_variant, training_mode)
     manifest = {
@@ -191,8 +194,12 @@ def _manifest(
         "feature_variant": feature_variant,
         "training_mode": training_mode,
     }
-    if league_round is not None or league_seed is not None or opponent_identity is not None \
-            or checkpoint_identity is not None or league_composition is not None:
+    if (
+        league_round is not None or league_seed is not None or opponent_identity is not None
+        or checkpoint_identity is not None or league_composition is not None
+        or league_probabilities is not None or league_checkpoint_window is not None
+        or league_checkpoints is not None
+    ):
         if league_round is not None and (type(league_round) is not int or league_round < 0):
             raise ValueError("league_round must be a nonnegative integer")
         if league_seed is not None and type(league_seed) is not int:
@@ -214,13 +221,37 @@ def _manifest(
                 raise ValueError("league_composition values must be nonnegative integers")
         else:
             composition = None
-        manifest["league"] = {
+        league = {
             "round": league_round,
             "seed": league_seed,
             "opponent_identity": opponent_identity,
             "checkpoint_identity": checkpoint_identity,
             "composition": composition,
         }
+        if league_probabilities is not None:
+            if not isinstance(league_probabilities, Mapping) or not league_probabilities:
+                raise ValueError("league_probabilities must be a non-empty mapping")
+            probabilities = dict(league_probabilities)
+            if any(
+                type(name) is not str or not name
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or float(value) < 0.0
+                for name, value in probabilities.items()
+            ) or sum(float(value) for value in probabilities.values()) <= 0.0:
+                raise ValueError("league_probabilities must contain finite nonnegative weights")
+            league["probabilities"] = probabilities
+        if league_checkpoint_window is not None:
+            if type(league_checkpoint_window) is not int or league_checkpoint_window < 0:
+                raise ValueError("league_checkpoint_window must be a nonnegative integer")
+            league["checkpoint_window"] = league_checkpoint_window
+        if league_checkpoints is not None:
+            if isinstance(league_checkpoints, (str, bytes)) or not isinstance(
+                league_checkpoints, Sequence,
+            ):
+                raise ValueError("league_checkpoints must be a sequence of paths")
+            league["configured_checkpoints"] = [str(path) for path in league_checkpoints]
+        manifest["league"] = league
     return manifest
 
 
@@ -396,6 +427,9 @@ def collect(
     opponent_identity: str | None = None,
     checkpoint_identity: str | None = None,
     league_composition: Mapping[str, int] | None = None,
+    league_probabilities: Mapping[str, object] | None = None,
+    league_checkpoint_window: int | None = None,
+    league_checkpoints: Sequence[str | Path] | None = None,
 ) -> dict[str, Any]:
     """Collect and write one validated transition per output JSONL line."""
     normalized_seeds = _strict_int_values(seeds, "seeds")
@@ -451,6 +485,9 @@ def collect(
         opponent_identity=opponent_identity,
         checkpoint_identity=checkpoint_identity or opponent_checkpoint_identity,
         league_composition=league_composition,
+        league_probabilities=league_probabilities,
+        league_checkpoint_window=league_checkpoint_window,
+        league_checkpoints=league_checkpoints,
     )
     if no_progress_window:
         manifest["no_progress_window"] = no_progress_window

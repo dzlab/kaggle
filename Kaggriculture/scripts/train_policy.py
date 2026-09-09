@@ -161,7 +161,13 @@ _PPO_RESUME_METRIC_FIELDS = {
     "ppo_updates", "rollout_count", "early_stopped", "last_metrics",
     "promotion", "completed_steps",
 }
-_PPO_OPTIONAL_RESUME_METRIC_FIELDS = {"shaping_count", "truncation_count"}
+_PPO_OPTIONAL_RESUME_METRIC_FIELDS = {
+    "shaping_count", "truncation_count", "league_composition",
+    "league_checkpoint_identities",
+}
+_PPO_LEAGUE_COMPOSITION_DEFAULT = {
+    "current": 0, "mixed": 0, "random": 0, "starter": 0, "checkpoint": 0,
+}
 
 
 def _validate_experiment_id(value: Any, *, source: str) -> None:
@@ -431,6 +437,7 @@ class OpponentPool:
         sampler: LeagueSampler | None = None,
         checkpoint_window: int = 5,
         probabilities: Mapping[str, object] | None = None,
+        configured_checkpoints: Sequence[str | Path] | None = None,
     ) -> None:
         if league_sampler is not None and sampler is not None:
             raise ValueError("provide only one of league_sampler or sampler")
@@ -446,6 +453,16 @@ class OpponentPool:
         ):
             raise ValueError("previous_checkpoints must be a sequence or None")
         candidates = tuple(str(path) for path in previous_checkpoints)
+        if configured_checkpoints is not None:
+            if isinstance(configured_checkpoints, (str, bytes)) or not isinstance(
+                configured_checkpoints, Sequence,
+            ):
+                raise ValueError("configured_checkpoints must be a sequence of paths")
+            configured_candidates = tuple(str(path) for path in configured_checkpoints)
+        else:
+            configured_candidates = candidates
+        self.configured_checkpoint_candidates = configured_candidates
+        self.checkpoint_window = checkpoint_window
         self.checkpoint_candidates = candidates[-checkpoint_window:] if checkpoint_window else ()
         configured_probabilities = (
             dict(DEFAULT_OPPONENT_PROBABILITIES)
@@ -455,7 +472,29 @@ class OpponentPool:
             probabilities=configured_probabilities,
             checkpoint_candidates=self.checkpoint_candidates,
         )
+        self.configured_probabilities = dict(configured_probabilities)
+        if selected_sampler is not None:
+            self.configured_probabilities = dict(
+                getattr(selected_sampler, "configured_probabilities", selected_sampler.probabilities)
+            )
+            if configured_checkpoints is None:
+                self.configured_checkpoint_candidates = tuple(
+                    getattr(
+                        selected_sampler,
+                        "configured_checkpoint_candidates",
+                        self.configured_checkpoint_candidates,
+                    )
+                )
         self.probabilities = dict(self.league_sampler.probabilities)
+
+    @property
+    def league_configuration(self) -> dict[str, Any]:
+        """Return the original league inputs for rollout-manifest provenance."""
+        return {
+            "league_probabilities": dict(self.configured_probabilities),
+            "league_checkpoint_window": self.checkpoint_window,
+            "league_checkpoints": list(self.configured_checkpoint_candidates),
+        }
 
     def sample(self, index: int, *, seed: int = 0) -> OpponentMatch:
         return self.league_sampler.sample(index, seed=seed)
@@ -1801,6 +1840,8 @@ def _validate_resume_payload(
     else:
         if type(ppo_metrics) is not dict:
             raise ValueError("resume checkpoint metrics ppo_metrics is required after PPO progress")
+        ppo_metrics.setdefault("league_composition", dict(_PPO_LEAGUE_COMPOSITION_DEFAULT))
+        ppo_metrics.setdefault("league_checkpoint_identities", [])
         missing = sorted(_PPO_RESUME_METRIC_FIELDS - set(ppo_metrics))
         allowed_fields = _PPO_RESUME_METRIC_FIELDS | _PPO_OPTIONAL_RESUME_METRIC_FIELDS
         unexpected = sorted(set(ppo_metrics) - allowed_fields)
@@ -1819,7 +1860,7 @@ def _validate_resume_payload(
                 raise ValueError(
                     f"resume checkpoint ppo_metrics {field} must be a nonnegative integer"
                 )
-        for field in _PPO_OPTIONAL_RESUME_METRIC_FIELDS:
+        for field in ("shaping_count", "truncation_count"):
             if field in ppo_metrics and (
                 type(ppo_metrics[field]) is not int or ppo_metrics[field] < 0
             ):
@@ -1833,6 +1874,25 @@ def _validate_resume_payload(
                 raise ValueError(
                     f"resume checkpoint ppo_metrics {field} must be an object or null"
                 )
+        league_composition = ppo_metrics["league_composition"]
+        if type(league_composition) is not dict or any(
+            type(name) is not str or not name
+            or type(count) is not int or count < 0
+            for name, count in league_composition.items()
+        ):
+            raise ValueError(
+                "resume checkpoint ppo_metrics league_composition must map names to "
+                "nonnegative integers"
+            )
+        checkpoint_identities = ppo_metrics["league_checkpoint_identities"]
+        if type(checkpoint_identities) is not list or any(
+            type(identity) is not str or not identity
+            for identity in checkpoint_identities
+        ):
+            raise ValueError(
+                "resume checkpoint ppo_metrics league_checkpoint_identities must be a "
+                "list of nonempty strings"
+            )
         if ppo_metrics["ppo_updates"] != metrics["ppo_updates"]:
             raise ValueError(
                 "resume checkpoint ppo_metrics ppo_updates does not match metrics ppo_updates"
@@ -1897,6 +1957,9 @@ def make_fresh_rollout_fn(
     seeds: Sequence[int], steps: int, workers: int = 1,
     game_timeout: float = 120.0, candidate_identity: str | None = None,
     no_progress_window: int = 0, resolved_margin: float = 0.0,
+    league_probabilities: Mapping[str, object] | None = None,
+    league_checkpoint_window: int | None = None,
+    league_checkpoints: Sequence[str | Path] | None = None,
     experiment_id: str = DEFAULT_EXPERIMENT_ID,
     feature_variant: str = "production_v1",
     training_mode: str = "behavior_clone_then_ppo",
@@ -1941,6 +2004,13 @@ def make_fresh_rollout_fn(
         raise ValueError("resolved_margin must be a nonnegative finite number")
     run_path = Path(run_directory)
     run_path.mkdir(parents=True, exist_ok=True)
+    configured_league_probabilities = (
+        dict(league_probabilities) if league_probabilities is not None else None
+    )
+    configured_league_checkpoints = (
+        [str(path) for path in league_checkpoints]
+        if league_checkpoints is not None else None
+    )
 
     def fresh_rollout(
         *, step: int, opponent: str, seat: int, checkpoint: str | None,
@@ -2021,6 +2091,9 @@ def make_fresh_rollout_fn(
                 "starter": int(opponent == "starter"),
                 "checkpoint": int(opponent == "checkpoint"),
             },
+            league_probabilities=configured_league_probabilities,
+            league_checkpoint_window=league_checkpoint_window,
+            league_checkpoints=configured_league_checkpoints,
             source_policy_identity=identity,
             no_progress_window=no_progress_window,
             resolved_margin=resolved_margin,

@@ -147,3 +147,28 @@ def test_native_rollout_manifest_contains_league_round_provenance():
             "current": 0, "mixed": 0, "random": 0, "starter": 0, "checkpoint": 1,
         },
     }
+
+
+def test_native_rollout_manifest_preserves_original_league_configuration():
+    from scripts.collect_trajectories import _manifest
+
+    probabilities = {
+        "current": 2.0,
+        "mixed": 1.0,
+        "random": 0.0,
+        "starter": 3.0,
+        "checkpoint": 4.0,
+    }
+    checkpoints = ["first.pt", "second.pt", "third.pt"]
+
+    manifest = _manifest(
+        seeds=[41], opponents=["pass"], seats=[1], steps=4,
+        source_policy_identity="candidate",
+        league_probabilities=probabilities,
+        league_checkpoint_window=2,
+        league_checkpoints=checkpoints,
+    )
+
+    assert manifest["league"]["probabilities"] == probabilities
+    assert manifest["league"]["checkpoint_window"] == 2
+    assert manifest["league"]["configured_checkpoints"] == checkpoints

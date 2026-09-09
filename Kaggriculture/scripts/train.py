@@ -933,6 +933,10 @@ def train_candidate(
         experiment_id=config.experiment_id,
         feature_variant=config.feature_variant,
         training_mode=config.training_mode,
+        **(
+            opponent_pool.league_configuration
+            if hasattr(opponent_pool, "league_configuration") else {}
+        ),
     )
 
     def record_training_event(event: str, metrics: Mapping[str, Any] | None = None, **values: Any) -> None:
@@ -1213,6 +1217,7 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
         previous_checkpoints=compatible,
         checkpoint_window=config.league_checkpoint_window,
         probabilities=config.league_probabilities,
+        configured_checkpoints=config.league_checkpoints,
     )
     resume_selection = select_resume_checkpoint(
         _checkpoint_candidates(config), training_contract=training_contract,

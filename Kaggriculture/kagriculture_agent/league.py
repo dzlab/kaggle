@@ -108,6 +108,7 @@ class OpponentMatch:
     mixed_opponent: str | None = None
     skill_band: str | None = None
     checkpoint_identity: str | None = None
+    fallback_reason: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.opponent, str) or self.opponent not in _OPPONENTS:
@@ -128,6 +129,10 @@ class OpponentMatch:
             not isinstance(self.checkpoint_identity, str) or not self.checkpoint_identity
         ):
             raise ValueError("checkpoint_identity must be a non-empty string when provided")
+        if self.fallback_reason is not None and (
+            not isinstance(self.fallback_reason, str) or not self.fallback_reason
+        ):
+            raise ValueError("fallback_reason must be a non-empty string when provided")
 
 
 DEFAULT_OPPONENT_PROBABILITIES: dict[OpponentName, float] = {
@@ -199,6 +204,7 @@ class LeagueSampler:
         unknown = set(validated) - _OPPONENTS
         if unknown:
             raise ValueError(f"unsupported opponent probabilities: {sorted(unknown)}")
+        self.configured_probabilities = dict(validated)
         self.probabilities = validated
 
         if isinstance(checkpoint_candidates, (str, bytes)) or not isinstance(
@@ -220,6 +226,9 @@ class LeagueSampler:
                 raise ValueError("skill-band mapping keys must match SkillBand names")
         normalized_bands = tuple(skill_bands.values())
         self.skill_bands = normalized_bands
+        self.configured_checkpoint_candidates = tuple(
+            checkpoint.path for band in normalized_bands for checkpoint in band.checkpoints
+        )
 
         if band_probabilities is None:
             selected_band_weights = {band.name: band.weight for band in normalized_bands}
@@ -264,23 +273,23 @@ class LeagueSampler:
         seat = index % 2
         if selected == "checkpoint":
             if not self.skill_bands:
-                return OpponentMatch("current", seat)
+                return OpponentMatch("current", seat, fallback_reason="checkpoint_unavailable")
             band_weights = {
                 name: weight * self.hard_opponent_weights.get(name, 1.0)
                 for name, weight in self.band_probabilities.items()
             }
             if sum(band_weights.values()) <= 0.0:
-                return OpponentMatch("current", seat)
+                return OpponentMatch("current", seat, fallback_reason="checkpoint_band_unavailable")
             band_name = _choose(_rng(seed, index, "skill-band"), band_weights)
             band = next(band for band in self.skill_bands if band.name == band_name)
             available = band.available_checkpoints
             if not available:
-                return OpponentMatch("current", seat)
+                return OpponentMatch("current", seat, fallback_reason="checkpoint_unavailable")
             checkpoint = available[_rng(seed, index, "checkpoint").randrange(len(available))]
             try:
                 identity = checkpoint.identity
             except OSError:
-                return OpponentMatch("current", seat)
+                return OpponentMatch("current", seat, fallback_reason="checkpoint_identity_unavailable")
             return OpponentMatch(
                 "checkpoint", seat, checkpoint=checkpoint.path, skill_band=band.name,
                 checkpoint_identity=identity,
@@ -322,20 +331,26 @@ class LeagueSampler:
             seat = index % 2
             if opponent == "checkpoint":
                 if not self.skill_bands:
-                    matches.append(OpponentMatch("current", seat))
+                    matches.append(OpponentMatch(
+                        "current", seat, fallback_reason="checkpoint_unavailable",
+                    ))
                     continue
                 band_weights = {
                     name: weight * self.hard_opponent_weights.get(name, 1.0)
                     for name, weight in self.band_probabilities.items()
                 }
                 if sum(band_weights.values()) <= 0.0:
-                    matches.append(OpponentMatch("current", seat))
+                    matches.append(OpponentMatch(
+                        "current", seat, fallback_reason="checkpoint_band_unavailable",
+                    ))
                     continue
                 band_name = _choose(_rng(seed, index, "skill-band"), band_weights)
                 band = next(band for band in self.skill_bands if band.name == band_name)
                 available = band.available_checkpoints
                 if not available:
-                    matches.append(OpponentMatch("current", seat))
+                    matches.append(OpponentMatch(
+                        "current", seat, fallback_reason="checkpoint_unavailable",
+                    ))
                     continue
                 if len(self.skill_bands) == 1 and band.name == "default":
                     checkpoint = available[checkpoint_slot % len(available)]
@@ -347,7 +362,9 @@ class LeagueSampler:
                 try:
                     identity = checkpoint.identity
                 except OSError:
-                    matches.append(OpponentMatch("current", seat))
+                    matches.append(OpponentMatch(
+                        "current", seat, fallback_reason="checkpoint_identity_unavailable",
+                    ))
                     continue
                 matches.append(OpponentMatch(
                     "checkpoint", seat, checkpoint=checkpoint.path,

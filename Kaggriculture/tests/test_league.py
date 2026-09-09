@@ -81,7 +81,9 @@ def test_empty_selected_band_falls_back_to_current(tmp_path):
 
     match = sampler.sample(0, seed=4)
 
-    assert match == OpponentMatch(opponent="current", seat=0)
+    assert match == OpponentMatch(
+        opponent="current", seat=0, fallback_reason="checkpoint_unavailable",
+    )
 
 
 def test_missing_checkpoint_path_is_not_selected(tmp_path):
@@ -92,6 +94,19 @@ def test_missing_checkpoint_path_is_not_selected(tmp_path):
     )
 
     assert sampler.sample(0, seed=1).opponent == "current"
+
+
+def test_missing_checkpoint_fallback_reports_its_reason(tmp_path):
+    missing = HistoricalCheckpoint(path=tmp_path / "gone.pt", skill_band="hard")
+    sampler = LeagueSampler(
+        probabilities={"checkpoint": 1.0},
+        skill_bands={"hard": SkillBand("hard", (missing,))},
+    )
+
+    match = sampler.sample(0, seed=1)
+
+    assert match.opponent == "current"
+    assert match.fallback_reason == "checkpoint_unavailable"
 
 
 def test_checkpoint_matches_carry_content_identity(tmp_path):

@@ -1384,6 +1384,20 @@ def test_opponent_pool_mixed_matches_resolve_to_a_real_non_current_variant():
     assert sampled == [pool.sample(index) for index in range(100)]
 
 
+def test_opponent_pool_reports_missing_checkpoint_fallback(tmp_path):
+    from scripts.train_policy import OpponentPool
+
+    pool = OpponentPool(
+        previous_checkpoints=[tmp_path / "missing.pt"],
+        probabilities={"checkpoint": 1.0},
+    )
+
+    match = pool.sample(0, seed=1)
+
+    assert match.opponent == "current"
+    assert match.fallback_reason == "checkpoint_unavailable"
+
+
 def test_ppo_rollout_callback_receives_mixed_opponent_resolution_and_network():
     from scripts.train_policy import OpponentMatch, PPOConfig, run_ppo_training
 
@@ -1704,6 +1718,44 @@ def test_fresh_rollout_passes_training_identity_to_native_collector(tmp_path, mo
     assert collected[0]["experiment_id"] == "orbit-context-test"
     assert collected[0]["feature_variant"] == "experimental_context_v1"
     assert collected[0]["training_mode"] == "reduced_behavior_clone_then_ppo"
+
+
+def test_fresh_rollout_threads_original_league_configuration_to_collector(tmp_path, monkeypatch):
+    from scripts import train_policy
+
+    collected = []
+
+    def fake_collect(*, output, candidate_artifact, **kwargs):
+        collected.append(kwargs)
+        Path(output).write_text(json.dumps({"step": 1}) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr("scripts.collect_trajectories.collect", fake_collect)
+    artifact = tmp_path / "candidate.json"
+    artifact.write_text("artifact", encoding="utf-8")
+    probabilities = {
+        "current": 2.0,
+        "mixed": 1.0,
+        "random": 0.0,
+        "starter": 3.0,
+        "checkpoint": 4.0,
+    }
+    checkpoints = [tmp_path / "first.pt", tmp_path / "second.pt", tmp_path / "third.pt"]
+    rollout_fn = train_policy.make_fresh_rollout_fn(
+        run_directory=tmp_path, candidate_artifact=artifact,
+        seeds=[41], steps=4,
+        league_probabilities=probabilities,
+        league_checkpoint_window=2,
+        league_checkpoints=checkpoints,
+    )
+
+    rollout_fn(
+        step=0, seed=41, opponent="pass", seat=0, checkpoint=None,
+        rollout_steps=3,
+    )
+
+    assert collected[0]["league_probabilities"] == probabilities
+    assert collected[0]["league_checkpoint_window"] == 2
+    assert collected[0]["league_checkpoints"] == [str(path) for path in checkpoints]
 
 
 def test_behavior_cloning_emits_loss_and_update_count_at_checkpoint_intervals(tmp_path):
@@ -2063,6 +2115,56 @@ def test_resume_continues_from_saved_ppo_round(tmp_path, monkeypatch):
     assert payload["progress"] == {"epoch": 1, "round": 3, "cursor": 0}
 
 
+def test_resume_accepts_ppo_league_provenance_metrics(tmp_path):
+    torch = pytest.importorskip("torch")
+    from kagriculture_agent.checkpoints import save_checkpoint
+    from kagriculture_agent.model import CompactPolicyNet
+    from scripts import train_policy
+
+    input_path = tmp_path / "transitions.jsonl"
+    resume_path = tmp_path / "resume.pt"
+    output_path = tmp_path / "continued.pt"
+    input_path.write_text(json.dumps(_transition(done=True)) + "\n", encoding="utf-8")
+    model = CompactPolicyNet().to("cpu")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    ppo_metrics = _ppo_checkpoint_metrics()
+    ppo_metrics.update({
+        "league_composition": {
+            "current": 1, "mixed": 0, "random": 0, "starter": 0, "checkpoint": 0,
+        },
+        "league_checkpoint_identities": [],
+    })
+    save_checkpoint(
+        resume_path,
+        model=model,
+        optimizer=optimizer,
+        configuration=_resume_configuration(input_path, ppo_steps=1),
+        epoch=1,
+        round_index=1,
+        cursor=0,
+        metrics={
+            "behavior_clone_updates": 1,
+            "ppo_updates": 4,
+            "ppo_metrics": ppo_metrics,
+        },
+        metadata=train_policy.checkpoint_metadata(transition_count=1, device="cpu"),
+    )
+
+    metadata = train_policy.train_behavior_clone(
+        input_path=input_path,
+        output_path=output_path,
+        steps=1,
+        batch_size=1,
+        seed=7,
+        ppo_steps=1,
+        device="cpu",
+        resume_checkpoint=resume_path,
+    )
+
+    assert metadata["ppo_metrics"]["league_composition"]["current"] == 1
+    assert metadata["ppo_metrics"]["league_checkpoint_identities"] == []
+
+
 def test_resume_ppo_extension_updates_target_and_skips_behavior_cloning(
     tmp_path, monkeypatch,
 ):
@@ -2314,8 +2416,15 @@ def test_resume_with_all_ppo_steps_completed_is_idempotent(tmp_path, monkeypatch
     payload = torch.load(output_path, map_location="cpu", weights_only=True)
     assert ppo_calls == []
     assert metadata["ppo_updates"] == 5
-    assert metadata["ppo_metrics"] == ppo_metrics
-    assert payload["metrics"]["ppo_metrics"] == ppo_metrics
+    expected_metrics = {
+        **ppo_metrics,
+        "league_composition": {
+            "current": 0, "mixed": 0, "random": 0, "starter": 0, "checkpoint": 0,
+        },
+        "league_checkpoint_identities": [],
+    }
+    assert metadata["ppo_metrics"] == expected_metrics
+    assert payload["metrics"]["ppo_metrics"] == expected_metrics
     assert payload["progress"] == {"epoch": 1, "round": 2, "cursor": 0}
 
 
