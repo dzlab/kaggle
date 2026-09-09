@@ -172,3 +172,16 @@ def test_native_rollout_manifest_preserves_original_league_configuration():
     assert manifest["league"]["probabilities"] == probabilities
     assert manifest["league"]["checkpoint_window"] == 2
     assert manifest["league"]["configured_checkpoints"] == checkpoints
+
+
+def test_native_rollout_manifest_records_checkpoint_fallback_reason():
+    from scripts.collect_trajectories import _manifest
+
+    manifest = _manifest(
+        seeds=[41], opponents=["current"], seats=[0], steps=4,
+        source_policy_identity="candidate",
+        opponent_identity="current",
+        fallback_reason="checkpoint_unavailable",
+    )
+
+    assert manifest["league"]["fallback_reason"] == "checkpoint_unavailable"

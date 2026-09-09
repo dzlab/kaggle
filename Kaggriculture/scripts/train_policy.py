@@ -1366,6 +1366,8 @@ def run_ppo_training(
     initial_rollout_count: int = 0,
     initial_shaping_count: int = 0,
     initial_truncation_count: int = 0,
+    initial_league_composition: Mapping[str, int] | None = None,
+    initial_league_checkpoint_identities: Sequence[str] | None = None,
     progress_fn: Any | None = None,
     telemetry_callback: Any | None = None,
 ) -> dict[str, Any]:
@@ -1382,6 +1384,37 @@ def run_ppo_training(
         raise ValueError("initial_shaping_count must be a nonnegative integer")
     if type(initial_truncation_count) is not int or initial_truncation_count < 0:
         raise ValueError("initial_truncation_count must be a nonnegative integer")
+    if initial_league_composition is None:
+        league_composition = dict(_PPO_LEAGUE_COMPOSITION_DEFAULT)
+    else:
+        if not isinstance(initial_league_composition, Mapping):
+            raise ValueError("initial_league_composition must be a mapping")
+        if any(
+            type(name) is not str or not name
+            or type(count) is not int or count < 0
+            for name, count in initial_league_composition.items()
+        ):
+            raise ValueError(
+                "initial_league_composition must map names to nonnegative integers"
+            )
+        league_composition = dict(_PPO_LEAGUE_COMPOSITION_DEFAULT)
+        league_composition.update(initial_league_composition)
+    if initial_league_checkpoint_identities is None:
+        league_checkpoint_identities = []
+    else:
+        if (
+            isinstance(initial_league_checkpoint_identities, (str, bytes))
+            or not isinstance(initial_league_checkpoint_identities, Sequence)
+            or any(
+                type(identity) is not str or not identity
+                for identity in initial_league_checkpoint_identities
+            )
+        ):
+            raise ValueError(
+                "initial_league_checkpoint_identities must be a sequence of "
+                "nonempty strings"
+            )
+        league_checkpoint_identities = list(initial_league_checkpoint_identities)
     if steps == 0:
         return {
             "ppo_updates": initial_ppo_updates,
@@ -1392,16 +1425,14 @@ def run_ppo_training(
             "completed_steps": 0,
             "shaping_count": initial_shaping_count,
             "truncation_count": initial_truncation_count,
+            "league_composition": dict(league_composition),
+            "league_checkpoint_identities": list(league_checkpoint_identities),
         }
     updater = update_fn or ppo_update
     if rollout_fn is None and not offline_ppo_fallback:
         raise ValueError("rollout_fn is required for PPO unless offline_ppo_fallback is explicitly selected")
     pool = opponent_pool if opponent_pool is not None else OpponentPool()
     schedule = pool.schedule(count=steps, seed=seed) if rollout_fn is not None else []
-    league_composition = {
-        opponent: 0 for opponent in ("current", "mixed", "random", "starter", "checkpoint")
-    }
-    league_checkpoint_identities: list[str] = []
     total_updates = initial_ppo_updates
     rollout_count = initial_rollout_count
     shaping_count = initial_shaping_count
@@ -1447,6 +1478,8 @@ def run_ppo_training(
                 rollout_kwargs["opponent_identity"] = match.opponent
             if _accepts_keyword_argument(rollout_fn, "checkpoint_identity"):
                 rollout_kwargs["checkpoint_identity"] = checkpoint_identity
+            if _accepts_keyword_argument(rollout_fn, "fallback_reason"):
+                rollout_kwargs["fallback_reason"] = getattr(match, "fallback_reason", None)
             if _accepts_keyword_argument(rollout_fn, "mixed_opponent"):
                 rollout_kwargs["mixed_opponent"] = getattr(match, "mixed_opponent", None)
             if _accepts_keyword_argument(rollout_fn, "network"):
@@ -1508,6 +1541,7 @@ def run_ppo_training(
                     "league/seat": match.seat,
                     "league/seed": int(seed) + step,
                     "league/checkpoint_identity": checkpoint_identity,
+                    "league/fallback_reason": getattr(match, "fallback_reason", None),
                     **{
                         f"league/{name}": count
                         for name, count in league_composition.items()
@@ -2017,6 +2051,7 @@ def make_fresh_rollout_fn(
         rollout_steps: int, candidate_artifact: str | Path | None = None,
         opponent_identity: str | None = None,
         checkpoint_identity: str | None = None,
+        fallback_reason: str | None = None,
         mixed_opponent: str | None = None,
         seed: int | None = None, round_index: int | None = None,
         network: Any = None,
@@ -2081,6 +2116,7 @@ def make_fresh_rollout_fn(
             opponent_artifact=opponent_artifact,
             opponent_checkpoint_identity=checkpoint_provenance,
             checkpoint_identity=checkpoint_provenance,
+            fallback_reason=fallback_reason,
             opponent_identity=opponent_identity or opponent,
             league_round=selected_step,
             league_seed=selected_seed,
@@ -2168,6 +2204,8 @@ def train_behavior_clone(
     initial_rollout_count = 0
     initial_shaping_count = 0
     initial_truncation_count = 0
+    initial_league_composition = dict(_PPO_LEAGUE_COMPOSITION_DEFAULT)
+    initial_league_checkpoint_identities: list[str] = []
     previous_ppo_metrics: dict[str, Any] | None = None
     resumed = None
     if resume_checkpoint is not None:
@@ -2185,6 +2223,14 @@ def train_behavior_clone(
             initial_rollout_count = previous_ppo_metrics.get("rollout_count", 0)
             initial_shaping_count = previous_ppo_metrics.get("shaping_count", 0)
             initial_truncation_count = previous_ppo_metrics.get("truncation_count", 0)
+            initial_league_composition = dict(
+                previous_ppo_metrics.get(
+                    "league_composition", _PPO_LEAGUE_COMPOSITION_DEFAULT,
+                )
+            )
+            initial_league_checkpoint_identities = list(
+                previous_ppo_metrics.get("league_checkpoint_identities", [])
+            )
     rng_before_resume = capture_rng_state() if resumed is not None else None
     try:
         set_training_seed(seed)
@@ -2424,6 +2470,8 @@ def train_behavior_clone(
             initial_rollout_count=initial_rollout_count,
             initial_shaping_count=initial_shaping_count,
             initial_truncation_count=initial_truncation_count,
+            initial_league_composition=initial_league_composition,
+            initial_league_checkpoint_identities=initial_league_checkpoint_identities,
             progress_fn=save_ppo_progress,
             telemetry_callback=telemetry_callback,
         )

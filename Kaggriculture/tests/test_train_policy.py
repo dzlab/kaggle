@@ -852,6 +852,38 @@ def test_ppo_training_emits_progress_metrics_to_optional_telemetry_callback():
     ]
 
 
+def test_ppo_fallback_reason_reaches_rollout_callback_and_telemetry():
+    from scripts.train_policy import OpponentMatch, PPOConfig, run_ppo_training
+
+    seen = []
+    events = []
+
+    class Pool:
+        def schedule(self, *, count, seed):
+            return [OpponentMatch(
+                "current", 0, fallback_reason="checkpoint_unavailable",
+            )]
+
+    def rollout_fn(**kwargs):
+        seen.append(kwargs)
+        return [_transition(done=True)]
+
+    run_ppo_training(
+        network=None,
+        optimizer=None,
+        transitions=[],
+        ppo_steps=1,
+        config=PPOConfig(),
+        opponent_pool=Pool(),
+        rollout_fn=rollout_fn,
+        update_fn=lambda **_kwargs: {"updates": 1, "early_stopped": False},
+        telemetry_callback=lambda event, values: events.append((event, values)),
+    )
+
+    assert seen[0]["fallback_reason"] == "checkpoint_unavailable"
+    assert events[0][1]["league/fallback_reason"] == "checkpoint_unavailable"
+
+
 def test_ppo_callback_forwards_training_health_metrics_from_injected_update():
     from scripts.train_policy import PPOConfig, run_ppo_training
 
@@ -1464,6 +1496,7 @@ def test_ppo_rollout_callback_receives_league_provenance_and_round_seed(tmp_path
         "round_index": 0,
         "opponent_identity": "checkpoint",
         "checkpoint_identity": "checkpoint:historical",
+        "fallback_reason": None,
         "mixed_opponent": None,
         "network": seen[0]["network"],
         "experiment_id": "orbit-task2",
@@ -1756,6 +1789,30 @@ def test_fresh_rollout_threads_original_league_configuration_to_collector(tmp_pa
     assert collected[0]["league_probabilities"] == probabilities
     assert collected[0]["league_checkpoint_window"] == 2
     assert collected[0]["league_checkpoints"] == [str(path) for path in checkpoints]
+
+
+def test_fresh_rollout_threads_fallback_reason_to_collector(tmp_path, monkeypatch):
+    from scripts import train_policy
+
+    collected = []
+
+    def fake_collect(*, output, candidate_artifact, **kwargs):
+        collected.append(kwargs)
+        Path(output).write_text(json.dumps({"step": 1}) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr("scripts.collect_trajectories.collect", fake_collect)
+    artifact = tmp_path / "candidate.json"
+    artifact.write_text("artifact", encoding="utf-8")
+    rollout_fn = train_policy.make_fresh_rollout_fn(
+        run_directory=tmp_path, candidate_artifact=artifact, seeds=[41], steps=4,
+    )
+
+    rollout_fn(
+        step=0, seed=41, opponent="current", seat=0, checkpoint=None,
+        fallback_reason="checkpoint_unavailable", rollout_steps=3,
+    )
+
+    assert collected[0]["fallback_reason"] == "checkpoint_unavailable"
 
 
 def test_behavior_cloning_emits_loss_and_update_count_at_checkpoint_intervals(tmp_path):
@@ -2163,6 +2220,77 @@ def test_resume_accepts_ppo_league_provenance_metrics(tmp_path):
 
     assert metadata["ppo_metrics"]["league_composition"]["current"] == 1
     assert metadata["ppo_metrics"]["league_checkpoint_identities"] == []
+
+
+def test_resume_accumulates_prior_ppo_league_provenance(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    from kagriculture_agent.checkpoints import save_checkpoint
+    from kagriculture_agent.model import CompactPolicyNet
+    from scripts import train_policy
+
+    monkeypatch.setattr(
+        train_policy, "ppo_update",
+        lambda **_kwargs: {"updates": 1, "early_stopped": False},
+    )
+
+    input_path = tmp_path / "transitions.jsonl"
+    resume_path = tmp_path / "resume.pt"
+    output_path = tmp_path / "continued.pt"
+    input_path.write_text(json.dumps(_transition(done=True)) + "\n", encoding="utf-8")
+    model = CompactPolicyNet().to("cpu")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    ppo_metrics = _ppo_checkpoint_metrics()
+    ppo_metrics.update({
+        "league_composition": {
+            "current": 3, "mixed": 0, "random": 2, "starter": 0, "checkpoint": 0,
+        },
+        "league_checkpoint_identities": ["checkpoint:old"],
+    })
+    save_checkpoint(
+        resume_path,
+        model=model,
+        optimizer=optimizer,
+        configuration=_resume_configuration(input_path, ppo_steps=3),
+        epoch=1,
+        round_index=1,
+        cursor=0,
+        metrics={
+            "behavior_clone_updates": 1,
+            "ppo_updates": 4,
+            "ppo_metrics": ppo_metrics,
+        },
+        metadata=train_policy.checkpoint_metadata(transition_count=1, device="cpu"),
+    )
+
+    class Pool:
+        def schedule(self, *, count, seed):
+            return [
+                train_policy.OpponentMatch("current", 0),
+                train_policy.OpponentMatch(
+                    "checkpoint", 1, "ckpt-new", None, None, "checkpoint:new",
+                ),
+                train_policy.OpponentMatch("current", 0),
+            ]
+
+    metadata = train_policy.train_behavior_clone(
+        input_path=input_path,
+        output_path=output_path,
+        steps=1,
+        batch_size=1,
+        seed=7,
+        ppo_steps=3,
+        device="cpu",
+        resume_checkpoint=resume_path,
+        opponent_pool=Pool(),
+        rollout_fn=lambda **_kwargs: [_transition(done=True)],
+    )
+
+    assert metadata["ppo_metrics"]["league_composition"] == {
+        "current": 4, "mixed": 0, "random": 2, "starter": 0, "checkpoint": 1,
+    }
+    assert metadata["ppo_metrics"]["league_checkpoint_identities"] == [
+        "checkpoint:old", "checkpoint:new",
+    ]
 
 
 def test_resume_ppo_extension_updates_target_and_skips_behavior_cloning(

@@ -174,6 +174,7 @@ def _manifest(
     league_seed: int | None = None,
     opponent_identity: str | None = None,
     checkpoint_identity: str | None = None,
+    fallback_reason: str | None = None,
     league_composition: Mapping[str, int] | None = None,
     league_probabilities: Mapping[str, object] | None = None,
     league_checkpoint_window: int | None = None,
@@ -197,6 +198,7 @@ def _manifest(
     if (
         league_round is not None or league_seed is not None or opponent_identity is not None
         or checkpoint_identity is not None or league_composition is not None
+        or fallback_reason is not None
         or league_probabilities is not None or league_checkpoint_window is not None
         or league_checkpoints is not None
     ):
@@ -207,6 +209,7 @@ def _manifest(
         for name, value in (
             ("opponent_identity", opponent_identity),
             ("checkpoint_identity", checkpoint_identity),
+            ("fallback_reason", fallback_reason),
         ):
             if value is not None and (type(value) is not str or not value):
                 raise ValueError(f"{name} must be a non-empty string when provided")
@@ -228,6 +231,8 @@ def _manifest(
             "checkpoint_identity": checkpoint_identity,
             "composition": composition,
         }
+        if fallback_reason is not None:
+            league["fallback_reason"] = fallback_reason
         if league_probabilities is not None:
             if not isinstance(league_probabilities, Mapping) or not league_probabilities:
                 raise ValueError("league_probabilities must be a non-empty mapping")
@@ -426,6 +431,7 @@ def collect(
     league_seed: int | None = None,
     opponent_identity: str | None = None,
     checkpoint_identity: str | None = None,
+    fallback_reason: str | None = None,
     league_composition: Mapping[str, int] | None = None,
     league_probabilities: Mapping[str, object] | None = None,
     league_checkpoint_window: int | None = None,
@@ -484,6 +490,7 @@ def collect(
         league_seed=league_seed,
         opponent_identity=opponent_identity,
         checkpoint_identity=checkpoint_identity or opponent_checkpoint_identity,
+        fallback_reason=fallback_reason,
         league_composition=league_composition,
         league_probabilities=league_probabilities,
         league_checkpoint_window=league_checkpoint_window,
