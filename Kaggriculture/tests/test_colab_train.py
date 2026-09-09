@@ -631,6 +631,138 @@ def test_validation_telemetry_exposes_safety_regression_diagnostics():
     assert candidate["safety_regression"] is True
 
 
+def test_validation_safety_regression_compares_stall_counts_rates_and_streaks():
+    from scripts.telemetry import validation_safety_regression
+
+    baseline_records = [
+        {
+            "termination_reason": "resolved" if index == 0 else "terminal",
+            "bootstrap_truncated": index == 0,
+            "no_progress_steps": 2 if index == 0 else 0,
+            "time_limit_ending": False,
+            "safety_regression": False,
+        }
+        for index in range(10)
+    ]
+    candidate_records = [{
+        "termination_reason": "no_progress",
+        "bootstrap_truncated": True,
+        "no_progress_steps": 9,
+        "time_limit_ending": False,
+        "safety_regression": False,
+    }]
+
+    report = {
+        "records": {"current": baseline_records, "candidate": candidate_records},
+    }
+
+    assert validation_safety_regression(report, candidate="candidate") is True
+
+
+def test_colab_controller_blocks_holdout_on_stall_safety_regression(tmp_path, monkeypatch):
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+    invoked = []
+
+    def report_with_regression(phase):
+        report = _complete_colab_evaluation_report(config, phase=phase)
+        report["records"]["current"][0].update({
+            "termination_reason": "resolved",
+            "bootstrap_truncated": False,
+            "no_progress_steps": 1,
+            "time_limit_ending": False,
+            "safety_regression": False,
+        })
+        report["records"][config.candidate_tag][0].update({
+            "termination_reason": "no_progress",
+            "bootstrap_truncated": True,
+            "no_progress_steps": 8,
+            "time_limit_ending": False,
+            "safety_regression": False,
+        })
+        report["decision"] = {"status": "promote"}
+        return report
+
+    def fake_run(command, *, check, capture_output=False):
+        script = Path(command[1]).name
+        invoked.append(script)
+        if script == colab_train.COLLECT_SCRIPT.name:
+            config.trajectory_path.write_text("{}\n", encoding="utf-8")
+        elif script == colab_train.EVALUATE_SCRIPT.name:
+            phase = "holdout" if "holdout" in command[-1] else "development"
+            report_path = config.holdout_report_path if phase == "holdout" else config.development_report_path
+            report_path.write_text(json.dumps(report_with_regression(phase)), encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_train(config, **kwargs):
+        config.stage_checkpoint_path.write_bytes(b"checkpoint")
+        config.stage_artifact_path.write_text("artifact", encoding="utf-8")
+        return {}
+
+    monkeypatch.setattr(colab_train, "run_command", fake_run)
+    monkeypatch.setattr(colab_train, "train_candidate", fake_train)
+    monkeypatch.setattr(colab_train, "initialize_telemetry", lambda config: None)
+    monkeypatch.setattr(colab_train, "smoke_test_artifact", lambda config: None)
+
+    result = colab_train.run_workflow(config)
+
+    assert result.development_evaluation_promoted is False
+    assert result.holdout_evaluation_complete is None
+    assert invoked.count(colab_train.EVALUATE_SCRIPT.name) == 1
+
+
+def test_colab_controller_rejects_holdout_stall_safety_regression(tmp_path, monkeypatch):
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+
+    def report_for(phase):
+        report = _complete_colab_evaluation_report(config, phase=phase)
+        if phase == "holdout":
+            report["records"][config.candidate_tag][0].update({
+                "termination_reason": "resolved",
+                "bootstrap_truncated": True,
+                "no_progress_steps": 12,
+                "time_limit_ending": False,
+                "safety_regression": False,
+            })
+        return report
+
+    def fake_run(command, *, check, capture_output=False):
+        script = Path(command[1]).name
+        if script == colab_train.COLLECT_SCRIPT.name:
+            config.trajectory_path.write_text("{}\n", encoding="utf-8")
+        elif script == colab_train.EVALUATE_SCRIPT.name:
+            phase = "holdout" if "holdout" in command[-1] else "development"
+            report_path = config.holdout_report_path if phase == "holdout" else config.development_report_path
+            report_path.write_text(json.dumps(report_for(phase)), encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_train(config, **kwargs):
+        config.stage_checkpoint_path.write_bytes(b"checkpoint")
+        config.stage_artifact_path.write_text("artifact", encoding="utf-8")
+        return {}
+
+    monkeypatch.setattr(colab_train, "run_command", fake_run)
+    monkeypatch.setattr(colab_train, "train_candidate", fake_train)
+    monkeypatch.setattr(colab_train, "initialize_telemetry", lambda config: None)
+    monkeypatch.setattr(colab_train, "smoke_test_artifact", lambda config: None)
+
+    result = colab_train.run_workflow(config)
+
+    assert result.development_evaluation_promoted is True
+    assert result.holdout_evaluation_complete is False
+
+
 def test_colab_relative_paths_are_stable_when_cwd_changes(tmp_path, monkeypatch):
     from scripts import colab_train
 

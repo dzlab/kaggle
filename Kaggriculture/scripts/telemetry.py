@@ -296,6 +296,7 @@ def _diagnostic_summary(records: list[Mapping[str, Any]]) -> dict[str, Any]:
     shaping_count = 0
     time_limit_endings = 0
     safety_regression_count = 0
+    record_count = len(records)
     for record in records:
         reason = record.get("termination_reason")
         if reason is not None and str(reason):
@@ -309,7 +310,7 @@ def _diagnostic_summary(records: list[Mapping[str, Any]]) -> dict[str, Any]:
         no_progress_steps = _finite_number(record.get("no_progress_steps"))
         if no_progress_steps is not None:
             max_no_progress_steps = max(max_no_progress_steps, max(0, int(no_progress_steps)))
-        normalized_reason = str(reason or "").strip().lower()
+        normalized_reason = str(reason or "").strip().lower().replace("-", "_")
         if record.get("time_limit_ending") is True or normalized_reason in {
             "time_limit", "timeout", "time_limit_ending",
         }:
@@ -320,15 +321,32 @@ def _diagnostic_summary(records: list[Mapping[str, Any]]) -> dict[str, Any]:
         )
         if record.get("safety_regression") is True or has_safety_flag:
             safety_regression_count += 1
+    resolved_count = sum(
+        count for reason, count in termination_reasons.items()
+        if reason.strip().lower().replace("-", "_") == "resolved"
+    )
+    no_progress_count = sum(
+        count for reason, count in termination_reasons.items()
+        if reason.strip().lower().replace("-", "_") == "no_progress"
+    )
+    denominator = float(record_count) if record_count else 1.0
     return {
+        "record_count": record_count,
         "termination_reasons": termination_reasons,
         "bootstrap_truncated_count": bootstrap_truncated_count,
         "truncation_count": bootstrap_truncated_count,
+        "truncation_rate": bootstrap_truncated_count / denominator,
         "shaping_count": shaping_count,
+        "resolved_count": resolved_count,
+        "resolved_rate": resolved_count / denominator,
+        "no_progress_count": no_progress_count,
+        "no_progress_rate": no_progress_count / denominator,
         "max_no_progress_steps": max_no_progress_steps,
         "max_no_progress_streak": max_no_progress_steps,
         "time_limit_endings": time_limit_endings,
+        "time_limit_rate": time_limit_endings / denominator,
         "safety_regression_count": safety_regression_count,
+        "safety_regression_rate": safety_regression_count / denominator,
     }
 
 
@@ -341,9 +359,15 @@ def validation_safety_regression(
     grouped = _candidate_records(report)
     candidate_summary = _diagnostic_summary(grouped.get(str(candidate), []))
     baseline_summary = _diagnostic_summary(grouped.get("current", []))
-    return (
-        candidate_summary["safety_regression_count"] > baseline_summary["safety_regression_count"]
-        or candidate_summary["time_limit_endings"] > baseline_summary["time_limit_endings"]
+    compared_metrics = (
+        "truncation_count", "truncation_rate", "resolved_count", "resolved_rate",
+        "no_progress_count", "no_progress_rate", "max_no_progress_streak",
+        "time_limit_endings", "time_limit_rate", "safety_regression_count",
+        "safety_regression_rate",
+    )
+    return any(
+        candidate_summary[metric] > baseline_summary[metric]
+        for metric in compared_metrics
     )
 
 

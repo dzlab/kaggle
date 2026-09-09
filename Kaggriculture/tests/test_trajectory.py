@@ -400,6 +400,17 @@ def test_collection_resolution_ignores_malformed_bank_differential(tmp_path):
     assert resolved[0].termination_reason is None
 
 
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_collection_rejects_nonfinite_resolved_margin(value):
+    from scripts.collect_trajectories import _parser, _resolve_collection_transitions
+
+    with pytest.raises(ValueError, match="resolved_margin must be a nonnegative finite number"):
+        _resolve_collection_transitions([], resolved_margin=value)
+
+    with pytest.raises(SystemExit):
+        _parser().parse_args(["--output", "trajectories.jsonl", "--resolved-margin", str(value)])
+
+
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
 def test_transition_is_frozen_and_normalizes_safety_flags_to_json_list(tmp_path):
     from kagriculture_agent.trajectory import transitions_from_replay

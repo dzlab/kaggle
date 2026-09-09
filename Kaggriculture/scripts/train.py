@@ -1437,7 +1437,7 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
                     **_identity_fields(config),
                 )
             holdout_decision = holdout_report.get("decision", {})
-            holdout_complete = (
+            holdout_report_complete = (
                 evaluation_report_is_complete(
                     holdout_report, identity=config.candidate_tag,
                     seed_values=config.holdout_seeds,
@@ -1447,8 +1447,15 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
                 )
                 and holdout_decision.get("status") in {"promote", "discard"}
             )
+            holdout_safety_regression = validation_safety_regression(
+                holdout_report, candidate=config.candidate_tag,
+            )
+            holdout_complete = holdout_report_complete and not holdout_safety_regression
             if not holdout_complete:
-                raise RuntimeError("Holdout report is incomplete or has no valid decision status")
+                if holdout_safety_regression:
+                    print("Holdout candidate rejected: stall safety regression detected.")
+                else:
+                    raise RuntimeError("Holdout report is incomplete or has no valid decision status")
             print("Holdout evaluator exit:", holdout_process.returncode)
             print("Holdout status:", holdout_decision.get("status"))
         else:
