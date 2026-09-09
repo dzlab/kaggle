@@ -24,9 +24,12 @@ from kagriculture_agent.features import (
     FEATURE_SCHEMA_VERSION,
     PRODUCTION_FEATURE_VARIANT,
 )
-from kagriculture_agent.learned_policy import artifact_tensor_shapes
+from kagriculture_agent.learned_policy import (
+    artifact_tensor_shapes,
+    task_intent_loss_mask_metadata,
+    validate_action_vocabulary,
+)
 from kagriculture_agent.model import (
-    ACTION_VOCAB,
     DEFAULT_MODEL_DEPTH,
     HIDDEN_WIDTH,
     MODEL_VERSION,
@@ -127,13 +130,6 @@ def _strict_equal(actual: Any, expected: Any) -> bool:
     return actual == expected
 
 
-def validate_action_vocab(action_vocab: Any) -> dict[str, list[Any]]:
-    expected_vocab = {key: list(value) for key, value in ACTION_VOCAB.items()}
-    if not _strict_equal(action_vocab, expected_vocab):
-        raise ValueError("checkpoint action_vocab mismatch")
-    return expected_vocab
-
-
 def _checkpoint_model_shape(metadata: dict[str, Any]) -> tuple[int, int]:
     width = metadata.get("model_width", metadata.get("hidden_width", HIDDEN_WIDTH))
     depth = metadata.get("model_depth", metadata.get("depth", DEFAULT_MODEL_DEPTH))
@@ -170,7 +166,11 @@ def validate_checkpoint_metadata(metadata: Any) -> dict[str, list[Any]]:
                 nested_identity["action_representation"], source="checkpoint ppo_config",
             )
     _checkpoint_model_shape(metadata)
-    return validate_action_vocab(metadata.get("action_vocab"))
+    return validate_action_vocabulary(
+        metadata.get("action_vocab"),
+        model_version=metadata.get("model_version"),
+        source="checkpoint",
+    )
 
 
 def validate_checkpoint_state_dict(
@@ -213,7 +213,9 @@ def build_artifact(
         feature_variant=feature_variant,
         action_representation=action_representation,
     )
-    validated_vocab = validate_action_vocab(action_vocab)
+    validated_vocab = validate_action_vocabulary(
+        action_vocab, model_version=MODEL_VERSION, source="artifact export",
+    )
     shapes = artifact_tensor_shapes(
         model_width, model_depth, feature_variant, action_representation,
     )
@@ -226,6 +228,7 @@ def build_artifact(
         "model_depth": model_depth,
         "quantization": QUANTIZATION,
         "action_vocab": validated_vocab,
+        "task_intent_loss_mask": task_intent_loss_mask_metadata(),
         "weights": {name: _tensor_to_artifact(name, state[name], shapes[name]) for name in shapes},
     }
     if feature_variant != PRODUCTION_FEATURE_VARIANT:

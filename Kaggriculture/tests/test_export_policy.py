@@ -143,6 +143,13 @@ def test_train_export_load_compile_action_round_trip(tmp_path):
     action = compile_proposal(state, proposal, PolicyMemory())
 
     assert artifact["action_vocab"] == checkpoint_metadata(1)["action_vocab"]
+    assert artifact["task_intent_loss_mask"] == {
+        "excluded_worker_kinds": ["PASS", "MOVE"],
+        "objectives": ["worker_target", "worker_kind"],
+    }
+    assert json.loads(artifact_path.read_text())["task_intent_loss_mask"] == artifact[
+        "task_intent_loss_mask"
+    ]
     assert proposal.workers
     assert {worker.kind for worker in proposal.workers} <= COMPILER_VALID_WORKER_KINDS
     assert action["farmer"] == ["WATER"]
@@ -302,6 +309,30 @@ def test_build_artifact_validates_action_vocab_independently():
         state[name] = _FakeTensor(values, shape)
     with pytest.raises(ValueError, match="action_vocab"):
         build_artifact(state, {})
+
+
+def test_export_artifact_metadata_uses_shared_action_vocabulary_validator(monkeypatch):
+    from kagriculture_agent.model import ACTION_VOCAB
+    from scripts import export_policy
+
+    calls = []
+
+    def validate(value, *, model_version, source):
+        calls.append((value, model_version, source))
+        return {key: list(items) for key, items in ACTION_VOCAB.items()}
+
+    monkeypatch.setattr(export_policy, "validate_action_vocabulary", validate)
+    metadata = {
+        "model_version": "learned_v1",
+        "feature_schema_version": 1,
+        "engine_version": "1.32.7",
+        "action_vocab": {key: list(items) for key, items in ACTION_VOCAB.items()},
+    }
+
+    validated = export_policy.validate_checkpoint_metadata(metadata)
+
+    assert validated == metadata["action_vocab"]
+    assert calls == [(metadata["action_vocab"], "learned_v1", "checkpoint")]
 
 
 def test_target_first_artifact_has_distinct_head_and_identity():
