@@ -34,8 +34,9 @@ def test_assign_tasks_falls_back_to_reserved_worker_when_only_farmer():
     tasks = [Task("ANIMAL", Position(0, 1), 100, 1, 1, item="GOOSE"),
              Task("WATER", Position(4, 3), 100, 1, 1, item="WHEAT")]
     assignments = assign_tasks(tasks, state["workers"], state)
-    assert [assignment.task.kind for assignment in assignments] == ["ANIMAL", "WATER"]
-    assert assignments[0].worker_index == 0
+    assert [(assignment.worker_index, assignment.task.kind) for assignment in assignments] == [
+        (0, "ANIMAL"), (1, "WATER"),
+    ]
 
 
 @__import__("pytest").mark.parametrize("shed,carried", [
@@ -58,10 +59,17 @@ def test_day_27_does_not_plan_melon_purchase_or_planting():
 
 
 def test_shed_assignment_prefers_worker_with_inventory():
-    state = _state(workers=_workers(("FARMER", Position(0, 0)), ("WORKER", Position(4, 4))),
-                   private={"seeds": {}, "shed": {}, "inventories": [{}, {"EGG": 1}]})
-    assignments = assign_tasks([Task("SHED", Position(0, 1), 1, None, 1)], state["workers"], state)
-    assert assignments[0].worker_index == 1
+    workers = _workers(("FARMER", Position(0, 0)), ("WORKER", Position(0, 0)))
+    task = Task("SHED", Position(1, 0), 1, None, 1)
+    with_inventory = _state(workers=workers,
+                             private={"seeds": {}, "shed": {}, "inventories": [{}, {"EGG": 1}]})
+    without_inventory = _state(workers=workers,
+                                private={"seeds": {}, "shed": {}, "inventories": [{"EGG": 1}, {}]})
+    selected_with = assign_tasks([task], workers, with_inventory)[0].worker_index
+    selected_without = assign_tasks([task], workers, without_inventory)[0].worker_index
+    assert selected_with == 1
+    assert selected_without == 0
+    assert selected_with != selected_without
 
 
 def test_animal_budget_includes_feed_after_shed_pickup():
