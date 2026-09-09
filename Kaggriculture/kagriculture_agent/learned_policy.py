@@ -45,8 +45,7 @@ from .features import (
 from .memory import PolicyMemory
 from .routing import is_locked_tile, normalize_position, route_to
 from .types import Position, Task, WorkerAssignment
-from scripts.training_identity import (
-    ACTION_REPRESENTATIONS,
+from .runtime_identity import (
     DEFAULT_ACTION_REPRESENTATION,
     validate_action_representation,
 )

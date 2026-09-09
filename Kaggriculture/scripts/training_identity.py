@@ -4,10 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from kagriculture_agent.runtime_identity import (
+    ACTION_REPRESENTATIONS,
+    DEFAULT_ACTION_REPRESENTATION,
+    validate_action_representation,
+)
+
 DEFAULT_EXPERIMENT_ID = "orbit-policy-v1"
 FEATURE_VARIANTS = ("production_v1", "experimental_context_v1")
-ACTION_REPRESENTATIONS = ("current_v1", "target_first_v1")
-DEFAULT_ACTION_REPRESENTATION = "current_v1"
 TRAINING_MODES = (
     "behavior_clone_then_ppo",
     "pure_ppo",
@@ -39,13 +43,6 @@ def validate_training_mode(value: Any, *, source: str = "") -> None:
     if value not in TRAINING_MODES:
         choices = ", ".join(TRAINING_MODES)
         raise ValueError(f"{prefix}training_mode must be one of: {choices}")
-
-
-def validate_action_representation(value: Any, *, source: str = "") -> None:
-    prefix = f"{source} " if source else ""
-    if value not in ACTION_REPRESENTATIONS:
-        choices = ", ".join(ACTION_REPRESENTATIONS)
-        raise ValueError(f"{prefix}action_representation must be one of: {choices}")
 
 
 def validate_identity_consistency(

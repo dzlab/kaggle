@@ -42,8 +42,7 @@ from .model_topology import (
     compact_policy_parameter_count,
     validate_topology_shape,
 )
-from scripts.training_identity import (
-    ACTION_REPRESENTATIONS,
+from .runtime_identity import (
     DEFAULT_ACTION_REPRESENTATION,
     validate_action_representation,
 )

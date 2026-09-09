@@ -1,4 +1,7 @@
 import io
+import os
+import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -23,10 +26,43 @@ def test_submission_archive_contains_only_runtime_and_executes_without_site_pack
     assert "main.py" in names
     assert "kagriculture_agent/learned_policy.py" in names
     assert "kagriculture_agent/experimental_features.py" in names
+    assert "kagriculture_agent/runtime_identity.py" in names
     assert manifest["runtime_dependencies"] == []
     assert all(not name.startswith(("tests/", "docs/", "scripts/", "reports/", "replays/")) for name in names)
     smoke_test_archive(archive)
     assert archive.read_bytes() == repeat.read_bytes()
+
+
+def test_runtime_identity_and_learned_policy_import_without_scripts(tmp_path):
+    archive = tmp_path / "submission.tar.gz"
+    build_submission_archive(PROJECT_ROOT, archive)
+    extracted = tmp_path / "extracted"
+    extracted.mkdir()
+    with tarfile.open(archive, "r:gz") as tar:
+        tar.extractall(extracted)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            "from kagriculture_agent.runtime_identity import (\n"
+            "    ACTION_REPRESENTATIONS, DEFAULT_ACTION_REPRESENTATION,\n"
+            "    validate_action_representation,\n"
+            ")\n"
+            "from kagriculture_agent.learned_policy import artifact_tensor_shapes\n"
+            "assert DEFAULT_ACTION_REPRESENTATION in ACTION_REPRESENTATIONS\n"
+            "validate_action_representation(DEFAULT_ACTION_REPRESENTATION)\n"
+            "assert artifact_tensor_shapes()\n",
+        ],
+        cwd=extracted,
+        env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(extracted)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def test_submission_archive_can_include_selected_artifact_only(tmp_path):

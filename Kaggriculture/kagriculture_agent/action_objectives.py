@@ -15,7 +15,7 @@ try:  # pragma: no cover - import safety is covered by the model module tests
 except ModuleNotFoundError:  # pragma: no cover - exercised without training extras
     torch = None
 
-from scripts.training_identity import DEFAULT_ACTION_REPRESENTATION, validate_action_representation
+from .runtime_identity import DEFAULT_ACTION_REPRESENTATION, validate_action_representation
 
 
 _OUTPUT_NAMES = (

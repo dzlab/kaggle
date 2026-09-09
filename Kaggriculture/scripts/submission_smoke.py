@@ -45,6 +45,7 @@ _RUNTIME_MODULES = (
     "observation.py",
     "planner.py",
     "policy.py",
+    "runtime_identity.py",
     "routing.py",
     "strategy.py",
     "types.py",
