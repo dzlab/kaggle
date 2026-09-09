@@ -150,6 +150,35 @@ def test_behavior_clone_budget_is_resolved_by_training_mode(mode, configured, ex
     assert resolve_behavior_clone_steps(mode, configured) == expected
 
 
+@pytest.mark.parametrize(
+    ("training_mode", "configured_steps", "effective_steps"),
+    [
+        ("pure_ppo", 8, 1),
+        ("reduced_behavior_clone_then_ppo", 8, 8),
+        ("behavior_clone_then_ppo", 8, 2),
+    ],
+)
+def test_training_api_rejects_contradictory_effective_behavior_clone_budget(
+    tmp_path, training_mode, configured_steps, effective_steps,
+):
+    pytest.importorskip("torch")
+    from scripts.train_policy import train_behavior_clone
+
+    input_path = tmp_path / "transitions.jsonl"
+    input_path.write_text(json.dumps(_transition(done=True)) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="effective behavior_clone_steps"):
+        train_behavior_clone(
+            input_path=input_path,
+            output_path=tmp_path / "policy.pt",
+            steps=configured_steps,
+            effective_behavior_clone_steps=effective_steps,
+            batch_size=1,
+            device="cpu",
+            training_mode=training_mode,
+        )
+
+
 def test_train_policy_parser_exposes_league_configuration(tmp_path):
     from scripts.train_policy import _cli_training_options, _parser
 
@@ -1802,6 +1831,7 @@ def test_colab_resolves_behavior_clone_budget_once_and_propagates_effective_valu
         steps=config.training_steps,
         batch_size=config.training_batch_size,
         device=config.device,
+        training_mode=config.training_mode,
         effective_behavior_clone_steps=config.behavior_clone_steps,
     )
 
@@ -1877,6 +1907,52 @@ def test_pure_ppo_skips_behavior_clone_and_starts_fresh_ppo(tmp_path, monkeypatc
     assert metadata["behavior_clone_updates"] == 0
     assert checkpoint["metrics"]["behavior_clone_updates"] == 0
     assert checkpoint["metadata"]["training_mode"] == "pure_ppo"
+
+
+@pytest.mark.parametrize(
+    ("training_mode", "configured_steps", "expected_bc_updates"),
+    [
+        ("behavior_clone_then_ppo", 1, 1),
+        ("reduced_behavior_clone_then_ppo", 8, 2),
+        ("pure_ppo", 8, 0),
+    ],
+)
+def test_training_modes_run_real_bc_and_fresh_rollout_in_order(
+    tmp_path, training_mode, configured_steps, expected_bc_updates,
+):
+    pytest.importorskip("torch")
+    from scripts import train_policy
+
+    input_path = tmp_path / f"{training_mode}.jsonl"
+    output_path = tmp_path / f"{training_mode}.pt"
+    input_path.write_text(json.dumps(_transition(done=True)) + "\n", encoding="utf-8")
+    events = []
+    rollout_steps = []
+
+    def rollout_fn(**kwargs):
+        rollout_steps.append(kwargs["step"])
+        return [_transition(done=True, final_bank=1001, opponent_final_bank=999)]
+
+    def telemetry(event, _values):
+        events.append(event)
+
+    metadata = train_policy.train_behavior_clone(
+        input_path=input_path,
+        output_path=output_path,
+        steps=configured_steps,
+        behavior_clone_steps=configured_steps,
+        batch_size=1,
+        seed=7,
+        ppo_steps=1,
+        device="cpu",
+        training_mode=training_mode,
+        rollout_fn=rollout_fn,
+        telemetry_callback=telemetry,
+    )
+
+    assert metadata["behavior_clone_updates"] == expected_bc_updates
+    assert rollout_steps == [0]
+    assert events == (["ppo"] if expected_bc_updates == 0 else ["behavior_clone", "ppo"])
 
 
 def test_resume_rejects_incompatible_model_shape(tmp_path):

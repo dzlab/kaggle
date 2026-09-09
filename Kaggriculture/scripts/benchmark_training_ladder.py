@@ -27,6 +27,7 @@ DEFAULT_INPUT_SIZE = 64
 DEFAULT_OUTPUT_SIZE = 32
 _PRODUCTION_DIRECTORY_NAMES = frozenset({
     "model", "models", "checkpoint", "checkpoints", "artifact", "artifacts",
+    "deploy", "deployment", "production",
 })
 _PROTECTED_OUTPUT_NAMES = frozenset({
     "model.json", "model.pt", "model.pth",
@@ -55,6 +56,13 @@ def parse_ladder(value: str | Path | Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(value.get("ladder"), Mapping):
         value = value["ladder"]
 
+    for key in (
+        "run_directory", "run_root", "output", "output_directory", "output_root", "report_root",
+    ):
+        configured_path = value.get(key)
+        if configured_path is not None:
+            _validate_isolated_ladder_path(configured_path, key)
+
     widths = _model_width_list(value.get("widths"), "widths", MAX_LADDER_WIDTH)
     depths = _positive_int_list(value.get("depths"), "depths", MAX_LADDER_DEPTH)
     budgets = _positive_int_list(
@@ -78,6 +86,10 @@ def parse_ladder(value: str | Path | Mapping[str, Any]) -> dict[str, Any]:
         "rollout_episodes": rollout_episodes,
         "rollout_steps": rollout_steps,
     }
+    if value.get("run_root") is not None:
+        normalized["run_root"] = str(Path(value["run_root"]).expanduser())
+    elif value.get("run_directory") is not None:
+        normalized["run_root"] = str(Path(value["run_directory"]).expanduser())
     for key in ("artifact_output", "model_output", "checkpoint_output"):
         if value.get(key) is not None:
             raise ValueError(f"{key} is a production artifact/checkpoint output")
@@ -100,10 +112,10 @@ def expand_ladder(ladder: Mapping[str, Any]) -> list[dict[str, Any]]:
                         "depth": depth,
                         "ppo_steps": ppo_steps,
                         "seed": seed,
-                        "run_directory": (
-                            f"ladder-runs/width-{width}-depth-{depth}-"
+                        "run_directory": str(Path(normalized.get("run_root", "ladder-runs")) / (
+                            f"width-{width}-depth-{depth}-"
                             f"ppo-{ppo_steps}-seed-{seed}"
-                        ),
+                        )),
                         "parameter_estimate": estimate_parameter_count(width, depth),
                         "rollout_budget": estimate_rollout_budget(
                             ppo_steps,
@@ -339,6 +351,16 @@ def _model_width_list(value: Any, name: str, maximum: int) -> list[int]:
     if len(set(result)) != len(result):
         raise ValueError(f"{name} must not contain duplicates")
     return result
+
+
+def _validate_isolated_ladder_path(value: Any, name: str) -> None:
+    if not isinstance(value, (str, Path)) or not str(value).strip():
+        raise ValueError(f"{name} must be a nonempty path")
+    path = Path(value).expanduser()
+    if any(part.lower() in _PRODUCTION_DIRECTORY_NAMES for part in path.parts):
+        raise ValueError(f"{name} may not be nested under a production path")
+    if path.name.lower() in _PROTECTED_OUTPUT_NAMES:
+        raise ValueError(f"{name} may not target a production artifact or checkpoint")
 
 
 def _seeds(value: Mapping[str, Any]) -> list[int]:

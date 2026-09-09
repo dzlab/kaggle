@@ -84,6 +84,35 @@ def test_ladder_rejects_production_artifact_and_checkpoint_paths(tmp_path):
         validate_report_path(tmp_path / "checkpoints" / "trial.pt", report_root)
 
 
+@pytest.mark.parametrize("path_key", ["run_directory", "run_root", "output", "report_root"])
+@pytest.mark.parametrize("production_directory", ["models", "checkpoints", "artifacts", "deployment"])
+def test_ladder_rejects_configured_paths_under_production_directories(
+    tmp_path, path_key, production_directory,
+):
+    from scripts.benchmark_training_ladder import parse_ladder
+
+    ladder = {
+        "widths": [128], "depths": [4], "ppo_budgets": [16], "seeds": [7],
+        path_key: str(tmp_path / production_directory / "ladder-run"),
+    }
+    with pytest.raises(ValueError, match="production"):
+        parse_ladder(ladder)
+
+
+def test_ladder_configured_run_root_is_isolated_and_used_for_generated_runs(tmp_path):
+    from scripts.benchmark_training_ladder import expand_ladder, parse_ladder
+
+    run_root = tmp_path / "isolated-ladder-runs"
+    ladder = parse_ladder({
+        "widths": [128], "depths": [4], "ppo_budgets": [16], "seeds": [7],
+        "run_root": str(run_root),
+    })
+
+    experiment = expand_ladder(ladder)[0]
+    assert experiment["run_directory"].startswith(str(run_root))
+    assert "models" not in experiment["run_directory"]
+
+
 @pytest.mark.parametrize("name", ["model.json", "trained_model.json", "checkpoint.pt", "artifact.json"])
 def test_report_validation_rejects_generic_protected_output_names(tmp_path, name):
     from scripts.benchmark_training_ladder import validate_report_path

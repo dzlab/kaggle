@@ -80,11 +80,34 @@ def resolve_behavior_clone_steps(training_mode: str, configured_steps: int) -> i
     _validate_training_mode(training_mode, source="requested")
     if type(configured_steps) is not int or configured_steps < 0:
         raise ValueError("behavior_clone_steps must be a nonnegative integer")
+    return _canonical_behavior_clone_steps(training_mode, configured_steps)
+
+
+def _canonical_behavior_clone_steps(training_mode: str, configured_steps: int) -> int:
     if training_mode == "pure_ppo":
         return 0
     if training_mode == "reduced_behavior_clone_then_ppo":
         return max(1, configured_steps // 4)
     return configured_steps
+
+
+def validate_effective_behavior_clone_steps(
+    training_mode: str, configured_steps: int, effective_steps: int, *, source: str = "requested",
+) -> None:
+    """Reject a caller-provided effective BC budget that contradicts its mode."""
+    _validate_training_mode(training_mode, source=source)
+    if type(configured_steps) is not int or configured_steps < 0:
+        raise ValueError(f"{source} behavior_clone_steps must be a nonnegative integer")
+    if type(effective_steps) is not int or effective_steps < 0:
+        raise ValueError(
+            f"{source} effective behavior_clone_steps must be a nonnegative integer"
+        )
+    expected = _canonical_behavior_clone_steps(training_mode, configured_steps)
+    if effective_steps != expected:
+        raise ValueError(
+            f"{source} effective behavior_clone_steps {effective_steps} does not match "
+            f"training_mode {training_mode!r} (expected {expected})"
+        )
 
 
 @dataclass(frozen=True)
@@ -306,6 +329,10 @@ def _validate_configuration_shape(configuration: Any, *, source: str) -> None:
     _validate_experiment_id(configuration["experiment_id"], source=source)
     _validate_feature_variant(configuration["feature_variant"], source=source)
     _validate_training_mode(configuration["training_mode"], source=source)
+    validate_effective_behavior_clone_steps(
+        configuration["training_mode"], configuration["steps"],
+        configuration["behavior_clone_steps"], source=source,
+    )
     if type(configuration["device"]) is not str or not configuration["device"]:
         raise ValueError(f"{source} configuration device must be a nonempty string")
     if type(configuration["offline_ppo_fallback"]) is not bool:
@@ -379,6 +406,11 @@ def build_training_contract(
     if effective_behavior_clone_steps is None:
         effective_behavior_clone_steps = resolve_behavior_clone_steps(
             training_mode, configured_behavior_clone_steps,
+        )
+    else:
+        validate_effective_behavior_clone_steps(
+            training_mode, configured_behavior_clone_steps,
+            effective_behavior_clone_steps, source="requested",
         )
     input_identity = _trajectory_identity(input_path)
     transitions = _read_transitions(input_path)
