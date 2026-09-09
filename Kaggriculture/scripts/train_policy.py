@@ -39,6 +39,10 @@ from kagriculture_agent.league import (
     OpponentMatch,
     validate_league_composition,
 )
+from kagriculture_agent.learned_policy import (
+    task_intent_loss_mask_metadata,
+    validate_action_vocabulary,
+)
 from kagriculture_agent.model import (
     ACTION_VOCAB,
     DEFAULT_MODEL_DEPTH,
@@ -82,6 +86,11 @@ _DIRECTION_DELTAS = {
 _CURRENT_TILE_KINDS = {
     "WATER", "HARVEST", "FERTILIZE", "FEED", "CARE", "DROP", "SELL", "DIG", "WEED",
 }
+_TRAINING_ACTION_VOCAB = validate_action_vocabulary(
+    {key: list(value) for key, value in ACTION_VOCAB.items()},
+    model_version=MODEL_VERSION,
+    source="training",
+)
 
 
 def resolve_behavior_clone_steps(training_mode: str, configured_steps: int) -> int:
@@ -932,7 +941,7 @@ def _command_kind(command: Any) -> str:
     name = str(command[0]).upper()
     if name in {"NORTH", "SOUTH", "EAST", "WEST"}:
         return "MOVE"
-    return name if name in ACTION_VOCAB["worker_kinds"] else "PASS"
+    return name if name in _TRAINING_ACTION_VOCAB["worker_kinds"] else "PASS"
 
 
 def _selected_farm(observation: dict[str, Any]) -> dict[str, Any]:
@@ -1240,6 +1249,38 @@ def _select_outputs(
                     if not all(value is not None for value in values):
                         raise ValueError(f"{objective_name} must be present for every transition")
                     masks[objective_name] = th.tensor(values, dtype=th.bool, device=device)
+    excluded_kind_indices = th.tensor(
+        [
+            _TRAINING_ACTION_VOCAB["worker_kinds"].index(kind)
+            for kind in task_intent_loss_mask_metadata()["excluded_worker_kinds"]
+        ],
+        dtype=worker_kind.dtype,
+        device=device,
+    )
+    excluded_rows = (worker_kind.unsqueeze(-1) == excluded_kind_indices).any(dim=-1)
+    target_one_hot = th.nn.functional.one_hot(
+        worker_target, num_classes=outputs["worker_target_logits"].shape[-1],
+    ).bool()
+    target_mask = masks.get(
+        "worker_target_mask", th.ones_like(outputs["worker_target_logits"], dtype=th.bool),
+    )
+    masks["worker_target_mask"] = th.where(
+        excluded_rows.unsqueeze(-1), target_one_hot, target_mask,
+    )
+    kind_one_hot = th.nn.functional.one_hot(
+        worker_kind, num_classes=outputs["worker_kind_logits"].shape[-1],
+    ).bool()
+    kind_mask = masks.get(
+        "worker_kind_mask", th.ones_like(outputs["worker_kind_logits"], dtype=th.bool),
+    )
+    if outputs["worker_kind_logits"].ndim == 4:
+        kind_one_hot = kind_one_hot.unsqueeze(2).expand_as(kind_mask)
+        kind_excluded_rows = excluded_rows.unsqueeze(-1).unsqueeze(-1)
+    else:
+        kind_excluded_rows = excluded_rows.unsqueeze(-1)
+    masks["worker_kind_mask"] = th.where(
+        kind_excluded_rows, kind_one_hot, kind_mask,
+    )
     return conditional_action_objectives(
         outputs,
         worker_active=worker_act,
@@ -1344,9 +1385,10 @@ def validate_prior_checkpoint_metadata(
             raise ValueError(
                 "prior checkpoint action_representation conflicts with ppo_config"
             )
-    expected_vocab = {key: list(value) for key, value in ACTION_VOCAB.items()}
-    if metadata.get("action_vocab") != expected_vocab:
-        raise ValueError("prior checkpoint action_vocab mismatch")
+    validate_action_vocabulary(
+        metadata.get("action_vocab"), model_version=metadata.get("model_version"),
+        source="prior checkpoint",
+    )
     for field, expected_value in (
         ("model_width", model_width), ("model_depth", model_depth),
     ):
@@ -2077,7 +2119,8 @@ def _checkpoint_metadata(
     return {
         "model_version": MODEL_VERSION,
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
-        "action_vocab": {key: list(value) for key, value in ACTION_VOCAB.items()},
+        "action_vocab": {key: list(value) for key, value in _TRAINING_ACTION_VOCAB.items()},
+        "task_intent_loss_mask": task_intent_loss_mask_metadata(),
         "engine_version": ENGINE_VERSION,
         "transition_count": int(transition_count),
         "ppo_config": asdict(resolved_config),

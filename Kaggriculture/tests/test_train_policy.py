@@ -1011,6 +1011,50 @@ def test_prior_checkpoint_metadata_validation_rejects_action_vocab_mismatch():
         validate_prior_checkpoint_metadata(metadata)
 
 
+def test_task_intent_objective_masks_move_and_pass_rows():
+    torch = pytest.importorskip("torch")
+    from scripts.train_policy import PPOConfig, _select_outputs, build_rollout_batch
+
+    transitions = [{
+        "action": {"farmer": ["EAST"], "hands": [["PASS"]], "market": []},
+        "observation": {
+            "board_size": 2,
+            "workers": [
+                {"index": 0, "position": [0, 0]},
+                {"index": 1, "position": [0, 0]},
+            ],
+        },
+    }]
+    batch = build_rollout_batch(transitions, config=PPOConfig())
+    outputs = {
+        "worker_act_logits": torch.zeros(1, 10, 2, requires_grad=True),
+        "worker_target_logits": torch.zeros(1, 10, 4, requires_grad=True),
+        "worker_kind_logits": torch.zeros(1, 10, 14, requires_grad=True),
+        "market_active_logits": torch.zeros(1, 2, requires_grad=True),
+        "market_item_logits": torch.zeros(1, 9, requires_grad=True),
+        "market_quantity_logits": torch.zeros(1, 8, requires_grad=True),
+        "value": torch.zeros(1, requires_grad=True),
+    }
+
+    log_probs, _entropy = _select_outputs(outputs, batch)
+    (-log_probs.mean()).backward()
+
+    assert outputs["worker_act_logits"].grad[0, 0].abs().sum() > 0
+    assert outputs["worker_target_logits"].grad[0, 0].abs().sum() == 0
+    assert outputs["worker_kind_logits"].grad[0, 0].abs().sum() == 0
+
+
+def test_checkpoint_metadata_records_task_intent_objective_loss_mask():
+    from scripts.train_policy import checkpoint_metadata
+
+    metadata = checkpoint_metadata(transition_count=1)
+
+    assert metadata["task_intent_loss_mask"] == {
+        "excluded_worker_kinds": ["PASS", "MOVE"],
+        "objectives": ["worker_target", "worker_kind"],
+    }
+
+
 def test_ppo_rollouts_require_callback_unless_offline_fallback_is_explicit():
     from scripts.train_policy import PPOConfig, run_ppo_training
 

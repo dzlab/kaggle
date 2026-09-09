@@ -80,6 +80,8 @@ _VALID_KINDS = frozenset({
     "WATER", "HARVEST", "FERTILIZE", "FEED", "CARE", "COLLECT_FERTILIZER",
     "WEED", "DIG", "ANIMAL", "STRUCTURE", "BUILD_COOP", "BUILD_PASTURE",
 })
+NON_OVERRIDING_WORKER_KINDS = frozenset({"PASS", "MOVE"})
+COMPILER_VALID_WORKER_KINDS = _VALID_KINDS | NON_OVERRIDING_WORKER_KINDS
 _ITEM_KINDS = frozenset({"PICKUP", "PLACE", "PLANT", "FERTILIZE", "FEED", "ANIMAL", "SELL"})
 
 _ARTIFACT_FORMAT_VERSION = 1
@@ -96,6 +98,52 @@ _ARTIFACT_WORKER_KINDS = (
     "CARE", "PICKUP", "PLACE", "DROP", "SELL", "DIG", "WEED",
 )
 _ARTIFACT_MARKET_QUANTITIES = (0, 1, 2, 4, 8, 16, 32, 64)
+
+
+def _learned_v1_action_vocab() -> dict[str, list[Any]]:
+    return {
+        "worker_kinds": list(_ARTIFACT_WORKER_KINDS),
+        "market_items": sorted(PRODUCTS),
+        "market_quantities": list(_ARTIFACT_MARKET_QUANTITIES),
+    }
+
+
+def task_intent_loss_mask_metadata() -> dict[str, list[str]]:
+    """Describe learned_v1 classes excluded from task-intent objectives."""
+    return {
+        "excluded_worker_kinds": ["PASS", "MOVE"],
+        "objectives": ["worker_target", "worker_kind"],
+    }
+
+
+def validate_action_vocabulary(
+    value: Any, *, model_version: str = _ARTIFACT_MODEL_VERSION,
+    source: str = "learned artifact",
+) -> dict[str, list[Any]]:
+    """Validate the fixed learned_v1 vocabulary against compiler capabilities."""
+    diagnostic = f"model_version={model_version!r}; action_vocab={value!r}"
+    if model_version != _ARTIFACT_MODEL_VERSION:
+        raise ValueError(f"{source} has unsupported {diagnostic}")
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{source} action_vocab must be an object; {diagnostic}")
+    worker_kinds = value.get("worker_kinds")
+    if isinstance(worker_kinds, Sequence) and not isinstance(worker_kinds, (str, bytes)):
+        unsupported = [kind for kind in worker_kinds if kind not in COMPILER_VALID_WORKER_KINDS]
+        if unsupported:
+            raise ValueError(
+                f"{source} worker class {unsupported[0]!r} cannot be compiled; "
+                f"model_version={model_version!r}; action_vocab={value!r}"
+            )
+    expected = _learned_v1_action_vocab()
+    if set(value) != set(expected) or any(value.get(key) != item for key, item in expected.items()):
+        raise ValueError(f"{source} action_vocab mismatch; {diagnostic}")
+    for key, items in expected.items():
+        actual = value.get(key)
+        if not isinstance(actual, list) or not actual or len(set(actual)) != len(actual):
+            raise ValueError(f"{source} action vocabulary {key} is malformed; {diagnostic}")
+        if not all(type(item) is type(expected_item) for item, expected_item in zip(actual, items)):
+            raise ValueError(f"{source} action vocabulary {key} is malformed; {diagnostic}")
+    return expected
 
 
 def _validate_artifact_model_shape(hidden_width: Any, model_depth: Any) -> tuple[int, int]:
@@ -156,6 +204,10 @@ def artifact_tensor_shapes(
     action_representation: str = DEFAULT_ACTION_REPRESENTATION,
 ) -> dict[str, tuple[int, ...]]:
     """Return the exact state-dict shapes for a CompactPolicyNet topology."""
+    validate_action_vocabulary(
+        _learned_v1_action_vocab(), model_version=_ARTIFACT_MODEL_VERSION,
+        source="learned export",
+    )
     hidden_width, model_depth = _validate_artifact_model_shape(hidden_width, model_depth)
     validate_action_representation(action_representation, source="learned artifact")
     mlp_width = 2 * hidden_width
@@ -237,23 +289,6 @@ def _artifact_canonical_bytes(value: Mapping[str, Any]) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 
 
-def _validate_artifact_vocab(value: Any) -> None:
-    if not isinstance(value, Mapping):
-        raise ValueError("learned artifact action_vocab must be an object")
-    expected = {
-        "worker_kinds": list(_ARTIFACT_WORKER_KINDS),
-        "market_items": sorted(PRODUCTS),
-        "market_quantities": list(_ARTIFACT_MARKET_QUANTITIES),
-    }
-    if set(value) != set(expected) or any(value.get(key) != item for key, item in expected.items()):
-        raise ValueError("learned artifact action_vocab mismatch")
-    for key, items in expected.items():
-        if not isinstance(value.get(key), list) or not items or len(set(value[key])) != len(items):
-            raise ValueError(f"learned artifact action vocabulary {key} is malformed")
-        if not all(type(item) is type(expected_item) for item, expected_item in zip(value[key], items)):
-            raise ValueError(f"learned artifact action vocabulary {key} is malformed")
-
-
 def _finite_fp32(value: Any, label: str) -> float:
     if type(value) not in (int, float):
         raise ValueError(f"{label} must be a JSON number")
@@ -321,7 +356,10 @@ def _validate_artifact(value: Any) -> dict[str, Any]:
     if "model_depth" in value and value["model_depth"] != model_depth:
         raise ValueError("unsupported learned artifact model_depth")
     expected_headers["model_depth"] = model_depth
-    _validate_artifact_vocab(value.get("action_vocab"))
+    action_vocab = validate_action_vocabulary(
+        value.get("action_vocab"), model_version=value.get("model_version"),
+        source="learned artifact",
+    )
     checksum = value.get("checksum")
     if not isinstance(checksum, str) or len(checksum) != 64 or any(char not in "0123456789abcdef" for char in checksum):
         raise ValueError("learned artifact checksum is missing or malformed")
@@ -348,7 +386,10 @@ def _validate_artifact(value: Any) -> dict[str, Any]:
     headers["feature_variant"] = feature_variant
     if action_representation != DEFAULT_ACTION_REPRESENTATION:
         headers["action_representation"] = action_representation
-    return {"headers": headers, "action_vocab": value["action_vocab"], "weights": decoded}
+    headers["task_intent_loss_mask"] = value.get(
+        "task_intent_loss_mask", task_intent_loss_mask_metadata(),
+    )
+    return {"headers": headers, "action_vocab": action_vocab, "weights": decoded}
 
 
 def load_exported_policy(path: str | Path) -> "DependencyFreePolicy":
@@ -531,6 +572,12 @@ class DependencyFreePolicy:
 
     def __init__(self, artifact: Mapping[str, Any]) -> None:
         self.model_version = str(artifact["headers"]["model_version"])
+        self.action_vocab = {
+            key: list(items) for key, items in artifact["action_vocab"].items()
+        }
+        self.task_intent_loss_mask = dict(
+            artifact["headers"]["task_intent_loss_mask"],
+        )
         self._hidden_width = int(artifact["headers"]["hidden_width"])
         self._model_depth = int(artifact["headers"]["model_depth"])
         self.feature_variant = artifact["headers"].get(
@@ -732,7 +779,8 @@ class DependencyFreePolicy:
                 else kind_logits
             )
             kind = _ARTIFACT_WORKER_KINDS[max(range(len(selected_kind_logits)), key=selected_kind_logits.__getitem__)]
-            workers.append(WorkerProposal(index, kind, target, None, max(selected_kind_logits)))
+            if kind not in NON_OVERRIDING_WORKER_KINDS:
+                workers.append(WorkerProposal(index, kind, target, None, max(selected_kind_logits)))
         # The artifact has no buy/sell direction head.  Emit only the narrow
         # product-buy intent that the normal market compiler can validate;
         # unsupported products and the zero quantity bucket become no-op.
@@ -1222,13 +1270,19 @@ def compile_proposal(state: Any, proposal: PolicyProposal, memory: PolicyMemory,
     """Compile target/task intents into the normal action schema."""
     from .policy import PASS, _get as policy_get, _unit_command, _worker_records, build_market_orders, worker_action
 
+    validate_action_vocabulary(
+        _learned_v1_action_vocab(), model_version=_ARTIFACT_MODEL_VERSION,
+        source="proposal compiler",
+    )
     board_size = _board_size(state)
     worker_records = _worker_records(state)
     known = {record["index"]: record for record in worker_records}
     candidates_by_worker: dict[int, list[WorkerProposal]] = {}
     existing_crops, existing_animals = _existing_counts(state, strategy)
     for candidate in proposal.workers if isinstance(proposal, PolicyProposal) else ():
-        if candidate.worker_index not in known or candidate.kind not in _VALID_KINDS:
+        if candidate.worker_index not in known or candidate.kind in NON_OVERRIDING_WORKER_KINDS:
+            continue
+        if candidate.kind not in _VALID_KINDS:
             continue
         target = normalize_position(candidate.target)
         if target is not None and not (0 <= target.x < board_size and 0 <= target.y < board_size):

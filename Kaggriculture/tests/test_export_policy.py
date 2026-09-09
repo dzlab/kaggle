@@ -75,6 +75,79 @@ def test_artifact_headers_and_checksum_are_valid(tmp_path):
         load_exported_policy(path)
 
 
+def test_action_vocabulary_validator_rejects_uncompilable_class_with_diagnostics():
+    from kagriculture_agent.learned_policy import validate_action_vocabulary
+
+    vocabulary = _artifact()["action_vocab"]
+    vocabulary["worker_kinds"][2] = "TELEPORT"
+
+    with pytest.raises(ValueError, match="TELEPORT.*learned_v1.*action_vocab"):
+        validate_action_vocabulary(
+            vocabulary, model_version="learned_v1", source="test artifact",
+        )
+
+
+def test_loaded_artifact_reports_vocabulary_and_version(tmp_path):
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(_artifact()), encoding="utf-8")
+
+    runtime = load_exported_policy(path)
+
+    assert runtime.model_version == "learned_v1"
+    assert runtime.action_vocab["worker_kinds"][:2] == ["PASS", "MOVE"]
+    assert runtime.task_intent_loss_mask["excluded_worker_kinds"] == ["PASS", "MOVE"]
+
+
+def test_train_export_load_compile_action_round_trip(tmp_path):
+    torch = pytest.importorskip("torch")
+    from kagriculture_agent.learned_policy import (
+        COMPILER_VALID_WORKER_KINDS,
+        compile_proposal,
+    )
+    from kagriculture_agent.memory import PolicyMemory
+    from kagriculture_agent.model import ACTION_VOCAB, CompactPolicyNet
+    from scripts.export_policy import export_checkpoint
+    from scripts.train_policy import checkpoint_metadata
+
+    network = CompactPolicyNet()
+    with torch.no_grad():
+        for parameter in network.parameters():
+            parameter.zero_()
+        network.worker_act_head.bias[1] = 1.0
+        network.worker_kind_head.bias[
+            ACTION_VOCAB["worker_kinds"].index("WATER")
+        ] = 1.0
+    checkpoint = tmp_path / "policy.pt"
+    artifact_path = tmp_path / "policy.json"
+    torch.save({
+        "metadata": checkpoint_metadata(transition_count=1),
+        "model_state_dict": network.state_dict(),
+    }, checkpoint)
+
+    artifact = export_checkpoint(checkpoint, artifact_path)
+    runtime = load_exported_policy(artifact_path)
+    state = {
+        "board_size": 10,
+        "day": 1,
+        "hour": 1,
+        "cash": 100,
+        "tiles": [[None] * 10 for _ in range(10)],
+        "workers": [{"index": 0, "role": "FARMER", "position": [0, 0]}],
+        "private": {"inventories": [{}], "shed": {}, "seeds": {}},
+        "market": {"prices": {}, "inventory": {}},
+    }
+    state["tiles"][0][0] = {
+        "kind": "PLANT", "crop": "WHEAT", "watered_today": False,
+    }
+    proposal = runtime.propose(state, extract_features(state))
+    action = compile_proposal(state, proposal, PolicyMemory())
+
+    assert artifact["action_vocab"] == checkpoint_metadata(1)["action_vocab"]
+    assert proposal.workers
+    assert {worker.kind for worker in proposal.workers} <= COMPILER_VALID_WORKER_KINDS
+    assert action["farmer"] == ["WATER"]
+
+
 def test_checksum_valid_architecture_shape_mismatch_is_rejected(tmp_path):
     from scripts.export_policy import artifact_checksum
 

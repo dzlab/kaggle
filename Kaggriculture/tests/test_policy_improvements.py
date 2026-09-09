@@ -409,6 +409,43 @@ def test_learned_policy_liquidates_shed_inventory_in_terminal_window(monkeypatch
     assert ["SELL", "CARROT", 1] in learned["market"]
 
 
+@__import__("pytest").mark.parametrize("kind", ["PASS", "MOVE"])
+def test_loaded_non_overriding_learned_class_preserves_deterministic_assignment(kind):
+    from kagriculture_agent.learned_policy import (
+        WorkerProposal,
+        compile_proposal,
+        validate_action_vocabulary,
+    )
+    from kagriculture_agent.model import ACTION_VOCAB
+    from kagriculture_agent.memory import PolicyMemory
+
+    state = _state(
+        tiles=[[None] * 5 for _ in range(5)],
+        private={"seeds": {}, "shed": {}, "inventories": [{}]},
+    )
+    state["tiles"][0][1] = {
+        "kind": "PLANT", "crop": "WHEAT", "watered_today": False,
+    }
+    task = Task("WATER", Position(1, 0), 10, None, 10.0)
+    memory = PolicyMemory(assignments=[WorkerAssignment(0, task, [Position(1, 0)])])
+    proposal = PolicyProposal(
+        (WorkerProposal(0, kind, Position(0, 0), None, 100.0),),
+        (), 1.0, "learned_v1",
+    )
+
+    validated = validate_action_vocabulary(
+        {key: list(value) for key, value in ACTION_VOCAB.items()},
+        model_version="learned_v1",
+        source="proposal compiler test",
+    )
+
+    action = compile_proposal(state, proposal, memory)
+
+    assert kind in validated["worker_kinds"]
+    assert memory.assignments[0].task.kind == "WATER"
+    assert action["farmer"] == ["EAST"]
+
+
 def test_learned_policy_caches_terminal_path_load_failure_with_safe_diagnostic(monkeypatch, tmp_path):
     path = tmp_path / "private-model.json"
     policy = LearnedPolicy(path)
