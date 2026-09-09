@@ -57,6 +57,7 @@ from scripts.training_identity import (
     validate_feature_variant,
     validate_training_mode,
 )
+from scripts.output_paths import validate_training_output_path
 
 PROMOTION_MATCH_SIZE = 100
 LOG_RATIO_CLAMP = 20.0
@@ -1483,6 +1484,14 @@ def run_ppo_training(
     model_depth: int = DEFAULT_MODEL_DEPTH,
 ) -> dict[str, Any]:
     """Run PPO with fresh scheduled league rollouts or explicit offline fallback."""
+    if candidate_checkpoint is not None:
+        validate_training_output_path(
+            candidate_checkpoint, name="candidate checkpoint", reject_protected_names=False,
+        )
+    if best_checkpoint_path is not None:
+        validate_training_output_path(
+            best_checkpoint_path, name="best checkpoint", reject_protected_names=False,
+        )
     _validate_experiment_id(experiment_id, source="PPO")
     steps = max(0, int(ppo_steps))
     if type(start_step) is not int or not 0 <= start_step <= steps:
@@ -1733,14 +1742,9 @@ def _checkpoint_metadata(
     validate_model_shape(model_width, model_depth, source="checkpoint metadata")
     if type(behavior_clone_updates) is not int or behavior_clone_updates < 0:
         raise ValueError("checkpoint metadata behavior_clone_updates must be a nonnegative integer")
-    if behavior_clone_steps is None:
-        effective_bc_steps = 0 if training_mode == "pure_ppo" else 1
-    else:
-        if type(behavior_clone_steps) is not int or behavior_clone_steps < 0:
-            raise ValueError(
-                "checkpoint metadata behavior_clone_steps must be a nonnegative integer"
-            )
-        effective_bc_steps = behavior_clone_steps
+    effective_bc_steps = _checkpoint_metadata_behavior_clone_steps(
+        training_mode, behavior_clone_steps,
+    )
     parameter_count = (
         model_parameter_count(model)
         if model is not None
@@ -1775,10 +1779,9 @@ def checkpoint_metadata(
     model_width: int = DEFAULT_MODEL_WIDTH,
     model_depth: int = DEFAULT_MODEL_DEPTH,
 ) -> dict[str, Any]:
-    if behavior_clone_steps is None:
-        effective_bc_steps = 0 if training_mode == "pure_ppo" else 1
-    else:
-        effective_bc_steps = behavior_clone_steps
+    effective_bc_steps = _checkpoint_metadata_behavior_clone_steps(
+        training_mode, behavior_clone_steps,
+    )
     return _checkpoint_metadata(
         transition_count, config, device=device,
         experiment_id=experiment_id,
@@ -1789,6 +1792,27 @@ def checkpoint_metadata(
         model_width=model_width,
         model_depth=model_depth,
     )
+
+
+def _checkpoint_metadata_behavior_clone_steps(
+    training_mode: str, behavior_clone_steps: int | None,
+) -> int:
+    """Canonicalize metadata's already-effective BC budget without re-resolving it."""
+    if behavior_clone_steps is None:
+        return 0 if training_mode == "pure_ppo" else 1
+    if type(behavior_clone_steps) is not int or behavior_clone_steps < 0:
+        raise ValueError(
+            "checkpoint metadata behavior_clone_steps must be a nonnegative integer"
+        )
+    if training_mode == "pure_ppo" and behavior_clone_steps != 0:
+        raise ValueError(
+            "checkpoint metadata pure_ppo requires behavior_clone_steps=0"
+        )
+    if training_mode != "pure_ppo" and behavior_clone_steps < 1:
+        raise ValueError(
+            "checkpoint metadata behavior_clone_steps must be positive for BC modes"
+        )
+    return behavior_clone_steps
 
 
 def _candidate_won(result: Any) -> bool:
@@ -1840,7 +1864,9 @@ def _cleanup_checkpoint(path: str | Path) -> None:
 
 def _persist_best_checkpoint(candidate: str | Path, best: str | Path) -> str:
     candidate_path = Path(candidate)
-    best_path = Path(best)
+    best_path = validate_training_output_path(
+        best, name="best checkpoint", reject_protected_names=False,
+    )
     if not candidate_path.exists():
         raise OSError(f"candidate checkpoint does not exist: {candidate_path}")
     best_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2206,7 +2232,7 @@ def make_fresh_rollout_fn(
         or resolved_margin < 0
     ):
         raise ValueError("resolved_margin must be a nonnegative finite number")
-    run_path = Path(run_directory)
+    run_path = validate_training_output_path(run_directory, name="rollout directory")
     run_path.mkdir(parents=True, exist_ok=True)
     configured_league_probabilities = (
         dict(league_probabilities) if league_probabilities is not None else None
@@ -2336,6 +2362,9 @@ def train_behavior_clone(
     model_depth: int = DEFAULT_MODEL_DEPTH,
 ) -> dict[str, Any]:
     """Run complete behavior-cloning epochs, optional PPO, and checkpoint."""
+    destination = validate_training_output_path(
+        output_path, name="output path", reject_protected_names=False,
+    )
     if type(allow_ppo_extension) is not bool:
         raise ValueError("allow_ppo_extension must be boolean")
     th = require_torch()
@@ -2457,7 +2486,6 @@ def train_behavior_clone(
     )
     metadata["ppo_steps"] = int(ppo_steps)
     metadata["behavior_clone_epochs"] = epochs
-    destination = Path(output_path)
     last_bc_loss: float | None = None
     last_bc_entropy: float | None = None
     last_bc_gradient_norm: float | None = None

@@ -113,6 +113,21 @@ def test_ladder_configured_run_root_is_isolated_and_used_for_generated_runs(tmp_
     assert "models" not in experiment["run_directory"]
 
 
+def test_ladder_rejects_symlinked_run_root_into_production_directory(tmp_path):
+    from scripts.benchmark_training_ladder import parse_ladder
+
+    production_root = tmp_path / "models"
+    production_root.mkdir()
+    symlink_root = tmp_path / "isolated-runs"
+    symlink_root.symlink_to(production_root, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="production"):
+        parse_ladder({
+            "widths": [128], "depths": [4], "ppo_budgets": [16], "seeds": [7],
+            "run_root": str(symlink_root / "candidate"),
+        })
+
+
 @pytest.mark.parametrize("name", ["model.json", "trained_model.json", "checkpoint.pt", "artifact.json"])
 def test_report_validation_rejects_generic_protected_output_names(tmp_path, name):
     from scripts.benchmark_training_ladder import validate_report_path

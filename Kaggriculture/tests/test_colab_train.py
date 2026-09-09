@@ -884,6 +884,51 @@ def test_plot_training_metrics_creates_parent_and_closes_figure(tmp_path, monkey
     assert closed
 
 
+def test_build_config_rejects_symlinked_run_directory_into_production(tmp_path, monkeypatch):
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    production_root = tmp_path / "models"
+    production_root.mkdir()
+    symlink_root = tmp_path / "safe-run"
+    symlink_root.symlink_to(production_root, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="production"):
+        colab_train.build_config(
+            run_directory=symlink_root / "candidate",
+            device="cpu",
+            mount_drive=False,
+        )
+
+
+def test_run_workflow_rechecks_symlinked_run_directory_before_commands(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    config = colab_train.build_config(
+        run_directory=tmp_path / "safe-run",
+        device="cpu",
+        mount_drive=False,
+    )
+    production_root = tmp_path / "artifacts"
+    production_root.mkdir()
+    symlink_root = tmp_path / "run-link"
+    symlink_root.symlink_to(production_root, target_is_directory=True)
+    config = replace(config, run_directory=symlink_root / "candidate")
+    commands_called = []
+    monkeypatch.setattr(
+        colab_train, "run_command",
+        lambda command, **kwargs: commands_called.append(command),
+    )
+
+    with pytest.raises(ValueError, match="production"):
+        colab_train.run_workflow(config)
+
+    assert commands_called == []
+    assert not (production_root / "candidate").exists()
+
+
 @pytest.mark.parametrize("hash_value", [None, "", "not-a-sha256", "0" * 64])
 def test_evaluation_report_requires_matching_artifact_sha256(tmp_path, monkeypatch, hash_value):
     from scripts import colab_train

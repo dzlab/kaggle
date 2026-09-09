@@ -16,6 +16,11 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
+from scripts.output_paths import (
+    resolve_output_path,
+    validate_training_output_path,
+)
+
 MAX_LADDER_WIDTH = 4096
 MAX_LADDER_DEPTH = 64
 MAX_PPO_STEPS = 10_000_000
@@ -25,17 +30,6 @@ MAX_ROLLOUT_EPISODES = 100_000
 MAX_ROLLOUT_STEPS = 1_000_000
 DEFAULT_INPUT_SIZE = 64
 DEFAULT_OUTPUT_SIZE = 32
-_PRODUCTION_DIRECTORY_NAMES = frozenset({
-    "model", "models", "checkpoint", "checkpoints", "artifact", "artifacts",
-    "deploy", "deployment", "production",
-})
-_PROTECTED_OUTPUT_NAMES = frozenset({
-    "model.json", "model.pt", "model.pth",
-    "trained_model.json", "trained_model.pt", "trained_model.pth",
-    "checkpoint.json", "checkpoint.pt", "checkpoint.pth",
-    "artifact.json", "artifact.pt", "artifact.pth",
-    "learned_v1.json", "learned_v1.pt",
-})
 
 
 def parse_ladder(value: str | Path | Mapping[str, Any]) -> dict[str, Any]:
@@ -87,9 +81,13 @@ def parse_ladder(value: str | Path | Mapping[str, Any]) -> dict[str, Any]:
         "rollout_steps": rollout_steps,
     }
     if value.get("run_root") is not None:
-        normalized["run_root"] = str(Path(value["run_root"]).expanduser())
+        normalized["run_root"] = str(
+            _validate_isolated_ladder_path(value["run_root"], "run_root")
+        )
     elif value.get("run_directory") is not None:
-        normalized["run_root"] = str(Path(value["run_directory"]).expanduser())
+        normalized["run_root"] = str(
+            _validate_isolated_ladder_path(value["run_directory"], "run_directory")
+        )
     for key in ("artifact_output", "model_output", "checkpoint_output"):
         if value.get(key) is not None:
             raise ValueError(f"{key} is a production artifact/checkpoint output")
@@ -222,24 +220,22 @@ def validate_report_path(path: str | Path, report_root: str | Path | None = None
     """Validate a report output against an explicit safe report root."""
     if report_root is None:
         raise ValueError("an explicit report root is required")
-    root = Path(report_root).expanduser().resolve()
-    if any(part.lower() in _PRODUCTION_DIRECTORY_NAMES for part in root.parts):
-        raise ValueError("report root may not be nested under a production path")
+    root = validate_training_output_path(
+        report_root, name="report root", reject_protected_names=True,
+    )
 
     raw_path = Path(path).expanduser()
     if raw_path.is_absolute():
-        candidate = raw_path.resolve()
+        candidate = resolve_output_path(raw_path, name="report path")
     elif raw_path.parts and raw_path.parts[0].lower() == root.name.lower():
-        candidate = (Path.cwd() / raw_path).resolve()
+        candidate = resolve_output_path(Path.cwd() / raw_path, name="report path")
     else:
-        candidate = (root / raw_path).resolve()
+        candidate = resolve_output_path(root / raw_path, name="report path")
     if candidate == root or root not in candidate.parents:
         raise ValueError("production/output path must remain inside the report root")
-    relative_parts = candidate.relative_to(root).parts
-    if any(part.lower() in _PRODUCTION_DIRECTORY_NAMES for part in relative_parts):
-        raise ValueError("report path may not target a production artifact or checkpoint")
-    if candidate.name.lower() in _PROTECTED_OUTPUT_NAMES:
-        raise ValueError("report path may not target a production artifact or checkpoint")
+    validate_training_output_path(
+        candidate, name="report path", reject_protected_names=True,
+    )
     if candidate.suffix.lower() not in {".json", ".jsonl"}:
         raise ValueError("report path must be JSON")
     return candidate
@@ -353,14 +349,10 @@ def _model_width_list(value: Any, name: str, maximum: int) -> list[int]:
     return result
 
 
-def _validate_isolated_ladder_path(value: Any, name: str) -> None:
-    if not isinstance(value, (str, Path)) or not str(value).strip():
-        raise ValueError(f"{name} must be a nonempty path")
-    path = Path(value).expanduser()
-    if any(part.lower() in _PRODUCTION_DIRECTORY_NAMES for part in path.parts):
-        raise ValueError(f"{name} may not be nested under a production path")
-    if path.name.lower() in _PROTECTED_OUTPUT_NAMES:
-        raise ValueError(f"{name} may not target a production artifact or checkpoint")
+def _validate_isolated_ladder_path(value: Any, name: str) -> Path:
+    return validate_training_output_path(
+        value, name=name, reject_protected_names=True,
+    )
 
 
 def _seeds(value: Mapping[str, Any]) -> list[int]:

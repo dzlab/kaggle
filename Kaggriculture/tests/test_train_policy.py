@@ -724,6 +724,53 @@ def test_prior_checkpoint_metadata_validation_accepts_current_schema():
     assert validate_prior_checkpoint_metadata(metadata) is None
 
 
+@pytest.mark.parametrize(
+    ("helper_name", "training_mode", "behavior_clone_steps"),
+    [
+        ("checkpoint_metadata", "pure_ppo", 1),
+        ("checkpoint_metadata", "reduced_behavior_clone_then_ppo", 0),
+        ("checkpoint_metadata", "behavior_clone_then_ppo", 0),
+        ("_checkpoint_metadata", "pure_ppo", 1),
+        ("_checkpoint_metadata", "reduced_behavior_clone_then_ppo", 0),
+        ("_checkpoint_metadata", "behavior_clone_then_ppo", 0),
+    ],
+)
+def test_checkpoint_metadata_rejects_contradictory_mode_and_bc_budget(
+    helper_name, training_mode, behavior_clone_steps,
+):
+    from scripts import train_policy
+
+    with pytest.raises(ValueError, match="behavior_clone_steps|training_mode"):
+        getattr(train_policy, helper_name)(
+            transition_count=1,
+            training_mode=training_mode,
+            behavior_clone_steps=behavior_clone_steps,
+        )
+
+
+@pytest.mark.parametrize(
+    ("training_mode", "behavior_clone_steps"),
+    [
+        ("pure_ppo", 0),
+        ("reduced_behavior_clone_then_ppo", 2),
+        ("behavior_clone_then_ppo", 8),
+    ],
+)
+def test_checkpoint_metadata_accepts_canonical_mode_and_bc_budget(
+    training_mode, behavior_clone_steps,
+):
+    from scripts.train_policy import checkpoint_metadata
+
+    metadata = checkpoint_metadata(
+        transition_count=1,
+        training_mode=training_mode,
+        behavior_clone_steps=behavior_clone_steps,
+    )
+
+    assert metadata["training_mode"] == training_mode
+    assert metadata["behavior_clone_steps"] == behavior_clone_steps
+
+
 @pytest.mark.parametrize("field,value", [
     ("model_version", "old"),
     ("feature_schema_version", -1),

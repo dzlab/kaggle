@@ -37,6 +37,7 @@ from scripts.train_policy import (
     resolve_behavior_clone_steps,
     validate_training_checkpoint,
 )
+from scripts.output_paths import validate_training_output_path
 from scripts.training_identity import (
     DEFAULT_EXPERIMENT_ID,
     FEATURE_VARIANTS,
@@ -496,7 +497,13 @@ def build_config(
         if not opponents or any(opponent not in allowed_opponents for opponent in opponents):
             raise ValueError(f"{name} must contain supported opponents")
     resolved = str(resolve_device(device)) if resolve_runtime_device else device
-    run_path = _absolute_path(run_directory)
+    run_path = validate_training_output_path(
+        _absolute_path(run_directory), name="run directory",
+    )
+    resolved_plot_path = (
+        validate_training_output_path(_absolute_path(plot_path), name="plot path")
+        if plot_path is not None else None
+    )
     input_path = (
         _absolute_path(trajectory_path)
         if trajectory_path is not None else run_path / "bootstrap-trajectories.jsonl"
@@ -535,7 +542,7 @@ def build_config(
         int(smoke_seed),
         smoke_steps,
         plot,
-        _absolute_path(plot_path) if plot_path is not None else None,
+        resolved_plot_path,
         experiment_id,
         feature_variant,
         training_mode,
@@ -1208,7 +1215,7 @@ def plot_training_metrics(config: ColabConfig) -> Path | None:
             axis.set_axis_off()
     fig.tight_layout()
     output = config.plot_path or config.run_directory / f"{config.candidate_tag}-training-telemetry.png"
-    output = Path(output).expanduser()
+    output = validate_training_output_path(output, name="plot path")
     output.parent.mkdir(parents=True, exist_ok=True)
     try:
         fig.savefig(output)
@@ -1220,6 +1227,7 @@ def plot_training_metrics(config: ColabConfig) -> Path | None:
 def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResult:
     """Execute or plan the complete resumable Colab workflow."""
     _validate_explicit_resume(config)
+    validate_training_output_path(config.run_directory, name="run directory")
     commands = (
         tuple(build_collection_command(config)),
         tuple(build_evaluation_command(config, phase="development")),
