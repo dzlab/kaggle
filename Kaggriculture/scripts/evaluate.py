@@ -51,10 +51,13 @@ from scripts.evaluation_metrics import (  # noqa: E402
     summarize_by_opponent as _summarize_by_opponent,
 )
 from scripts.training_identity import (  # noqa: E402
+    ACTION_REPRESENTATIONS,
+    DEFAULT_ACTION_REPRESENTATION,
     DEFAULT_EXPERIMENT_ID,
     FEATURE_VARIANTS,
     TRAINING_MODES,
     validate_training_identity,
+    validate_action_representation,
 )
 
 
@@ -273,6 +276,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--experiment-id", default=DEFAULT_EXPERIMENT_ID)
     parser.add_argument("--feature-variant", choices=FEATURE_VARIANTS, default="production_v1")
     parser.add_argument("--training-mode", choices=TRAINING_MODES, default="behavior_clone_then_ppo")
+    parser.add_argument(
+        "--action-representation", choices=ACTION_REPRESENTATIONS,
+        default=DEFAULT_ACTION_REPRESENTATION,
+    )
     parser.add_argument("--seats", nargs="+", type=int, choices=(0, 1), default=[0, 1],
                         help="candidate seats to evaluate (0 and 1 are supported)")
     parser.add_argument("--variant", action="append", dest="single_variants", choices=VARIANTS)
@@ -4466,7 +4473,8 @@ def build_manifest(*, candidates: Sequence[str], opponents: Sequence[str], seeds
                    steps: int, seats: Sequence[int], command: Sequence[str] | None = None,
                    selection_path: str = "candidate", experiment_id: str | None = None,
                    feature_variant: str | None = None,
-                   training_mode: str | None = None) -> dict[str, Any]:
+                   training_mode: str | None = None,
+                   action_representation: str | None = None) -> dict[str, Any]:
     """Return the JSON-compatible, versioned reproducibility manifest."""
     manifest = {
         "schema_version": 3,
@@ -4489,9 +4497,13 @@ def build_manifest(*, candidates: Sequence[str], opponents: Sequence[str], seeds
         "experiment_id": experiment_id,
         "feature_variant": feature_variant,
         "training_mode": training_mode,
+        "action_representation": action_representation,
     }
     if any(value is not None for value in identity.values()):
         validate_training_identity(experiment_id, feature_variant, training_mode)
+        validate_action_representation(
+            action_representation or DEFAULT_ACTION_REPRESENTATION,
+        )
         manifest.update(identity)
     return manifest
 
@@ -4638,6 +4650,7 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
         experiment_id=config.get("experiment_id"),
         feature_variant=config.get("feature_variant"),
         training_mode=config.get("training_mode"),
+        action_representation=config.get("action_representation"),
     )
     holdout_document = None
     development_selected_default = _select_default(
@@ -4710,6 +4723,7 @@ def build_result_document(*, config: Mapping[str, Any], records: Sequence[Mappin
             experiment_id=config.get("experiment_id"),
             feature_variant=config.get("feature_variant"),
             training_mode=config.get("training_mode"),
+            action_representation=config.get("action_representation"),
         )
         holdout_document = {
             "manifest": holdout_manifest,
@@ -4851,6 +4865,7 @@ def main(argv: list[str] | None = None) -> int:
         "experiment_id": args.experiment_id,
         "feature_variant": args.feature_variant,
         "training_mode": args.training_mode,
+        "action_representation": args.action_representation,
         "seeds": args.seeds,
         "start_seed": args.start_seed,
         "seed_values": seeds,

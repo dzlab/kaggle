@@ -29,10 +29,13 @@ from kagriculture_agent.rollouts import resolve_worker_count, run_rollouts
 from kagriculture_agent.reward_shaping import classify_progress, should_bootstrap_truncate
 from kagriculture_agent.trajectory import TRANSITION_SCHEMA_VERSION, Transition, transitions_from_replay
 from scripts.training_identity import (
+    ACTION_REPRESENTATIONS,
+    DEFAULT_ACTION_REPRESENTATION,
     DEFAULT_EXPERIMENT_ID,
     FEATURE_VARIANTS,
     TRAINING_MODES,
     validate_training_identity,
+    validate_action_representation,
 )
 from scripts.output_paths import validate_training_output_path
 
@@ -172,6 +175,7 @@ def _manifest(
     experiment_id: str = DEFAULT_EXPERIMENT_ID,
     feature_variant: str = "production_v1",
     training_mode: str = "behavior_clone_then_ppo",
+    action_representation: str = DEFAULT_ACTION_REPRESENTATION,
     potential_reward_coef: float = 0.0,
     no_progress_window: int = 0,
     resolved_margin: float = 0.0,
@@ -186,6 +190,7 @@ def _manifest(
     league_checkpoints: Sequence[str | Path] | None = None,
 ) -> dict[str, Any]:
     validate_training_identity(experiment_id, feature_variant, training_mode)
+    validate_action_representation(action_representation, source="trajectory")
     manifest = {
         "schema_version": TRANSITION_SCHEMA_VERSION,
         "transition_schema_version": TRANSITION_SCHEMA_VERSION,
@@ -203,6 +208,8 @@ def _manifest(
         "no_progress_window": int(no_progress_window),
         "resolved_margin": float(resolved_margin),
     }
+    if action_representation != DEFAULT_ACTION_REPRESENTATION:
+        manifest["action_representation"] = action_representation
     if (
         league_round is not None or league_seed is not None or opponent_identity is not None
         or checkpoint_identity is not None or league_composition is not None
@@ -451,6 +458,7 @@ def collect(
     experiment_id: str = DEFAULT_EXPERIMENT_ID,
     feature_variant: str = "production_v1",
     training_mode: str = "behavior_clone_then_ppo",
+    action_representation: str = DEFAULT_ACTION_REPRESENTATION,
     game_timeout: float = DEFAULT_GAME_TIMEOUT_SECONDS,
     candidate_artifact: str | Path | None = None,
     candidate_identity: str | None = None,
@@ -528,6 +536,7 @@ def collect(
         experiment_id=experiment_id,
         feature_variant=feature_variant,
         training_mode=training_mode,
+        action_representation=action_representation,
         potential_reward_coef=potential_reward_coef,
         no_progress_window=no_progress_window,
         resolved_margin=resolved_margin,
@@ -708,6 +717,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--experiment-id", default=DEFAULT_EXPERIMENT_ID)
     parser.add_argument("--feature-variant", choices=FEATURE_VARIANTS, default="production_v1")
     parser.add_argument("--training-mode", choices=TRAINING_MODES, default="behavior_clone_then_ppo")
+    parser.add_argument(
+        "--action-representation", choices=ACTION_REPRESENTATIONS,
+        default=DEFAULT_ACTION_REPRESENTATION,
+    )
     parser.add_argument("--candidate-artifact", type=Path, default=None)
     parser.add_argument("--candidate-identity", default=None)
     parser.add_argument("--workers", type=_positive_int, default=1)
@@ -743,6 +756,7 @@ def main(argv: list[str] | None = None) -> int:
         experiment_id=args.experiment_id,
         feature_variant=args.feature_variant,
         training_mode=args.training_mode,
+        action_representation=args.action_representation,
         candidate_artifact=args.candidate_artifact,
         candidate_identity=args.candidate_identity,
         workers=args.workers,

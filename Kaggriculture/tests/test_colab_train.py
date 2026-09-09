@@ -321,6 +321,43 @@ def test_colab_cli_propagates_action_representation_and_training_mask(tmp_path, 
     assert config.training_action_mask is True
 
 
+def test_experiment_matrix_propagates_action_representation_and_rejects_conflicts(tmp_path, monkeypatch):
+    from scripts import train
+
+    monkeypatch.setattr(train, "resolve_device", lambda value: "cpu")
+    matrix = tmp_path / "matrix.json"
+    matrix.write_text(json.dumps({
+        "schema_version": 1,
+        "shared": {
+            "training_seeds": [7], "collection_seeds": [0],
+            "development_seeds": [1], "holdout_seeds": [2],
+        },
+        "experiments": {
+            "target": {
+                "run_directory": "target", "experiment_id": "target",
+                "feature_variant": "production_v1",
+                "training_mode": "behavior_clone_then_ppo",
+                "action_representation": "target_first_v1",
+                "bc_steps": 1, "ppo_steps": 1,
+            },
+        },
+    }), encoding="utf-8")
+
+    config = train.config_from_args(train.parse_args([
+        "--experiment-config", str(matrix), "--experiment", "target",
+        "--run-directory", str(tmp_path / "run"), "--device", "cpu",
+        "--no-mount-drive", "--no-wandb", "--dry-run",
+    ]))
+    assert config.action_representation == "target_first_v1"
+
+    with pytest.raises(ValueError, match="action_representation"):
+        train.config_from_args(train.parse_args([
+            "--experiment-config", str(matrix), "--experiment", "target",
+            "--action-representation", "current_v1", "--device", "cpu",
+            "--no-mount-drive", "--no-wandb", "--dry-run",
+        ]))
+
+
 @pytest.mark.parametrize(
     "flag,value",
     [

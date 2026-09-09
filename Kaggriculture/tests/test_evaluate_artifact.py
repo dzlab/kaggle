@@ -93,6 +93,23 @@ def test_parse_args_accepts_and_validates_training_identity(tmp_path):
         ])
 
 
+def test_evaluate_configuration_carries_action_representation(tmp_path, monkeypatch):
+    from scripts import evaluate_artifact
+
+    artifact = _artifact(tmp_path / "artifact.json")
+    monkeypatch.setattr(evaluate_artifact, "load_exported_policy", lambda path: object())
+    result = evaluate_artifact.evaluate(
+        artifact=artifact, seeds=[3], opponents=["pass"], seats=[0, 1],
+        steps=4, workers=1, min_valid_games=1,
+        game_runner=lambda request: _record(
+            request["candidate"], request["opponent"], request["seed"], request["seat"],
+        ),
+        action_representation="target_first_v1",
+    )
+
+    assert result["configuration"]["action_representation"] == "target_first_v1"
+
+
 def test_evaluate_configuration_contains_training_identity(tmp_path, monkeypatch):
     from scripts import evaluate_artifact
 

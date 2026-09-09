@@ -194,3 +194,18 @@ def test_batching_feature_batches_preserves_documented_shapes():
     assert outputs["worker_act_logits"].shape[0] == 2
     assert outputs["worker_target_logits"].shape == (2, 10, 100)
     assert outputs["value"].shape == (2,)
+
+
+def test_target_first_policy_uses_target_conditioned_kind_head():
+    torch = pytest.importorskip("torch")
+    from kagriculture_agent.model import ACTION_VOCAB, CompactPolicyNet
+
+    network = CompactPolicyNet(action_representation="target_first_v1")
+    outputs = network(extract_features(sample_state()))
+
+    assert network.action_representation == "target_first_v1"
+    assert outputs["worker_target_logits"].shape == (1, 10, 100)
+    assert outputs["worker_kind_logits"].shape == (
+        1, 10, 100, len(ACTION_VOCAB["worker_kinds"]),
+    )
+    assert all(torch.isfinite(tensor).all().item() for tensor in outputs.values())

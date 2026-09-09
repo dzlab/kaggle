@@ -33,6 +33,7 @@ from kagriculture_agent.model import (
     validate_model_shape,
 )
 from scripts.output_paths import validate_training_output_path
+from scripts.training_identity import DEFAULT_ACTION_REPRESENTATION, validate_action_representation
 
 FORMAT_VERSION = 1
 QUANTIZATION = "int8-per-row"
@@ -106,8 +107,10 @@ def _tensor_to_artifact(name: str, tensor: Any, expected_shape: tuple[int, ...])
     raise ValueError(f"unsupported tensor rank for {name!r}: {value.ndim}")
 
 
-def expected_tensor_names() -> tuple[str, ...]:
-    return tuple(artifact_tensor_shapes())
+def expected_tensor_names(
+    *, action_representation: str = DEFAULT_ACTION_REPRESENTATION,
+) -> tuple[str, ...]:
+    return tuple(artifact_tensor_shapes(action_representation=action_representation))
 
 
 def _strict_equal(actual: Any, expected: Any) -> bool:
@@ -149,6 +152,10 @@ def validate_checkpoint_metadata(metadata: Any) -> dict[str, list[Any]]:
     feature_variant = metadata.get("feature_variant", PRODUCTION_FEATURE_VARIANT)
     if feature_variant not in {PRODUCTION_FEATURE_VARIANT, EXPERIMENTAL_FEATURE_VARIANT}:
         raise ValueError("checkpoint feature_variant mismatch")
+    validate_action_representation(
+        metadata.get("action_representation", DEFAULT_ACTION_REPRESENTATION),
+        source="checkpoint",
+    )
     _checkpoint_model_shape(metadata)
     return validate_action_vocab(metadata.get("action_vocab"))
 
@@ -156,10 +163,13 @@ def validate_checkpoint_metadata(metadata: Any) -> dict[str, list[Any]]:
 def validate_checkpoint_state_dict(
     state: Any, *, model_width: int = HIDDEN_WIDTH, model_depth: int = DEFAULT_MODEL_DEPTH,
     feature_variant: str = PRODUCTION_FEATURE_VARIANT,
+    action_representation: str = DEFAULT_ACTION_REPRESENTATION,
 ) -> None:
     if not isinstance(state, dict):
         raise ValueError("checkpoint model_state_dict is required")
-    shapes = artifact_tensor_shapes(model_width, model_depth, feature_variant)
+    shapes = artifact_tensor_shapes(
+        model_width, model_depth, feature_variant, action_representation,
+    )
     expected = set(shapes)
     actual = set(state)
     missing = expected - actual
@@ -180,15 +190,20 @@ def build_artifact(
     state: dict[str, Any], action_vocab: dict[str, list[Any]], *,
     model_width: int = HIDDEN_WIDTH, model_depth: int = DEFAULT_MODEL_DEPTH,
     feature_variant: str = PRODUCTION_FEATURE_VARIANT,
+    action_representation: str = DEFAULT_ACTION_REPRESENTATION,
 ) -> dict[str, Any]:
     """Build the serialized artifact after checkpoint validation."""
     validate_model_shape(model_width, model_depth, source="artifact")
+    validate_action_representation(action_representation, source="artifact")
     validate_checkpoint_state_dict(
         state, model_width=model_width, model_depth=model_depth,
         feature_variant=feature_variant,
+        action_representation=action_representation,
     )
     validated_vocab = validate_action_vocab(action_vocab)
-    shapes = artifact_tensor_shapes(model_width, model_depth, feature_variant)
+    shapes = artifact_tensor_shapes(
+        model_width, model_depth, feature_variant, action_representation,
+    )
     artifact: dict[str, Any] = {
         "format_version": FORMAT_VERSION,
         "model_version": MODEL_VERSION,
@@ -202,6 +217,8 @@ def build_artifact(
     }
     if feature_variant != PRODUCTION_FEATURE_VARIANT:
         artifact["feature_variant"] = feature_variant
+    if action_representation != DEFAULT_ACTION_REPRESENTATION:
+        artifact["action_representation"] = action_representation
     artifact["checksum"] = artifact_checksum(artifact)
     return artifact
 
@@ -269,6 +286,9 @@ def export_checkpoint(
     metadata = checkpoint.get("metadata")
     expected_vocab = validate_checkpoint_metadata(metadata)
     feature_variant = metadata.get("feature_variant", PRODUCTION_FEATURE_VARIANT)
+    action_representation = metadata.get(
+        "action_representation", DEFAULT_ACTION_REPRESENTATION,
+    )
     checkpoint_width, checkpoint_depth = _checkpoint_model_shape(metadata)
     if model_width is not None or model_depth is not None:
         requested_width = checkpoint_width if model_width is None else model_width
@@ -283,6 +303,7 @@ def export_checkpoint(
     artifact = build_artifact(
         state, expected_vocab, model_width=checkpoint_width, model_depth=checkpoint_depth,
         feature_variant=feature_variant,
+        action_representation=action_representation,
     )
     write_artifact(artifact, artifact_path)
     return artifact

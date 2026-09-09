@@ -17,6 +17,7 @@ from scripts.training_identity import (
     FEATURE_VARIANTS,
     TRAINING_MODES,
     validate_training_identity,
+    validate_action_representation,
 )
 
 DEFAULT_WEAVE_PROJECT = "dzlab/kaggriculture"
@@ -556,6 +557,7 @@ def record_validation_report(
     experiment_id: str = DEFAULT_EXPERIMENT_ID,
     feature_variant: str = "production_v1",
     training_mode: str = "behavior_clone_then_ppo",
+    action_representation: str = "current_v1",
     potential_reward_coef: float = 0.0,
     no_progress_window: int = 0,
     resolved_margin: float = 0.0,
@@ -569,6 +571,7 @@ def record_validation_report(
     if not isinstance(report, Mapping):
         return
     validate_training_identity(experiment_id, feature_variant, training_mode)
+    validate_action_representation(action_representation, source="telemetry")
     for name, value in (
         ("potential_reward_coef", potential_reward_coef),
         ("resolved_margin", resolved_margin),
@@ -606,6 +609,7 @@ def record_validation_report(
         "experiment_id": experiment_id,
         "feature_variant": feature_variant,
         "training_mode": training_mode,
+        "action_representation": action_representation,
         "potential_reward_coef": float(potential_reward_coef),
         "no_progress_window": no_progress_window,
         "resolved_margin": float(resolved_margin),

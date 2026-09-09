@@ -45,6 +45,8 @@ from scripts.training_identity import (
     DEFAULT_EXPERIMENT_ID,
     FEATURE_VARIANTS,
     TRAINING_MODES,
+    validate_action_representation,
+    validate_identity_consistency,
     validate_training_identity,
 )
 
@@ -127,6 +129,10 @@ def load_experiment_matrix(path: str | Path) -> dict[str, Any]:
             entry["experiment_id"], entry["feature_variant"], entry["training_mode"],
             source=f"matrix experiment {name}",
         )
+        validate_action_representation(
+            entry.get("action_representation", DEFAULT_ACTION_REPRESENTATION),
+            source=f"matrix experiment {name}",
+        )
         for field, minimum in (("bc_steps", 0), ("ppo_steps", 1)):
             value = entry.get(field)
             if type(value) is not int or value < minimum:
@@ -155,6 +161,13 @@ def _matrix_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"unknown matrix experiment {experiment_name!r}; choose from: {choices}")
     shared = matrix["shared"]
     entry = experiments[experiment_name]
+    for field in ("experiment_id", "feature_variant", "training_mode", "action_representation"):
+        requested = getattr(args, field, None)
+        entry_value = entry.get(field, DEFAULT_ACTION_REPRESENTATION if field == "action_representation" else None)
+        if requested is not None and requested != entry_value:
+            raise ValueError(
+                f"matrix experiment {experiment_name} {field} conflicts with explicit CLI value"
+            )
     training_seed = args.training_seed
     if training_seed not in shared["training_seeds"]:
         raise ValueError(
@@ -172,6 +185,9 @@ def _matrix_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "experiment_id": args.experiment_id or entry["experiment_id"],
         "feature_variant": args.feature_variant or entry["feature_variant"],
         "training_mode": args.training_mode or entry["training_mode"],
+        "action_representation": entry.get(
+            "action_representation", DEFAULT_ACTION_REPRESENTATION,
+        ),
         "training_steps": entry["bc_steps"],
         "training_batch_size": shared.get("training_batch_size", args.training_batch_size),
         "collection_seed_values": tuple(shared["collection_seeds"]),
@@ -575,6 +591,7 @@ def build_config(
         potential_reward_coef=potential_reward_coef,
         no_progress_window=no_progress_window,
         resolved_margin=resolved_margin,
+        action_representation=action_representation,
     )
     if isinstance(league_checkpoints, (str, bytes)):
         raise ValueError("league_checkpoints must be a sequence of paths")
@@ -787,7 +804,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--training-mode", choices=TRAINING_MODES, default=None)
     parser.add_argument(
         "--action-representation", choices=ACTION_REPRESENTATIONS,
-        default=DEFAULT_ACTION_REPRESENTATION,
+        default=None,
     )
     parser.add_argument("--training-action-mask", dest="training_action_mask", action="store_true", default=False)
     parser.add_argument("--no-training-action-mask", dest="training_action_mask", action="store_false")
@@ -873,7 +890,10 @@ def config_from_args(args: argparse.Namespace) -> ColabConfig:
         experiment_id=matrix.get("experiment_id", args.experiment_id or DEFAULT_EXPERIMENT_ID),
         feature_variant=matrix.get("feature_variant", args.feature_variant or "production_v1"),
         training_mode=matrix.get("training_mode", args.training_mode or "behavior_clone_then_ppo"),
-        action_representation=args.action_representation,
+        action_representation=matrix.get(
+            "action_representation",
+            args.action_representation or DEFAULT_ACTION_REPRESENTATION,
+        ),
         training_action_mask=args.training_action_mask,
         model_width=args.model_width,
         model_depth=args.model_depth,
@@ -952,6 +972,7 @@ def build_collection_command(config: ColabConfig) -> list[str]:
         "--experiment-id", config.experiment_id,
         "--feature-variant", config.feature_variant,
         "--training-mode", config.training_mode,
+        "--action-representation", config.action_representation,
         "--potential-reward-coef", str(config.potential_reward_coef),
         "--no-progress-window", str(config.no_progress_window),
         "--resolved-margin", str(config.resolved_margin),
@@ -982,6 +1003,7 @@ def build_evaluation_command(config: ColabConfig, *, phase: str) -> list[str]:
         "--experiment-id", config.experiment_id,
         "--feature-variant", config.feature_variant,
         "--training-mode", config.training_mode,
+        "--action-representation", config.action_representation,
         "--seeds", str(len(seeds)),
         "--start-seed", str(seeds[0]),
         "--steps", str(steps),
@@ -1077,6 +1099,7 @@ def initialize_telemetry(config: ColabConfig) -> Any | None:
             "parameter_count": model_parameter_count_for_shape(
                 config.model_width, config.model_depth,
                 feature_variant=config.feature_variant,
+                action_representation=config.action_representation,
             ),
             "batch_size": config.training_batch_size,
             "seed": config.training_seed,
@@ -1332,6 +1355,7 @@ def _identity_fields(config: ColabConfig) -> dict[str, str]:
         "experiment_id": config.experiment_id,
         "feature_variant": config.feature_variant,
         "training_mode": config.training_mode,
+        "action_representation": config.action_representation,
     }
 
 
@@ -1355,13 +1379,24 @@ def _validate_identity_document(
             continue
         if not isinstance(nested, Mapping):
             raise ValueError(f"{path} {label} must be an object")
+        validate_identity_consistency(
+            document, nested, source=f"{path} {label}",
+        )
         for field, value in expected.items():
             if field in nested and nested[field] != value:
                 raise ValueError(
                     f"{path} {label}.{field} does not match requested experiment identity"
                 )
-            if label == "configuration" and require_configuration and field not in nested:
-                raise ValueError(f"{path} configuration.{field} is missing experiment identity")
+                if (
+                    label == "configuration"
+                    and require_configuration
+                    and field not in nested
+                    and not (
+                        field == "action_representation"
+                        and value == DEFAULT_ACTION_REPRESENTATION
+                    )
+                ):
+                    raise ValueError(f"{path} configuration.{field} is missing experiment identity")
 
 
 def _invalidate_evaluation_report(path: Path) -> None:

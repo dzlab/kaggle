@@ -168,6 +168,21 @@ def test_policy_cli_propagates_action_representation_and_mask_ablation():
     assert options["ppo_config"].training_action_mask is True
 
 
+def test_training_rejects_conflicting_top_level_and_nested_action_identity():
+    from scripts.train_policy import PPOConfig, build_training_contract
+
+    input_path = Path("transitions.jsonl")
+    with pytest.raises(ValueError, match="action_representation"):
+        build_training_contract(
+            input_path=input_path,
+            steps=1,
+            batch_size=1,
+            resolved_device="cpu",
+            action_representation="target_first_v1",
+            ppo_config=PPOConfig(action_representation="current_v1"),
+        )
+
+
 def test_policy_cli_propagates_reward_and_stall_ablations_into_ppo_config():
     from scripts.train_policy import PPOConfig, _cli_training_options, _parser
 

@@ -33,6 +33,7 @@ except ImportError:  # pragma: no cover - exercised by the dependency-free smoke
 
 from .constants import ANIMALS, CROPS, PRODUCTS
 from .features import (
+    BOARD_SIZE,
     EXPERIMENTAL_CONTEXT_FEATURE_SIZE,
     EXPERIMENTAL_FEATURE_VARIANT,
     GLOBAL_TOKEN_SIZE,
@@ -44,6 +45,11 @@ from .features import (
 from .memory import PolicyMemory
 from .routing import is_locked_tile, normalize_position, route_to
 from .types import Position, Task, WorkerAssignment
+from scripts.training_identity import (
+    ACTION_REPRESENTATIONS,
+    DEFAULT_ACTION_REPRESENTATION,
+    validate_action_representation,
+)
 
 
 @dataclass(frozen=True)
@@ -98,7 +104,9 @@ def _validate_artifact_model_shape(hidden_width: Any, model_depth: Any) -> tuple
 def _artifact_tensor_names(
     model_depth: int = _ARTIFACT_MODEL_DEPTH,
     feature_variant: str = PRODUCTION_FEATURE_VARIANT,
+    action_representation: str = DEFAULT_ACTION_REPRESENTATION,
 ) -> tuple[str, ...]:
+    validate_action_representation(action_representation, source="learned artifact")
     names = [
         "tile_projection.weight", "tile_projection.bias",
         "worker_projection.weight", "worker_projection.bias",
@@ -118,7 +126,11 @@ def _artifact_tensor_names(
         ])
     names.extend([
         "worker_act_head.weight", "worker_act_head.bias",
-        "worker_kind_head.weight", "worker_kind_head.bias",
+        *(
+            ("worker_kind_head.weight", "worker_kind_head.bias")
+            if action_representation == DEFAULT_ACTION_REPRESENTATION
+            else ("worker_kind_by_target_head.weight", "worker_kind_by_target_head.bias")
+        ),
         "target_worker_head.weight", "target_worker_head.bias",
         "target_tile_head.weight", "target_tile_head.bias",
         "market_item_head.weight", "market_item_head.bias",
@@ -136,9 +148,11 @@ def artifact_tensor_shapes(
     hidden_width: int = _ARTIFACT_HIDDEN_WIDTH,
     model_depth: int = _ARTIFACT_MODEL_DEPTH,
     feature_variant: str = PRODUCTION_FEATURE_VARIANT,
+    action_representation: str = DEFAULT_ACTION_REPRESENTATION,
 ) -> dict[str, tuple[int, ...]]:
     """Return the exact state-dict shapes for a CompactPolicyNet topology."""
     hidden_width, model_depth = _validate_artifact_model_shape(hidden_width, model_depth)
+    validate_action_representation(action_representation, source="learned artifact")
     mlp_width = 2 * hidden_width
     shapes: dict[str, tuple[int, ...]] = {
         "tile_projection.weight": (hidden_width, TILE_TOKEN_SIZE),
@@ -167,11 +181,31 @@ def artifact_tensor_shapes(
             f"{prefix}.mlp_norm.weight": (hidden_width,),
             f"{prefix}.mlp_norm.bias": (hidden_width,),
         })
+    kind_weight_name = (
+        "worker_kind_head.weight"
+        if action_representation == DEFAULT_ACTION_REPRESENTATION
+        else "worker_kind_by_target_head.weight"
+    )
+    kind_bias_name = (
+        "worker_kind_head.bias"
+        if action_representation == DEFAULT_ACTION_REPRESENTATION
+        else "worker_kind_by_target_head.bias"
+    )
+    kind_weight_shape = (
+        (len(_ARTIFACT_WORKER_KINDS), hidden_width)
+        if action_representation == DEFAULT_ACTION_REPRESENTATION
+        else (BOARD_SIZE * BOARD_SIZE * len(_ARTIFACT_WORKER_KINDS), hidden_width)
+    )
+    kind_bias_shape = (
+        (len(_ARTIFACT_WORKER_KINDS),)
+        if action_representation == DEFAULT_ACTION_REPRESENTATION
+        else (BOARD_SIZE * BOARD_SIZE * len(_ARTIFACT_WORKER_KINDS),)
+    )
     shapes.update({
         "worker_act_head.weight": (2, hidden_width),
         "worker_act_head.bias": (2,),
-        "worker_kind_head.weight": (len(_ARTIFACT_WORKER_KINDS), hidden_width),
-        "worker_kind_head.bias": (len(_ARTIFACT_WORKER_KINDS),),
+        kind_weight_name: kind_weight_shape,
+        kind_bias_name: kind_bias_shape,
         "target_worker_head.weight": (hidden_width, hidden_width),
         "target_worker_head.bias": (hidden_width,),
         "target_tile_head.weight": (hidden_width, hidden_width),
@@ -290,17 +324,25 @@ def _validate_artifact(value: Any) -> dict[str, Any]:
     if not hmac.compare_digest(actual, checksum):
         raise ValueError("learned artifact checksum mismatch")
     weights = value.get("weights")
-    expected_names = set(_artifact_tensor_names(model_depth, feature_variant))
+    action_representation = value.get(
+        "action_representation", DEFAULT_ACTION_REPRESENTATION,
+    )
+    validate_action_representation(action_representation, source="learned artifact")
+    expected_names = set(_artifact_tensor_names(model_depth, feature_variant, action_representation))
     if not isinstance(weights, Mapping) or set(weights) != expected_names:
         missing = sorted(expected_names - set(weights or ())) if isinstance(weights, Mapping) else sorted(expected_names)
         raise ValueError(f"learned artifact tensors mismatch; missing={missing}")
-    shapes = artifact_tensor_shapes(hidden_width, model_depth, feature_variant)
+    shapes = artifact_tensor_shapes(
+        hidden_width, model_depth, feature_variant, action_representation,
+    )
     decoded = {
         name: _read_artifact_tensor(name, weights[name], shapes[name])
-        for name in _artifact_tensor_names(model_depth, feature_variant)
+        for name in _artifact_tensor_names(model_depth, feature_variant, action_representation)
     }
     headers = dict(expected_headers)
     headers["feature_variant"] = feature_variant
+    if action_representation != DEFAULT_ACTION_REPRESENTATION:
+        headers["action_representation"] = action_representation
     return {"headers": headers, "action_vocab": value["action_vocab"], "weights": decoded}
 
 
@@ -480,6 +522,9 @@ class DependencyFreePolicy:
         self.feature_variant = artifact["headers"].get(
             "feature_variant", PRODUCTION_FEATURE_VARIANT,
         )
+        self.action_representation = artifact["headers"].get(
+            "action_representation", DEFAULT_ACTION_REPRESENTATION,
+        )
         self._weights = artifact["weights"]
         self._numpy_weights = (
             {name: _np.asarray(value, dtype=_np.float32) for name, value in self._weights.items()}
@@ -560,10 +605,21 @@ class DependencyFreePolicy:
         tile_target_key = tile_rows @ weights["target_tile_head.weight"].T + weights["target_tile_head.bias"]
         target_logits = worker_target_query @ tile_target_key.T / _np.sqrt(_np.float32(self._hidden_width))
         pooled_market = market_rows.mean(axis=0) if market_count else _np.zeros(self._hidden_width, dtype=_np.float32)
+        kind_output = worker_rows @ weights[
+            "worker_kind_head.weight" if self.action_representation == DEFAULT_ACTION_REPRESENTATION
+            else "worker_kind_by_target_head.weight"
+        ].T + weights[
+            "worker_kind_head.bias" if self.action_representation == DEFAULT_ACTION_REPRESENTATION
+            else "worker_kind_by_target_head.bias"
+        ]
+        if self.action_representation != DEFAULT_ACTION_REPRESENTATION:
+            kind_output = kind_output.reshape(
+                worker_count, BOARD_SIZE * BOARD_SIZE, len(_ARTIFACT_WORKER_KINDS),
+            )
         return {
             "worker_act_logits": (worker_rows @ weights["worker_act_head.weight"].T + weights["worker_act_head.bias"]).tolist(),
             "worker_target_logits": target_logits.tolist(),
-            "worker_kind_logits": (worker_rows @ weights["worker_kind_head.weight"].T + weights["worker_kind_head.bias"]).tolist(),
+            "worker_kind_logits": kind_output.tolist(),
             "market_item_logits": (pooled_market @ weights["market_item_head.weight"].T + weights["market_item_head.bias"]).tolist(),
             "market_quantity_logits": (pooled_market @ weights["market_quantity_head.weight"].T + weights["market_quantity_head.bias"]).tolist(),
             "value": float((global_row @ weights["value_head.weight"].T + weights["value_head.bias"])[0]),
@@ -627,10 +683,23 @@ class DependencyFreePolicy:
             for row in _matrix_multiply(worker_target_query, tile_target_transposed)
         ]
         pooled_market = [sum(row[index] for row in market_rows) / len(market_rows) for index in range(self._hidden_width)]
+        kind_name = (
+            "worker_kind_head" if self.action_representation == DEFAULT_ACTION_REPRESENTATION
+            else "worker_kind_by_target_head"
+        )
+        kind_output = _linear(worker_rows, weights[f"{kind_name}.weight"], weights[f"{kind_name}.bias"])
+        if self.action_representation != DEFAULT_ACTION_REPRESENTATION:
+            kind_output = [
+                [
+                    row[offset:offset + len(_ARTIFACT_WORKER_KINDS)]
+                    for offset in range(0, BOARD_SIZE * BOARD_SIZE * len(_ARTIFACT_WORKER_KINDS), len(_ARTIFACT_WORKER_KINDS))
+                ]
+                for row in kind_output
+            ]
         return {
             "worker_act_logits": _linear(worker_rows, weights["worker_act_head.weight"], weights["worker_act_head.bias"]),
             "worker_target_logits": target_logits,
-            "worker_kind_logits": _linear(worker_rows, weights["worker_kind_head.weight"], weights["worker_kind_head.bias"]),
+            "worker_kind_logits": kind_output,
             "market_item_logits": _vector_linear(pooled_market, weights["market_item_head.weight"], weights["market_item_head.bias"]),
             "market_quantity_logits": _vector_linear(pooled_market, weights["market_quantity_head.weight"], weights["market_quantity_head.bias"]),
             "value": _vector_linear(global_row, weights["value_head.weight"], weights["value_head.bias"])[0],
@@ -645,9 +714,15 @@ class DependencyFreePolicy:
         )):
             if max(range(len(act_logits)), key=act_logits.__getitem__) == 0:
                 continue
-            target = positions[max(range(len(target_logits)), key=target_logits.__getitem__)] if positions else None
-            kind = _ARTIFACT_WORKER_KINDS[max(range(len(kind_logits)), key=kind_logits.__getitem__)]
-            workers.append(WorkerProposal(index, kind, target, None, max(kind_logits)))
+            target_index = max(range(len(target_logits)), key=target_logits.__getitem__)
+            target = positions[target_index] if positions else None
+            selected_kind_logits = (
+                kind_logits[target_index]
+                if self.action_representation != DEFAULT_ACTION_REPRESENTATION
+                else kind_logits
+            )
+            kind = _ARTIFACT_WORKER_KINDS[max(range(len(selected_kind_logits)), key=selected_kind_logits.__getitem__)]
+            workers.append(WorkerProposal(index, kind, target, None, max(selected_kind_logits)))
         # The artifact has no buy/sell direction head.  Emit only the narrow
         # product-buy intent that the normal market compiler can validate;
         # unsupported products and the zero quantity bucket become no-op.

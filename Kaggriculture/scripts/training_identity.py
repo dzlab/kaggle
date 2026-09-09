@@ -13,6 +13,12 @@ TRAINING_MODES = (
     "pure_ppo",
     "reduced_behavior_clone_then_ppo",
 )
+IDENTITY_FIELDS = (
+    "experiment_id",
+    "feature_variant",
+    "training_mode",
+    "action_representation",
+)
 
 
 def validate_experiment_id(value: Any, *, source: str = "") -> None:
@@ -40,6 +46,27 @@ def validate_action_representation(value: Any, *, source: str = "") -> None:
     if value not in ACTION_REPRESENTATIONS:
         choices = ", ".join(ACTION_REPRESENTATIONS)
         raise ValueError(f"{prefix}action_representation must be one of: {choices}")
+
+
+def validate_identity_consistency(
+    top_level: Any, nested: Any, *, source: str = "identity",
+) -> None:
+    """Reject contradictory duplicated identity fields while allowing legacy omissions."""
+    if top_level is None or nested is None:
+        return
+    if not isinstance(top_level, dict) or not isinstance(nested, dict):
+        raise ValueError(f"{source} identity layers must be objects")
+    for field in IDENTITY_FIELDS:
+        if field in top_level and field in nested:
+            left = top_level[field]
+            right = nested[field]
+            if field == "action_representation":
+                left = left or DEFAULT_ACTION_REPRESENTATION
+                right = right or DEFAULT_ACTION_REPRESENTATION
+            if left != right:
+                raise ValueError(
+                    f"{source} {field} conflicts between top-level and nested identity"
+                )
 
 
 def validate_training_identity(

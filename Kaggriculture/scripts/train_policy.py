@@ -11,7 +11,7 @@ import random
 import shutil
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +63,7 @@ from scripts.training_identity import (
     validate_action_representation,
     validate_feature_variant,
     validate_training_mode,
+    validate_identity_consistency,
 )
 from scripts.output_paths import validate_training_output_path
 
@@ -360,6 +361,14 @@ def _validate_configuration_shape(configuration: Any, *, source: str) -> None:
     configuration["ppo_config"] = _validate_ppo_configuration(
         configuration["ppo_config"], source=source,
     )
+    nested_identity = {
+        field: configuration["ppo_config"][field]
+        for field in ("action_representation",)
+        if field in configuration["ppo_config"]
+    }
+    validate_identity_consistency(
+        configuration, nested_identity, source=f"{source} configuration",
+    )
 
 
 def build_training_contract(
@@ -418,6 +427,10 @@ def build_training_contract(
     validate_action_representation(action_representation, source="requested")
     if ppo_config is not None and not isinstance(ppo_config, PPOConfig):
         raise ValueError("ppo_config must be a PPOConfig or None")
+    if ppo_config is not None and ppo_config.action_representation != action_representation:
+        raise ValueError(
+            "requested action_representation conflicts with ppo_config action_representation"
+        )
     resolved = resolve_device(device) if resolved_device is None else resolved_device
     normalized_batch_size = max(1, batch_size)
     normalized_steps = max(1, steps)
@@ -451,7 +464,9 @@ def build_training_contract(
         "device": str(resolved),
         "prior_checkpoint": _checkpoint_identity(prior_checkpoint),
         "offline_ppo_fallback": offline_ppo_fallback,
-        "ppo_config": asdict(ppo_config or PPOConfig()),
+        "ppo_config": asdict(
+            ppo_config or PPOConfig(action_representation=action_representation)
+        ),
         "checkpoint_interval": checkpoint_interval,
     }
     _validate_configuration_shape(configuration, source="requested")
@@ -976,7 +991,11 @@ def _target_index(command: Any, position: tuple[int, int]) -> int:
     return y * 10 + x
 
 
-def worker_labels(action: dict[str, Any], observation: dict[str, Any] | None = None) -> WorkerLabels:
+def worker_labels(
+    action: dict[str, Any], observation: dict[str, Any] | None = None,
+    *, action_representation: str = DEFAULT_ACTION_REPRESENTATION,
+) -> WorkerLabels:
+    validate_action_representation(action_representation, source="worker labels")
     commands = [action.get("farmer", ["PASS"])]
     hands = action.get("hands", [])
     if isinstance(hands, Sequence) and not isinstance(hands, (str, bytes)):
@@ -995,8 +1014,13 @@ def worker_labels(action: dict[str, Any], observation: dict[str, Any] | None = N
     return WorkerLabels(act_labels, target_labels, kind_labels)
 
 
-def _worker_labels(action: dict[str, Any], observation: dict[str, Any] | None = None) -> tuple[list[int], list[int], list[int]]:
-    labels = worker_labels(action, observation)
+def _worker_labels(
+    action: dict[str, Any], observation: dict[str, Any] | None = None,
+    *, action_representation: str = DEFAULT_ACTION_REPRESENTATION,
+) -> tuple[list[int], list[int], list[int]]:
+    labels = worker_labels(
+        action, observation, action_representation=action_representation,
+    )
     return labels.act, labels.target, labels.kind
 
 
@@ -1130,7 +1154,9 @@ def build_rollout_batch(
         observation = transition.get("observation", {})
         if not isinstance(observation, dict):
             observation = {}
-        labels = worker_labels(action, observation)
+        labels = worker_labels(
+            action, observation, action_representation=config.action_representation,
+        )
         worker_act.append(labels.act)
         worker_target.append(labels.target)
         worker_kind.append(labels.kind)
@@ -1172,6 +1198,7 @@ def build_rollout_batch(
 def _select_outputs(
     outputs: dict[str, Any], batch: RolloutBatch, *, device: Any = None,
     training_action_mask: bool = False,
+    action_representation: str = DEFAULT_ACTION_REPRESENTATION,
 ) -> tuple[Any, Any]:
     th = require_torch()
     if "market_active_logits" not in outputs:
@@ -1221,6 +1248,7 @@ def _select_outputs(
         market_active=market_active,
         market_item=market_items,
         market_quantity=market_quantities,
+        action_representation=action_representation,
         **masks,
     )
 
@@ -1228,6 +1256,7 @@ def _select_outputs(
 def _distribution_regularization(
     outputs: dict[str, Any], prior_outputs: dict[str, Any] | None,
     *, batch: RolloutBatch | None = None,
+    action_representation: str = DEFAULT_ACTION_REPRESENTATION,
 ) -> tuple[Any, Any]:
     th = require_torch()
     zero = outputs["value"].sum() * 0.0
@@ -1242,6 +1271,20 @@ def _distribution_regularization(
         market_active = th.tensor(
             batch.market_active, dtype=th.bool, device=outputs["value"].device,
         )
+    validate_action_representation(action_representation, source="regularization")
+    if action_representation != DEFAULT_ACTION_REPRESENTATION:
+        if batch is None:
+            raise ValueError("target_first_v1 regularization requires rollout labels")
+        target = th.tensor(
+            batch.worker.target, dtype=th.long, device=outputs["value"].device,
+        ).masked_fill(~worker_active, 0)
+        index = target.unsqueeze(-1).unsqueeze(-1).expand(
+            -1, -1, 1, outputs["worker_kind_logits"].shape[-1],
+        )
+        outputs = dict(outputs)
+        prior_outputs = dict(prior_outputs)
+        outputs["worker_kind_logits"] = outputs["worker_kind_logits"].gather(2, index).squeeze(2)
+        prior_outputs["worker_kind_logits"] = prior_outputs["worker_kind_logits"].gather(2, index).squeeze(2)
 
     def masked_mean(values: Any, mask: Any | None) -> Any:
         if mask is None:
@@ -1292,6 +1335,15 @@ def validate_prior_checkpoint_metadata(
         raise ValueError("prior checkpoint feature_variant mismatch")
     if metadata.get("action_representation", DEFAULT_ACTION_REPRESENTATION) != action_representation:
         raise ValueError("prior checkpoint action_representation mismatch")
+    nested_ppo = metadata.get("ppo_config")
+    if isinstance(nested_ppo, Mapping):
+        nested_action = nested_ppo.get(
+            "action_representation", DEFAULT_ACTION_REPRESENTATION,
+        )
+        if nested_action != action_representation:
+            raise ValueError(
+                "prior checkpoint action_representation conflicts with ppo_config"
+            )
     expected_vocab = {key: list(value) for key, value in ACTION_VOCAB.items()}
     if metadata.get("action_vocab") != expected_vocab:
         raise ValueError("prior checkpoint action_vocab mismatch")
@@ -1326,7 +1378,12 @@ def _load_prior_network(
     state = checkpoint["model_state_dict"]
     if not isinstance(state, Mapping):
         raise ValueError("prior checkpoint model_state_dict must be an object")
-    prior = CompactPolicyNet(hidden_width=model_width, depth=model_depth).to(device)
+    prior = CompactPolicyNet(
+        hidden_width=model_width,
+        depth=model_depth,
+        feature_variant=feature_variant,
+        action_representation=action_representation,
+    ).to(device)
     prior.load_state_dict(state)
     prior.eval()
     for parameter in prior.parameters():
@@ -1440,6 +1497,7 @@ def ppo_update(
         old_log_probs, _old_entropy = _select_outputs(
             old_outputs, bootstrap, device=device,
             training_action_mask=config.training_action_mask,
+            action_representation=config.action_representation,
         )
         bootstrap_values = _bootstrap_value_estimates(
             network, rows, config=config, feature_variant=feature_variant,
@@ -1523,6 +1581,7 @@ def ppo_update(
             log_probs, entropy = _select_outputs(
                 outputs, mini, device=device,
                 training_action_mask=config.training_action_mask,
+                action_representation=config.action_representation,
             )
             old_log = th.tensor(mini.old_log_probs, dtype=th.float32, device=device)
             advantages = th.tensor(mini.advantages, dtype=th.float32, device=device)
@@ -1546,6 +1605,7 @@ def ppo_update(
             prior_outputs = prior(mini_features) if prior is not None else None
             kl_to_prior, prior_ce = _distribution_regularization(
                 outputs, prior_outputs, batch=mini,
+                action_representation=config.action_representation,
             )
             loss = (
                 policy_loss
@@ -1567,6 +1627,7 @@ def ppo_update(
                 post_log_probs, _post_entropy = _select_outputs(
                     post_outputs, mini, device=device,
                     training_action_mask=config.training_action_mask,
+                    action_representation=config.action_representation,
                 )
                 post_log_ratio = th.clamp(post_log_probs - old_log, -LOG_RATIO_CLAMP, LOG_RATIO_CLAMP)
                 post_step_kl = ((post_log_ratio.exp() - 1.0) - post_log_ratio).mean()
@@ -2005,9 +2066,14 @@ def _checkpoint_metadata(
         if model is not None
         else model_parameter_count_for_shape(
             model_width, model_depth, feature_variant=feature_variant,
+            action_representation=action_representation,
         )
     )
-    resolved_config = config or PPOConfig()
+    resolved_config = config or PPOConfig(action_representation=action_representation)
+    if resolved_config.action_representation != action_representation:
+        raise ValueError(
+            "checkpoint action_representation conflicts with ppo_config action_representation"
+        )
     return {
         "model_version": MODEL_VERSION,
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
@@ -2472,7 +2538,9 @@ def _validate_resume_payload(
     if type(metadata.get("device")) is not str or not metadata["device"]:
         raise ValueError("resume checkpoint metadata device must be a nonempty string")
     saved_configuration = payload["configuration"]
-    for field in ("experiment_id", "feature_variant", "training_mode"):
+    for field in (
+        "experiment_id", "feature_variant", "training_mode", "action_representation",
+    ):
         if field in metadata and metadata[field] != saved_configuration[field]:
             raise ValueError(
                 f"resume checkpoint metadata {field} does not match saved configuration"
@@ -2492,6 +2560,7 @@ def _validate_resume_payload(
         expected_count = model_parameter_count_for_shape(
             saved_configuration["model_width"], saved_configuration["model_depth"],
             feature_variant=saved_configuration["feature_variant"],
+            action_representation=saved_configuration["action_representation"],
         )
         if type(parameter_count) is not int or parameter_count != expected_count:
             raise ValueError("resume checkpoint metadata parameter_count is incompatible")
@@ -2758,7 +2827,9 @@ def train_behavior_clone(
         raise ValueError("ppo_config must be a PPOConfig or None")
     validate_action_representation(action_representation, source="training")
     if ppo_config.action_representation != action_representation:
-        ppo_config = replace(ppo_config, action_representation=action_representation)
+        raise ValueError(
+            "training action_representation conflicts with ppo_config action_representation"
+        )
     offline_ppo_fallback = bool(offline_ppo_fallback)
     if type(checkpoint_interval) is not int or checkpoint_interval < 1:
         raise ValueError("checkpoint_interval must be a positive integer")
@@ -2933,7 +3004,10 @@ def train_behavior_clone(
             ]
             outputs = network(batch_features)
             labels = [
-                worker_labels(action, observation)
+                worker_labels(
+                    action, observation,
+                    action_representation=action_representation,
+                )
                 for action, observation in zip(batch_actions, batch_observations)
             ]
             act_target = th.tensor([label.act for label in labels], dtype=th.long, device=resolved_device)
@@ -2967,6 +3041,7 @@ def train_behavior_clone(
             log_probs, entropy = _select_outputs(
                 outputs, bc_batch, device=resolved_device,
                 training_action_mask=ppo_config.training_action_mask,
+                action_representation=action_representation,
             )
             loss = -log_probs.mean()
             optimizer.zero_grad()

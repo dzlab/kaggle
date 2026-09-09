@@ -283,3 +283,42 @@ def test_finite_logits_produce_finite_objectives():
 
     assert torch.isfinite(log_probs).all()
     assert torch.isfinite(entropy)
+
+
+def test_target_first_objective_scores_kind_conditioned_on_selected_target():
+    from kagriculture_agent.action_objectives import conditional_action_objectives
+
+    outputs = _outputs(batch_size=1, worker_count=1)
+    outputs["worker_target_logits"] = torch.tensor([[[0.0, 2.0]]])
+    outputs["worker_kind_logits"] = torch.tensor([[[
+        [0.0, 10.0],
+        [4.0, 0.0],
+    ]]])
+    outputs["market_item_logits"] = outputs["market_item_logits"][:, :1]
+    outputs["market_quantity_logits"] = outputs["market_quantity_logits"][:, :1]
+    labels = {
+        "worker_active": torch.tensor([[1]]),
+        "worker_target": torch.tensor([[1]]),
+        "worker_kind": torch.tensor([[0]]),
+        "market_active": torch.tensor([0]),
+        "market_item": torch.tensor([0]),
+        "market_quantity": torch.tensor([0]),
+    }
+
+    log_probs, _entropy = conditional_action_objectives(
+        outputs, **labels, action_representation="target_first_v1",
+    )
+    expected = (
+        outputs["worker_act_logits"].log_softmax(-1)[0, 0, 1]
+        + outputs["worker_target_logits"].log_softmax(-1)[0, 0, 1]
+        + outputs["worker_kind_logits"].log_softmax(-1)[0, 0, 1, 0]
+        + outputs["market_active_logits"].log_softmax(-1)[0, 0]
+    )
+    torch.testing.assert_close(log_probs, expected.reshape(1))
+
+    changed = {name: value.clone() for name, value in outputs.items()}
+    changed["worker_kind_logits"][0, 0, 0] = torch.tensor([1000.0, -1000.0])
+    changed_log_probs, _ = conditional_action_objectives(
+        changed, **labels, action_representation="target_first_v1",
+    )
+    torch.testing.assert_close(changed_log_probs, log_probs)

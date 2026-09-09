@@ -215,6 +215,24 @@ def test_build_artifact_validates_action_vocab_independently():
         build_artifact(state, {})
 
 
+def test_target_first_artifact_has_distinct_head_and_identity():
+    from kagriculture_agent.model import ACTION_VOCAB
+    from kagriculture_agent.learned_policy import artifact_tensor_shapes
+    from scripts.export_policy import build_artifact
+
+    state = {}
+    for name, shape in artifact_tensor_shapes(action_representation="target_first_v1").items():
+        values = [0.0] * shape[0] if len(shape) == 1 else [[0.0] * shape[1] for _ in range(shape[0])]
+        state[name] = _FakeTensor(values, shape)
+    artifact = build_artifact(
+        state, {key: list(value) for key, value in ACTION_VOCAB.items()},
+        action_representation="target_first_v1",
+    )
+
+    assert artifact["action_representation"] == "target_first_v1"
+    assert "worker_kind_by_target_head.weight" in artifact["weights"]
+
+
 def test_artifact_writer_rejects_symlink_destination_and_writes_atomically(tmp_path):
     from scripts.export_policy import write_artifact
 

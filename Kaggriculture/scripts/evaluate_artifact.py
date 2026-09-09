@@ -31,9 +31,12 @@ from scripts.evaluate import (  # noqa: E402
 )
 from scripts.run_local import OPPONENTS, run_episode  # noqa: E402
 from scripts.training_identity import (  # noqa: E402
+    ACTION_REPRESENTATIONS,
+    DEFAULT_ACTION_REPRESENTATION,
     DEFAULT_EXPERIMENT_ID,
     FEATURE_VARIANTS,
     TRAINING_MODES,
+    validate_action_representation,
     validate_training_identity,
 )
 
@@ -51,8 +54,10 @@ DEFAULT_SEATS = (0, 1)
 DEFAULT_OUTPUT = Path("reports/artifact-evaluation.json")
 def _validate_training_identity(
     experiment_id: Any, feature_variant: Any, training_mode: Any,
+    action_representation: Any = DEFAULT_ACTION_REPRESENTATION,
 ) -> None:
     validate_training_identity(experiment_id, feature_variant, training_mode)
+    validate_action_representation(action_representation)
 
 
 def _positive_int(value: str) -> int:
@@ -136,7 +141,10 @@ def build_matrix(*, opponents: Sequence[str], seeds: Sequence[int], seats: Seque
     ]
 
 
-def validate_artifact(path: str | Path, identity: str = "learned_artifact") -> dict[str, str]:
+def validate_artifact(
+    path: str | Path, identity: str = "learned_artifact",
+    expected_action_representation: str = DEFAULT_ACTION_REPRESENTATION,
+) -> dict[str, str]:
     """Validate a dependency-free artifact and return stable report metadata."""
     if type(identity) is not str or not identity.strip():
         raise ValueError("identity must be a non-empty string")
@@ -147,11 +155,17 @@ def validate_artifact(path: str | Path, identity: str = "learned_artifact") -> d
         raise ValueError(f"artifact does not exist or is not a file: {artifact_path}")
     artifact_bytes = artifact_path.read_bytes()
     try:
-        load_exported_policy(artifact_path)
+        policy = load_exported_policy(artifact_path)
     except Exception as exc:
         raise ValueError(
             f"artifact is not valid: {type(exc).__name__}: {exc}"
         ) from exc
+    validate_action_representation(expected_action_representation, source="evaluator")
+    artifact_action = getattr(policy, "action_representation", None)
+    if artifact_action is not None and artifact_action != expected_action_representation:
+        raise ValueError(
+            "artifact action_representation does not match evaluator configuration"
+        )
     return {
         "path": str(artifact_path),
         "name": artifact_path.name,
@@ -357,6 +371,7 @@ def evaluate(
     experiment_id: str = DEFAULT_EXPERIMENT_ID,
     feature_variant: str = "production_v1",
     training_mode: str = "behavior_clone_then_ppo",
+    action_representation: str = DEFAULT_ACTION_REPRESENTATION,
 ) -> dict[str, Any]:
     """Evaluate current and artifact candidates on one identical matrix."""
     if quick:
@@ -375,8 +390,13 @@ def evaluate(
     if isinstance(evaluation_timeout, bool) or not isinstance(evaluation_timeout, Real) \
             or not math.isfinite(float(evaluation_timeout)) or float(evaluation_timeout) <= 0:
         raise ValueError("evaluation_timeout must be a positive finite number")
-    _validate_training_identity(experiment_id, feature_variant, training_mode)
-    artifact_info = validate_artifact(artifact, identity)
+    _validate_training_identity(
+        experiment_id, feature_variant, training_mode, action_representation,
+    )
+    artifact_info = validate_artifact(
+        artifact, identity,
+        expected_action_representation=action_representation,
+    )
     snapshot_directory, snapshot_info = _snapshot_artifact(artifact_info)
     try:
         normalized_opponents = validate_opponents(opponents)
@@ -432,6 +452,7 @@ def evaluate(
             "experiment_id": experiment_id,
             "feature_variant": feature_variant,
             "training_mode": training_mode,
+            "action_representation": action_representation,
             "seeds": len(normalized_seeds),
             "start_seed": start_seed,
             "seed_values": normalized_seeds,
@@ -492,6 +513,7 @@ def _configuration_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "experiment_id": args.experiment_id,
         "feature_variant": args.feature_variant,
         "training_mode": args.training_mode,
+        "action_representation": args.action_representation,
         "seeds": args.seeds,
         "start_seed": args.start_seed,
         "seed_values": seed_values(args.seeds, args.start_seed),
@@ -582,6 +604,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--experiment-id", default=DEFAULT_EXPERIMENT_ID)
     parser.add_argument("--feature-variant", choices=FEATURE_VARIANTS, default="production_v1")
     parser.add_argument("--training-mode", choices=TRAINING_MODES, default="behavior_clone_then_ppo")
+    parser.add_argument(
+        "--action-representation", choices=ACTION_REPRESENTATIONS,
+        default=DEFAULT_ACTION_REPRESENTATION,
+    )
     parser.add_argument("--seeds", type=_positive_int, default=DEFAULT_SEEDS)
     parser.add_argument("--start-seed", type=int, default=0)
     parser.add_argument("--steps", type=_positive_int, default=DEFAULT_STEPS)
@@ -609,6 +635,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     try:
         _validate_training_identity(
             args.experiment_id, args.feature_variant, args.training_mode,
+            args.action_representation,
         )
     except ValueError as exc:
         parser.error(str(exc))

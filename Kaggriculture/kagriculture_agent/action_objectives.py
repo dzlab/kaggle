@@ -15,6 +15,8 @@ try:  # pragma: no cover - import safety is covered by the model module tests
 except ModuleNotFoundError:  # pragma: no cover - exercised without training extras
     torch = None
 
+from scripts.training_identity import DEFAULT_ACTION_REPRESENTATION, validate_action_representation
+
 
 _OUTPUT_NAMES = (
     "worker_act_logits",
@@ -53,7 +55,9 @@ def _require_tensor(value: Any, name: str) -> Any:
     return value
 
 
-def _validate_logits(outputs: Mapping[str, Any]) -> dict[str, Any]:
+def _validate_logits(
+    outputs: Mapping[str, Any], *, action_representation: str,
+) -> dict[str, Any]:
     th = _require_torch()
     missing = [name for name in _OUTPUT_NAMES if name not in outputs]
     if missing:
@@ -66,10 +70,21 @@ def _validate_logits(outputs: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{name} must contain only finite values")
     if logits["worker_act_logits"].ndim != 3 or logits["worker_act_logits"].shape[-1] != 2:
         raise ValueError("worker_act_logits must have shape [batch, workers, 2]")
-    for name in ("worker_target_logits", "worker_kind_logits"):
-        value = logits[name]
-        if value.ndim != 3 or value.shape[-1] < 1:
-            raise ValueError(f"{name} must have shape [batch, workers, classes]")
+    validate_action_representation(action_representation, source="objective")
+    if logits["worker_target_logits"].ndim != 3 or logits["worker_target_logits"].shape[-1] < 1:
+        raise ValueError("worker_target_logits must have shape [batch, workers, classes]")
+    kind_logits = logits["worker_kind_logits"]
+    if action_representation == DEFAULT_ACTION_REPRESENTATION:
+        if kind_logits.ndim != 3 or kind_logits.shape[-1] < 1:
+            raise ValueError("worker_kind_logits must have shape [batch, workers, classes]")
+    elif (
+        kind_logits.ndim != 4
+        or kind_logits.shape[2] != logits["worker_target_logits"].shape[2]
+        or kind_logits.shape[-1] < 1
+    ):
+        raise ValueError(
+            "worker_kind_logits must have shape [batch, workers, targets, classes]"
+        )
     value = logits["market_active_logits"]
     if value.ndim != 2 or value.shape[-1] != 2:
         raise ValueError("market_active_logits must have shape [batch, 2]")
@@ -191,6 +206,7 @@ def conditional_action_objectives(
     worker_kind_mask: Tensor | None = None,
     market_item_mask: Tensor | None = None,
     market_quantity_mask: Tensor | None = None,
+    action_representation: str = DEFAULT_ACTION_REPRESENTATION,
 ) -> tuple[Tensor, Tensor]:
     """Return conditional batch log-probabilities and mean entropy.
 
@@ -204,7 +220,7 @@ def conditional_action_objectives(
     ignored safely, but every active row must have at least one legal choice.
     """
     th = _require_torch()
-    logits = _validate_logits(outputs)
+    logits = _validate_logits(outputs, action_representation=action_representation)
     batch_size, worker_count = logits["worker_act_logits"].shape[:2]
     labels = _validate_labels(
         {
@@ -231,8 +247,25 @@ def conditional_action_objectives(
     target_log = _masked_log_softmax(
         logits["worker_target_logits"], worker_target_mask, worker_is_active, "worker_target_mask",
     )
+    if action_representation == DEFAULT_ACTION_REPRESENTATION:
+        selected_kind_logits = logits["worker_kind_logits"]
+        selected_kind_mask = worker_kind_mask
+    else:
+        safe_targets = labels["worker_target"].masked_fill(~worker_is_active, 0)
+        target_index = safe_targets.unsqueeze(-1).unsqueeze(-1).expand(
+            -1, -1, 1, logits["worker_kind_logits"].shape[-1],
+        )
+        selected_kind_logits = logits["worker_kind_logits"].gather(2, target_index).squeeze(2)
+        if worker_kind_mask is None:
+            selected_kind_mask = None
+        else:
+            if worker_kind_mask.shape != logits["worker_kind_logits"].shape:
+                raise ValueError(
+                    "worker_kind_mask shape must match worker_kind_logits shape"
+                )
+            selected_kind_mask = worker_kind_mask.gather(2, target_index).squeeze(2)
     kind_log = _masked_log_softmax(
-        logits["worker_kind_logits"], worker_kind_mask, worker_is_active, "worker_kind_mask",
+        selected_kind_logits, selected_kind_mask, worker_is_active, "worker_kind_mask",
     )
     item_log = _masked_log_softmax(
         logits["market_item_logits"], market_item_mask, market_is_active, "market_item_mask",
@@ -241,7 +274,9 @@ def conditional_action_objectives(
         logits["market_quantity_logits"], market_quantity_mask, market_is_active, "market_quantity_mask",
     )
     _validate_selected_mask(labels["worker_target"], worker_target_mask, worker_is_active, "worker target")
-    _validate_selected_mask(labels["worker_kind"], worker_kind_mask, worker_is_active, "worker kind")
+    _validate_selected_mask(
+        labels["worker_kind"], selected_kind_mask, worker_is_active, "worker kind",
+    )
     _validate_selected_mask(labels["market_item"], market_item_mask, market_is_active, "market item")
     _validate_selected_mask(labels["market_quantity"], market_quantity_mask, market_is_active, "market quantity")
 

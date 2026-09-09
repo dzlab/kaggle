@@ -33,6 +33,7 @@ from .features import (
     WORKER_TOKEN_SIZE,
     FeatureBatch,
     PRODUCTION_FEATURE_VARIANT,
+    BOARD_SIZE,
 )
 from .model_topology import (
     ATTENTION_HEADS,
@@ -73,6 +74,7 @@ ACTION_VOCAB = {
     "market_items": tuple(sorted(PRODUCTS)),
     "market_quantities": (0, 1, 2, 4, 8, 16, 32, 64),
 }
+ACTION_TARGET_COUNT = BOARD_SIZE * BOARD_SIZE
 
 
 def validate_feature_variant(value: Any) -> str:
@@ -221,7 +223,15 @@ if nn is not None:
                 _ResidualAttentionBlock(self.hidden_width) for _ in range(self.depth)
             )
             self.worker_act_head = nn.Linear(self.hidden_width, 2)
-            self.worker_kind_head = nn.Linear(self.hidden_width, len(ACTION_VOCAB["worker_kinds"]))
+            if self.action_representation == DEFAULT_ACTION_REPRESENTATION:
+                self.worker_kind_head = nn.Linear(
+                    self.hidden_width, len(ACTION_VOCAB["worker_kinds"]),
+                )
+            else:
+                self.worker_kind_by_target_head = nn.Linear(
+                    self.hidden_width,
+                    ACTION_TARGET_COUNT * len(ACTION_VOCAB["worker_kinds"]),
+                )
             self.target_worker_head = nn.Linear(self.hidden_width, self.hidden_width)
             self.target_tile_head = nn.Linear(self.hidden_width, self.hidden_width)
             self.market_item_head = nn.Linear(self.hidden_width, len(ACTION_VOCAB["market_items"]))
@@ -275,7 +285,14 @@ if nn is not None:
             return {
                 "worker_act_logits": self.worker_act_head(encoded_workers),
                 "worker_target_logits": worker_target_logits,
-                "worker_kind_logits": self.worker_kind_head(encoded_workers),
+                "worker_kind_logits": (
+                    self.worker_kind_head(encoded_workers)
+                    if self.action_representation == DEFAULT_ACTION_REPRESENTATION
+                    else self.worker_kind_by_target_head(encoded_workers).view(
+                        batch_size, worker_count, ACTION_TARGET_COUNT,
+                        len(ACTION_VOCAB["worker_kinds"]),
+                    )
+                ),
                 "market_active_logits": self.market_active_head(pooled_market),
                 "market_item_logits": self.market_item_head(pooled_market),
                 "market_quantity_logits": self.market_quantity_head(pooled_market),
@@ -303,11 +320,16 @@ def model_parameter_count(model: Any) -> int:
 def model_parameter_count_for_shape(
     hidden_width: int = DEFAULT_MODEL_WIDTH, depth: int = DEFAULT_MODEL_DEPTH,
     *, feature_variant: str = PRODUCTION_FEATURE_VARIANT,
+    action_representation: str = DEFAULT_ACTION_REPRESENTATION,
 ) -> int:
     """Count CompactPolicyNet parameters without constructing or initializing it."""
     validate_model_shape(hidden_width, depth, source="parameter count")
     validate_feature_variant(feature_variant)
+    validate_action_representation(action_representation, source="parameter count")
     count = compact_policy_parameter_count(hidden_width, depth)
     if feature_variant == EXPERIMENTAL_FEATURE_VARIANT:
         count += hidden_width * EXPERIMENTAL_CONTEXT_FEATURE_SIZE + hidden_width
+    if action_representation == "target_first_v1":
+        kind_count = len(ACTION_VOCAB["worker_kinds"])
+        count += hidden_width * ACTION_TARGET_COUNT * kind_count + ACTION_TARGET_COUNT * kind_count
     return count
