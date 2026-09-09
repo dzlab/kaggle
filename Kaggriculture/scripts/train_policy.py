@@ -30,7 +30,11 @@ from kagriculture_agent.checkpoints import (
 from kagriculture_agent.action_objectives import conditional_action_objectives
 from kagriculture_agent.constants import ENGINE_VERSION
 from kagriculture_agent.features import FEATURE_SCHEMA_VERSION, extract_features
-from kagriculture_agent.league import LeagueSampler, OpponentMatch
+from kagriculture_agent.league import (
+    DEFAULT_OPPONENT_PROBABILITIES,
+    LeagueSampler,
+    OpponentMatch,
+)
 from kagriculture_agent.model import (
     ACTION_VOCAB,
     MODEL_VERSION,
@@ -425,104 +429,39 @@ class OpponentPool:
         self, previous_checkpoints: Sequence[str | Path] | None = None, *,
         league_sampler: LeagueSampler | None = None,
         sampler: LeagueSampler | None = None,
+        checkpoint_window: int = 5,
+        probabilities: Mapping[str, object] | None = None,
     ) -> None:
         if league_sampler is not None and sampler is not None:
             raise ValueError("provide only one of league_sampler or sampler")
         selected_sampler = league_sampler if league_sampler is not None else sampler
         if selected_sampler is not None and not isinstance(selected_sampler, LeagueSampler):
             raise ValueError("league_sampler must be a LeagueSampler or None")
-        self.league_sampler = selected_sampler
+        if type(checkpoint_window) is not int or checkpoint_window < 0:
+            raise ValueError("checkpoint_window must be a nonnegative integer")
         if previous_checkpoints is None:
             previous_checkpoints = ()
         elif isinstance(previous_checkpoints, (str, bytes)) or not isinstance(
             previous_checkpoints, Sequence,
         ):
             raise ValueError("previous_checkpoints must be a sequence or None")
-        self.checkpoint_candidates = tuple(str(path) for path in previous_checkpoints[-5:])
-        total = sum(self.probabilities.values())
-        if abs(total - 1.0) > 1e-12:
-            raise ValueError("opponent pool probabilities must sum to one")
+        candidates = tuple(str(path) for path in previous_checkpoints)
+        self.checkpoint_candidates = candidates[-checkpoint_window:] if checkpoint_window else ()
+        configured_probabilities = (
+            dict(DEFAULT_OPPONENT_PROBABILITIES)
+            if probabilities is None else dict(probabilities)
+        )
+        self.league_sampler = selected_sampler or LeagueSampler(
+            probabilities=configured_probabilities,
+            checkpoint_candidates=self.checkpoint_candidates,
+        )
+        self.probabilities = dict(self.league_sampler.probabilities)
 
     def sample(self, index: int, *, seed: int = 0) -> OpponentMatch:
-        rng_seed = int(index) if seed == 0 else ((int(seed) << 32) ^ int(index))
-        rng = random.Random(rng_seed)
-        if self.league_sampler is not None:
-            return self.league_sampler.sample(index, seed=seed)
-        draw = rng.random()
-        cumulative = 0.0
-        selected = "checkpoint"
-        for opponent, probability in self.probabilities.items():
-            cumulative += probability
-            if draw <= cumulative:
-                selected = opponent
-                break
-        checkpoint = None
-        if selected == "checkpoint":
-            if self.checkpoint_candidates:
-                checkpoint = self.checkpoint_candidates[rng.randrange(len(self.checkpoint_candidates))]
-            else:
-                selected = "current"
-        mixed_opponent = None
-        if selected == "mixed":
-            mixed_opponent = self.mixed_opponents[rng.randrange(len(self.mixed_opponents))]
-        return OpponentMatch(
-            opponent=selected, seat=int(index) % 2, checkpoint=checkpoint,
-            mixed_opponent=mixed_opponent,
-        )
+        return self.league_sampler.sample(index, seed=seed)
 
     def schedule(self, *, count: int, seed: int = 0) -> list[OpponentMatch]:
-        """Return a deterministic stratified schedule with alternating seats."""
-        if self.league_sampler is not None:
-            return self.league_sampler.schedule(count, seed=seed)
-        if count < 1:
-            raise ValueError("count must be positive")
-        counts = {
-            opponent: int(count * probability)
-            for opponent, probability in self.probabilities.items()
-        }
-        missing = count - sum(counts.values())
-        remainders = sorted(
-            (
-                (count * probability - counts[opponent], opponent)
-                for opponent, probability in self.probabilities.items()
-            ),
-            reverse=True,
-        )
-        for _fraction, opponent in remainders[:missing]:
-            counts[opponent] += 1
-        matches: list[OpponentMatch] = []
-        for opponent in self.probabilities:
-            if opponent != "checkpoint":
-                for index in range(counts[opponent]):
-                    mixed_opponent = None
-                    if opponent == "mixed":
-                        mixed_rng = random.Random(int(seed) + index)
-                        mixed_opponent = self.mixed_opponents[
-                            mixed_rng.randrange(len(self.mixed_opponents))
-                        ]
-                    matches.append(
-                        OpponentMatch(
-                            opponent=opponent, seat=0,
-                            mixed_opponent=mixed_opponent,
-                        )
-                    )
-        if self.checkpoint_candidates:
-            matches.extend(
-                OpponentMatch(
-                    opponent="checkpoint", seat=0,
-                    checkpoint=self.checkpoint_candidates[index % len(self.checkpoint_candidates)],
-                )
-                for index in range(counts["checkpoint"])
-            )
-        else:
-            matches.extend(OpponentMatch(opponent="current", seat=0) for _ in range(counts["checkpoint"]))
-        random.Random(int(seed)).shuffle(matches)
-        return [
-            OpponentMatch(
-                match.opponent, index % 2, match.checkpoint, match.mixed_opponent,
-            )
-            for index, match in enumerate(matches)
-        ]
+        return self.league_sampler.schedule(count, seed=seed)
 
 
 def should_promote(
@@ -1355,6 +1294,19 @@ def _accepts_keyword_argument(callback: Any, name: str) -> bool:
     ) or any(item.kind == item.VAR_KEYWORD for item in parameters.values())
 
 
+def _rollout_checkpoint_identity(path: str | Path | None) -> str | None:
+    if path is None:
+        return None
+    checkpoint_path = Path(path)
+    if not checkpoint_path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with checkpoint_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return f"checkpoint:{digest.hexdigest()}"
+
+
 def run_ppo_training(
     *, network: Any, optimizer: Any, transitions: Sequence[dict[str, Any]],
     ppo_steps: int, config: PPOConfig, batch_size: int | None = None,
@@ -1367,6 +1319,7 @@ def run_ppo_training(
     checkpoint_registry: dict[str, Any] | None = None,
     candidate_artifact: str | Path | None = None,
     candidate_identity: str | None = None,
+    experiment_id: str = DEFAULT_EXPERIMENT_ID,
     save_candidate_fn: Any | None = None,
     cleanup_candidate_fn: Any | None = None,
     start_step: int = 0,
@@ -1378,6 +1331,7 @@ def run_ppo_training(
     telemetry_callback: Any | None = None,
 ) -> dict[str, Any]:
     """Run PPO with fresh scheduled league rollouts or explicit offline fallback."""
+    _validate_experiment_id(experiment_id, source="PPO")
     steps = max(0, int(ppo_steps))
     if type(start_step) is not int or not 0 <= start_step <= steps:
         raise ValueError("start_step must be an integer between zero and ppo_steps")
@@ -1405,6 +1359,10 @@ def run_ppo_training(
         raise ValueError("rollout_fn is required for PPO unless offline_ppo_fallback is explicitly selected")
     pool = opponent_pool if opponent_pool is not None else OpponentPool()
     schedule = pool.schedule(count=steps, seed=seed) if rollout_fn is not None else []
+    league_composition = {
+        opponent: 0 for opponent in ("current", "mixed", "random", "starter", "checkpoint")
+    }
+    league_checkpoint_identities: list[str] = []
     total_updates = initial_ppo_updates
     rollout_count = initial_rollout_count
     shaping_count = initial_shaping_count
@@ -1416,6 +1374,8 @@ def run_ppo_training(
     ran_step = False
     for step in range(start_step, steps):
         ran_step = True
+        match = None
+        checkpoint_identity = None
         if rollout_fn is None:
             rollout = offline_rows[:config.rollout_steps]
         else:
@@ -1433,6 +1393,9 @@ def run_ppo_training(
                 "checkpoint": match.checkpoint,
                 "rollout_steps": config.rollout_steps,
             }
+            checkpoint_identity = getattr(match, "checkpoint_identity", None)
+            if checkpoint_identity is None and match.checkpoint is not None:
+                checkpoint_identity = _rollout_checkpoint_identity(match.checkpoint)
             if _accepts_keyword_argument(rollout_fn, "candidate_artifact"):
                 rollout_kwargs["candidate_artifact"] = candidate_artifact
             if _accepts_keyword_argument(rollout_fn, "candidate_identity"):
@@ -1444,13 +1407,18 @@ def run_ppo_training(
             if _accepts_keyword_argument(rollout_fn, "opponent_identity"):
                 rollout_kwargs["opponent_identity"] = match.opponent
             if _accepts_keyword_argument(rollout_fn, "checkpoint_identity"):
-                rollout_kwargs["checkpoint_identity"] = match.checkpoint
+                rollout_kwargs["checkpoint_identity"] = checkpoint_identity
             if _accepts_keyword_argument(rollout_fn, "mixed_opponent"):
                 rollout_kwargs["mixed_opponent"] = getattr(match, "mixed_opponent", None)
             if _accepts_keyword_argument(rollout_fn, "network"):
                 rollout_kwargs["network"] = network
+            if _accepts_keyword_argument(rollout_fn, "experiment_id"):
+                rollout_kwargs["experiment_id"] = experiment_id
             rollout = rollout_fn(**rollout_kwargs)
             rollout_count += 1
+            league_composition[match.opponent] += 1
+            if checkpoint_identity is not None:
+                league_checkpoint_identities.append(checkpoint_identity)
         if not isinstance(rollout, Sequence) or isinstance(rollout, (str, bytes)):
             raise ValueError("rollout_fn must return a sequence of transitions")
         if not rollout:
@@ -1479,6 +1447,8 @@ def run_ppo_training(
             "truncation_count": truncation_count,
             "promotion": None,
             "completed_steps": step + 1,
+            "league_composition": dict(league_composition),
+            "league_checkpoint_identities": list(league_checkpoint_identities),
         }
         if telemetry_callback is not None:
             telemetry_payload = {
@@ -1492,6 +1462,18 @@ def run_ppo_training(
                 "entropy": last_metrics.get("entropy"),
                 "approx_kl": last_metrics.get("approx_kl"),
             }
+            if match is not None:
+                telemetry_payload.update({
+                    "experiment_id": experiment_id,
+                    "league/opponent": match.opponent,
+                    "league/seat": match.seat,
+                    "league/seed": int(seed) + step,
+                    "league/checkpoint_identity": checkpoint_identity,
+                    **{
+                        f"league/{name}": count
+                        for name, count in league_composition.items()
+                    },
+                })
             for name in (
                 "clip_fraction", "explained_variance", "return_mean", "return_std",
                 "advantage_mean", "advantage_std", "gradient_norm", "parameter_norm",
@@ -1513,6 +1495,8 @@ def run_ppo_training(
         "completed_steps": steps,
         "shaping_count": shaping_count,
         "truncation_count": truncation_count,
+        "league_composition": dict(league_composition),
+        "league_checkpoint_identities": list(league_checkpoint_identities),
     }
     if promotion_match_fn is not None and ran_step:
         if candidate_checkpoint is None:
@@ -2026,6 +2010,17 @@ def make_fresh_rollout_fn(
             candidate_artifact=selected_artifact, candidate_identity=identity,
             opponent_artifact=opponent_artifact,
             opponent_checkpoint_identity=checkpoint_provenance,
+            checkpoint_identity=checkpoint_provenance,
+            opponent_identity=opponent_identity or opponent,
+            league_round=selected_step,
+            league_seed=selected_seed,
+            league_composition={
+                "current": int(opponent == "current"),
+                "mixed": int(opponent == "mixed"),
+                "random": int(opponent == "random"),
+                "starter": int(opponent == "starter"),
+                "checkpoint": int(opponent == "checkpoint"),
+            },
             source_policy_identity=identity,
             no_progress_window=no_progress_window,
             resolved_margin=resolved_margin,
@@ -2349,6 +2344,7 @@ def train_behavior_clone(
             checkpoint_registry=checkpoint_registry,
             candidate_artifact=candidate_artifact,
             candidate_identity=(str(candidate_artifact) if candidate_artifact is not None else None),
+            experiment_id=experiment_id,
             save_candidate_fn=save_current_candidate,
             start_step=round_index,
             initial_ppo_updates=initial_ppo_updates,
@@ -2395,15 +2391,40 @@ def _nonnegative_int(value: str) -> int:
     return number
 
 
+def _nonnegative_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a nonnegative finite number") from exc
+    if not math.isfinite(number) or number < 0.0:
+        raise argparse.ArgumentTypeError("must be a nonnegative finite number")
+    return number
+
+
 def _cli_training_options(args: argparse.Namespace) -> dict[str, Any]:
     if args.ppo_steps > 0 and not args.offline_ppo_fallback:
         raise ValueError(
             "--ppo-steps requires --offline-ppo-fallback in the standalone CLI; "
             "fresh league rollouts are available through the rollout_fn API"
         )
+    probabilities = {
+        name: getattr(args, f"league_{name}_probability", None)
+        for name in ("current", "mixed", "random", "starter", "checkpoint")
+    }
+    if any(value is None for value in probabilities.values()):
+        probabilities = dict(DEFAULT_OPPONENT_PROBABILITIES)
+        for name in probabilities:
+            value = getattr(args, f"league_{name}_probability", None)
+            if value is not None:
+                probabilities[name] = value
     return {
         "offline_ppo_fallback": bool(args.offline_ppo_fallback),
         "allow_ppo_extension": bool(args.allow_ppo_extension),
+        "opponent_pool": OpponentPool(
+            previous_checkpoints=args.league_checkpoints,
+            checkpoint_window=args.league_checkpoint_window,
+            probabilities=probabilities,
+        ),
     }
 
 
@@ -2425,6 +2446,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--ppo-steps", type=_nonnegative_int, default=0)
     parser.add_argument("--prior-checkpoint", type=Path, default=None)
     parser.add_argument("--best-checkpoint", type=Path, default=None)
+    parser.add_argument("--experiment-id", default=DEFAULT_EXPERIMENT_ID)
+    parser.add_argument("--league-checkpoints", type=Path, action="append", default=[])
+    parser.add_argument("--league-checkpoint-window", type=_nonnegative_int, default=5)
+    parser.add_argument("--league-current-probability", type=_nonnegative_float, default=None)
+    parser.add_argument("--league-mixed-probability", type=_nonnegative_float, default=None)
+    parser.add_argument("--league-random-probability", type=_nonnegative_float, default=None)
+    parser.add_argument("--league-starter-probability", type=_nonnegative_float, default=None)
+    parser.add_argument("--league-checkpoint-probability", type=_nonnegative_float, default=None)
     parser.add_argument(
         "--offline-ppo-fallback",
         action="store_true",
@@ -2451,6 +2480,8 @@ def main(argv: list[str] | None = None) -> int:
             prior_checkpoint=args.prior_checkpoint,
             offline_ppo_fallback=options["offline_ppo_fallback"],
             best_checkpoint_path=args.best_checkpoint,
+            opponent_pool=options["opponent_pool"],
+            experiment_id=args.experiment_id,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

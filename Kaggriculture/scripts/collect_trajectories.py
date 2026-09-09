@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -170,9 +170,14 @@ def _manifest(
     experiment_id: str = DEFAULT_EXPERIMENT_ID,
     feature_variant: str = "production_v1",
     training_mode: str = "behavior_clone_then_ppo",
+    league_round: int | None = None,
+    league_seed: int | None = None,
+    opponent_identity: str | None = None,
+    checkpoint_identity: str | None = None,
+    league_composition: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     validate_training_identity(experiment_id, feature_variant, training_mode)
-    return {
+    manifest = {
         "schema_version": TRANSITION_SCHEMA_VERSION,
         "transition_schema_version": TRANSITION_SCHEMA_VERSION,
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
@@ -186,6 +191,37 @@ def _manifest(
         "feature_variant": feature_variant,
         "training_mode": training_mode,
     }
+    if league_round is not None or league_seed is not None or opponent_identity is not None \
+            or checkpoint_identity is not None or league_composition is not None:
+        if league_round is not None and (type(league_round) is not int or league_round < 0):
+            raise ValueError("league_round must be a nonnegative integer")
+        if league_seed is not None and type(league_seed) is not int:
+            raise ValueError("league_seed must be an integer")
+        for name, value in (
+            ("opponent_identity", opponent_identity),
+            ("checkpoint_identity", checkpoint_identity),
+        ):
+            if value is not None and (type(value) is not str or not value):
+                raise ValueError(f"{name} must be a non-empty string when provided")
+        if league_composition is not None:
+            if not isinstance(league_composition, Mapping):
+                raise ValueError("league_composition must be a mapping")
+            composition = dict(league_composition)
+            if any(
+                type(value) is not int or value < 0
+                for value in composition.values()
+            ):
+                raise ValueError("league_composition values must be nonnegative integers")
+        else:
+            composition = None
+        manifest["league"] = {
+            "round": league_round,
+            "seed": league_seed,
+            "opponent_identity": opponent_identity,
+            "checkpoint_identity": checkpoint_identity,
+            "composition": composition,
+        }
+    return manifest
 
 
 def _resolve_collection_transitions(
@@ -355,6 +391,11 @@ def collect(
     workers: int | None = 1,
     no_progress_window: int = 0,
     resolved_margin: float = 0.0,
+    league_round: int | None = None,
+    league_seed: int | None = None,
+    opponent_identity: str | None = None,
+    checkpoint_identity: str | None = None,
+    league_composition: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """Collect and write one validated transition per output JSONL line."""
     normalized_seeds = _strict_int_values(seeds, "seeds")
@@ -405,6 +446,11 @@ def collect(
         experiment_id=experiment_id,
         feature_variant=feature_variant,
         training_mode=training_mode,
+        league_round=league_round,
+        league_seed=league_seed,
+        opponent_identity=opponent_identity,
+        checkpoint_identity=checkpoint_identity or opponent_checkpoint_identity,
+        league_composition=league_composition,
     )
     if no_progress_window:
         manifest["no_progress_window"] = no_progress_window

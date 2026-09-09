@@ -23,6 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from kagriculture_agent.checkpoints import CheckpointError, read_checkpoint
+from kagriculture_agent.league import DEFAULT_OPPONENT_PROBABILITIES, LeagueSampler
 from kagriculture_agent.model import resolve_device
 from scripts.telemetry import record_validation_report
 from scripts.train_policy import (
@@ -91,6 +92,23 @@ class ColabConfig:
     experiment_id: str = DEFAULT_EXPERIMENT_ID
     feature_variant: str = "production_v1"
     training_mode: str = "behavior_clone_then_ppo"
+    league_checkpoints: tuple[Path, ...] = ()
+    league_checkpoint_window: int = 5
+    league_current_probability: float = DEFAULT_OPPONENT_PROBABILITIES["current"]
+    league_mixed_probability: float = DEFAULT_OPPONENT_PROBABILITIES["mixed"]
+    league_random_probability: float = DEFAULT_OPPONENT_PROBABILITIES["random"]
+    league_starter_probability: float = DEFAULT_OPPONENT_PROBABILITIES["starter"]
+    league_checkpoint_probability: float = DEFAULT_OPPONENT_PROBABILITIES["checkpoint"]
+
+    @property
+    def league_probabilities(self) -> dict[str, float]:
+        return {
+            "current": self.league_current_probability,
+            "mixed": self.league_mixed_probability,
+            "random": self.league_random_probability,
+            "starter": self.league_starter_probability,
+            "checkpoint": self.league_checkpoint_probability,
+        }
 
     @property
     def candidate_tag(self) -> str:
@@ -373,12 +391,36 @@ def build_config(
     experiment_id: str = DEFAULT_EXPERIMENT_ID,
     feature_variant: str = "production_v1",
     training_mode: str = "behavior_clone_then_ppo",
+    league_checkpoints: Sequence[str | Path] = (),
+    league_checkpoint_window: int = 5,
+    league_current_probability: float | None = None,
+    league_mixed_probability: float | None = None,
+    league_random_probability: float | None = None,
+    league_starter_probability: float | None = None,
+    league_checkpoint_probability: float | None = None,
     resolve_runtime_device: bool = True,
 ) -> ColabConfig:
     if type(workers) is not int or workers < 1:
         raise ValueError("workers must be a positive integer")
     if type(ppo_target_steps) is not int or ppo_target_steps < 0:
         raise ValueError("ppo_target_steps must be a nonnegative integer")
+    if type(league_checkpoint_window) is not int or league_checkpoint_window < 0:
+        raise ValueError("league_checkpoint_window must be a nonnegative integer")
+    if isinstance(league_checkpoints, (str, bytes)):
+        raise ValueError("league_checkpoints must be a sequence of paths")
+    weights = {
+        "current": DEFAULT_OPPONENT_PROBABILITIES["current"]
+        if league_current_probability is None else league_current_probability,
+        "mixed": DEFAULT_OPPONENT_PROBABILITIES["mixed"]
+        if league_mixed_probability is None else league_mixed_probability,
+        "random": DEFAULT_OPPONENT_PROBABILITIES["random"]
+        if league_random_probability is None else league_random_probability,
+        "starter": DEFAULT_OPPONENT_PROBABILITIES["starter"]
+        if league_starter_probability is None else league_starter_probability,
+        "checkpoint": DEFAULT_OPPONENT_PROBABILITIES["checkpoint"]
+        if league_checkpoint_probability is None else league_checkpoint_probability,
+    }
+    LeagueSampler(probabilities=weights)
     validate_training_identity(experiment_id, feature_variant, training_mode)
     for name, value in (
         ("training_steps", training_steps),
@@ -481,6 +523,13 @@ def build_config(
         experiment_id,
         feature_variant,
         training_mode,
+        tuple(_absolute_path(path) for path in league_checkpoints),
+        league_checkpoint_window,
+        weights["current"],
+        weights["mixed"],
+        weights["random"],
+        weights["starter"],
+        weights["checkpoint"],
     )
 
 
@@ -504,6 +553,16 @@ def _nonnegative_int(value: str) -> int:
     return number
 
 
+def _nonnegative_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a nonnegative finite number") from exc
+    if not math.isfinite(number) or number < 0.0:
+        raise argparse.ArgumentTypeError("must be a nonnegative finite number")
+    return number
+
+
 def _path_or_none(value: str) -> Path | None:
     if value.lower() == "none":
         return None
@@ -520,6 +579,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--experiment-id", default=DEFAULT_EXPERIMENT_ID)
     parser.add_argument("--feature-variant", choices=FEATURE_VARIANTS, default="production_v1")
     parser.add_argument("--training-mode", choices=TRAINING_MODES, default="behavior_clone_then_ppo")
+    parser.add_argument("--league-checkpoints", type=Path, action="append", default=[])
+    parser.add_argument("--league-checkpoint-window", type=_nonnegative_int, default=5)
+    parser.add_argument("--league-current-probability", type=_nonnegative_float, default=None)
+    parser.add_argument("--league-mixed-probability", type=_nonnegative_float, default=None)
+    parser.add_argument("--league-random-probability", type=_nonnegative_float, default=None)
+    parser.add_argument("--league-starter-probability", type=_nonnegative_float, default=None)
+    parser.add_argument("--league-checkpoint-probability", type=_nonnegative_float, default=None)
     parser.add_argument("--training-steps", type=_positive_int, default=25)
     parser.add_argument("--training-batch-size", type=_positive_int, default=256)
     parser.add_argument("--training-seed", type=int, default=7)
@@ -589,6 +655,13 @@ def config_from_args(args: argparse.Namespace) -> ColabConfig:
         experiment_id=args.experiment_id,
         feature_variant=args.feature_variant,
         training_mode=args.training_mode,
+        league_checkpoints=tuple(args.league_checkpoints),
+        league_checkpoint_window=args.league_checkpoint_window,
+        league_current_probability=args.league_current_probability,
+        league_mixed_probability=args.league_mixed_probability,
+        league_random_probability=args.league_random_probability,
+        league_starter_probability=args.league_starter_probability,
+        league_checkpoint_probability=args.league_checkpoint_probability,
         training_steps=args.training_steps,
         training_batch_size=args.training_batch_size,
         training_seed=args.training_seed,
@@ -804,21 +877,38 @@ def compatible_prior_checkpoints(
     """Filter the league pool with the same strict checkpoint validator as resume."""
     compatible: list[Path] = []
     candidates = (
-        config.current_checkpoint_path,
-        *sorted(config.run_directory.glob("policy-ppo*.pt")),
+        tuple(config.league_checkpoints)
+        if config.league_checkpoints else (
+            config.current_checkpoint_path,
+            *sorted(config.run_directory.glob("policy-ppo*.pt")),
+        )
     )
+    requested_target = training_contract.configuration["ppo_steps"]
     for candidate in candidates:
+        path = Path(candidate).expanduser()
+        if not path.is_file():
+            print(f"Skipping missing league checkpoint {path}; current opponent will be used")
+            continue
         try:
-            selection = select_resume_checkpoint(
-                (candidate,), training_contract=training_contract,
-                diagnostic=lambda message: print(message),
+            payload = read_checkpoint(path, map_location="cpu")
+            saved_target = payload.get("configuration", {}).get("ppo_steps")
+            if type(saved_target) is not int or saved_target < 0:
+                raise ValueError("saved checkpoint PPO target is missing")
+            validate_training_checkpoint(
+                payload,
+                contract=training_contract,
+                allow_ppo_extension=saved_target < requested_target,
             )
         except ValueError as exc:
-            print(f"Skipping malformed or incompatible checkpoint {candidate}: {exc}")
+            print(f"Skipping malformed or incompatible checkpoint {path}: {exc}")
             continue
-        if selection is not None:
-            compatible.append(selection.path)
-    return compatible
+        except (CheckpointError, EOFError, FileNotFoundError, UnpicklingError) as exc:
+            print(f"Skipping malformed or incompatible checkpoint {path}: {exc}")
+            continue
+        resolved = path.resolve()
+        if resolved not in compatible:
+            compatible.append(resolved)
+    return compatible[-config.league_checkpoint_window:] if config.league_checkpoint_window else []
 
 
 def train_candidate(
@@ -1119,7 +1209,11 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
         training_mode=config.training_mode,
     )
     compatible = compatible_prior_checkpoints(config, training_contract=training_contract)
-    opponent_pool = train_policy.OpponentPool(previous_checkpoints=compatible)
+    opponent_pool = train_policy.OpponentPool(
+        previous_checkpoints=compatible,
+        checkpoint_window=config.league_checkpoint_window,
+        probabilities=config.league_probabilities,
+    )
     resume_selection = select_resume_checkpoint(
         _checkpoint_candidates(config), training_contract=training_contract,
     )

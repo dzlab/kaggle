@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -93,6 +94,17 @@ def test_missing_checkpoint_path_is_not_selected(tmp_path):
     assert sampler.sample(0, seed=1).opponent == "current"
 
 
+def test_checkpoint_matches_carry_content_identity(tmp_path):
+    checkpoint = _checkpoint(tmp_path, "identity.pt", "hard")
+    match = LeagueSampler(
+        probabilities={"checkpoint": 1.0},
+        skill_bands={"hard": SkillBand("hard", (checkpoint,))},
+    ).sample(0, seed=3)
+
+    digest = hashlib.sha256(Path(checkpoint.path).read_bytes()).hexdigest()
+    assert match.checkpoint_identity == f"checkpoint:{digest}"
+
+
 def test_explicit_hard_band_weight_changes_selection_without_changing_count(tmp_path):
     easy = _checkpoint(tmp_path, "easy.pt", "easy")
     hard = _checkpoint(tmp_path, "hard.pt", "hard")
@@ -173,6 +185,18 @@ def test_skill_band_rejects_empty_or_non_string_checkpoint_entries(checkpoints):
 def test_sampler_rejects_string_checkpoint_candidates():
     with pytest.raises(ValueError):
         LeagueSampler(checkpoint_candidates="checkpoint.pt")
+
+
+@pytest.mark.parametrize(
+    "probabilities",
+    [
+        {"current": -0.1, "checkpoint": 1.0},
+        {"current": 0.0, "checkpoint": 0.0},
+    ],
+)
+def test_sampler_requires_nonnegative_probabilities_with_positive_total(probabilities):
+    with pytest.raises(ValueError):
+        LeagueSampler(probabilities=probabilities)
 
 
 @pytest.mark.parametrize("opponents", ["current", b"current"])

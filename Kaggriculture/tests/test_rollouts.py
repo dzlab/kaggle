@@ -119,3 +119,31 @@ def test_cli_exposes_parallel_rollout_options():
     assert args.candidate_artifact == Path("candidate.json")
     assert args.candidate_identity == "round-4"
     assert args.game_timeout == 2.5
+
+
+def test_native_rollout_manifest_contains_league_round_provenance():
+    from scripts.collect_trajectories import _manifest
+
+    manifest = _manifest(
+        seeds=[41], opponents=["pass"], seats=[1], steps=4,
+        source_policy_identity="candidate",
+        experiment_id="orbit-task2",
+        league_round=3,
+        league_seed=41,
+        opponent_identity="checkpoint",
+        checkpoint_identity="checkpoint:abc123",
+        league_composition={
+            "current": 0, "mixed": 0, "random": 0, "starter": 0, "checkpoint": 1,
+        },
+    )
+
+    assert manifest["experiment_id"] == "orbit-task2"
+    assert manifest["league"] == {
+        "round": 3,
+        "seed": 41,
+        "opponent_identity": "checkpoint",
+        "checkpoint_identity": "checkpoint:abc123",
+        "composition": {
+            "current": 0, "mixed": 0, "random": 0, "starter": 0, "checkpoint": 1,
+        },
+    }

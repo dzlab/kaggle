@@ -348,6 +348,90 @@ def test_colab_cli_supports_explicit_none_checkpoint_and_fallback_opt_out():
     assert config.training_offline_ppo_fallback is False
 
 
+def test_colab_cli_supports_configured_league_schedule(tmp_path):
+    from scripts import colab_train
+
+    first = tmp_path / "old.pt"
+    second = tmp_path / "new.pt"
+    args = colab_train.parse_args([
+        "--league-checkpoints", str(first),
+        "--league-checkpoints", str(second),
+        "--league-checkpoint-window", "1",
+        "--league-current-probability", "2",
+        "--league-mixed-probability", "1",
+        "--league-random-probability", "0",
+        "--league-starter-probability", "3",
+        "--league-checkpoint-probability", "4",
+        "--dry-run",
+    ])
+
+    config = colab_train.config_from_args(args)
+
+    assert config.league_checkpoints == (first.resolve(), second.resolve())
+    assert config.league_checkpoint_window == 1
+    assert config.league_probabilities == {
+        "current": 2.0,
+        "mixed": 1.0,
+        "random": 0.0,
+        "starter": 3.0,
+        "checkpoint": 4.0,
+    }
+
+
+def test_colab_cli_rejects_zero_total_league_probability(tmp_path):
+    from scripts import colab_train
+
+    with pytest.raises(ValueError, match="positive"):
+        colab_train.build_config(
+            run_directory=tmp_path,
+            league_current_probability=0.0,
+            league_mixed_probability=0.0,
+            league_random_probability=0.0,
+            league_starter_probability=0.0,
+            league_checkpoint_probability=0.0,
+            resolve_runtime_device=False,
+        )
+
+
+def test_compatible_league_checkpoints_uses_validator_and_recent_window(tmp_path, monkeypatch, capsys):
+    from scripts import colab_train
+
+    missing = tmp_path / "missing.pt"
+    incompatible = tmp_path / "incompatible.pt"
+    compatible = tmp_path / "compatible.pt"
+    incompatible.touch()
+    compatible.touch()
+    config = colab_train.build_config(
+        run_directory=tmp_path,
+        league_checkpoints=(missing, incompatible, compatible),
+        league_checkpoint_window=1,
+        resolve_runtime_device=False,
+    )
+    contract = _training_contract(tmp_path, target=16)
+    calls = []
+
+    monkeypatch.setattr(
+        colab_train,
+        "read_checkpoint",
+        lambda path, *, map_location: {"configuration": {"ppo_steps": 16}},
+    )
+
+    def validate(payload, *, contract, allow_ppo_extension):
+        calls.append((payload, allow_ppo_extension))
+        if len(calls) == 1:
+            raise colab_train.CheckpointError("incompatible league checkpoint")
+
+    monkeypatch.setattr(colab_train, "validate_training_checkpoint", validate)
+
+    selected = colab_train.compatible_prior_checkpoints(
+        config, training_contract=contract,
+    )
+
+    assert selected == [compatible.resolve()]
+    assert len(calls) == 2
+    assert "Skipping missing league checkpoint" in capsys.readouterr().out
+
+
 def test_colab_workflow_builds_parameterized_commands(tmp_path, monkeypatch):
     from scripts import colab_train
 

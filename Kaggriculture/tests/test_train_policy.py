@@ -118,6 +118,33 @@ def test_parser_rejects_negative_ppo_steps():
         ])
 
 
+def test_train_policy_parser_exposes_league_configuration(tmp_path):
+    from scripts.train_policy import _cli_training_options, _parser
+
+    args = _parser().parse_args([
+        "--input", "transitions.jsonl", "--output", "policy.pt",
+        "--league-checkpoints", str(tmp_path / "old.pt"),
+        "--league-checkpoint-window", "2",
+        "--league-current-probability", "2",
+        "--league-mixed-probability", "1",
+        "--league-random-probability", "0",
+        "--league-starter-probability", "3",
+        "--league-checkpoint-probability", "4",
+    ])
+
+    options = _cli_training_options(args)
+
+    assert args.league_checkpoints == [tmp_path / "old.pt"]
+    assert args.league_checkpoint_window == 2
+    assert options["opponent_pool"].probabilities == {
+        "current": 2.0,
+        "mixed": 1.0,
+        "random": 0.0,
+        "starter": 3.0,
+        "checkpoint": 4.0,
+    }
+
+
 def test_parser_accepts_supported_device_names_and_rejects_invalid_name():
     from scripts.train_policy import _parser
 
@@ -1315,12 +1342,17 @@ def test_opponent_pool_probabilities_and_checkpoint_sampling_are_deterministic()
     assert {match.seat for match in first[:2]} == {0, 1}
 
 
-def test_opponent_pool_schedule_uses_requested_probabilities_and_uniform_checkpoints():
+def test_opponent_pool_schedule_uses_requested_probabilities_and_uniform_checkpoints(tmp_path):
     from collections import Counter
 
     from scripts.train_policy import OpponentPool
 
-    pool = OpponentPool(previous_checkpoints=[f"ckpt-{index}" for index in range(7)])
+    checkpoints = []
+    for index in range(7):
+        checkpoint = tmp_path / f"ckpt-{index}"
+        checkpoint.touch()
+        checkpoints.append(checkpoint)
+    pool = OpponentPool(previous_checkpoints=checkpoints)
     schedule = pool.schedule(count=100, seed=11)
     opponent_counts = Counter(match.opponent for match in schedule)
     checkpoint_counts = Counter(match.checkpoint for match in schedule if match.checkpoint)
@@ -1379,6 +1411,76 @@ def test_ppo_rollout_callback_receives_mixed_opponent_resolution_and_network():
     )
 
     assert seen == [(0, "mixed", 0, None, 5, "starter", network)]
+
+
+def test_ppo_rollout_callback_receives_league_provenance_and_round_seed(tmp_path):
+    from scripts.train_policy import OpponentMatch, PPOConfig, run_ppo_training
+
+    checkpoint = tmp_path / "historical.pt"
+    checkpoint.write_bytes(b"historical-policy")
+    seen = []
+
+    class Pool:
+        def schedule(self, *, count, seed):
+            assert (count, seed) == (1, 41)
+            return [OpponentMatch(
+                "checkpoint", 1, str(checkpoint), None, "hard", "checkpoint:historical",
+            )]
+
+    def rollout_fn(**kwargs):
+        seen.append(kwargs)
+        return [_transition(done=True)]
+
+    run_ppo_training(
+        network=object(), optimizer=None, transitions=[], ppo_steps=1,
+        config=PPOConfig(rollout_steps=5), opponent_pool=Pool(),
+        rollout_fn=rollout_fn, seed=41, experiment_id="orbit-task2",
+        update_fn=lambda **_kwargs: {"updates": 1, "early_stopped": False},
+    )
+
+    assert seen == [{
+        "step": 0,
+        "opponent": "checkpoint",
+        "seat": 1,
+        "checkpoint": str(checkpoint),
+        "rollout_steps": 5,
+        "candidate_artifact": None,
+        "candidate_identity": None,
+        "seed": 41,
+        "round_index": 0,
+        "opponent_identity": "checkpoint",
+        "checkpoint_identity": "checkpoint:historical",
+        "mixed_opponent": None,
+        "network": seen[0]["network"],
+        "experiment_id": "orbit-task2",
+    }]
+
+
+def test_opponent_pool_uses_configured_league_window_and_probabilities(tmp_path):
+    from scripts.train_policy import OpponentPool
+
+    checkpoints = []
+    for index in range(4):
+        checkpoint = tmp_path / f"policy-{index}.pt"
+        checkpoint.write_bytes(str(index).encode())
+        checkpoints.append(checkpoint)
+
+    pool = OpponentPool(
+        previous_checkpoints=checkpoints, checkpoint_window=2,
+        probabilities={"checkpoint": 1.0},
+    )
+
+    assert pool.checkpoint_candidates == tuple(str(path) for path in checkpoints[-2:])
+    assert [match.seat for match in pool.schedule(count=6, seed=9)] == [0, 1, 0, 1, 0, 1]
+    assert all(match.opponent == "checkpoint" for match in pool.schedule(count=6, seed=9))
+    assert {match.checkpoint for match in pool.schedule(count=40, seed=9)} == set(pool.checkpoint_candidates)
+
+
+def test_opponent_pool_rejects_nonpositive_probability_total():
+    from scripts.train_policy import OpponentPool
+
+    with pytest.raises(ValueError):
+        OpponentPool(probabilities={"current": 0.0, "checkpoint": 0.0})
 
 
 def test_fresh_rollout_callback_can_refresh_candidate_artifact_per_round(tmp_path, monkeypatch):
