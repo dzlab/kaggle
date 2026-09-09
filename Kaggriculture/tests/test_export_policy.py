@@ -173,6 +173,22 @@ def test_exporter_rejects_hidden_width_metadata_mismatch():
         validate_checkpoint_metadata(metadata)
 
 
+def test_exporter_rejects_conflicting_top_level_and_nested_action_representation():
+    from kagriculture_agent.model import ACTION_VOCAB
+    from scripts.export_policy import validate_checkpoint_metadata
+
+    metadata = {
+        "model_version": "learned_v1", "feature_schema_version": 1,
+        "engine_version": "1.32.7",
+        "action_vocab": {key: list(value) for key, value in ACTION_VOCAB.items()},
+        "action_representation": "current_v1",
+        "ppo_config": {"action_representation": "target_first_v1"},
+    }
+
+    with pytest.raises(ValueError, match="action_representation.*conflicts"):
+        validate_checkpoint_metadata(metadata)
+
+
 def test_exporter_rejects_checkpoint_tensor_shape_mismatch():
     from scripts.export_policy import validate_checkpoint_state_dict
     from kagriculture_agent.learned_policy import artifact_tensor_shapes

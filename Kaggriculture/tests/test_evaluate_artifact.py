@@ -505,3 +505,61 @@ def test_cli_writes_discard_report_for_invalid_artifact(tmp_path):
     assert report["decision"]["status"] == "discard"
     assert report["decision"]["reasons"] == ["artifact_invalid"]
     assert set(report["records"]) == {"current", "learned_artifact"}
+
+
+def test_write_report_rejects_protected_model_output(tmp_path):
+    from scripts.evaluate_artifact import write_report
+
+    destination = tmp_path / "models" / "learned_v1.json"
+    destination.parent.mkdir()
+
+    with pytest.raises(ValueError, match="production|artifact"):
+        write_report(destination, {"status": "discard"})
+
+    assert not destination.exists()
+
+
+def test_write_report_rejects_symlinked_parent(tmp_path):
+    from scripts.evaluate_artifact import write_report
+
+    real_parent = tmp_path / "real-reports"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "reports"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        write_report(linked_parent / "evaluation.json", {"status": "discard"})
+
+    assert not (real_parent / "evaluation.json").exists()
+
+
+def test_cli_forwards_action_representation_to_evaluate(tmp_path, monkeypatch):
+    from scripts import evaluate_artifact
+
+    artifact = _artifact(tmp_path / "artifact.json")
+    output = tmp_path / "report.json"
+    captured = {}
+    result = {
+        "configuration": {"action_representation": "target_first_v1"},
+        "artifact": {
+            "name": artifact.name, "identity": "learned_artifact", "sha256": "a" * 64,
+        },
+        "expected_matrix": [],
+        "records": [],
+        "summaries": {},
+        "matrix_completeness": {},
+        "decision": {"status": "discard", "reasons": []},
+    }
+
+    def fake_evaluate(**kwargs):
+        captured.update(kwargs)
+        return result
+
+    monkeypatch.setattr(evaluate_artifact, "evaluate", fake_evaluate)
+    monkeypatch.setattr(evaluate_artifact, "_is_valid_comparison", lambda value: True)
+
+    assert evaluate_artifact.main([
+        "--artifact", str(artifact), "--output", str(output),
+        "--action-representation", "target_first_v1",
+    ]) == 0
+    assert captured["action_representation"] == "target_first_v1"

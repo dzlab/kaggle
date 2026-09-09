@@ -1387,16 +1387,16 @@ def _validate_identity_document(
                 raise ValueError(
                     f"{path} {label}.{field} does not match requested experiment identity"
                 )
-                if (
-                    label == "configuration"
-                    and require_configuration
-                    and field not in nested
-                    and not (
-                        field == "action_representation"
-                        and value == DEFAULT_ACTION_REPRESENTATION
-                    )
-                ):
-                    raise ValueError(f"{path} configuration.{field} is missing experiment identity")
+            if (
+                label == "configuration"
+                and require_configuration
+                and field not in nested
+                and not (
+                    field == "action_representation"
+                    and value == DEFAULT_ACTION_REPRESENTATION
+                )
+            ):
+                raise ValueError(f"{path} configuration.{field} is missing experiment identity")
 
 
 def _invalidate_evaluation_report(path: Path) -> None:
@@ -1508,6 +1508,7 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
         experiment_id=config.experiment_id,
         feature_variant=config.feature_variant,
         training_mode=config.training_mode,
+        action_representation=config.action_representation,
         effective_behavior_clone_steps=config.behavior_clone_steps,
         ppo_config=PPOConfig(
             potential_reward_coef=config.potential_reward_coef,

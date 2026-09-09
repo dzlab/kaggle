@@ -7,7 +7,6 @@ from concurrent.futures import ProcessPoolExecutor, wait
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -30,6 +29,7 @@ from scripts.evaluate import (  # noqa: E402
     replay_record,
 )
 from scripts.run_local import OPPONENTS, run_episode  # noqa: E402
+from scripts.output_paths import atomic_write_text  # noqa: E402
 from scripts.training_identity import (  # noqa: E402
     ACTION_REPRESENTATIONS,
     DEFAULT_ACTION_REPRESENTATION,
@@ -577,24 +577,8 @@ def _failure_report(args: argparse.Namespace, error: Exception) -> dict[str, Any
 
 
 def write_report(path: str | Path, report: Mapping[str, Any]) -> Path:
-    report_path = Path(path)
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=report_path.parent,
-            prefix=f".{report_path.name}.", suffix=".tmp", delete=False,
-        ) as handle:
-            temporary_path = Path(handle.name)
-            json.dump(report, handle, sort_keys=True, separators=(",", ":"))
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, report_path)
-    finally:
-        if temporary_path is not None and temporary_path.exists():
-            temporary_path.unlink()
-    return report_path
+    serialized = json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n"
+    return atomic_write_text(path, serialized, name="evaluation report")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -768,6 +752,7 @@ def main(argv: list[str] | None = None) -> int:
             experiment_id=args.experiment_id,
             feature_variant=args.feature_variant,
             training_mode=args.training_mode,
+            action_representation=args.action_representation,
         )
         report = build_report(result)
         write_report(output, report)

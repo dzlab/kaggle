@@ -1533,6 +1533,73 @@ def test_colab_workflow_records_validation_before_finishing_telemetry(tmp_path, 
     assert result.holdout_evaluation_complete is True
 
 
+def test_colab_workflow_passes_target_first_action_representation_to_training_contract(
+    tmp_path, monkeypatch,
+):
+    from scripts import train, train_policy
+
+    monkeypatch.setattr(train, "resolve_device", lambda value: "cpu")
+    config = train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        action_representation="target_first_v1",
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+    captured = {}
+    real_builder = train_policy.build_training_contract
+
+    def capture_builder(**kwargs):
+        captured["action_representation"] = kwargs.get("action_representation")
+        return real_builder(**kwargs)
+
+    monkeypatch.setattr(train_policy, "build_training_contract", capture_builder)
+
+    def fake_run(command, *, check, capture_output=False):
+        script = Path(command[1]).name
+        if script == train.COLLECT_SCRIPT.name:
+            config.trajectory_path.write_text("{}\n", encoding="utf-8")
+        elif script == train.EVALUATE_SCRIPT.name:
+            phase = "holdout" if "holdout" in command[-1] else "development"
+            report_path = (
+                config.holdout_report_path if phase == "holdout"
+                else config.development_report_path
+            )
+            report = _complete_colab_evaluation_report(config, phase=phase)
+            report["configuration"]["action_representation"] = config.action_representation
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(train, "run_command", fake_run)
+    monkeypatch.setattr(train, "train_candidate", lambda *args, **kwargs: {})
+    monkeypatch.setattr(train, "initialize_telemetry", lambda config: None)
+    monkeypatch.setattr(train, "smoke_test_artifact", lambda config: None)
+
+    train.run_workflow(config)
+
+    assert captured["action_representation"] == "target_first_v1"
+
+
+def test_required_nested_identity_fields_are_validated(tmp_path, monkeypatch):
+    from scripts import train
+
+    monkeypatch.setattr(train, "resolve_device", lambda value: "cpu")
+    config = train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        action_representation="target_first_v1",
+    )
+    document = {
+        "configuration": {
+            "experiment_id": config.experiment_id,
+            "feature_variant": config.feature_variant,
+            "training_mode": config.training_mode,
+        },
+    }
+
+    with pytest.raises(ValueError, match="configuration.action_representation"):
+        train._validate_identity_document(
+            document, config, path=tmp_path / "report.json", require_configuration=True,
+        )
+
+
 def test_build_training_contract_normalizes_zero_steps_and_batch_size(monkeypatch, tmp_path):
     from scripts import train_policy
 

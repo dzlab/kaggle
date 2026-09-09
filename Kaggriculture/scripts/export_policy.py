@@ -33,7 +33,11 @@ from kagriculture_agent.model import (
     validate_model_shape,
 )
 from scripts.output_paths import validate_training_output_path
-from scripts.training_identity import DEFAULT_ACTION_REPRESENTATION, validate_action_representation
+from scripts.training_identity import (
+    DEFAULT_ACTION_REPRESENTATION,
+    validate_action_representation,
+    validate_identity_consistency,
+)
 
 FORMAT_VERSION = 1
 QUANTIZATION = "int8-per-row"
@@ -156,6 +160,15 @@ def validate_checkpoint_metadata(metadata: Any) -> dict[str, list[Any]]:
         metadata.get("action_representation", DEFAULT_ACTION_REPRESENTATION),
         source="checkpoint",
     )
+    nested_identity = metadata.get("ppo_config")
+    if nested_identity is not None:
+        validate_identity_consistency(
+            metadata, nested_identity, source="checkpoint metadata",
+        )
+        if "action_representation" in nested_identity:
+            validate_action_representation(
+                nested_identity["action_representation"], source="checkpoint ppo_config",
+            )
     _checkpoint_model_shape(metadata)
     return validate_action_vocab(metadata.get("action_vocab"))
 
