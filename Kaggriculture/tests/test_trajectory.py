@@ -401,6 +401,25 @@ def test_collection_resolution_ignores_malformed_bank_differential(tmp_path):
 
 
 @pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_collection_resolution_ignores_nonfinite_bank_differential(value):
+    from kagriculture_agent.trajectory import Transition
+    from scripts.collect_trajectories import _resolve_collection_transitions
+
+    transition = Transition(
+        observation={"bank_differential": value}, action={},
+        next_observation={}, done=False, reward=7.0,
+        final_bank=5000.0, opponent_final_bank=0.0, safety_flags=(),
+    )
+
+    resolved = _resolve_collection_transitions(
+        [transition], no_progress_window=0, resolved_margin=1000.0,
+    )
+
+    assert resolved[0].bootstrap_truncated is None
+    assert resolved[0].termination_reason is None
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
 def test_collection_rejects_nonfinite_resolved_margin(value):
     from scripts.collect_trajectories import _parser, _resolve_collection_transitions
 

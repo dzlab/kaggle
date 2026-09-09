@@ -362,6 +362,68 @@ def _average(records: Sequence[Mapping[str, Any]], key: str) -> float:
     return float(mean(values)) if values else 0.0
 
 
+def _diagnostic_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Aggregate replay termination and safety metadata for promotion telemetry."""
+    records = list(records)
+    termination_reasons: dict[str, int] = {}
+    bootstrap_truncated_count = 0
+    shaping_count = 0
+    max_no_progress_steps = 0
+    time_limit_endings = 0
+    safety_regression_count = 0
+    for record in records:
+        reason = record.get("termination_reason")
+        if reason is not None and str(reason):
+            reason = str(reason)
+            termination_reasons[reason] = termination_reasons.get(reason, 0) + 1
+        if record.get("bootstrap_truncated") is True:
+            bootstrap_truncated_count += 1
+        shaping = _number(record.get("shaping_count"))
+        if shaping is not None:
+            shaping_count += max(0, int(shaping))
+        no_progress_steps = _number(record.get("no_progress_steps"))
+        if no_progress_steps is not None:
+            max_no_progress_steps = max(max_no_progress_steps, max(0, int(no_progress_steps)))
+        normalized_reason = str(reason or "").strip().lower().replace("-", "_")
+        if record.get("time_limit_ending") is True or normalized_reason in {
+            "time_limit", "timeout", "time_limit_ending",
+        }:
+            time_limit_endings += 1
+        safety_flags = record.get("safety_flags", ())
+        has_safety_flag = isinstance(safety_flags, (list, tuple, set)) and any(
+            "safety_regression" in str(flag).lower() for flag in safety_flags
+        )
+        if record.get("safety_regression") is True or has_safety_flag:
+            safety_regression_count += 1
+    resolved_count = sum(
+        count for reason, count in termination_reasons.items()
+        if reason.strip().lower().replace("-", "_") == "resolved"
+    )
+    no_progress_count = sum(
+        count for reason, count in termination_reasons.items()
+        if reason.strip().lower().replace("-", "_") == "no_progress"
+    )
+    denominator = float(len(records)) if records else 1.0
+    return {
+        "record_count": len(records),
+        "termination_reasons": termination_reasons,
+        "bootstrap_truncated_count": bootstrap_truncated_count,
+        "truncation_count": bootstrap_truncated_count,
+        "truncation_rate": bootstrap_truncated_count / denominator,
+        "shaping_count": shaping_count,
+        "resolved_count": resolved_count,
+        "resolved_rate": resolved_count / denominator,
+        "no_progress_count": no_progress_count,
+        "no_progress_rate": no_progress_count / denominator,
+        "max_no_progress_steps": max_no_progress_steps,
+        "max_no_progress_streak": max_no_progress_steps,
+        "time_limit_endings": time_limit_endings,
+        "time_limit_rate": time_limit_endings / denominator,
+        "safety_regression_count": safety_regression_count,
+        "safety_regression_rate": safety_regression_count / denominator,
+    }
+
+
 def _market_metrics(states: Sequence[Mapping[str, Any]], *, churn_window: int = 2) -> dict[str, int]:
     """Count submitted market order events and reversals in a replay.
 
@@ -455,6 +517,7 @@ def aggregate_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "average_shed_overflow": _average(records, "shed_overflow"),
         "average_price_floor_sales": _average(records, "price_floor_sales"),
         "average_missed_basic_needs_events": _average(records, "missed_basic_needs"),
+        **_diagnostic_summary(records),
     }
 
 
@@ -1650,10 +1713,90 @@ def _framework_error_record(*, variant: str, opponent: str, seed: int, seat: int
         "market_transaction_count": 0,
         "same_item_market_churn": 0,
         "same_item_sell_buy_churn": 0,
+        "termination_reason": "engine_error",
+        "bootstrap_truncated": False,
+        "no_progress_steps": 0,
+        "time_limit_ending": False,
+        "safety_flags": [],
+        "safety_regression": False,
+        "shaping_count": 0,
     }
     if error:
         record["error"] = str(error)[:1000]
     return record
+
+
+def _replay_diagnostics(
+    replay: Mapping[str, Any], own_states: Sequence[Mapping[str, Any]],
+    configuration: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Extract game-level diagnostics without inventing transition outcomes."""
+    sources: list[Mapping[str, Any]] = []
+    replay_info = _mapping(replay.get("info"))
+    replay_diagnostics = _mapping(replay.get("diagnostics"))
+    if replay_info:
+        sources.append(replay_info)
+    if replay_diagnostics:
+        sources.append(replay_diagnostics)
+    for state in own_states:
+        state_info = _mapping(state.get("info"))
+        state_diagnostics = _mapping(state.get("diagnostics"))
+        if state_info:
+            sources.append(state_info)
+        if state_diagnostics:
+            sources.append(state_diagnostics)
+
+    termination_reason = None
+    bootstrap_truncated = False
+    no_progress_steps = 0
+    time_limit_ending = False
+    shaping_count = 0
+    safety_flags: list[str] = []
+    safety_regression = False
+    for source in sources:
+        raw_reason = source.get("termination_reason")
+        if raw_reason is not None and str(raw_reason):
+            termination_reason = str(raw_reason)
+        if source.get("bootstrap_truncated") is True:
+            bootstrap_truncated = True
+        raw_steps = _number(source.get("no_progress_steps"))
+        if raw_steps is not None:
+            no_progress_steps = max(no_progress_steps, max(0, int(raw_steps)))
+        if source.get("time_limit_ending") is True:
+            time_limit_ending = True
+        raw_shaping = _number(source.get("shaping_count"))
+        if raw_shaping is not None:
+            shaping_count = max(shaping_count, max(0, int(raw_shaping)))
+        if source.get("safety_regression") is True:
+            safety_regression = True
+        raw_flags = source.get("safety_flags", ())
+        if isinstance(raw_flags, (list, tuple, set)):
+            for flag in raw_flags:
+                if isinstance(flag, str) and flag and flag not in safety_flags:
+                    safety_flags.append(flag)
+                    if "safety_regression" in flag.lower():
+                        safety_regression = True
+
+    final_state = own_states[-1] if own_states else {}
+    final_observation = _mapping(final_state.get("observation"))
+    final_step = _number(final_observation.get("step"))
+    episode_steps = _number(_config_value(configuration, "episodeSteps", 0))
+    inferred_time_limit = (
+        final_step is not None and episode_steps is not None and episode_steps > 0
+        and final_step >= episode_steps - 1
+    )
+    time_limit_ending = time_limit_ending or inferred_time_limit
+    if termination_reason is None:
+        termination_reason = "time_limit" if time_limit_ending else "terminal"
+    return {
+        "termination_reason": termination_reason,
+        "bootstrap_truncated": bootstrap_truncated,
+        "no_progress_steps": no_progress_steps,
+        "time_limit_ending": time_limit_ending,
+        "safety_flags": safety_flags,
+        "safety_regression": safety_regression,
+        "shaping_count": shaping_count,
+    }
 
 
 def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, seed: int,
@@ -1734,6 +1877,7 @@ def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, se
     reasons = framework_error_reasons(diagnostic_record)
     if reasons:
         outcome, differential = "framework_error", 0.0
+    diagnostics = _replay_diagnostics(replay, own_states, replay_configuration)
     return {
         "candidate": variant,
         "variant": variant,
@@ -1755,6 +1899,7 @@ def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, se
             if own_states else None
         ),
         **market_metrics,
+        **diagnostics,
     }
 
 
@@ -3605,6 +3750,29 @@ def _worker_record_error(record: Mapping[str, Any], *, variant: str, opponent: s
             malformed_numbers.append(field)
     if malformed_numbers:
         return f"worker numeric fields are malformed: {', '.join(sorted(malformed_numbers))}"
+    if "termination_reason" in record and (
+        record["termination_reason"] is not None
+        and (type(record["termination_reason"]) is not str or not record["termination_reason"])
+    ):
+        return "worker termination_reason must be a non-empty string or null"
+    if "bootstrap_truncated" in record and type(record["bootstrap_truncated"]) is not bool:
+        return "worker bootstrap_truncated must be boolean"
+    if "no_progress_steps" in record and (
+        type(record["no_progress_steps"]) is not int or record["no_progress_steps"] < 0
+    ):
+        return "worker no_progress_steps must be a nonnegative integer"
+    if "time_limit_ending" in record and type(record["time_limit_ending"]) is not bool:
+        return "worker time_limit_ending must be boolean"
+    if "safety_regression" in record and type(record["safety_regression"]) is not bool:
+        return "worker safety_regression must be boolean"
+    if "shaping_count" in record and (
+        type(record["shaping_count"]) is not int or record["shaping_count"] < 0
+    ):
+        return "worker shaping_count must be a nonnegative integer"
+    if "safety_flags" in record:
+        flags = record["safety_flags"]
+        if not isinstance(flags, list) or any(type(flag) is not str or not flag for flag in flags):
+            return "worker safety_flags must be a list of non-empty strings"
     return None
 
 

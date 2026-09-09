@@ -963,6 +963,12 @@ def test_worker_runs_from_project_root_in_a_fresh_interpreter(seat):
     assert response["outcome"] in {"win", "loss", "tie"}
     assert response["final_bank"] is not None
     assert response["opponent_final_bank"] is not None
+    assert response["termination_reason"] in {"terminal", "time_limit"}
+    assert response["bootstrap_truncated"] is False
+    assert response["no_progress_steps"] == 0
+    assert response["time_limit_ending"] is (response["termination_reason"] == "time_limit")
+    assert response["safety_flags"] == []
+    assert response["safety_regression"] is False
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
@@ -1976,6 +1982,44 @@ def test_aggregate_counts_outcomes_and_metrics():
     assert summary["average_shed_overflow"] == pytest.approx(1)
     assert summary["average_price_floor_sales"] == pytest.approx(2)
     assert summary["average_missed_basic_needs_events"] == pytest.approx(4 / 3)
+
+
+def test_replay_record_and_aggregation_emit_real_stall_diagnostics():
+    from scripts.evaluate import aggregate_records, replay_record
+
+    replay = _strict_two_turn_replay()
+    replay["info"] = {
+        "time_limit_ending": True,
+        "safety_flags": ["safety_regression"],
+    }
+    replay["steps"][-1][0]["info"] = {
+        "termination_reason": "no_progress",
+        "bootstrap_truncated": True,
+        "no_progress_steps": 7,
+    }
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+    summary = aggregate_records([record])
+
+    assert record["termination_reason"] == "no_progress"
+    assert record["bootstrap_truncated"] is True
+    assert record["no_progress_steps"] == 7
+    assert record["time_limit_ending"] is True
+    assert record["safety_flags"] == ["safety_regression"]
+    assert record["safety_regression"] is True
+    assert summary["termination_reasons"] == {"no_progress": 1}
+    assert summary["bootstrap_truncated_count"] == 1
+    assert summary["truncation_count"] == 1
+    assert summary["truncation_rate"] == pytest.approx(1.0)
+    assert summary["resolved_count"] == 0
+    assert summary["no_progress_count"] == 1
+    assert summary["no_progress_rate"] == pytest.approx(1.0)
+    assert summary["max_no_progress_steps"] == 7
+    assert summary["max_no_progress_streak"] == 7
+    assert summary["time_limit_endings"] == 1
+    assert summary["time_limit_rate"] == pytest.approx(1.0)
+    assert summary["safety_regression_count"] == 1
+    assert summary["safety_regression_rate"] == pytest.approx(1.0)
 
 
 def test_run_matrix_executes_variant_opponent_cartesian_product_with_same_seeds(monkeypatch):

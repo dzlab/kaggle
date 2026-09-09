@@ -312,7 +312,12 @@ def _resolve_collection_transitions(
             if raw_margin is None:
                 raw_margin = transition.next_observation.get("bank_differential")
             try:
-                decided = raw_margin is not None and abs(float(raw_margin)) >= resolved_margin
+                margin = float(raw_margin) if raw_margin is not None else None
+                decided = (
+                    margin is not None
+                    and math.isfinite(margin)
+                    and abs(margin) >= resolved_margin
+                )
             except (TypeError, ValueError, OverflowError):
                 decided = False
             if decided:
