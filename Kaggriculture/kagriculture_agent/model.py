@@ -45,6 +45,8 @@ HIDDEN_WIDTH = 128
 ATTENTION_BLOCKS = 4
 ATTENTION_HEADS = 4
 MLP_WIDTH = 256
+DEFAULT_MODEL_WIDTH = HIDDEN_WIDTH
+DEFAULT_MODEL_DEPTH = ATTENTION_BLOCKS
 FEATURE_INPUT_SIZES = {
     "tile": TILE_TOKEN_SIZE,
     "worker": WORKER_TOKEN_SIZE,
@@ -72,6 +74,21 @@ def require_torch() -> Any:
             "training dependencies, for example `uv sync --extra training`."
         )
     return torch
+
+
+def validate_model_shape(
+    hidden_width: Any, depth: Any, *, source: str = "model",
+) -> tuple[int, int]:
+    """Validate the opt-in model topology while preserving current defaults."""
+    if type(hidden_width) is not int or hidden_width < 1:
+        raise ValueError(f"{source} hidden_width must be a positive integer")
+    if hidden_width % ATTENTION_HEADS:
+        raise ValueError(
+            f"{source} hidden_width must be divisible by {ATTENTION_HEADS}"
+        )
+    if type(depth) is not int or depth < 1:
+        raise ValueError(f"{source} depth must be a positive integer")
+    return hidden_width, depth
 
 
 def resolve_device(requested: str = "auto") -> Any:
@@ -135,14 +152,15 @@ def feature_batch_to_tensors(
 if nn is not None:
 
     class _ResidualAttentionBlock(nn.Module):
-        def __init__(self, width: int = HIDDEN_WIDTH) -> None:
+        def __init__(self, width: int = HIDDEN_WIDTH, mlp_width: int | None = None) -> None:
             super().__init__()
+            mlp_width = 2 * width if mlp_width is None else mlp_width
             self.attention = nn.MultiheadAttention(width, ATTENTION_HEADS, batch_first=True)
             self.attention_norm = nn.LayerNorm(width)
             self.mlp = nn.Sequential(
-                nn.Linear(width, MLP_WIDTH),
+                nn.Linear(width, mlp_width),
                 nn.GELU(),
-                nn.Linear(MLP_WIDTH, width),
+                nn.Linear(mlp_width, width),
             )
             self.mlp_norm = nn.LayerNorm(width)
 
@@ -155,16 +173,18 @@ if nn is not None:
     class CompactPolicyNet(nn.Module):
         """Small attention policy over tile, worker, market, and global tokens."""
 
-        def __init__(self, *, hidden_width: int = HIDDEN_WIDTH) -> None:
+        def __init__(
+            self, *, hidden_width: int = HIDDEN_WIDTH, depth: int = ATTENTION_BLOCKS,
+        ) -> None:
             super().__init__()
-            self.hidden_width = int(hidden_width)
+            self.hidden_width, self.depth = validate_model_shape(hidden_width, depth)
             self.tile_projection = nn.Linear(TILE_TOKEN_SIZE, self.hidden_width)
             self.worker_projection = nn.Linear(WORKER_TOKEN_SIZE, self.hidden_width)
             self.market_projection = nn.Linear(MARKET_TOKEN_SIZE, self.hidden_width)
             self.global_projection = nn.Linear(GLOBAL_TOKEN_SIZE, self.hidden_width)
             self.type_embedding = nn.Embedding(4, self.hidden_width)
             self.blocks = nn.ModuleList(
-                _ResidualAttentionBlock(self.hidden_width) for _ in range(ATTENTION_BLOCKS)
+                _ResidualAttentionBlock(self.hidden_width) for _ in range(self.depth)
             )
             self.worker_act_head = nn.Linear(self.hidden_width, 2)
             self.worker_kind_head = nn.Linear(self.hidden_width, len(ACTION_VOCAB["worker_kinds"]))
@@ -182,6 +202,10 @@ if nn is not None:
             # intent training is explicitly enabled.
             nn.init.zeros_(self.market_active_head.weight)
             nn.init.zeros_(self.market_active_head.bias)
+
+        @property
+        def parameter_count(self) -> int:
+            return model_parameter_count(self)
 
         def forward(self, feature_batch: FeatureBatch | Sequence[FeatureBatch]) -> dict[str, Any]:
             tensors = feature_batch_to_tensors(feature_batch, device=next(self.parameters()).device)
@@ -223,3 +247,11 @@ else:
                 "PyTorch is required for CompactPolicyNet; install the optional "
                 "training dependencies."
             )
+
+
+def model_parameter_count(model: Any) -> int:
+    """Return the number of trainable and non-trainable model parameters."""
+    parameters = getattr(model, "parameters", None)
+    if not callable(parameters):
+        raise TypeError("model must expose a parameters() method")
+    return sum(int(parameter.numel()) for parameter in parameters())

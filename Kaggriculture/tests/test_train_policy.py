@@ -118,6 +118,38 @@ def test_parser_rejects_negative_ppo_steps():
         ])
 
 
+def test_parser_accepts_training_mode_bc_budget_and_model_shape():
+    from scripts.train_policy import _parser
+
+    args = _parser().parse_args([
+        "--input", "transitions.jsonl", "--output", "policy.pt",
+        "--training-mode", "pure_ppo",
+        "--behavior-clone-steps", "8",
+        "--model-width", "256",
+        "--model-depth", "8",
+    ])
+
+    assert args.training_mode == "pure_ppo"
+    assert args.behavior_clone_steps == 8
+    assert args.model_width == 256
+    assert args.model_depth == 8
+
+
+@pytest.mark.parametrize(
+    ("mode", "configured", "expected"),
+    [
+        ("behavior_clone_then_ppo", 8, 8),
+        ("reduced_behavior_clone_then_ppo", 8, 2),
+        ("reduced_behavior_clone_then_ppo", 3, 1),
+        ("pure_ppo", 8, 0),
+    ],
+)
+def test_behavior_clone_budget_is_resolved_by_training_mode(mode, configured, expected):
+    from scripts.train_policy import resolve_behavior_clone_steps
+
+    assert resolve_behavior_clone_steps(mode, configured) == expected
+
+
 def test_train_policy_parser_exposes_league_configuration(tmp_path):
     from scripts.train_policy import _cli_training_options, _parser
 
@@ -1631,6 +1663,127 @@ def test_behavior_cloning_smoke_writes_checkpoint_metadata(tmp_path):
     assert checkpoint["configuration"]["device"] == "cpu"
     assert checkpoint["progress"] == {"epoch": 1, "round": 0, "cursor": 0}
     assert checkpoint["metrics"]["behavior_clone_updates"] == 1
+
+
+def test_reduced_behavior_clone_records_effective_budget_and_actual_updates(tmp_path):
+    pytest.importorskip("torch")
+    from scripts import train_policy
+
+    input_path = tmp_path / "transitions.jsonl"
+    output_path = tmp_path / "policy.pt"
+    input_path.write_text(
+        "\n".join(json.dumps(row) for row in [_transition(done=False), _transition(done=True)]) + "\n",
+        encoding="utf-8",
+    )
+
+    metadata = train_policy.train_behavior_clone(
+        input_path=input_path,
+        output_path=output_path,
+        steps=4,
+        behavior_clone_steps=4,
+        batch_size=2,
+        seed=7,
+        device="cpu",
+        training_mode="reduced_behavior_clone_then_ppo",
+    )
+
+    checkpoint = pytest.importorskip("torch").load(output_path, map_location="cpu", weights_only=True)
+    assert metadata["behavior_clone_steps"] == 1
+    assert metadata["behavior_clone_updates"] == 1
+    assert checkpoint["configuration"]["behavior_clone_steps"] == 1
+    assert checkpoint["metrics"]["behavior_clone_updates"] == 1
+
+
+def test_pure_ppo_skips_behavior_clone_and_starts_fresh_ppo(tmp_path, monkeypatch):
+    pytest.importorskip("torch")
+    from scripts import train_policy
+
+    input_path = tmp_path / "transitions.jsonl"
+    output_path = tmp_path / "policy.pt"
+    input_path.write_text(json.dumps(_transition(done=True)) + "\n", encoding="utf-8")
+    calls = []
+
+    def fail_if_behavior_cloning_runs(*_args, **_kwargs):
+        raise AssertionError("pure PPO must not execute a BC minibatch")
+
+    def fake_ppo(**kwargs):
+        calls.append(kwargs)
+        return {
+            "ppo_updates": 1,
+            "rollout_count": 1,
+            "early_stopped": False,
+            "last_metrics": None,
+            "promotion": None,
+            "completed_steps": 1,
+        }
+
+    monkeypatch.setattr(train_policy, "epoch_minibatches", fail_if_behavior_cloning_runs)
+    monkeypatch.setattr(train_policy, "run_ppo_training", fake_ppo)
+
+    metadata = train_policy.train_behavior_clone(
+        input_path=input_path,
+        output_path=output_path,
+        steps=8,
+        behavior_clone_steps=8,
+        batch_size=1,
+        seed=7,
+        ppo_steps=1,
+        device="cpu",
+        training_mode="pure_ppo",
+        offline_ppo_fallback=True,
+    )
+
+    checkpoint = pytest.importorskip("torch").load(output_path, map_location="cpu", weights_only=True)
+    assert len(calls) == 1
+    assert metadata["behavior_clone_steps"] == 0
+    assert metadata["behavior_clone_updates"] == 0
+    assert checkpoint["metrics"]["behavior_clone_updates"] == 0
+    assert checkpoint["metadata"]["training_mode"] == "pure_ppo"
+
+
+def test_resume_rejects_incompatible_model_shape(tmp_path):
+    pytest.importorskip("torch")
+    from kagriculture_agent.checkpoints import save_checkpoint
+    from kagriculture_agent.model import CompactPolicyNet
+    from scripts import train_policy
+
+    input_path = tmp_path / "transitions.jsonl"
+    resume_path = tmp_path / "resume.pt"
+    output_path = tmp_path / "continued.pt"
+    input_path.write_text(json.dumps(_transition(done=True)) + "\n", encoding="utf-8")
+    model = CompactPolicyNet(hidden_width=256, depth=8).to("cpu")
+    optimizer = pytest.importorskip("torch").optim.AdamW(model.parameters(), lr=1e-3)
+    configuration = train_policy.build_training_contract(
+        input_path=input_path,
+        steps=1,
+        batch_size=1,
+        device="cpu",
+        model_width=256,
+        model_depth=8,
+    ).configuration
+    save_checkpoint(
+        resume_path,
+        model=model,
+        optimizer=optimizer,
+        configuration=configuration,
+        epoch=1,
+        round_index=0,
+        cursor=0,
+        metrics={"behavior_clone_updates": 1, "ppo_updates": 0, "ppo_metrics": None},
+        metadata=train_policy.checkpoint_metadata(
+            transition_count=1, device="cpu", model_width=256, model_depth=8,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="model_width|model_depth"):
+        train_policy.train_behavior_clone(
+            input_path=input_path,
+            output_path=output_path,
+            steps=1,
+            batch_size=1,
+            device="cpu",
+            resume_checkpoint=resume_path,
+        )
 
 
 def test_training_contract_and_checkpoint_metadata_include_experiment_identity(tmp_path):

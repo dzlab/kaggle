@@ -24,7 +24,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from kagriculture_agent.checkpoints import CheckpointError, read_checkpoint
 from kagriculture_agent.league import DEFAULT_OPPONENT_PROBABILITIES, LeagueSampler
-from kagriculture_agent.model import resolve_device
+from kagriculture_agent.model import (
+    DEFAULT_MODEL_DEPTH,
+    DEFAULT_MODEL_WIDTH,
+    CompactPolicyNet,
+    model_parameter_count,
+    resolve_device,
+    validate_model_shape,
+)
 from scripts.telemetry import record_validation_report
 from scripts.train_policy import (
     TrainingContract,
@@ -99,6 +106,8 @@ class ColabConfig:
     league_random_probability: float = DEFAULT_OPPONENT_PROBABILITIES["random"]
     league_starter_probability: float = DEFAULT_OPPONENT_PROBABILITIES["starter"]
     league_checkpoint_probability: float = DEFAULT_OPPONENT_PROBABILITIES["checkpoint"]
+    model_width: int = DEFAULT_MODEL_WIDTH
+    model_depth: int = DEFAULT_MODEL_DEPTH
 
     @property
     def league_probabilities(self) -> dict[str, float]:
@@ -398,6 +407,8 @@ def build_config(
     league_random_probability: float | None = None,
     league_starter_probability: float | None = None,
     league_checkpoint_probability: float | None = None,
+    model_width: int = DEFAULT_MODEL_WIDTH,
+    model_depth: int = DEFAULT_MODEL_DEPTH,
     resolve_runtime_device: bool = True,
 ) -> ColabConfig:
     if type(workers) is not int or workers < 1:
@@ -422,6 +433,7 @@ def build_config(
     }
     LeagueSampler(probabilities=weights)
     validate_training_identity(experiment_id, feature_variant, training_mode)
+    validate_model_shape(model_width, model_depth, source="training")
     for name, value in (
         ("training_steps", training_steps),
         ("training_batch_size", training_batch_size),
@@ -530,6 +542,8 @@ def build_config(
         weights["random"],
         weights["starter"],
         weights["checkpoint"],
+        model_width,
+        model_depth,
     )
 
 
@@ -579,6 +593,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--experiment-id", default=DEFAULT_EXPERIMENT_ID)
     parser.add_argument("--feature-variant", choices=FEATURE_VARIANTS, default="production_v1")
     parser.add_argument("--training-mode", choices=TRAINING_MODES, default="behavior_clone_then_ppo")
+    parser.add_argument("--model-width", type=_positive_int, default=DEFAULT_MODEL_WIDTH)
+    parser.add_argument("--model-depth", type=_positive_int, default=DEFAULT_MODEL_DEPTH)
     parser.add_argument("--league-checkpoints", type=Path, action="append", default=[])
     parser.add_argument("--league-checkpoint-window", type=_nonnegative_int, default=5)
     parser.add_argument("--league-current-probability", type=_nonnegative_float, default=None)
@@ -655,6 +671,8 @@ def config_from_args(args: argparse.Namespace) -> ColabConfig:
         experiment_id=args.experiment_id,
         feature_variant=args.feature_variant,
         training_mode=args.training_mode,
+        model_width=args.model_width,
+        model_depth=args.model_depth,
         league_checkpoints=tuple(args.league_checkpoints),
         league_checkpoint_window=args.league_checkpoint_window,
         league_current_probability=args.league_current_probability,
@@ -837,6 +855,14 @@ def initialize_telemetry(config: ColabConfig) -> Any | None:
             "candidate_tag": config.candidate_tag,
             "ppo_target_steps": config.ppo_target_steps,
             "training_steps": config.training_steps,
+            "behavior_clone_steps": config.training_steps,
+            "model_width": config.model_width,
+            "model_depth": config.model_depth,
+            "parameter_count": model_parameter_count(
+                CompactPolicyNet(
+                    hidden_width=config.model_width, depth=config.model_depth,
+                )
+            ),
             "batch_size": config.training_batch_size,
             "seed": config.training_seed,
             "device": config.device,
@@ -966,6 +992,9 @@ def train_candidate(
         experiment_id=config.experiment_id,
         feature_variant=config.feature_variant,
         training_mode=config.training_mode,
+        behavior_clone_steps=config.training_steps,
+        model_width=config.model_width,
+        model_depth=config.model_depth,
     )
     export_checkpoint(config.stage_checkpoint_path, config.stage_artifact_path)
     return metadata
@@ -1211,6 +1240,9 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
         experiment_id=config.experiment_id,
         feature_variant=config.feature_variant,
         training_mode=config.training_mode,
+        behavior_clone_steps=config.training_steps,
+        model_width=config.model_width,
+        model_depth=config.model_depth,
     )
     compatible = compatible_prior_checkpoints(config, training_contract=training_contract)
     opponent_pool = train_policy.OpponentPool(
@@ -1253,6 +1285,7 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
                     "artifact": str(config.stage_artifact_path),
                     "behavior_clone_updates": training_metadata.get("behavior_clone_updates"),
                     "ppo_updates": training_metadata.get("ppo_updates"),
+                    "parameter_count": training_metadata.get("parameter_count"),
                     "ppo_steps": config.ppo_target_steps,
                     "configuration": {
                         "training_contract": training_contract.configuration,

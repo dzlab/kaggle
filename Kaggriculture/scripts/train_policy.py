@@ -37,11 +37,15 @@ from kagriculture_agent.league import (
 )
 from kagriculture_agent.model import (
     ACTION_VOCAB,
+    DEFAULT_MODEL_DEPTH,
+    DEFAULT_MODEL_WIDTH,
     MODEL_VERSION,
     CompactPolicyNet,
+    model_parameter_count,
     require_torch,
     resolve_device,
     set_training_seed,
+    validate_model_shape,
 )
 from kagriculture_agent.reward_shaping import shaped_transition_reward, should_bootstrap_truncate
 from scripts.training_identity import (
@@ -68,6 +72,18 @@ _DIRECTION_DELTAS = {
 _CURRENT_TILE_KINDS = {
     "WATER", "HARVEST", "FERTILIZE", "FEED", "CARE", "DROP", "SELL", "DIG", "WEED",
 }
+
+
+def resolve_behavior_clone_steps(training_mode: str, configured_steps: int) -> int:
+    """Resolve the effective BC epoch budget for a supported training mode."""
+    _validate_training_mode(training_mode, source="requested")
+    if type(configured_steps) is not int or configured_steps < 0:
+        raise ValueError("behavior_clone_steps must be a nonnegative integer")
+    if training_mode == "pure_ppo":
+        return 0
+    if training_mode == "reduced_behavior_clone_then_ppo":
+        return max(1, configured_steps // 4)
+    return configured_steps
 
 
 @dataclass(frozen=True)
@@ -140,6 +156,9 @@ _RESUME_CONFIGURATION_FIELDS = (
     "batch_size",
     "seed",
     "ppo_steps",
+    "behavior_clone_steps",
+    "model_width",
+    "model_depth",
     "prior_checkpoint",
     "offline_ppo_fallback",
     "ppo_config",
@@ -250,6 +269,12 @@ def _validate_configuration_shape(configuration: Any, *, source: str) -> None:
         # treat omitted fields as the production defaults while validating all
         # newly-created contracts strictly below.
         configuration.setdefault(field, default)
+    configuration.setdefault(
+        "behavior_clone_steps",
+        resolve_behavior_clone_steps(configuration["training_mode"], configuration.get("steps", 1)),
+    )
+    configuration.setdefault("model_width", DEFAULT_MODEL_WIDTH)
+    configuration.setdefault("model_depth", DEFAULT_MODEL_DEPTH)
     missing = sorted(expected_fields - set(configuration))
     unexpected = sorted(set(configuration) - expected_fields)
     if missing:
@@ -261,6 +286,7 @@ def _validate_configuration_shape(configuration: Any, *, source: str) -> None:
     )
     for field, minimum in (
         ("steps", 1), ("batch_size", 1), ("ppo_steps", 0),
+        ("behavior_clone_steps", 0),
         ("checkpoint_interval", 1),
     ):
         value = configuration[field]
@@ -268,6 +294,12 @@ def _validate_configuration_shape(configuration: Any, *, source: str) -> None:
             raise ValueError(
                 f"{source} configuration {field} must be an integer at least {minimum}"
             )
+    try:
+        validate_model_shape(
+            configuration["model_width"], configuration["model_depth"], source=f"{source} configuration",
+        )
+    except ValueError:
+        raise
     if type(configuration["seed"]) is not int:
         raise ValueError(f"{source} configuration seed must be an integer")
     _validate_experiment_id(configuration["experiment_id"], source=source)
@@ -292,6 +324,9 @@ def build_training_contract(
     experiment_id: str = DEFAULT_EXPERIMENT_ID,
     feature_variant: str = "production_v1",
     training_mode: str = "behavior_clone_then_ppo",
+    behavior_clone_steps: int | None = None,
+    model_width: int = DEFAULT_MODEL_WIDTH,
+    model_depth: int = DEFAULT_MODEL_DEPTH,
 ) -> TrainingContract:
     """Build the canonical input/configuration contract used by training and resume.
 
@@ -312,6 +347,11 @@ def build_training_contract(
         raise ValueError("device must be a string")
     if type(checkpoint_interval) is not int or checkpoint_interval < 1:
         raise ValueError("checkpoint_interval must be a positive integer")
+    if behavior_clone_steps is not None and (
+        type(behavior_clone_steps) is not int or behavior_clone_steps < 0
+    ):
+        raise ValueError("behavior_clone_steps must be a nonnegative integer")
+    validate_model_shape(model_width, model_depth, source="requested")
     if type(offline_ppo_fallback) is not bool:
         raise ValueError("offline_ppo_fallback must be boolean")
     _validate_experiment_id(experiment_id, source="requested")
@@ -322,6 +362,12 @@ def build_training_contract(
     resolved = resolve_device(device) if resolved_device is None else resolved_device
     normalized_batch_size = max(1, batch_size)
     normalized_steps = max(1, steps)
+    configured_behavior_clone_steps = (
+        normalized_steps if behavior_clone_steps is None else behavior_clone_steps
+    )
+    effective_behavior_clone_steps = resolve_behavior_clone_steps(
+        training_mode, configured_behavior_clone_steps,
+    )
     input_identity = _trajectory_identity(input_path)
     transitions = _read_transitions(input_path)
     configuration = {
@@ -333,6 +379,9 @@ def build_training_contract(
         "batch_size": normalized_batch_size,
         "seed": seed,
         "ppo_steps": ppo_steps,
+        "behavior_clone_steps": effective_behavior_clone_steps,
+        "model_width": model_width,
+        "model_depth": model_depth,
         "device": str(resolved),
         "prior_checkpoint": _checkpoint_identity(prior_checkpoint),
         "offline_ppo_fallback": offline_ppo_fallback,
@@ -1046,7 +1095,10 @@ def _distribution_regularization(
     return sum(kl_terms) / len(kl_terms), sum(ce_terms) / len(ce_terms)
 
 
-def validate_prior_checkpoint_metadata(metadata: Any) -> None:
+def validate_prior_checkpoint_metadata(
+    metadata: Any, *, model_width: int = DEFAULT_MODEL_WIDTH,
+    model_depth: int = DEFAULT_MODEL_DEPTH,
+) -> None:
     if not isinstance(metadata, dict):
         raise ValueError("prior checkpoint metadata must be an object")
     expected = {
@@ -1060,9 +1112,17 @@ def validate_prior_checkpoint_metadata(metadata: Any) -> None:
     expected_vocab = {key: list(value) for key, value in ACTION_VOCAB.items()}
     if metadata.get("action_vocab") != expected_vocab:
         raise ValueError("prior checkpoint action_vocab mismatch")
+    for field, expected_value in (
+        ("model_width", model_width), ("model_depth", model_depth),
+    ):
+        if field in metadata and metadata[field] != expected_value:
+            raise ValueError(f"prior checkpoint {field} mismatch")
 
 
-def _load_prior_network(prior_checkpoint: str | Path | None, *, device: Any) -> Any:
+def _load_prior_network(
+    prior_checkpoint: str | Path | None, *, device: Any,
+    model_width: int = DEFAULT_MODEL_WIDTH, model_depth: int = DEFAULT_MODEL_DEPTH,
+) -> Any:
     if prior_checkpoint is None:
         return None
     th = require_torch()
@@ -1071,13 +1131,15 @@ def _load_prior_network(prior_checkpoint: str | Path | None, *, device: Any) -> 
     )
     if not isinstance(checkpoint, dict) or "metadata" not in checkpoint:
         raise ValueError("prior checkpoint metadata is required")
-    validate_prior_checkpoint_metadata(checkpoint["metadata"])
+    validate_prior_checkpoint_metadata(
+        checkpoint["metadata"], model_width=model_width, model_depth=model_depth,
+    )
     if "model_state_dict" not in checkpoint:
         raise ValueError("prior checkpoint model_state_dict is required")
     state = checkpoint["model_state_dict"]
     if not isinstance(state, Mapping):
         raise ValueError("prior checkpoint model_state_dict must be an object")
-    prior = CompactPolicyNet().to(device)
+    prior = CompactPolicyNet(hidden_width=model_width, depth=model_depth).to(device)
     prior.load_state_dict(state)
     prior.eval()
     for parameter in prior.parameters():
@@ -1168,6 +1230,7 @@ def ppo_update(
     network: Any, optimizer: Any, transitions: Sequence[dict[str, Any]], *,
     config: PPOConfig, batch_size: int | None = None, seed: int = 0,
     prior_checkpoint: str | Path | None = None, device: Any = None,
+    model_width: int = DEFAULT_MODEL_WIDTH, model_depth: int = DEFAULT_MODEL_DEPTH,
 ) -> dict[str, float | int | bool]:
     """Run clipped PPO updates over one rollout batch."""
     th = require_torch()
@@ -1191,7 +1254,9 @@ def ppo_update(
         old_log_probs=old_log_probs.detach().tolist(),
         bootstrap_values=bootstrap_values,
     )
-    prior = _load_prior_network(prior_checkpoint, device=device)
+    prior = _load_prior_network(
+        prior_checkpoint, device=device, model_width=model_width, model_depth=model_depth,
+    )
     return_mean, return_std = _tensor_mean_std(
         rollout.returns, device=device,
     )
@@ -1370,6 +1435,8 @@ def run_ppo_training(
     initial_league_checkpoint_identities: Sequence[str] | None = None,
     progress_fn: Any | None = None,
     telemetry_callback: Any | None = None,
+    model_width: int = DEFAULT_MODEL_WIDTH,
+    model_depth: int = DEFAULT_MODEL_DEPTH,
 ) -> dict[str, Any]:
     """Run PPO with fresh scheduled league rollouts or explicit offline fallback."""
     _validate_experiment_id(experiment_id, source="PPO")
@@ -1506,6 +1573,10 @@ def run_ppo_training(
         }
         if _accepts_keyword_argument(updater, "device"):
             update_kwargs["device"] = device
+        if _accepts_keyword_argument(updater, "model_width"):
+            update_kwargs["model_width"] = model_width
+        if _accepts_keyword_argument(updater, "model_depth"):
+            update_kwargs["model_depth"] = model_depth
         last_metrics = updater(**update_kwargs)
         total_updates += int(last_metrics.get("updates", 0))
         shaping_count += int(last_metrics.get("shaping_count", 0))
@@ -1606,10 +1677,23 @@ def _checkpoint_metadata(
     experiment_id: str = DEFAULT_EXPERIMENT_ID,
     feature_variant: str = "production_v1",
     training_mode: str = "behavior_clone_then_ppo",
+    behavior_clone_steps: int | None = None,
+    behavior_clone_updates: int = 0,
+    model_width: int = DEFAULT_MODEL_WIDTH,
+    model_depth: int = DEFAULT_MODEL_DEPTH,
 ) -> dict[str, Any]:
     _validate_experiment_id(experiment_id, source="checkpoint metadata")
     _validate_feature_variant(feature_variant, source="checkpoint metadata")
     _validate_training_mode(training_mode, source="checkpoint metadata")
+    validate_model_shape(model_width, model_depth, source="checkpoint metadata")
+    if type(behavior_clone_updates) is not int or behavior_clone_updates < 0:
+        raise ValueError("checkpoint metadata behavior_clone_updates must be a nonnegative integer")
+    resolved_bc_steps = (
+        resolve_behavior_clone_steps(training_mode, 1)
+        if behavior_clone_steps is None
+        else resolve_behavior_clone_steps(training_mode, behavior_clone_steps)
+    )
+    model = CompactPolicyNet(hidden_width=model_width, depth=model_depth)
     return {
         "model_version": MODEL_VERSION,
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
@@ -1621,6 +1705,11 @@ def _checkpoint_metadata(
         "experiment_id": experiment_id,
         "feature_variant": feature_variant,
         "training_mode": training_mode,
+        "behavior_clone_steps": resolved_bc_steps,
+        "behavior_clone_updates": behavior_clone_updates,
+        "model_width": model_width,
+        "model_depth": model_depth,
+        "parameter_count": model_parameter_count(model),
     }
 
 
@@ -1629,12 +1718,20 @@ def checkpoint_metadata(
     experiment_id: str = DEFAULT_EXPERIMENT_ID,
     feature_variant: str = "production_v1",
     training_mode: str = "behavior_clone_then_ppo",
+    behavior_clone_steps: int | None = None,
+    behavior_clone_updates: int = 0,
+    model_width: int = DEFAULT_MODEL_WIDTH,
+    model_depth: int = DEFAULT_MODEL_DEPTH,
 ) -> dict[str, Any]:
     return _checkpoint_metadata(
         transition_count, config, device=device,
         experiment_id=experiment_id,
         feature_variant=feature_variant,
         training_mode=training_mode,
+        behavior_clone_steps=behavior_clone_steps,
+        behavior_clone_updates=behavior_clone_updates,
+        model_width=model_width,
+        model_depth=model_depth,
     )
 
 
@@ -1808,7 +1905,7 @@ def _validate_resume_payload(
     epoch = progress["epoch"]
     cursor = progress["cursor"]
     round_index = progress["round"]
-    epochs = configuration["steps"]
+    epochs = configuration["behavior_clone_steps"]
     saved_ppo_steps = payload["configuration"]["ppo_steps"]
     if round_index > saved_ppo_steps:
         raise ValueError(
@@ -1952,6 +2049,26 @@ def _validate_resume_payload(
             raise ValueError(
                 f"resume checkpoint metadata {field} does not match saved configuration"
             )
+    for field in ("model_width", "model_depth", "behavior_clone_steps"):
+        if field in metadata:
+            value = metadata[field]
+            minimum = 0 if field == "behavior_clone_steps" else 1
+            if type(value) is not int or value < minimum:
+                raise ValueError(f"resume checkpoint metadata {field} is invalid")
+            if value != saved_configuration[field]:
+                raise ValueError(
+                    f"resume checkpoint metadata {field} does not match saved configuration"
+                )
+    if "parameter_count" in metadata:
+        parameter_count = metadata["parameter_count"]
+        expected_count = model_parameter_count(
+            CompactPolicyNet(
+                hidden_width=saved_configuration["model_width"],
+                depth=saved_configuration["model_depth"],
+            )
+        )
+        if type(parameter_count) is not int or parameter_count != expected_count:
+            raise ValueError("resume checkpoint metadata parameter_count is incompatible")
     if "ppo_steps" in metadata:
         metadata_ppo_steps = metadata["ppo_steps"]
         if type(metadata_ppo_steps) is not int or metadata_ppo_steps < 0:
@@ -2160,6 +2277,9 @@ def train_behavior_clone(
     experiment_id: str = DEFAULT_EXPERIMENT_ID,
     feature_variant: str = "production_v1",
     training_mode: str = "behavior_clone_then_ppo",
+    behavior_clone_steps: int | None = None,
+    model_width: int = DEFAULT_MODEL_WIDTH,
+    model_depth: int = DEFAULT_MODEL_DEPTH,
 ) -> dict[str, Any]:
     """Run complete behavior-cloning epochs, optional PPO, and checkpoint."""
     if type(allow_ppo_extension) is not bool:
@@ -2167,7 +2287,14 @@ def train_behavior_clone(
     th = require_torch()
     resolved_device = resolve_device(device)
     batch_size = max(1, int(batch_size))
-    epochs = max(1, int(steps))
+    normalized_steps = max(1, int(steps))
+    if behavior_clone_steps is not None and (
+        type(behavior_clone_steps) is not int or behavior_clone_steps < 0
+    ):
+        raise ValueError("behavior_clone_steps must be a nonnegative integer")
+    configured_behavior_clone_steps = (
+        normalized_steps if behavior_clone_steps is None else behavior_clone_steps
+    )
     seed = int(seed)
     ppo_steps = int(ppo_steps)
     ppo_config = ppo_config or PPOConfig()
@@ -2178,7 +2305,7 @@ def train_behavior_clone(
         raise ValueError("checkpoint_interval must be a positive integer")
     contract = build_training_contract(
         input_path=input_path,
-        steps=epochs,
+        steps=normalized_steps,
         batch_size=batch_size,
         seed=seed,
         ppo_steps=ppo_steps,
@@ -2191,8 +2318,12 @@ def train_behavior_clone(
         experiment_id=experiment_id,
         feature_variant=feature_variant,
         training_mode=training_mode,
+        behavior_clone_steps=configured_behavior_clone_steps,
+        model_width=model_width,
+        model_depth=model_depth,
     )
     configuration = contract.configuration
+    epochs = configuration["behavior_clone_steps"]
     transitions = _read_transitions(input_path)
     features = [extract_features(transition.get("observation", {})) for transition in transitions]
     actions = [transition.get("action", {}) if isinstance(transition.get("action"), dict) else {} for transition in transitions]
@@ -2234,7 +2365,9 @@ def train_behavior_clone(
     rng_before_resume = capture_rng_state() if resumed is not None else None
     try:
         set_training_seed(seed)
-        network = CompactPolicyNet().to(resolved_device)
+        network = CompactPolicyNet(
+            hidden_width=model_width, depth=model_depth,
+        ).to(resolved_device)
         optimizer = th.optim.AdamW(network.parameters(), lr=1e-3)
         if resumed is not None:
             restore_checkpoint(
@@ -2249,6 +2382,10 @@ def train_behavior_clone(
         experiment_id=experiment_id,
         feature_variant=feature_variant,
         training_mode=training_mode,
+        behavior_clone_steps=epochs,
+        behavior_clone_updates=bc_updates,
+        model_width=model_width,
+        model_depth=model_depth,
     )
     metadata["ppo_steps"] = int(ppo_steps)
     metadata["behavior_clone_epochs"] = epochs
@@ -2474,6 +2611,8 @@ def train_behavior_clone(
             initial_league_checkpoint_identities=initial_league_checkpoint_identities,
             progress_fn=save_ppo_progress,
             telemetry_callback=telemetry_callback,
+            model_width=model_width,
+            model_depth=model_depth,
         )
     metadata["ppo_updates"] = initial_ppo_updates if ppo_metrics is None else ppo_metrics["ppo_updates"]
     metadata["ppo_metrics"] = ppo_metrics
@@ -2554,6 +2693,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", type=Path, required=True, dest="input_path")
     parser.add_argument("--output", type=Path, required=True, dest="output_path")
     parser.add_argument("--steps", type=_positive_int, default=1)
+    parser.add_argument("--behavior-clone-steps", type=_nonnegative_int, default=None)
     parser.add_argument("--batch-size", type=_positive_int, default=32)
     parser.add_argument("--checkpoint-interval", type=_positive_int, default=100)
     parser.add_argument("--seed", type=int, default=0)
@@ -2568,6 +2708,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--prior-checkpoint", type=Path, default=None)
     parser.add_argument("--best-checkpoint", type=Path, default=None)
     parser.add_argument("--experiment-id", default=DEFAULT_EXPERIMENT_ID)
+    parser.add_argument(
+        "--training-mode", choices=TRAINING_MODES, default="behavior_clone_then_ppo",
+    )
+    parser.add_argument("--model-width", type=_positive_int, default=DEFAULT_MODEL_WIDTH)
+    parser.add_argument("--model-depth", type=_positive_int, default=DEFAULT_MODEL_DEPTH)
     parser.add_argument("--league-checkpoints", type=Path, action="append", default=[])
     parser.add_argument("--league-checkpoint-window", type=_nonnegative_int, default=5)
     parser.add_argument("--league-current-probability", type=_nonnegative_float, default=None)
@@ -2603,6 +2748,10 @@ def main(argv: list[str] | None = None) -> int:
             best_checkpoint_path=args.best_checkpoint,
             opponent_pool=options["opponent_pool"],
             experiment_id=args.experiment_id,
+            training_mode=args.training_mode,
+            behavior_clone_steps=args.behavior_clone_steps,
+            model_width=args.model_width,
+            model_depth=args.model_depth,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

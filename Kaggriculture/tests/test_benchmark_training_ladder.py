@@ -35,6 +35,36 @@ def test_ladder_parser_expands_stable_seeded_configurations_and_estimates_budget
     assert experiments == expand_ladder(ladder)
 
 
+def test_orbit_policy_ladder_config_matches_task_matrix():
+    from scripts.benchmark_training_ladder import parse_ladder
+
+    config_path = Path(__file__).resolve().parents[1] / "configs" / "orbit_policy_ladder.json"
+    ladder = parse_ladder(config_path)
+
+    assert ladder == {
+        "widths": [128, 256],
+        "depths": [4, 8],
+        "ppo_budgets": [16, 128, 512],
+        "seeds": [7, 11, 19],
+        "rollout_episodes": 32,
+        "rollout_steps": 96,
+    }
+
+
+def test_dry_run_expansion_only_estimates_isolated_experiments():
+    from scripts.benchmark_training_ladder import build_report
+
+    report = build_report({
+        "widths": [128], "depths": [4], "ppo_budgets": [16], "seeds": [7],
+        "rollout_episodes": 32, "rollout_steps": 96,
+    })
+
+    assert report["dry_run"] is True
+    assert report["experiments"][0]["width"] == 128
+    assert "checkpoint" not in json.dumps(report).lower()
+    assert "models/" not in json.dumps(report).lower()
+
+
 def test_ladder_rejects_production_artifact_and_checkpoint_paths(tmp_path):
     from scripts.benchmark_training_ladder import validate_report_path
 

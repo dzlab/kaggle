@@ -1,0 +1,8 @@
+{
+  "widths": [128, 256],
+  "depths": [4, 8],
+  "ppo_budgets": [16, 128, 512],
+  "seeds": [7, 11, 19],
+  "rollout_episodes": 32,
+  "rollout_steps": 96
+}

@@ -100,6 +100,10 @@ def expand_ladder(ladder: Mapping[str, Any]) -> list[dict[str, Any]]:
                         "depth": depth,
                         "ppo_steps": ppo_steps,
                         "seed": seed,
+                        "run_directory": (
+                            f"ladder-runs/width-{width}-depth-{depth}-"
+                            f"ppo-{ppo_steps}-seed-{seed}"
+                        ),
                         "parameter_estimate": estimate_parameter_count(width, depth),
                         "rollout_budget": estimate_rollout_budget(
                             ppo_steps,

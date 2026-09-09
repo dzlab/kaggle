@@ -128,6 +128,32 @@ def test_policy_network_initialization_is_deterministic_with_seed():
         assert torch.equal(first[name], second[name]), name
 
 
+def test_policy_network_supports_opt_in_width_and_depth_and_reports_parameters():
+    torch = pytest.importorskip("torch")
+    from kagriculture_agent.model import CompactPolicyNet, model_parameter_count
+
+    network = CompactPolicyNet(hidden_width=256, depth=8)
+
+    assert network.hidden_width == 256
+    assert network.depth == 8
+    assert len(network.blocks) == 8
+    assert network.parameter_count == model_parameter_count(network)
+    assert network.parameter_count > model_parameter_count(CompactPolicyNet())
+    assert all(torch.isfinite(parameter).all().item() for parameter in network.parameters())
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("hidden_width", 0), ("hidden_width", 3), ("depth", 0), ("depth", True)],
+)
+def test_policy_network_rejects_invalid_width_or_depth(field, value):
+    pytest.importorskip("torch")
+    from kagriculture_agent.model import CompactPolicyNet
+
+    with pytest.raises(ValueError, match=field):
+        CompactPolicyNet(**{field: value})
+
+
 def test_batching_feature_batches_preserves_documented_shapes():
     torch = pytest.importorskip("torch")
     from kagriculture_agent.model import CompactPolicyNet
