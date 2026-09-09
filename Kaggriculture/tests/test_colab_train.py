@@ -659,6 +659,31 @@ def test_validation_safety_regression_compares_stall_counts_rates_and_streaks():
     assert validation_safety_regression(report, candidate="candidate") is True
 
 
+def test_validation_safety_regression_uses_canonical_evaluator_diagnostics():
+    from scripts.telemetry import validation_safety_regression
+
+    safe = {
+        "truncation_count": 1, "truncation_rate": 0.5,
+        "resolved_count": 0, "resolved_rate": 0.0,
+        "no_progress_count": 0, "no_progress_rate": 0.0,
+        "max_no_progress_streak": 2,
+        "time_limit_endings": 0, "time_limit_rate": 0.0,
+        "safety_regression_count": 0, "safety_regression_rate": 0.0,
+    }
+    report = {
+        "records": {
+            "current": [{"termination_reason": "terminal"}],
+            "candidate": [{"termination_reason": "no_progress", "bootstrap_truncated": True}],
+        },
+        "paired_summaries": {
+            "current": {"diagnostics": safe},
+            "candidate": {"diagnostics": safe},
+        },
+    }
+
+    assert validation_safety_regression(report, candidate="candidate") is False
+
+
 def test_colab_controller_blocks_holdout_on_stall_safety_regression(tmp_path, monkeypatch):
     from scripts import colab_train
 

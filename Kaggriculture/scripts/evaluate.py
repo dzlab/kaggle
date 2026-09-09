@@ -424,6 +424,43 @@ def _diagnostic_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+_DIAGNOSTIC_GATE_METRICS = (
+    "truncation_count", "truncation_rate", "resolved_count", "resolved_rate",
+    "no_progress_count", "no_progress_rate", "max_no_progress_streak",
+    "time_limit_endings", "time_limit_rate", "safety_regression_count",
+    "safety_regression_rate",
+)
+
+
+def _diagnostic_regression(
+    candidate_summary: Mapping[str, Any], baseline_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compare canonical candidate diagnostics for promotion safety."""
+    candidate_diagnostics = candidate_summary.get("diagnostics", candidate_summary)
+    baseline_diagnostics = baseline_summary.get("diagnostics", baseline_summary)
+    if not isinstance(candidate_diagnostics, Mapping):
+        candidate_diagnostics = {}
+    if not isinstance(baseline_diagnostics, Mapping):
+        baseline_diagnostics = {}
+
+    deltas: dict[str, float] = {}
+    regressions: list[str] = []
+    for metric in _DIAGNOSTIC_GATE_METRICS:
+        candidate_value = _number(candidate_diagnostics.get(metric)) or 0.0
+        baseline_value = _number(baseline_diagnostics.get(metric)) or 0.0
+        delta = float(candidate_value - baseline_value)
+        deltas[metric] = delta
+        if delta > 0:
+            regressions.append(metric)
+    return {
+        "candidate": dict(candidate_diagnostics),
+        "baseline": dict(baseline_diagnostics),
+        "deltas": deltas,
+        "regressions": regressions,
+        "regressed": bool(regressions),
+    }
+
+
 def _market_metrics(states: Sequence[Mapping[str, Any]], *, churn_window: int = 2) -> dict[str, int]:
     """Count submitted market order events and reversals in a replay.
 
@@ -682,6 +719,7 @@ def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         and _record_candidate(record) != str(record.get("opponent"))
     ]
     elo = _league_elo_summary(elo_matches)
+    diagnostics = _diagnostic_summary(records)
     return {
         "record_count": len(records),
         "valid_records_by_seat": {"0": valid_by_seat[0], "1": valid_by_seat[1]},
@@ -725,6 +763,7 @@ def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         },
         "bootstrap_seat_balanced_win_rate": bootstrap_win_rate,
         "bootstrap_bank_differential": bootstrap,
+        "diagnostics": diagnostics,
     }
 
 
@@ -966,6 +1005,9 @@ def promotion_decision(
         min_terminal_cash=float(min_terminal_cash),
         min_terminal_inventory_value=float(min_terminal_inventory_value),
     )
+    diagnostic_comparison = _diagnostic_regression(candidate, baseline)
+    if diagnostic_comparison["regressed"]:
+        reasons.append("diagnostic_regression")
     paired_metric_deltas = (
         _external_metric_deltas(records, baseline_records)
         if baseline_policy is not None and not reasons else None
@@ -998,6 +1040,8 @@ def promotion_decision(
         "matrix_completeness": candidate_matrix,
         "baseline_matrix_completeness": baseline_matrix,
         "paired_metric_deltas": paired_metric_deltas,
+        "diagnostic_deltas": diagnostic_comparison["deltas"],
+        "diagnostic_regressions": diagnostic_comparison["regressions"],
     }
 
 
@@ -1731,7 +1775,7 @@ def _replay_diagnostics(
     configuration: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Extract game-level diagnostics without inventing transition outcomes."""
-    sources: list[Mapping[str, Any]] = []
+    sources: list[Mapping[str, Any]] = [replay]
     replay_info = _mapping(replay.get("info"))
     replay_diagnostics = _mapping(replay.get("diagnostics"))
     if replay_info:
@@ -1739,6 +1783,7 @@ def _replay_diagnostics(
     if replay_diagnostics:
         sources.append(replay_diagnostics)
     for state in own_states:
+        sources.append(state)
         state_info = _mapping(state.get("info"))
         state_diagnostics = _mapping(state.get("diagnostics"))
         if state_info:

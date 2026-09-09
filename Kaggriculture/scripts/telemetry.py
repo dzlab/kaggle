@@ -11,6 +11,7 @@ from pathlib import Path
 from statistics import mean, median
 from typing import Any
 
+from scripts.evaluate import _diagnostic_regression
 from scripts.training_identity import (
     DEFAULT_EXPERIMENT_ID,
     FEATURE_VARIANTS,
@@ -279,6 +280,20 @@ def _decision_for(report: Mapping[str, Any], candidate: str) -> Mapping[str, Any
     return decision if isinstance(decision, Mapping) else {}
 
 
+def _canonical_diagnostics(
+    report: Mapping[str, Any], candidate: str, records: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Use evaluator paired-summary diagnostics, with a legacy raw-record fallback."""
+    summaries = report.get("summaries")
+    if not isinstance(summaries, Mapping):
+        summaries = report.get("paired_summaries")
+    summary = _mapping_for(summaries, candidate)
+    diagnostics = summary.get("diagnostics")
+    if isinstance(diagnostics, Mapping):
+        return dict(diagnostics)
+    return _diagnostic_summary(records)
+
+
 def _matrix_for(report: Mapping[str, Any], candidate: str) -> Mapping[str, Any]:
     matrix = _mapping_for(report.get("matrix_completeness"), candidate)
     if matrix:
@@ -357,18 +372,16 @@ def validation_safety_regression(
     if not isinstance(report, Mapping):
         return False
     grouped = _candidate_records(report)
-    candidate_summary = _diagnostic_summary(grouped.get(str(candidate), []))
-    baseline_summary = _diagnostic_summary(grouped.get("current", []))
-    compared_metrics = (
-        "truncation_count", "truncation_rate", "resolved_count", "resolved_rate",
-        "no_progress_count", "no_progress_rate", "max_no_progress_streak",
-        "time_limit_endings", "time_limit_rate", "safety_regression_count",
-        "safety_regression_rate",
+    candidate_summary = _canonical_diagnostics(
+        report, str(candidate), grouped.get(str(candidate), []),
     )
-    return any(
-        candidate_summary[metric] > baseline_summary[metric]
-        for metric in compared_metrics
+    baseline_summary = _canonical_diagnostics(
+        report, "current", grouped.get("current", []),
     )
+    return bool(_diagnostic_regression(
+        {"diagnostics": candidate_summary},
+        {"diagnostics": baseline_summary},
+    )["regressed"])
 
 
 def _breakdown_event(
@@ -652,7 +665,7 @@ def record_validation_report(
         else:
             reason_text = str(reasons)
         matrix = _flatten_matrix(_matrix_for(report, candidate))
-        diagnostics = _diagnostic_summary(records)
+        diagnostics = _canonical_diagnostics(report, candidate, records)
         summary_shaping_count = _number_from((summary,), "shaping_count")
         if summary_shaping_count is not None:
             diagnostics["shaping_count"] = max(0, int(summary_shaping_count))

@@ -687,6 +687,59 @@ def test_paired_seed_summary_has_confidence_metrics_and_both_seats():
     json.dumps(summary, allow_nan=False)
 
 
+def test_paired_seed_summary_exposes_canonical_candidate_diagnostics():
+    from scripts.evaluate import paired_seed_summary
+
+    records = [
+        {
+            **_metric_record(seat=seat, seed=1, outcome="win", differential=10),
+            "termination_reason": "resolved" if seat == 0 else "terminal",
+            "bootstrap_truncated": seat == 0,
+            "no_progress_steps": 4 if seat == 0 else 0,
+            "time_limit_ending": False,
+            "safety_flags": ["safety_regression"] if seat == 0 else [],
+            "safety_regression": seat == 0,
+        }
+        for seat in (0, 1)
+    ]
+
+    diagnostics = paired_seed_summary(records)["diagnostics"]
+
+    assert diagnostics["truncation_count"] == 1
+    assert diagnostics["resolved_count"] == 1
+    assert diagnostics["max_no_progress_streak"] == 4
+    assert diagnostics["safety_regression_count"] == 1
+
+
+def test_replay_record_reads_top_level_stall_metadata():
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    replay.update({
+        "termination_reason": "resolved",
+        "bootstrap_truncated": True,
+        "no_progress_steps": 6,
+        "time_limit_ending": True,
+        "safety_flags": ["safety_regression"],
+    })
+    replay["steps"][-1][0].update({
+        "termination_reason": "no_progress",
+        "bootstrap_truncated": True,
+        "no_progress_steps": 8,
+        "time_limit_ending": True,
+        "safety_flags": ["review_flag"],
+    })
+
+    record = replay_record(replay, variant="mixed", opponent="pass", seed=1)
+
+    assert record["termination_reason"] == "no_progress"
+    assert record["bootstrap_truncated"] is True
+    assert record["no_progress_steps"] == 8
+    assert record["time_limit_ending"] is True
+    assert record["safety_flags"] == ["safety_regression", "review_flag"]
+    assert record["safety_regression"] is True
+
+
 def test_paired_seed_summary_confidence_interval_uses_paired_seeds():
     from scripts.evaluate import _wilson_interval, paired_seed_summary
 
@@ -786,6 +839,48 @@ def test_promotion_decision_compares_baseline_only_after_gates():
 
     assert decision["status"] == "promote"
     assert decision["reasons"] == []
+
+
+def test_promotion_decision_rejects_diagnostic_regression_and_reports_deltas():
+    from scripts.evaluate import promotion_decision
+
+    candidate = [
+        {
+            **_metric_record(seat=seat, seed=1, outcome="win", differential=10),
+            "termination_reason": "no_progress",
+            "bootstrap_truncated": True,
+            "no_progress_steps": 8,
+            "time_limit_ending": True,
+            "safety_regression": True,
+            "safety_flags": ["safety_regression"],
+        }
+        for seat in (0, 1)
+    ]
+    baseline = [
+        {
+            **_metric_record(seat=seat, seed=1, candidate="current", outcome="loss", differential=1),
+            "termination_reason": "terminal",
+            "bootstrap_truncated": False,
+            "no_progress_steps": 0,
+            "time_limit_ending": False,
+            "safety_regression": False,
+            "safety_flags": [],
+        }
+        for seat in (0, 1)
+    ]
+
+    decision = promotion_decision(candidate, baseline, min_valid_games=1)
+
+    assert decision["status"] == "discard"
+    assert decision["reasons"] == ["diagnostic_regression"]
+    assert decision["diagnostic_deltas"]["truncation_count"] == 2
+    assert decision["diagnostic_deltas"]["no_progress_count"] == 2
+    assert decision["diagnostic_deltas"]["time_limit_endings"] == 2
+    assert decision["diagnostic_deltas"]["safety_regression_count"] == 2
+    assert set(decision["diagnostic_regressions"]) >= {
+        "truncation_count", "no_progress_count", "time_limit_endings",
+        "safety_regression_count",
+    }
 
 
 @pytest.mark.parametrize("issue", ["missing", "duplicate", "extra"])
@@ -1628,6 +1723,49 @@ def test_report_groups_records_by_candidate_identity():
     )
 
     assert document["results"]["animal-heavy"]["pass"]["wins"] == 1
+
+
+def test_report_schema_carries_candidate_diagnostics_from_paired_summary():
+    from scripts.evaluate import build_result_document
+
+    records = [
+        {
+            **_metric_record(
+                seat=seat, seed=1, candidate=candidate,
+                outcome="win" if candidate == "challenger" else "loss",
+                differential=10 if candidate == "challenger" else 1,
+            ),
+            "termination_reason": "no_progress" if candidate == "challenger" else "terminal",
+            "bootstrap_truncated": candidate == "challenger",
+            "no_progress_steps": 5 if candidate == "challenger" else 0,
+            "time_limit_ending": candidate == "challenger",
+            "safety_regression": candidate == "challenger",
+            "safety_flags": ["safety_regression"] if candidate == "challenger" else [],
+        }
+        for candidate in ("baseline", "challenger")
+        for seat in (0, 1)
+    ]
+
+    document = build_result_document(
+        config={
+            "candidates": ["baseline", "challenger"],
+            "opponents": ["pass"],
+            "min_valid_games": 1,
+        },
+        records=records,
+    )
+
+    diagnostics = document["paired_summaries"]["challenger"]["diagnostics"]
+    assert diagnostics["truncation_count"] == 2
+    assert diagnostics["no_progress_count"] == 2
+    assert diagnostics["time_limit_endings"] == 2
+    assert diagnostics["safety_regression_count"] == 2
+    assert document["promotion_decisions"]["challenger"]["reasons"] == [
+        "diagnostic_regression"
+    ]
+    assert document["promotion_decisions"]["challenger"]["diagnostic_deltas"][
+        "no_progress_count"
+    ] == 2
 
 
 def test_report_exposes_per_candidate_pairs_and_promotion_decisions():
