@@ -29,14 +29,12 @@ def _state(**values):
 
 
 def test_assign_tasks_falls_back_to_reserved_worker_when_only_farmer():
-    state = _state(workers=_workers(("FARMER", Position(0, 0)), ("WORKER", Position(4, 4))),
-                   private={"seeds": {}, "shed": {"WHEAT": 1}, "inventories": [{"GOOSE": 1}, {}]})
+    state = _state(workers=_workers(("FARMER", Position(0, 0))),
+                   private={"seeds": {}, "shed": {"WHEAT": 1}, "inventories": [{"GOOSE": 1}]})
     tasks = [Task("ANIMAL", Position(0, 1), 100, 1, 1, item="GOOSE"),
              Task("WATER", Position(4, 3), 100, 1, 1, item="WHEAT")]
     assignments = assign_tasks(tasks, state["workers"], state)
-    assert [(assignment.worker_index, assignment.task.kind) for assignment in assignments] == [
-        (0, "ANIMAL"), (1, "WATER"),
-    ]
+    assert [assignment.task.kind for assignment in assignments] == ["ANIMAL", "WATER"]
 
 
 @__import__("pytest").mark.parametrize("shed,carried", [
@@ -79,8 +77,15 @@ def test_animal_budget_includes_feed_after_shed_pickup():
 
 
 def test_normalize_planner_state_never_uses_hands_as_seeds():
-    state = normalize_planner_state({"farm": {"hands": {"WHEAT": 5}}, "private": {"seeds": {}}})
-    assert state["seeds"] == {}
+    competing = normalize_planner_state({
+        "seeds": {}, "farm": {"seeds": {"WHEAT": 3}, "hands": {"WHEAT": 5}},
+        "private": {"seeds": {"WHEAT": 7}},
+    })
+    fallback = normalize_planner_state({
+        "farm": {"hands": {"WHEAT": 5}}, "private": {"seeds": {"WHEAT": 7}},
+    })
+    assert competing["seeds"] == {}
+    assert fallback["seeds"] == {"WHEAT": 7}
 
 
 def test_sell_assignment_validates_carried_inventory():

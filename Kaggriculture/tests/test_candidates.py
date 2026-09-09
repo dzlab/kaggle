@@ -22,6 +22,7 @@ def test_artifact_candidate_policy_loads_once_and_returns_callable(monkeypatch, 
     policy = candidates.artifact_candidate_policy(artifact)
 
     assert policy({"turn": 1}) == {"observation": {"turn": 1}}
+    assert policy({"turn": 2}) == {"observation": {"turn": 2}}
     assert calls == [artifact]
 
 
