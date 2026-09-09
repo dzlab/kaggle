@@ -12,6 +12,8 @@ from typing import Any
 
 from scripts.output_paths import atomic_write_text
 
+_VALID_PROMOTION_STATUSES = frozenset({"baseline", "promote", "discard"})
+
 
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
@@ -50,6 +52,22 @@ def _coordinate_list(value: Any, *, label: str) -> list[tuple[str, int, int]]:
     return [_coordinate(item, label=label) for item in value]
 
 
+def _manifest_candidates(report: Mapping[str, Any]) -> tuple[str, ...] | None:
+    candidates = _manifest(report).get("candidates")
+    if candidates is None:
+        return None
+    if not isinstance(candidates, Sequence) or isinstance(candidates, (str, bytes)) or not candidates:
+        raise ValueError("report manifest must contain non-empty candidates")
+    normalized = []
+    for candidate in candidates:
+        if type(candidate) is not str or not candidate:
+            raise ValueError("report manifest contains invalid candidate coordinates")
+        normalized.append(candidate)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("report manifest candidates must be unique")
+    return tuple(normalized)
+
+
 def _matrix_signature(report: Mapping[str, Any]) -> dict[str, Any]:
     manifest = _manifest(report)
     seeds = manifest.get("seeds")
@@ -75,8 +93,8 @@ def _matrix_signature(report: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(matrix, Mapping):
             matrix = _mapping(matrix_views.get(candidate))
         if matrix:
-            expected = matrix.get("expected")
-            if not isinstance(expected, Sequence) or sorted(tuple(value) for value in expected) != coordinates:
+            expected = _coordinate_list(matrix.get("expected"), label="expected")
+            if sorted(expected) != coordinates:
                 raise ValueError("report matrix coordinates are incompatible with its manifest")
             if candidate_evidence.get("matrix_complete") is False:
                 raise ValueError("report matrix is incomplete and cannot be compared")
@@ -90,14 +108,31 @@ def _matrix_signature(report: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _candidate_evidence(report: Mapping[str, Any], candidate: str) -> Mapping[str, Any]:
-    evidence = _mapping(report.get("promotion_evidence")).get(candidate)
-    if isinstance(evidence, Mapping):
+def _candidate_mapping(report: Mapping[str, Any]) -> Mapping[str, Any]:
+    if "promotion_evidence" in report:
+        evidence = report.get("promotion_evidence")
+        if not isinstance(evidence, Mapping):
+            raise ValueError("report promotion evidence must be keyed by candidate")
         return evidence
-    decisions = _mapping(report.get("promotion_decisions")).get(candidate)
+    decisions = report.get("promotion_decisions")
     if isinstance(decisions, Mapping):
         return decisions
-    raise ValueError(f"report is missing complete promotion evidence for candidate {candidate}")
+    matrix_views = report.get("matrix_completeness")
+    decision = report.get("decision")
+    status = decision.get("status") if isinstance(decision, Mapping) else None
+    if isinstance(matrix_views, Mapping) and isinstance(status, str):
+        return {
+            candidate: {"status": status, "matrix_completeness": matrix}
+            for candidate, matrix in matrix_views.items()
+        }
+    raise ValueError("report is missing complete promotion evidence")
+
+
+def _candidate_evidence(report: Mapping[str, Any], candidate: str) -> Mapping[str, Any]:
+    evidence = _candidate_mapping(report).get(candidate)
+    if not isinstance(evidence, Mapping):
+        raise ValueError(f"report is missing complete promotion evidence for candidate {candidate}")
+    return evidence
 
 
 def _validate_matrix_evidence(
@@ -153,11 +188,46 @@ def _validate_finite_values(value: Any, *, label: str) -> None:
             _validate_finite_values(item, label=f"{label}[{index}]")
 
 
+def _candidate_keys(value: Any, *, label: str) -> set[str]:
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError(f"report {label} must contain complete candidate coverage")
+    candidates = set()
+    for candidate in value:
+        if type(candidate) is not str or not candidate:
+            raise ValueError(f"report {label} must be keyed by candidate")
+        candidates.add(candidate)
+    return candidates
+
+
 def _validate_report_evidence(report: Mapping[str, Any], metrics: Mapping[str, Any], signature: Mapping[str, Any]) -> None:
-    for candidate, opponent_metrics in metrics.items():
-        if not isinstance(candidate, str) or not isinstance(opponent_metrics, Mapping):
+    metric_candidates = _candidate_keys(metrics, label="metrics")
+    manifest_candidates = _manifest_candidates(report)
+    expected_candidates = set(manifest_candidates or metric_candidates)
+    if not expected_candidates:
+        raise ValueError("report is missing complete candidate coverage")
+    if metric_candidates != expected_candidates:
+        raise ValueError("report metrics do not match manifest candidates")
+
+    evidence_map = _candidate_mapping(report)
+    evidence_candidates = _candidate_keys(evidence_map, label="promotion evidence")
+    if evidence_candidates != expected_candidates:
+        raise ValueError("report promotion evidence does not match manifest candidates")
+
+    for field in ("promotion_decisions", "matrix_completeness"):
+        if field not in report:
+            continue
+        optional_map = report.get(field)
+        if not isinstance(optional_map, Mapping) or set(optional_map) != expected_candidates:
+            raise ValueError(f"report {field} does not match manifest candidates")
+
+    for candidate in expected_candidates:
+        opponent_metrics = metrics.get(candidate)
+        if not isinstance(opponent_metrics, Mapping):
             raise ValueError("report metrics must be keyed by candidate and opponent")
         evidence = _candidate_evidence(report, candidate)
+        status = evidence.get("status")
+        if status not in _VALID_PROMOTION_STATUSES:
+            raise ValueError(f"promotion evidence has invalid status for candidate {candidate}")
         _validate_matrix_evidence(evidence, signature, candidate=candidate)
         _validate_finite_values(opponent_metrics, label=f"metrics_by_opponent.{candidate}")
         _validate_finite_values(evidence, label=f"promotion_evidence.{candidate}")

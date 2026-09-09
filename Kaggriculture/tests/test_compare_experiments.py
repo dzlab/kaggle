@@ -25,6 +25,7 @@ def _report(*, seeds=(1,), win_rate=0.5, elo=1000.0, bank=0.0, safety=0.0):
         "schema_version": 1,
         "manifest": {
             "seeds": list(seeds), "opponents": ["hard"], "seats": [0, 1],
+            "candidates": ["candidate"],
         },
         "metrics_by_opponent": {"candidate": {"hard": metrics}},
         "promotion_evidence": {
@@ -138,6 +139,97 @@ def test_compare_reports_rejects_non_finite_metrics_and_json_constants(tmp_path)
 
     with pytest.raises(ValueError, match="finite|JSON"):
         compare_reports([first, second])
+
+
+@pytest.mark.parametrize("empty_field", ["metrics_by_opponent", "promotion_evidence"])
+def test_compare_reports_rejects_empty_candidate_evidence_with_matching_manifest(tmp_path, empty_field):
+    from scripts.compare_experiments import compare_reports
+
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text(json.dumps(_report()), encoding="utf-8")
+    incomplete = _report()
+    incomplete[empty_field] = {}
+    second.write_text(json.dumps(incomplete), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="candidate|evidence|metrics"):
+        compare_reports([first, second])
+
+
+def test_compare_reports_requires_manifest_candidate_coverage(tmp_path):
+    from scripts.compare_experiments import compare_reports
+
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text(json.dumps(_report()), encoding="utf-8")
+
+    incomplete = _report()
+    incomplete["manifest"]["candidates"] = ["candidate", "other"]
+    second.write_text(json.dumps(incomplete), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="candidate"):
+        compare_reports([first, second])
+
+
+def test_compare_reports_rejects_empty_manifest_candidates(tmp_path):
+    from scripts.compare_experiments import compare_reports
+
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text(json.dumps(_report()), encoding="utf-8")
+
+    incomplete = _report()
+    incomplete["manifest"]["candidates"] = []
+    incomplete["metrics_by_opponent"] = {}
+    incomplete["promotion_evidence"] = {}
+    second.write_text(json.dumps(incomplete), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="candidate"):
+        compare_reports([first, second])
+
+
+def test_compare_reports_requires_valid_promotion_status(tmp_path):
+    from scripts.compare_experiments import compare_reports
+
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text(json.dumps(_report()), encoding="utf-8")
+
+    invalid = _report()
+    invalid["promotion_evidence"]["candidate"]["status"] = "unknown"
+    second.write_text(json.dumps(invalid), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="promotion|status"):
+        compare_reports([first, second])
+
+
+def test_compare_reports_preserves_legacy_results_and_decisions_compatibility(tmp_path):
+    from scripts.compare_experiments import compare_reports
+
+    first = _report()
+    second = _report(win_rate=0.75)
+    for report in (first, second):
+        report["manifest"].pop("candidates")
+        report["results"] = {
+            "candidate": {
+                "hard": {
+                    "win_rate": report["metrics_by_opponent"]["candidate"]["hard"]["seat_balanced_win_rate"],
+                    "mean_bank_differential": report["metrics_by_opponent"]["candidate"]["hard"]["mean_bank_differential"],
+                    "framework_error_rate": 0.0,
+                },
+            },
+        }
+        report["promotion_decisions"] = report.pop("promotion_evidence")
+        report.pop("metrics_by_opponent")
+
+    first_path = tmp_path / "first.json"
+    second_path = tmp_path / "second.json"
+    first_path.write_text(json.dumps(first), encoding="utf-8")
+    second_path.write_text(json.dumps(second), encoding="utf-8")
+
+    comparison = compare_reports([first_path, second_path])
+
+    assert comparison["deltas"][0]["win_rate_delta"] == pytest.approx(0.25)
 
 
 def test_compare_cli_rejects_protected_and_symlinked_outputs(tmp_path):
