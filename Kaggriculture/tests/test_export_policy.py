@@ -328,11 +328,117 @@ def test_checkpoint_loader_requires_weights_only_support():
     assert calls["weights_only"] is True
 
 
-def test_runtime_gelu_matches_torch_exact_default():
-    from kagriculture_agent.learned_policy import _gelu
+def test_runtime_gelu_exact_parity_matches_torch_default():
+    np = pytest.importorskip("numpy", reason="NumPy GELU parity requires NumPy")
+    from kagriculture_agent.learned_policy import _gelu, _numpy_gelu
 
     assert _gelu(1.0) == pytest.approx(0.8413447460685429, abs=1e-12)
     assert _gelu(-1.0) == pytest.approx(-0.15865525393145707, abs=1e-12)
+    values = np.asarray([
+        [-4.0, -1.0, 0.0, 1.0, 4.0],
+        [-3.0, -0.5, 0.5, 2.0, 3.0],
+    ], dtype=np.float32)
+    expected = np.asarray([
+        [_gelu(float(value)) for value in row]
+        for row in values
+    ])
+    np.testing.assert_allclose(
+        _numpy_gelu(values), expected, rtol=1e-7, atol=1e-7,
+    )
+
+
+def test_torch_numpy_and_pure_python_runtime_have_logit_and_action_parity(tmp_path):
+    torch = pytest.importorskip("torch", reason="three-runtime parity requires PyTorch")
+    np = pytest.importorskip("numpy", reason="three-runtime parity requires NumPy")
+    from kagriculture_agent.model import CompactPolicyNet
+
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(_artifact()), encoding="utf-8")
+    runtime = load_exported_policy(path)
+    assert runtime._numpy_weights is not None
+
+    def zeros_like(value):
+        return [zeros_like(item) for item in value] if isinstance(value, list) else 0.0
+
+    runtime._weights = {
+        name: zeros_like(value) for name, value in runtime._weights.items()
+    }
+    for block in range(runtime._model_depth):
+        for norm in ("attention_norm", "mlp_norm"):
+            runtime._weights[f"blocks.{block}.{norm}.weight"] = [1.0] * 128
+    runtime._weights["blocks.0.mlp.0.bias"] = [
+        -4.0 + 8.0 * index / 255.0 for index in range(256)
+    ]
+    runtime._weights["blocks.0.mlp.2.weight"] = [
+        [1.0 if column == row else 0.0 for column in range(256)]
+        for row in range(128)
+    ]
+    runtime._weights["worker_act_head.weight"][0][64] = 1.0
+    runtime._weights["worker_act_head.weight"][1][96] = 1.0
+    runtime._numpy_weights = {
+        name: np.asarray(value, dtype=np.float32)
+        for name, value in runtime._weights.items()
+    }
+
+    network = CompactPolicyNet()
+    incompatible = network.load_state_dict({
+        name: torch.tensor(value, dtype=torch.float32)
+        for name, value in runtime._weights.items()
+    }, strict=False)
+    assert incompatible.missing_keys == [
+        "market_active_head.weight", "market_active_head.bias",
+    ]
+    assert incompatible.unexpected_keys == []
+    assert network.blocks[0].mlp[1].approximate == "none"
+
+    features = extract_features({"day": 7, "hour": 13, "cash": 42.5})
+    with torch.no_grad():
+        torch_raw = network(features)
+    torch_outputs = {
+        name: torch_raw[name][0].tolist()
+        for name in (
+            "worker_act_logits", "worker_target_logits", "worker_kind_logits",
+            "market_item_logits", "market_quantity_logits",
+        )
+    }
+    numpy_outputs = runtime.predict(features)
+    numpy_proposal = runtime.propose({}, features)
+    runtime._numpy_weights = None
+    python_outputs = runtime.predict(features)
+    python_proposal = runtime.propose({}, features)
+
+    def selected_action(outputs):
+        workers = []
+        for act_logits, target_logits, kind_logits in zip(
+            outputs["worker_act_logits"],
+            outputs["worker_target_logits"],
+            outputs["worker_kind_logits"],
+        ):
+            act = max(range(len(act_logits)), key=act_logits.__getitem__)
+            workers.append(None if act == 0 else (
+                max(range(len(target_logits)), key=target_logits.__getitem__),
+                max(range(len(kind_logits)), key=kind_logits.__getitem__),
+            ))
+        market = (
+            max(range(len(outputs["market_item_logits"])),
+                key=outputs["market_item_logits"].__getitem__),
+            max(range(len(outputs["market_quantity_logits"])),
+                key=outputs["market_quantity_logits"].__getitem__),
+        )
+        return tuple(workers), market
+
+    for name, expected in torch_outputs.items():
+        torch.testing.assert_close(
+            torch.tensor(numpy_outputs[name]), torch.tensor(expected),
+            rtol=1e-5, atol=1e-6,
+        )
+        torch.testing.assert_close(
+            torch.tensor(python_outputs[name]), torch.tensor(expected),
+            rtol=1e-5, atol=1e-6,
+        )
+    assert selected_action(torch_outputs) == selected_action(numpy_outputs)
+    assert selected_action(torch_outputs) == selected_action(python_outputs)
+    assert numpy_proposal == python_proposal
 
 
 def test_export_cli_returns_clean_nonzero_error_without_traceback(tmp_path, capsys):
@@ -345,17 +451,36 @@ def test_export_cli_returns_clean_nonzero_error_without_traceback(tmp_path, caps
 
 
 @pytest.mark.performance
-def test_dependency_free_fixture_inference_is_fast_enough(tmp_path):
+def test_numpy_full_state_inference_reports_latency_within_budget(tmp_path):
+    from scripts.benchmark_rollouts import MAX_POLICY_INFERENCE_P95_MS
+
     path = tmp_path / "policy.json"
     path.write_text(json.dumps(_artifact()), encoding="utf-8")
     policy = load_exported_policy(path)
     features = extract_features({})
+    assert policy._numpy_weights is not None
+    assert (
+        len(features.tile_tokens),
+        len(features.worker_tokens),
+        len(features.market_tokens),
+    ) == (100, 10, 9)
+
+    for _ in range(20):
+        policy.predict(features)
     samples = []
     for _ in range(1000):
         started = time.perf_counter()
         policy.predict(features)
         samples.append((time.perf_counter() - started) * 1000.0)
-    assert sorted(samples)[949] < 50.0
+    samples.sort()
+    p95_ms = samples[949]
+    max_ms = samples[-1]
+    print(f"NumPy full-state inference: p95={p95_ms:.3f} ms max={max_ms:.3f} ms")
+    assert p95_ms < MAX_POLICY_INFERENCE_P95_MS, (
+        f"NumPy full-state inference p95 {p95_ms:.3f} ms exceeds "
+        f"{MAX_POLICY_INFERENCE_P95_MS:g} ms promotion budget; "
+        f"max was {max_ms:.3f} ms"
+    )
 
 
 def test_exported_model_agrees_with_training_fixture_when_torch_is_available(tmp_path):

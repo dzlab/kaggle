@@ -189,7 +189,7 @@ if nn is not None:
             self.attention_norm = nn.LayerNorm(width)
             self.mlp = nn.Sequential(
                 nn.Linear(width, mlp_width),
-                nn.GELU(),
+                nn.GELU(approximate="none"),
                 nn.Linear(mlp_width, width),
             )
             self.mlp_norm = nn.LayerNorm(width)

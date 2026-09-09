@@ -32,6 +32,11 @@ try:
 except ImportError:  # pragma: no cover - exercised by the dependency-free smoke test
     _np = None
 
+_NUMPY_ERF = (
+    _np.vectorize(math.erf, otypes=[_np.float32])
+    if _np is not None else None
+)
+
 from .constants import ANIMALS, CROPS, PRODUCTS
 from .features import (
     BOARD_SIZE,
@@ -482,6 +487,15 @@ def _gelu(value: float) -> float:
     return 0.5 * value * (1.0 + math.erf(value / math.sqrt(2.0)))
 
 
+def _numpy_gelu(values: Any) -> Any:
+    """Apply learned_v1's exact GELU contract to a NumPy array."""
+    assert _np is not None and _NUMPY_ERF is not None
+    return _np.float32(0.5) * values * (
+        _np.float32(1.0)
+        + _NUMPY_ERF(values / _np.sqrt(_np.float32(2.0)))
+    )
+
+
 def _attention(tokens: list[list[float]], weights: Mapping[str, Any], prefix: str) -> list[list[float]]:
     hidden = len(tokens[0])
     qkv = _linear(tokens, weights[f"{prefix}.attention.in_proj_weight"], weights[f"{prefix}.attention.in_proj_bias"])
@@ -583,11 +597,7 @@ class DependencyFreePolicy:
             tokens = (residual - mean) / _np.sqrt(variance + _np.float32(1e-5)) * norm_weight + norm_bias
 
             hidden = linear(tokens, f"{prefix}.mlp.0.weight", f"{prefix}.mlp.0.bias")
-            hidden = _np.float32(0.5) * hidden * (
-                _np.float32(1.0) + _np.tanh(
-                    _np.float32(0.7978845608) * (hidden + _np.float32(0.044715) * hidden ** 3)
-                )
-            )
+            hidden = _numpy_gelu(hidden)
             hidden = hidden @ weights[f"{prefix}.mlp.2.weight"].T
             hidden += weights[f"{prefix}.mlp.2.bias"]
             residual = tokens + hidden
