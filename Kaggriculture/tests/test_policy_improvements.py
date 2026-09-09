@@ -15,9 +15,14 @@ from kagriculture_agent.planner import (
     build_daily_plan,
     normalize_planner_state,
 )
-from kagriculture_agent.policy import Policy, _assignment_valid, _drop_carried_goods
+from kagriculture_agent.policy import (
+    Policy,
+    _assignment_valid,
+    _drop_carried_goods,
+    worker_action,
+)
 from kagriculture_agent.strategy import StrategySpec
-from kagriculture_agent.types import Position, Task
+from kagriculture_agent.types import Position, Task, WorkerAssignment
 
 
 def _workers(*items):
@@ -272,12 +277,81 @@ def test_normalize_planner_state_never_uses_hands_as_seeds():
 
 
 def test_sell_assignment_validates_carried_inventory():
-    carried = _state(private={"shed": {}, "inventories": [{"EGG": 1}]})
-    empty = _state(private={"shed": {"EGG": 1}, "inventories": [{}]})
-    task = Task("SELL", Position(0, 1), 1, None, 1, item="EGG")
+    workers = _workers(("FARMER", Position(1, 1)))
+    carried = _state(
+        workers=workers,
+        private={"shed": {}, "inventories": [{"EGG": 1}]},
+    )
+    empty = _state(
+        workers=workers,
+        private={"shed": {"EGG": 1}, "inventories": [{}]},
+    )
+    task = Task("SELL", Position(1, 1), 1, None, 1, item="EGG")
     assignment = assign_tasks([task], carried["workers"], carried)[0]
     assert _assignment_valid(carried, assignment)
     assert not _assignment_valid(empty, assignment)
+    assert worker_action(0, carried, assignment) == ["DROP"]
+    assert worker_action(0, empty, assignment) == ["PASS"]
+
+
+def test_sell_assignment_requires_the_carried_product_and_sell_all_accepts_any_product():
+    state = _state(
+        workers=_workers(("FARMER", Position(1, 1))),
+        private={"shed": {"EGG": 4}, "inventories": [{"CARROT": 1}]},
+    )
+    egg = WorkerAssignment(
+        0, Task("SELL", Position(1, 1), 1, None, 1, item="EGG"),
+    )
+    sell_all = WorkerAssignment(
+        0, Task("SELL_ALL", Position(1, 1), 1, None, 1, sell_all=True),
+    )
+
+    assert not _assignment_valid(state, egg)
+    assert worker_action(0, state, egg) == ["PASS"]
+    assert _assignment_valid(state, sell_all)
+    assert worker_action(0, state, sell_all) == ["DROP"]
+
+
+def test_generic_sell_all_plans_deterministic_product_surplus_after_feed_reserve():
+    tiles = [["EMPTY"] * 5 for _ in range(5)]
+    tiles[0][0] = {"kind": "COOP", "animal": {"species": "GOOSE"}}
+    state = _state(
+        day=29,
+        hour=5,
+        tiles=tiles,
+        private={
+            "seeds": {},
+            "shed": {},
+            "inventories": [{"WHEAT": 2, "EGG": 1}],
+        },
+        market={"prices": {"WHEAT": 10, "EGG": 20}},
+    )
+
+    sell_tasks = [task for task in build_daily_plan(state) if task.kind == "SELL"]
+
+    assert [
+        (task.item, getattr(task, "quantity", None))
+        for task in sell_tasks
+    ] == [("EGG", 1), ("WHEAT", 1)]
+    assert all(task.sell_all for task in sell_tasks)
+
+
+def test_generic_sell_all_does_not_plan_protected_feed_wheat():
+    tiles = [["EMPTY"] * 5 for _ in range(5)]
+    tiles[0][0] = {"kind": "COOP", "animal": {"species": "GOOSE"}}
+    state = _state(
+        day=29,
+        hour=5,
+        tiles=tiles,
+        private={
+            "seeds": {},
+            "shed": {},
+            "inventories": [{"WHEAT": 1}],
+        },
+        market={"prices": {"WHEAT": 10}},
+    )
+
+    assert not any(task.kind == "SELL" for task in build_daily_plan(state))
 
 
 def test_basic_need_wheat_buy_survives_reversal_filter():

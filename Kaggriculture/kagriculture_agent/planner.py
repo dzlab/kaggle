@@ -16,7 +16,7 @@ from math import inf, isfinite
 from typing import Any
 
 from .constants import ANIMALS, CROPS, LAND_ORDER, LAND_PRICES, MARKET_I0, PRODUCTS, SHOPS, season_days, shed_capacity
-from .economics import forecast_crop, market_price, sell_batch_value
+from .economics import feed_reserve, forecast_crop, market_price, sell_batch_value
 from .observation import parse_observation, shed_access_tiles
 from .routing import distance, is_locked_tile, normalize_position, route_to
 from .strategy import StrategySpec
@@ -465,6 +465,40 @@ def _deduplicate_maintenance(plan: list[Task]) -> list[Task]:
 def _inventory(state: Any) -> Mapping[str, Any]:
     value = _get(state, "inventory", _get(_get(state, "farm", {}), "hands", {}))
     return value if isinstance(value, Mapping) else {}
+
+
+def _saleable_carried_surplus(
+    state: Mapping[str, Any], inventory: Mapping[str, Any], strategy: StrategySpec | None,
+) -> list[tuple[str, int]]:
+    """Return deterministic carried-product quantities safe to stage for sale."""
+    private = _mapping(state.get("private"))
+    live_animals = _feed_animal_counts(state)
+    strategy_reserve = strategy.reserve_wheat if strategy is not None and live_animals else 0
+    feed_wheat = feed_reserve(
+        live_animals,
+        max(0, season_days - _day(state, EpisodeMemory())),
+        reserve_wheat=strategy_reserve,
+    )
+    carried_wheat = int(_safe_quantity(inventory.get("WHEAT", 0)))
+    if "inventories" in private:
+        staged_wheat = int(_staged_wheat(state))
+        saleable_wheat = min(carried_wheat, max(0, staged_wheat - feed_wheat))
+    else:
+        # In the legacy flat planner contract, ``inventory`` is the only
+        # represented stock and may be the shed itself. Count it once.
+        saleable_wheat = max(0, carried_wheat - feed_wheat)
+
+    surplus: list[tuple[str, int]] = []
+    for raw_item, raw_quantity in sorted(inventory.items(), key=lambda entry: str(entry[0]).upper()):
+        item = str(raw_item).upper()
+        quantity = int(_safe_quantity(raw_quantity))
+        if item not in PRODUCTS or item == "FERTILIZER" or quantity <= 0:
+            continue
+        if item == "WHEAT":
+            quantity = saleable_wheat
+        if quantity > 0:
+            surplus.append((item, quantity))
+    return surplus
 
 
 def _shed_target(state: Any, board_size: int) -> Position:
@@ -1101,15 +1135,18 @@ def build_daily_plan(state: Any, memory: EpisodeMemory | Any = None,
     if held > 0:
         shed_target = _shed_target(state, board_size)
         _add(plan, "SHED", shed_target, 85, day, held)
-        for item, quantity in sorted(inventory.items()):
-            if item == "FERTILIZER" or not isinstance(quantity, (int, float)) or quantity <= 0:
-                continue
+        for item, quantity in _saleable_carried_surplus(state, inventory, strategy):
             try:
                 value = _observed_sale_value(item, int(quantity), state)
             except (KeyError, TypeError, ValueError, OverflowError):
                 value = 0
             if value > 0:
-                plan.append(Task("SELL", shed_target, 75, day, value, sell_all=True))
+                task = Task("SELL", shed_target, 75, day, value, sell_all=True, item=item)
+                # Task predates quantity-bearing market intents. Keep its
+                # public shape while recording the bounded planner quantity
+                # consumed by policy._requested_quantity.
+                task.quantity = int(quantity)
+                plan.append(task)
 
     return _deduplicate_maintenance(plan)
 
@@ -1394,6 +1431,18 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
             info for info in infos
             if info[0] in available and _fits_same_day_deadline(task, info, state, board_size, day)
         ]
+        if task.kind in {"SELL", "SELL_ALL"}:
+            item = str(task.item or "").upper()
+            if item:
+                candidates = [info for info in candidates if _worker_quantity(state, info[0], item) > 0]
+            else:
+                candidates = [
+                    info for info in candidates
+                    if any(
+                        product != "FERTILIZER" and _worker_quantity(state, info[0], product) > 0
+                        for product in PRODUCTS
+                    )
+                ]
         non_farmer_available = any(
             info[0] in available
             and info[1] != "FARMER"

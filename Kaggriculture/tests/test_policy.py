@@ -980,9 +980,15 @@ def test_planner_sell_all_is_explicit_and_excludes_fertilizer():
         "market": {"prices": {"WHEAT": 10, "CARROT": 20, "FERTILIZER": 30}},
     }
 
-    planner_sell = next(task for task in policy_module.build_daily_plan(state) if task.kind == "SELL")
-    assert planner_sell.sell_all is True
-    orders = policy_module.build_market_orders(state, [planner_sell])
+    planner_sales = [
+        task for task in policy_module.build_daily_plan(state)
+        if task.kind == "SELL"
+    ]
+    assert [
+        (task.item, task.quantity, task.sell_all)
+        for task in planner_sales
+    ] == [("CARROT", 1, True), ("WHEAT", 2, True)]
+    orders = policy_module.build_market_orders(state, planner_sales)
 
     assert ["SELL", "WHEAT", 2] in orders
     assert ["SELL", "CARROT", 1] in orders

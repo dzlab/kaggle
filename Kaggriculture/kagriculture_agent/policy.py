@@ -384,6 +384,8 @@ def _intent(item: Any) -> tuple[str, str | None, int] | None:
     if name is None and isinstance(_get(item, "target"), str):
         name = _get(item, "target")
     if kind == "SELL" and bool(_get(item, "sell_all", False)):
+        if name is not None:
+            return "SELL", str(name).upper(), _requested_quantity(item)
         return "SELL_ALL", None, _requested_quantity(item)
     if kind == "SELL" and name is None:
         return None
@@ -745,7 +747,17 @@ def _task_action(state: Any, worker_index: int, task: Task, position: Position) 
         if inventory.get(item, 0) <= 0:
             return PASS
         return f"PLACE {item} 1"
-    if kind in {"SHED", "SELL", "SELL_ALL", "DROP"}:
+    if kind in {"SELL", "SELL_ALL"}:
+        item = str(_get(task, "item", "") or "").upper()
+        sell_all = kind == "SELL_ALL" or (
+            bool(_get(task, "sell_all", False)) and not item
+        )
+        has_product = (
+            any(inventory.get(product, 0) > 0 for product in _SALEABLE_PRODUCTS)
+            if sell_all else item in PRODUCTS and inventory.get(item, 0) > 0
+        )
+        return "DROP" if _is_adjacent_to_shed(state, position) and has_product else PASS
+    if kind in {"SHED", "DROP"}:
         return "DROP" if _is_adjacent_to_shed(state, position) and inventory else PASS
     if kind == "STRUCTURE":
         return _structure_action(state, position) or PASS
@@ -965,7 +977,14 @@ def _assignment_valid(state: Any, assignment: WorkerAssignment) -> bool:
     if kind == "SHED":
         return any(quantity > 0 for quantity in _inventory_for_worker(state, worker_index).values())
     if kind in {"SELL", "SELL_ALL"}:
-        return any(_whole(_shed(state).get(item)) > 0 for item in _SALEABLE_PRODUCTS)
+        inventory = _inventory_for_worker(state, worker_index)
+        item = str(_get(assignment.task, "item", "") or "").upper()
+        sell_all = kind == "SELL_ALL" or (
+            bool(_get(assignment.task, "sell_all", False)) and not item
+        )
+        if sell_all:
+            return any(inventory.get(product, 0) > 0 for product in _SALEABLE_PRODUCTS)
+        return item in PRODUCTS and inventory.get(item, 0) > 0
     if kind in {"FEED", "CARE"}:
         animal = _animal(_tile_at(state, target))
         completed_field = "fed_today" if kind == "FEED" else "cared_today"
