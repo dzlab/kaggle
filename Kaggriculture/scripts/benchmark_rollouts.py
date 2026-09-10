@@ -17,12 +17,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from kagriculture_agent.constants import ENGINE_VERSION
+from kagriculture_agent.constants import ENGINE_VERSION, MAX_POLICY_INFERENCE_P95_MS
 from kagriculture_agent.policy import Policy
 from scripts.collect_trajectories import DEFAULT_GAME_TIMEOUT_SECONDS, _run_game_isolated
 
 MIN_REAL_ENGINE_STEPS_PER_MINUTE = 100_000
-MAX_POLICY_INFERENCE_P95_MS = 10.0
 DEFAULT_OPPONENT = "current"
 
 

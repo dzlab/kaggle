@@ -928,7 +928,26 @@ def test_terminal_cleanup_reserves_configured_shed_capacity_across_workers():
         day=29,
         hour=22,
         hands=[[2, 2]],
-        inventories=[["MELON"], ["CARROT"]],
+        inventories=[["MELON", "MELON"], ["CARROT", "CARROT"]],
+        shed={"WHEAT": 1},
+        seeds={},
+    )
+    obs["farms"][0]["farmer"] = [2, 2]
+    obs["configuration"] = {"shedCapacity": 2}
+
+    action = policy_module.Policy().act(obs)
+    worker_actions = [action["farmer"], *action["hands"]]
+
+    assert sum(command[0] in {"DROP", "PLACE"} for command in worker_actions) == 1
+    assert sum(command == ["PASS"] for command in worker_actions) == 1
+
+
+def test_nonterminal_cleanup_reserves_configured_shed_capacity_across_workers():
+    obs = observation(
+        day=28,
+        hour=0,
+        hands=[[2, 2]],
+        inventories=[["MELON", "MELON"], ["CARROT", "CARROT"]],
         shed={"WHEAT": 1},
         seeds={},
     )

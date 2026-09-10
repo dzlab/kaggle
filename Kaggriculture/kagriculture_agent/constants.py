@@ -66,4 +66,5 @@ turns_per_day = 24
 season_days = 30
 shed_capacity = 100
 max_market_orders = 10
+MAX_POLICY_INFERENCE_P95_MS = 10.0
 ENGINE_VERSION = "1.32.7"

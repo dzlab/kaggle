@@ -417,18 +417,18 @@ def test_late_animal_horizon_includes_structure_build_and_placement_turns():
             strategy=goose_only,
         )
 
-    last_productive = macro(24)
+    last_productive = macro(25)
     assert ["BUY_ANIMAL", "GOOSE", 1] in last_productive["market_intents"]
     assert any(task.kind == "BUILD_COOP" for task in last_productive["tasks"])
 
-    too_late = macro(25)
+    too_late = macro(26)
     assert ["BUY_ANIMAL", "GOOSE", 1] not in too_late["market_intents"]
     assert not any(task.kind in {"ANIMAL", "BUILD_COOP"} for task in too_late["tasks"])
 
 
 def test_late_daily_animal_and_structure_tasks_are_rejected():
     state = _state(
-        day=25,
+        day=26,
         desired_animals=[{"species": "GOOSE", "position": [0, 0], "owned": False}],
         structures=[{"kind": "COOP", "position": [1, 0], "built": False}],
     )
@@ -492,6 +492,20 @@ def test_shed_assignment_prefers_worker_with_inventory():
     assert selected_with == 1
     assert selected_without == 0
     assert selected_with != selected_without
+
+
+def test_shed_assignment_prefers_farther_carrying_worker_before_distance():
+    workers = _workers(("FARMER", Position(1, 0)), ("WORKER", Position(4, 4)))
+    state = _state(
+        workers=workers,
+        private={"seeds": {}, "shed": {}, "inventories": [{}, {"EGG": 1}]},
+    )
+
+    assignment = assign_tasks(
+        [Task("SHED", Position(1, 0), 1, None, 1)], workers, state,
+    )[0]
+
+    assert assignment.worker_index == 1
 
 
 def test_animal_budget_includes_feed_after_shed_pickup():

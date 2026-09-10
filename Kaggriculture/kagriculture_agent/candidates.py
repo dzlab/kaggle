@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from .constants import ENGINE_VERSION
+from .constants import ENGINE_VERSION, MAX_POLICY_INFERENCE_P95_MS
 from .features import FEATURE_SCHEMA_VERSION
 from .learned_policy import load_exported_policy
 from .policy import Policy
@@ -100,7 +100,11 @@ def candidate_policy(name: str) -> Callable[[Mapping[str, Any]], dict[str, Any]]
     """Return a fresh stateful route policy's observation callable."""
     if name == LEARNED_V1:
         _, learned_model = _load_validated_learned_v1_artifact()
-        policy = Policy(strategy="current", learned_model=learned_model)
+        policy = Policy(
+            strategy="current",
+            learned_model=learned_model,
+            learned_timeout_seconds=MAX_POLICY_INFERENCE_P95_MS / 1000.0,
+        )
     elif name in BASE_CANDIDATES:
         policy = Policy(strategy=name)
     else:
@@ -129,7 +133,11 @@ def artifact_candidate_policy(path: str | Path) -> Callable[[Mapping[str, Any]],
         if hasattr(learned_model, "act"):
             policy = learned_model
         else:
-            policy = Policy(strategy="current", learned_model=learned_model)
+            policy = Policy(
+                strategy="current",
+                learned_model=learned_model,
+                learned_timeout_seconds=MAX_POLICY_INFERENCE_P95_MS / 1000.0,
+            )
 
         def act(observation: Mapping[str, Any]) -> dict[str, Any]:
             return policy.act(observation)

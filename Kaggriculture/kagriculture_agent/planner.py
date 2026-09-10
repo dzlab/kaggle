@@ -15,7 +15,10 @@ from collections.abc import Iterable, Mapping, Sequence
 from math import inf, isfinite
 from typing import Any
 
-from .constants import ANIMALS, CROPS, LAND_ORDER, LAND_PRICES, MARKET_I0, PRODUCTS, SHOPS, season_days, shed_capacity
+from .constants import (
+    ANIMALS, CROPS, LAND_ORDER, LAND_PRICES, MARKET_I0, PRODUCTS, SHOPS,
+    season_days, shed_capacity, turns_per_day,
+)
 from .economics import feed_reserve, forecast_crop, market_price, sell_batch_value
 from .observation import parse_observation, shed_access_tiles
 from .routing import distance, is_locked_tile, normalize_position, route_to
@@ -518,9 +521,9 @@ _MACRO_MODES = ("cash", "demand", "balanced", "animal")
 
 def _can_produce_before_season_end(first_yield_day: Any, start_day: int,
                                    total_days: int = season_days) -> bool:
-    """Return whether first production lands within the zero-indexed season."""
+    """Return whether first production lands before the season time boundary."""
     try:
-        return int(start_day) + int(first_yield_day) <= int(total_days) - 1
+        return float(start_day) + float(first_yield_day) < int(total_days)
     except (TypeError, ValueError, OverflowError):
         return False
 
@@ -533,7 +536,9 @@ def _can_start_crop(crop: str, day: int) -> bool:
 def _can_start_animal(animal: str, day: int, action_turns: int) -> bool:
     rules = ANIMALS.get(animal)
     return bool(rules) and _can_produce_before_season_end(
-        int(rules["first_yield_day"]) - 1, day + action_turns,
+        float(rules["first_yield_day"])
+        + max(0, int(action_turns)) / turns_per_day,
+        day,
     )
 
 
@@ -1545,9 +1550,10 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
             default=inf,
         )
         return (
-            *base[:4],
+            *base[:3],
             0 if due_water_cannot_wait(task) else 1,
             route_distance,
+            base[3],
             base[5],
             base[4],
         )
@@ -1647,8 +1653,8 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
         if not candidates:
             return None
         return min(candidates, key=lambda info: (
-            distance(info[2], target) if info[2] is not None and target is not None else inf,
             0 if task.kind == "SHED" and _worker_carried_quantity(state, info[0]) > 0 else 1,
+            distance(info[2], target) if info[2] is not None and target is not None else inf,
             info[0],
             info[2].y if info[2] is not None else inf,
             info[2].x if info[2] is not None else inf,

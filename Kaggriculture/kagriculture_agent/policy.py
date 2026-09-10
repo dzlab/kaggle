@@ -6,7 +6,10 @@ from collections.abc import Mapping, Sequence
 from math import isfinite
 from typing import Any
 
-from .constants import ANIMALS, CROPS, LAND_PRICES, PRODUCTS, max_market_orders, season_days, shed_capacity as DEFAULT_SHED_CAPACITY
+from .constants import (
+    ANIMALS, CROPS, LAND_PRICES, MAX_POLICY_INFERENCE_P95_MS, PRODUCTS,
+    max_market_orders, season_days, shed_capacity as DEFAULT_SHED_CAPACITY,
+)
 from .economics import feed_reserve, market_price, market_regime
 from .learned_policy import LearnedPolicy, compile_proposal
 from .memory import PolicyMemory, market_order_allowed
@@ -916,6 +919,52 @@ def _bound_pickup_commands(
     return bounded
 
 
+def _bound_shed_deposit_commands(
+    state: Any, commands: Mapping[int, Sequence[Any]],
+) -> dict[int, list[Any]]:
+    """Reserve configured shed room across every deposit in one action."""
+    configuration = _mapping(_get(state, "configuration", {}))
+    capacity = max(1, _whole(
+        _get(configuration, "shedCapacity"), DEFAULT_SHED_CAPACITY,
+    ))
+    room = max(0, capacity - sum(_counts(_shed(state)).values()))
+    workers = {
+        worker["index"]: worker
+        for worker in _worker_records(state)
+    }
+    bounded: dict[int, list[Any]] = {}
+    for worker_index in sorted(commands):
+        raw_command = commands[worker_index]
+        command = list(raw_command)
+        worker = workers.get(worker_index, {})
+        position = _position(_get(worker, "position"))
+        inventory = _inventory_for_worker(state, worker_index)
+        if command and command[0] == "DROP":
+            carried = sum(inventory.get(item, 0) for item in (*PRODUCTS, *ANIMALS))
+            if carried <= room:
+                room -= carried
+            else:
+                command = next((
+                    ["PLACE", item, min(inventory[item], room)]
+                    for item in PRODUCTS
+                    if inventory.get(item, 0) > 0 and room > 0
+                ), [PASS])
+                if command[0] == "PLACE":
+                    room -= _whole(command[2])
+        elif (
+            len(command) >= 3
+            and command[0] == "PLACE"
+            and str(command[1]).upper() in PRODUCTS
+            and position is not None
+            and _is_adjacent_to_shed(state, position)
+        ):
+            quantity = min(_whole(command[2]), room)
+            command = ["PLACE", str(command[1]).upper(), quantity] if quantity else [PASS]
+            room -= quantity
+        bounded[worker_index] = command
+    return bounded
+
+
 def _market_order_direction(order: Any) -> tuple[str, str] | None:
     if not isinstance(order, Sequence) or isinstance(order, (str, bytes)) or len(order) < 2:
         return None
@@ -1051,12 +1100,15 @@ class Policy:
     """Stateful deterministic policy with reset-safe episode memory."""
 
     def __init__(self, strategy: str = "current", *, opponent_signals: bool = False,
-                 learned_model: str | None = None) -> None:
+                 learned_model: Any = None,
+                 learned_timeout_seconds: float = MAX_POLICY_INFERENCE_P95_MS / 1000.0) -> None:
         if strategy != "auto":
             get_strategy(strategy)
         self.strategy_name = strategy
         self.opponent_signals = bool(opponent_signals)
-        self.learned_policy = LearnedPolicy(learned_model)
+        self.learned_policy = LearnedPolicy(
+            learned_model, timeout_seconds=learned_timeout_seconds,
+        )
         self.memory = PolicyMemory()
 
     def _carried_assignments(self, state: Mapping[str, Any]) -> list[WorkerAssignment]:
@@ -1386,6 +1438,7 @@ class Policy:
                 )
                 if drop is not None:
                     commands[worker["index"]] = _unit_command(drop)
+        commands = _bound_shed_deposit_commands(state, commands)
         commands = _bound_pickup_commands(state, commands)
         farmer = commands.get(0, [PASS])
         market_plan = build_daily_plan(_state_for_planner(state), self.memory, strategy_spec)

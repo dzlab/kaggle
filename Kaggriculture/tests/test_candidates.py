@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from kagriculture_agent import candidates
+from kagriculture_agent.learned_policy import DependencyFreePolicy, PolicyProposal
 
 
 def test_artifact_candidate_policy_loads_artifact_once_for_reusable_callable(monkeypatch, tmp_path):
@@ -102,3 +103,64 @@ def test_returned_candidate_propagates_runtime_failure_and_reuses_one_loaded_art
         failures.append(str(error.value))
     assert failures == ["inference failed", "inference failed"]
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("elapsed_seconds", "expected_status", "expected_enabled"),
+    [(0.011, "slow_model", False), (0.009, "ok", True)],
+)
+def test_production_candidate_enforces_shared_inference_budget(
+    monkeypatch, tmp_path, elapsed_seconds, expected_status, expected_enabled,
+):
+    import kagriculture_agent.learned_policy as runtime
+
+    artifact = tmp_path / "learned-v1.json"
+    artifact.write_text("{}")
+    model = object.__new__(DependencyFreePolicy)
+    monkeypatch.setattr(candidates, "learned_v1_artifact_path", lambda: artifact)
+    monkeypatch.setattr(candidates, "load_exported_policy", lambda _path: model)
+    monkeypatch.setattr(
+        DependencyFreePolicy,
+        "propose",
+        lambda self, state, features: PolicyProposal((), (), 1.0, "learned_v1"),
+    )
+    ticks = iter((100.0, 100.0 + elapsed_seconds))
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: next(ticks))
+
+    candidate = candidates.candidate_policy(candidates.LEARNED_V1)
+    learned = candidate.__self__.learned_policy
+    proposal = learned.propose({"day": 0, "hour": 0}, object())
+
+    assert learned.timeout_seconds == pytest.approx(0.01)
+    assert learned.diagnostics["status"] == expected_status
+    assert learned.diagnostics.get("learned_overrides_enabled", True) is expected_enabled
+    assert proposal.model_version == ("learned_v1" if expected_enabled else "none")
+
+
+def test_production_candidate_passes_shared_budget_to_policy_factory(
+    monkeypatch, tmp_path,
+):
+    artifact = tmp_path / "learned-v1.json"
+    artifact.write_text("{}")
+    model = object()
+    calls = []
+
+    class StubPolicy:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def act(self, observation):
+            return {"observation": observation}
+
+    monkeypatch.setenv(candidates.LEARNED_V1_ARTIFACT_ENV, str(artifact))
+    monkeypatch.setattr(candidates, "learned_v1_artifact_path", lambda: artifact)
+    monkeypatch.setattr(candidates, "load_exported_policy", lambda _path: model)
+    monkeypatch.setattr(candidates, "Policy", StubPolicy)
+
+    candidates.candidate_policy(candidates.LEARNED_V1)
+
+    assert calls == [{
+        "strategy": "current",
+        "learned_model": model,
+        "learned_timeout_seconds": 0.01,
+    }]
