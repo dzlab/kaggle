@@ -1055,8 +1055,15 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
         cash_after_planned_intents = cash - _intent_purchase_cost(
             capacity_preserving_intents, normalized,
         )
+        one_day_feed_staged = _staged_wheat(normalized) >= sum(
+            int(quantity) for quantity in planning_animal_counts.values()
+        )
         can_fund_deadline_hire = (
-            cash_after_planned_intents >= hire_cost + reserve
+            cash >= hire_cost
+            and (
+                one_day_feed_staged
+                or cash_after_planned_intents >= hire_cost + reserve
+            )
         )
         if hand_count < 2 and hires_today == 0:
             if deadline_capacity_hire and can_fund_deadline_hire:

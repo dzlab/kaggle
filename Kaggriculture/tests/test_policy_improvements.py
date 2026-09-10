@@ -816,7 +816,7 @@ def test_macro_funds_deadline_hire_without_pre_funding_stored_animal_feed():
 
 @__import__("pytest").mark.parametrize(
     ("cash", "wheat", "expected"),
-    [(7, 30, True), (150, 30, True), (7, 0, False)],
+    [(7, 30, True), (150, 30, True), (7, 0, False), (0, 1, False)],
 )
 def test_macro_proposes_affordable_hire_for_due_basic_need_capacity(cash, wheat, expected):
     tiles = [["EMPTY"] * 10 for _ in range(10)]

@@ -619,7 +619,11 @@ def build_market_orders(state: Any, plan: Any,
     orders: list[list[Any]] = []
     product_buys: dict[str, int] = {}
     animal_buys = 0
-    shed_room = max(0, DEFAULT_SHED_CAPACITY - sum(shed.values()))
+    configuration = _mapping(_get(state, "configuration", {}))
+    shed_capacity = max(1, _whole(
+        _get(configuration, "shedCapacity"), DEFAULT_SHED_CAPACITY,
+    ))
+    shed_room = max(0, shed_capacity - sum(shed.values()))
     intents = _approved_intents(plan)
     allowed_crops = set(strategy.crops) if strategy is not None else set(CROPS)
     allowed_animals = set(strategy.animals) if strategy is not None else set(ANIMALS)
@@ -716,11 +720,11 @@ def build_market_orders(state: Any, plan: Any,
             available_shed_units -= quantity
 
     # Wheat reserved for feed is purchased before discretionary approvals.
-    if not final_turn and required_wheat and wheat_price > 0 and available_shed_units < DEFAULT_SHED_CAPACITY:
+    if not final_turn and required_wheat and wheat_price > 0 and available_shed_units < shed_capacity:
         affordable = 0
         purchase_cost = 0.0
         for offset in range(required_wheat):
-            if available_shed_units + affordable >= DEFAULT_SHED_CAPACITY:
+            if available_shed_units + affordable >= shed_capacity:
                 break
             unit_cost = _buy_product_quote("WHEAT", state, offset)
             if unit_cost <= 0 or purchase_cost + unit_cost > available_cash:
@@ -755,7 +759,7 @@ def build_market_orders(state: Any, plan: Any,
             affordable, purchase_cost = 0, 0.0
             already_bought = product_buys.get(item or "", 0)
             for offset in range(quantity):
-                if available_shed_units + affordable >= DEFAULT_SHED_CAPACITY:
+                if available_shed_units + affordable >= shed_capacity:
                     break
                 unit_cost = _buy_product_quote(item or "", state, already_bought + offset)
                 if unit_cost <= 0 or purchase_cost + unit_cost > available_cash:
@@ -769,7 +773,7 @@ def build_market_orders(state: Any, plan: Any,
                 if quantity <= 0:
                     continue
             unit_cost = _purchase_cost(kind, item, state)
-            room = DEFAULT_SHED_CAPACITY - available_shed_units if kind == "BUY_ANIMAL" else quantity
+            room = shed_capacity - available_shed_units if kind == "BUY_ANIMAL" else quantity
             affordable = min(quantity, max(0, room), int(max(0.0, available_cash) // unit_cost)) if unit_cost > 0 else 0
         if affordable <= 0:
             continue

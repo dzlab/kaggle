@@ -614,6 +614,29 @@ def test_market_orders_reserve_feed_wheat_and_never_sell_more_than_shed():
     assert len(orders) <= 10
 
 
+@pytest.mark.parametrize(
+    ("intent", "expected_prefix"),
+    [
+        (["BUY_PRODUCT", "WHEAT", 5], ["BUY_PRODUCT", "WHEAT"]),
+        (["BUY_ANIMAL", "GOOSE", 5], ["BUY_ANIMAL", "GOOSE"]),
+    ],
+)
+def test_market_orders_bound_purchases_by_configured_shed_capacity(intent, expected_prefix):
+    state = {
+        "day": 4,
+        "hour": 3,
+        "cash": 10_000,
+        "configuration": {"shedCapacity": 2},
+        "private": {"shed": {"WHEAT": 1}, "seeds": {}},
+        "market": {"prices": {"WHEAT": 1}, "inventory": {"WHEAT": 10_000}},
+    }
+
+    orders = policy_module.build_market_orders(state, [intent])
+
+    matching = [order for order in orders if order[:2] == expected_prefix]
+    assert matching == [[*expected_prefix, 1]]
+
+
 def test_mixed_animal_representations_merge_for_feed_and_cap_without_duplicates():
     from kagriculture_agent.planner import _feed_animal_counts, build_daily_plan
     from kagriculture_agent.strategy import StrategySpec
