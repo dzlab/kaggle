@@ -785,6 +785,8 @@ def test_policy_replans_when_a_newly_hired_hand_appears_before_deadline():
     policy.act(observation(day=27, hour=0, hands=[], tiles=board, seeds={}, money=1_000))
     action = policy.act(observation(day=27, hour=1, hands=[[4, 4]], tiles=board, seeds={}, money=999))
 
+    assert [(assignment.worker_index, assignment.task.kind)
+            for assignment in policy.memory.assignments] == [(1, "WATER")]
     assert action["hands"][0] != ["PASS"]
 
 

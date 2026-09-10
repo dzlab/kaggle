@@ -1352,12 +1352,17 @@ class Policy:
         macro = build_autonomous_macro_plan(state, self.memory, strategy_spec)
         workers = _worker_records(state)
         worker_indices = tuple(sorted(worker["index"] for worker in workers))
-        workers_changed = worker_indices != self.memory.diagnostics.get("worker_indices")
+        previous_worker_indices = self.memory.diagnostics.get("worker_indices")
+        workers_changed = worker_indices != previous_worker_indices
+        worker_roster_changed = previous_worker_indices is not None and workers_changed
         hour_zero = _whole(_get(state, "hour")) == 0
         regime_changed = bool(self.memory.market_regime) and dict(regime) != self.memory.market_regime
         assignments_valid = all(_assignment_valid(state, assignment) for assignment in self.memory.assignments)
         if reset or hour_zero or workers_changed or regime_changed or not self.memory.assignments or not assignments_valid:
-            protected = self._carried_assignments(state) if not reset and not hour_zero else ()
+            protected = (
+                self._carried_assignments(state)
+                if not reset and not hour_zero and not worker_roster_changed else ()
+            )
             assignments = self._replan(state, regime, macro, protected, strategy_spec)
         else:
             assignments = self.memory.assignments
