@@ -937,6 +937,31 @@ def test_promotion_decision_preserves_external_baseline_pairing_requirement():
     assert decision["baseline_safety_gate_reasons"] == ["missing_expected_matrix_records"]
 
 
+def test_promotion_decision_rejects_incomplete_baseline_without_baseline_policy():
+    from scripts.evaluate import promotion_decision
+
+    expected_matrix = [("pass", 1, 0), ("pass", 1, 1)]
+    candidate = [
+        _metric_record(seat=seat, seed=1, opponent="pass", outcome="win", differential=10)
+        for seat in (0, 1)
+    ]
+    incomplete_baseline = [
+        _metric_record(
+            seat=0, seed=1, opponent="pass", candidate="current",
+            outcome="loss", differential=1,
+        )
+    ]
+
+    decision = promotion_decision(
+        candidate, incomplete_baseline, min_valid_games=1,
+        expected_matrix=expected_matrix,
+    )
+
+    assert decision["status"] == "discard"
+    assert decision["reasons"] == ["baseline_incomplete_pairing"]
+    assert decision["baseline_safety_gate_reasons"] == ["missing_expected_matrix_records"]
+
+
 def test_promotion_decision_rejects_diagnostic_regression_and_reports_deltas():
     from scripts.evaluate import promotion_decision
 

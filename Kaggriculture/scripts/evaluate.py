@@ -1031,14 +1031,20 @@ def promotion_decision(
     )
     if not reasons and baseline_policy is not None and paired_metric_deltas is None:
         reasons.append("baseline_incomplete_pairing")
-    if not reasons and baseline_safety_reasons:
-        baseline_pairing_issues = {
-            "insufficient_valid_games", "missing_seat_pairs", "duplicate_seat_pairs",
-            "missing_expected_matrix_records", "duplicate_expected_matrix_records",
-            "extra_expected_matrix_records",
-        }
-        if baseline_policy and any(reason in baseline_pairing_issues for reason in baseline_safety_reasons):
-            reasons.append("baseline_incomplete_pairing")
+    baseline_pairing_issues = {
+        "insufficient_valid_games", "missing_seat_pairs", "duplicate_seat_pairs",
+        "missing_expected_matrix_records", "duplicate_expected_matrix_records",
+        "extra_expected_matrix_records",
+    }
+    baseline_matrix_incomplete = baseline_matrix is not None and any(
+        baseline_matrix[key]
+        for key in ("missing", "duplicate", "extra", "invalid_records")
+    )
+    if not reasons and (
+        baseline_matrix_incomplete
+        or any(reason in baseline_pairing_issues for reason in baseline_safety_reasons)
+    ):
+        reasons.append("baseline_incomplete_pairing")
     if not reasons and (
         baseline["seat_balanced_win_rate"] is None
         or baseline["median_paired_bank_differential"] is None
