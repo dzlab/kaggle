@@ -219,9 +219,42 @@ def _finite_nonnegative(value: object) -> bool:
 def _validate_embedded_evidence(root: Path, names: set[str], artifact: str) -> None:
     """Validate promotion evidence independently of the training scripts."""
     holdout = json.loads((root / "evidence/holdout.json").read_text(encoding="utf-8"))
-    decision = holdout.get("decision") if isinstance(holdout, dict) else None
+    if not isinstance(holdout, dict):
+        raise RuntimeError("holdout evidence must be an object")
+    decision = holdout.get("decision")
+    report_artifact = holdout.get("artifact")
+    configuration = holdout.get("configuration")
     if not isinstance(decision, dict) or decision.get("status") != "promote":
         raise RuntimeError("holdout evidence decision must have status promote")
+    if not isinstance(report_artifact, dict):
+        raise RuntimeError("holdout evidence artifact identity is missing")
+    identity = report_artifact.get("identity")
+    if not isinstance(identity, str) or not identity or identity == "current":
+        raise RuntimeError("holdout evidence candidate identity is invalid")
+    if not isinstance(configuration, dict):
+        raise RuntimeError("holdout evidence configuration is missing")
+    seed_values = configuration.get("seed_values")
+    opponents = configuration.get("opponents")
+    seats = configuration.get("seats")
+    if (
+        not isinstance(seed_values, list)
+        or not isinstance(opponents, list)
+        or not isinstance(seats, list)
+    ):
+        raise RuntimeError("holdout evidence configured matrix is missing")
+    from scripts.evaluation_validation import evaluation_report_is_complete
+    if not evaluation_report_is_complete(
+        holdout,
+        identity=identity,
+        seed_values=seed_values,
+        opponents=opponents,
+        seats=seats,
+        artifact_path=root / artifact,
+    ):
+        raise RuntimeError("holdout evidence schema, matrix, or artifact binding is incomplete")
+    from scripts.telemetry import validation_safety_regression
+    if validation_safety_regression(holdout, candidate=identity):
+        raise RuntimeError("holdout evidence contains a safety regression")
 
     latency = json.loads((root / "evidence/cpu-latency.json").read_text(encoding="utf-8"))
     if not isinstance(latency, dict) or latency.get("schema_version") != 1 or latency.get("device") != "cpu":

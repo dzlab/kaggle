@@ -43,6 +43,43 @@ def _valid_latency_document(artifact):
     }
 
 
+def _valid_holdout_document(artifact):
+    expected_matrix = [
+        [opponent, 100, seat]
+        for opponent in ("pass", "random", "starter")
+        for seat in (0, 1)
+    ]
+    records = [
+        {"opponent": opponent, "seed": seed, "seat": seat}
+        for opponent, seed, seat in expected_matrix
+    ]
+    completeness = {
+        "expected": expected_matrix,
+        "expected_count": len(expected_matrix),
+        "observed_count": len(expected_matrix),
+        "missing": [],
+        "duplicate": [],
+        "extra": [],
+        "invalid_records": [],
+    }
+    return {
+        "schema_version": 1,
+        "configuration": {
+            "seed_values": [100],
+            "opponents": ["pass", "random", "starter"],
+            "seats": [0, 1],
+        },
+        "artifact": {
+            "identity": "candidate",
+            "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        },
+        "expected_matrix": expected_matrix,
+        "records": {"current": records, "candidate": records},
+        "matrix_completeness": {"current": completeness, "candidate": completeness},
+        "decision": {"status": "promote"},
+    }
+
+
 def _minimal_promoted_archive_inputs(tmp_path):
     from scripts import benchmark_rollouts
 
@@ -62,7 +99,7 @@ def _minimal_promoted_archive_inputs(tmp_path):
     artifact = tmp_path / "stage-artifact.json"
     artifact.write_text('{"workers": [], "market_orders": []}', encoding="utf-8")
     holdout = tmp_path / "holdout.json"
-    holdout.write_text('{"decision": {"status": "promote"}}', encoding="utf-8")
+    holdout.write_text(json.dumps(_valid_holdout_document(artifact)), encoding="utf-8")
     latency = tmp_path / "latency.json"
     results = [
         benchmark_rollouts.summarize_run(
@@ -220,7 +257,7 @@ def test_promoted_archive_entrypoint_uses_bundled_artifact_candidate(tmp_path):
         encoding="utf-8",
     )
     holdout = tmp_path / "holdout.json"
-    holdout.write_text('{"decision": {"status": "promote"}}', encoding="utf-8")
+    holdout.write_text(json.dumps(_valid_holdout_document(artifact)), encoding="utf-8")
     latency = tmp_path / "latency.json"
     latency.write_text(json.dumps(_valid_latency_document(artifact)), encoding="utf-8")
     archive = tmp_path / "submission.tar.gz"
@@ -268,7 +305,7 @@ def test_promoted_archive_embeds_evidence_and_self_excluding_integrity_manifest(
     artifact = tmp_path / "stage-artifact.json"
     artifact.write_text('{"workers": [], "market_orders": []}', encoding="utf-8")
     holdout = tmp_path / "holdout.json"
-    holdout.write_text('{"decision": {"status": "promote"}}\n', encoding="utf-8")
+    holdout.write_text(json.dumps(_valid_holdout_document(artifact)) + "\n", encoding="utf-8")
     latency = tmp_path / "cpu-latency.json"
     latency.write_text(json.dumps(_valid_latency_document(artifact)), encoding="utf-8")
     archive = tmp_path / "submission.tar.gz"
@@ -315,6 +352,20 @@ def test_smoke_rejects_embedded_holdout_that_does_not_promote(tmp_path):
     )
 
     with pytest.raises(RuntimeError, match="holdout.*promote"):
+        smoke_test_archive(archive, "models/learned_v1.json")
+
+
+def test_smoke_rejects_promoted_holdout_with_incomplete_evidence(tmp_path):
+    project, artifact, holdout, latency = _minimal_promoted_archive_inputs(tmp_path)
+    holdout.write_text('{"decision": {"status": "promote"}}', encoding="utf-8")
+    archive = tmp_path / "submission.tar.gz"
+
+    build_submission_archive(
+        project, archive, artifact=artifact,
+        holdout_report=holdout, latency_report=latency,
+    )
+
+    with pytest.raises(RuntimeError, match="holdout.*evidence|promotion evidence"):
         smoke_test_archive(archive, "models/learned_v1.json")
 
 
