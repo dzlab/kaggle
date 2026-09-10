@@ -15,6 +15,82 @@ from scripts.submission_smoke import build_submission_archive, smoke_test_archiv
 PROJECT_ROOT = Path(__file__).parents[1]
 
 
+def _valid_latency_document(artifact):
+    from scripts import benchmark_rollouts
+
+    return {
+        "schema_version": 1,
+        "device": "cpu",
+        "candidate_artifact": str(artifact),
+        "candidate_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        "results": [
+            benchmark_rollouts.summarize_run(
+                worker_count=workers,
+                game_count=1,
+                environment_steps=200000,
+                rollout_seconds=1.0,
+                inference_latencies_ms=[1.0],
+            )
+            for workers in (1, 2, 4, 8)
+        ],
+        "gate": {
+            "four_worker_result_present": True,
+            "inference_p95_ms_threshold": 10.0,
+            "real_engine_kept": True,
+            "simulator_required": False,
+            "throughput_steps_per_minute_threshold": 100000.0,
+        },
+    }
+
+
+def _minimal_promoted_archive_inputs(tmp_path):
+    from scripts import benchmark_rollouts
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "main.py").write_text(
+        "def agent(obs): return {'farmer':['PASS'], 'hands':[], 'market':[]}\n",
+    )
+    package = project / "kagriculture_agent"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "policy.py").write_text(
+        "class Policy:\n"
+        "    def act(self, obs):\n"
+        "        return {'farmer':['PASS'], 'hands':[], 'market':[]}\n",
+    )
+    artifact = tmp_path / "stage-artifact.json"
+    artifact.write_text('{"workers": [], "market_orders": []}', encoding="utf-8")
+    holdout = tmp_path / "holdout.json"
+    holdout.write_text('{"decision": {"status": "promote"}}', encoding="utf-8")
+    latency = tmp_path / "latency.json"
+    results = [
+        benchmark_rollouts.summarize_run(
+            worker_count=workers,
+            game_count=1,
+            environment_steps=200000,
+            rollout_seconds=1.0,
+            inference_latencies_ms=[1.0],
+        )
+        for workers in (1, 2, 4, 8)
+    ]
+    latency.write_text(json.dumps({
+        "schema_version": 1,
+        "device": "cpu",
+        "candidate_artifact": str(artifact),
+        "candidate_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        "results": results,
+        "gate": {
+            "four_worker_result_present": True,
+            "inference_p95_ms_threshold": 10.0,
+            "real_engine_kept": True,
+            "simulator_required": False,
+            "throughput_steps_per_minute_threshold": 100000.0,
+        },
+    }), encoding="utf-8")
+    return project, artifact, holdout, latency
+
+
 def test_submission_archive_contains_only_runtime_and_executes_without_site_packages(tmp_path):
     archive = tmp_path / "submission.tar.gz"
     repeat = tmp_path / "submission-repeat.tar.gz"
@@ -146,7 +222,7 @@ def test_promoted_archive_entrypoint_uses_bundled_artifact_candidate(tmp_path):
     holdout = tmp_path / "holdout.json"
     holdout.write_text('{"decision": {"status": "promote"}}', encoding="utf-8")
     latency = tmp_path / "latency.json"
-    latency.write_text('{"device": "cpu"}', encoding="utf-8")
+    latency.write_text(json.dumps(_valid_latency_document(artifact)), encoding="utf-8")
     archive = tmp_path / "submission.tar.gz"
 
     build_submission_archive(
@@ -194,7 +270,7 @@ def test_promoted_archive_embeds_evidence_and_self_excluding_integrity_manifest(
     holdout = tmp_path / "holdout.json"
     holdout.write_text('{"decision": {"status": "promote"}}\n', encoding="utf-8")
     latency = tmp_path / "cpu-latency.json"
-    latency.write_text('{"device": "cpu", "gate": {"real_engine_kept": true}}\n', encoding="utf-8")
+    latency.write_text(json.dumps(_valid_latency_document(artifact)), encoding="utf-8")
     archive = tmp_path / "submission.tar.gz"
 
     build_submission_archive(
@@ -226,6 +302,77 @@ def test_promoted_archive_embeds_evidence_and_self_excluding_integrity_manifest(
         integrity["members"][name] == hashlib.sha256(content).hexdigest()
         for name, content in member_bytes.items()
     )
+
+
+def test_smoke_rejects_embedded_holdout_that_does_not_promote(tmp_path):
+    project, artifact, holdout, latency = _minimal_promoted_archive_inputs(tmp_path)
+    holdout.write_text('{"decision": {"status": "discard"}}', encoding="utf-8")
+    archive = tmp_path / "submission.tar.gz"
+
+    build_submission_archive(
+        project, archive, artifact=artifact,
+        holdout_report=holdout, latency_report=latency,
+    )
+
+    with pytest.raises(RuntimeError, match="holdout.*promote"):
+        smoke_test_archive(archive, "models/learned_v1.json")
+
+
+@pytest.mark.parametrize("holdout_payload", [b"", b"[]", b'{"decision": {}}'])
+def test_smoke_rejects_malformed_embedded_holdout_evidence(tmp_path, holdout_payload):
+    project, artifact, holdout, latency = _minimal_promoted_archive_inputs(tmp_path)
+    archive = tmp_path / "submission.tar.gz"
+    build_submission_archive(
+        project, archive, artifact=artifact,
+        holdout_report=holdout, latency_report=latency,
+    )
+
+    rewritten = tmp_path / "rewritten-submission.tar.gz"
+    with tarfile.open(archive, "r:gz") as source, tarfile.open(rewritten, "w:gz") as target:
+        members = source.getmembers()
+        contents = {
+            member.name: source.extractfile(member).read()
+            for member in members
+        }
+        contents["evidence/holdout.json"] = holdout_payload
+        integrity = json.loads(contents["manifest.json"])
+        integrity["members"]["evidence/holdout.json"] = hashlib.sha256(
+            holdout_payload
+        ).hexdigest()
+        integrity["evidence"]["holdout"]["sha256"] = hashlib.sha256(
+            holdout_payload
+        ).hexdigest()
+        contents["manifest.json"] = (
+            json.dumps(integrity, sort_keys=True, indent=2) + "\n"
+        ).encode("utf-8")
+        for member in members:
+            content = contents[member.name]
+            info = tarfile.TarInfo(member.name)
+            info.size = len(content)
+            target.addfile(info, io.BytesIO(content))
+
+    with pytest.raises(RuntimeError, match="promotion evidence|holdout"):
+        smoke_test_archive(rewritten, "models/learned_v1.json")
+
+
+@pytest.mark.parametrize("mutation", ["latency_schema", "artifact_hash"])
+def test_smoke_rejects_embedded_latency_without_complete_cpu_evidence(tmp_path, mutation):
+    project, artifact, holdout, latency = _minimal_promoted_archive_inputs(tmp_path)
+    report = json.loads(latency.read_text(encoding="utf-8"))
+    if mutation == "latency_schema":
+        report["results"][2]["policy_inference_latency_valid"] = False
+    else:
+        report["candidate_artifact_sha256"] = "0" * 64
+    latency.write_text(json.dumps(report), encoding="utf-8")
+    archive = tmp_path / "submission.tar.gz"
+
+    build_submission_archive(
+        project, archive, artifact=artifact,
+        holdout_report=holdout, latency_report=latency,
+    )
+
+    with pytest.raises(RuntimeError, match="latency"):
+        smoke_test_archive(archive, "models/learned_v1.json")
 
 
 def test_submission_archive_rejects_missing_selected_artifact(tmp_path):

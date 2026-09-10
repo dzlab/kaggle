@@ -7,6 +7,7 @@ import gzip
 import hashlib
 import io
 import json
+import math
 import os
 import subprocess
 import sys
@@ -205,6 +206,93 @@ def _read_json_evidence(path: str | Path, *, label: str) -> tuple[bytes, dict]:
     if not isinstance(value, dict):
         raise ValueError(f"{label} evidence must be a JSON object")
     return content, value
+
+
+def _finite_nonnegative(value: object) -> bool:
+    return (
+        type(value) in (int, float)
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
+def _validate_embedded_evidence(root: Path, names: set[str], artifact: str) -> None:
+    """Validate promotion evidence independently of the training scripts."""
+    holdout = json.loads((root / "evidence/holdout.json").read_text(encoding="utf-8"))
+    decision = holdout.get("decision") if isinstance(holdout, dict) else None
+    if not isinstance(decision, dict) or decision.get("status") != "promote":
+        raise RuntimeError("holdout evidence decision must have status promote")
+
+    latency = json.loads((root / "evidence/cpu-latency.json").read_text(encoding="utf-8"))
+    if not isinstance(latency, dict) or latency.get("schema_version") != 1 or latency.get("device") != "cpu":
+        raise RuntimeError("latency evidence is not a complete CPU report")
+    if latency.get("candidate_artifact_sha256") != hashlib.sha256(
+        (root / artifact).read_bytes()
+    ).hexdigest():
+        raise RuntimeError("latency evidence artifact hash does not match bundled artifact")
+    gate = latency.get("gate")
+    if not isinstance(gate, dict):
+        raise RuntimeError("latency evidence gate is missing")
+    if (
+        gate.get("four_worker_result_present") is not True
+        or gate.get("real_engine_kept") is not True
+        or gate.get("simulator_required") is not False
+        or gate.get("inference_p95_ms_threshold") != 10.0
+    ):
+        raise RuntimeError("latency evidence CPU gate is incomplete or inconsistent")
+    results = latency.get("results")
+    if not isinstance(results, list):
+        raise RuntimeError("latency evidence results are missing")
+    expected_workers = {1, 2, 4, 8}
+    seen_workers: set[int] = set()
+    required = {
+        "workers", "games", "successful_games", "failed_games", "failure_counts",
+        "environment_steps", "rollout_seconds", "games_per_hour",
+        "environment_steps_per_second", "environment_steps_per_minute",
+        "policy_inference_ms_per_turn", "policy_inference_p95_ms",
+        "policy_inference_max_ms", "policy_inference_p95_budget_ms",
+        "policy_inference_p95_within_budget", "policy_inference_budget_exceeded",
+        "policy_inference_valid_samples", "policy_inference_invalid_samples",
+        "policy_inference_latency_valid", "benchmark_valid",
+    }
+    for result in results:
+        if not isinstance(result, dict) or not required.issubset(result):
+            raise RuntimeError("latency evidence result schema is incomplete")
+        workers = result["workers"]
+        if type(workers) is not int or workers in seen_workers:
+            raise RuntimeError("latency evidence worker matrix is invalid")
+        seen_workers.add(workers)
+        if (
+            result["benchmark_valid"] is not True
+            or result["failed_games"] != 0
+            or result["policy_inference_latency_valid"] is not True
+            or result["policy_inference_invalid_samples"] != 0
+            or type(result["policy_inference_valid_samples"]) is not int
+            or result["policy_inference_valid_samples"] < 1
+        ):
+            raise RuntimeError("latency evidence contains an invalid sample result")
+        for field in (
+            "rollout_seconds", "games_per_hour", "environment_steps_per_second",
+            "environment_steps_per_minute", "policy_inference_ms_per_turn",
+            "policy_inference_p95_ms", "policy_inference_max_ms",
+            "policy_inference_p95_budget_ms",
+        ):
+            if not _finite_nonnegative(result[field]):
+                raise RuntimeError(f"latency evidence numeric field is invalid: {field}")
+        if (
+            result["policy_inference_p95_budget_ms"] != 10.0
+            or result["policy_inference_max_ms"] < result["policy_inference_p95_ms"]
+            or result["policy_inference_p95_ms"] >= 10.0
+            or result["policy_inference_p95_within_budget"] is not True
+            or result["policy_inference_budget_exceeded"] is not False
+        ):
+            raise RuntimeError("latency evidence does not pass the 10 ms p95 gate")
+    if seen_workers != expected_workers:
+        raise RuntimeError("latency evidence worker matrix is incomplete")
+    worker_four = next(result for result in results if result["workers"] == 4)
+    threshold = gate.get("throughput_steps_per_minute_threshold")
+    if not _finite_nonnegative(threshold) or worker_four["environment_steps_per_minute"] < threshold:
+        raise RuntimeError("latency evidence throughput gate is invalid")
 
 
 def build_submission_archive(
@@ -444,6 +532,12 @@ def smoke_test_archive(archive: str | Path, artifact: str | None = None) -> dict
                         raise RuntimeError(f"archive {label} evidence is invalid: {exc}") from exc
                     if not isinstance(evidence_value, dict):
                         raise RuntimeError(f"archive {label} evidence must be an object")
+                if artifact is None or "models/learned_v1.json" not in names:
+                    raise RuntimeError("archive integrity manifest is missing the selected artifact")
+                try:
+                    _validate_embedded_evidence(root, names, artifact)
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(f"archive promotion evidence is invalid: {exc}") from exc
 
         code = (
             "import socket\n"

@@ -779,6 +779,7 @@ def test_colab_workflow_creates_promotion_archive_and_manifest_after_all_gates(t
                     "inference_p95_ms_threshold": 10.0,
                     "real_engine_kept": True,
                     "simulator_required": False,
+                    "throughput_steps_per_minute_threshold": 100000.0,
                 },
             }
             config.latency_report_path.write_text(json.dumps(report), encoding="utf-8")
@@ -1254,6 +1255,7 @@ def _write_passing_latency_report(config):
             "inference_p95_ms_threshold": 10.0,
             "real_engine_kept": True,
             "simulator_required": False,
+            "throughput_steps_per_minute_threshold": 100000.0,
         },
     }
     config.latency_report_path.write_text(json.dumps(report), encoding="utf-8")
@@ -1352,6 +1354,73 @@ def test_promotion_package_refuses_artifact_changed_before_packaging(tmp_path):
         )
     assert not config.promotion_archive_path.exists()
     assert not config.promotion_manifest_path.exists()
+
+
+def test_promotion_package_refuses_incomplete_promoting_holdout_evidence(tmp_path):
+    from scripts import colab_train
+
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+    config.stage_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    config.stage_artifact_path.write_text(
+        '{"workers": [], "market_orders": []}', encoding="utf-8",
+    )
+    config.holdout_report_path.write_text(
+        '{"decision": {"status": "promote"}}', encoding="utf-8",
+    )
+    _write_passing_latency_report(config)
+
+    with pytest.raises(RuntimeError, match="holdout evidence"):
+        colab_train._create_promotion_package(
+            config,
+            latency_report=config.latency_report_path,
+            development_safety_regression=False,
+        )
+    assert not config.promotion_archive_path.exists()
+    assert not config.promotion_manifest_path.exists()
+
+
+@pytest.mark.parametrize("evidence_name", ["holdout", "latency"])
+def test_promotion_package_refuses_evidence_changed_since_gate_validation(
+    tmp_path, evidence_name,
+):
+    from scripts import colab_train
+
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+    config.stage_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    config.stage_artifact_path.write_text(
+        '{"workers": [], "market_orders": []}', encoding="utf-8",
+    )
+    config.holdout_report_path.write_text(
+        '{"decision": {"status": "promote"}}', encoding="utf-8",
+    )
+    _write_passing_latency_report(config)
+    expected_holdout_sha256 = hashlib.sha256(
+        config.holdout_report_path.read_bytes(),
+    ).hexdigest()
+    expected_latency_sha256 = hashlib.sha256(
+        config.latency_report_path.read_bytes(),
+    ).hexdigest()
+    target = config.holdout_report_path if evidence_name == "holdout" else config.latency_report_path
+    target.write_text(
+        '{"decision": {"status": "discard"}}' if evidence_name == "holdout"
+        else '{"device": "cpu"}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="evidence changed"):
+        colab_train._create_promotion_package(
+            config,
+            latency_report=config.latency_report_path,
+            development_safety_regression=False,
+            expected_holdout_sha256=expected_holdout_sha256,
+            expected_latency_sha256=expected_latency_sha256,
+        )
 
 
 def test_latency_report_rejects_missing_emitted_schema_fields(tmp_path):

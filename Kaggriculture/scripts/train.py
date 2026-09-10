@@ -1652,6 +1652,8 @@ def _write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
 def _create_promotion_package(
     config: ColabConfig, *, latency_report: Path,
     development_safety_regression: bool,
+    expected_holdout_sha256: str | None = None,
+    expected_latency_sha256: str | None = None,
 ) -> tuple[Path, Path]:
     """Build, smoke-test, and document the deterministic submission package."""
     from scripts.submission_smoke import build_submission_archive, smoke_test_archive
@@ -1661,6 +1663,16 @@ def _create_promotion_package(
     archive.unlink(missing_ok=True)
     manifest_path.unlink(missing_ok=True)
     try:
+        current_holdout_sha256 = _sha256_path(config.holdout_report_path)
+        current_latency_sha256 = _sha256_path(latency_report)
+        if (
+            expected_holdout_sha256 is not None
+            and current_holdout_sha256 != expected_holdout_sha256
+        ) or (
+            expected_latency_sha256 is not None
+            and current_latency_sha256 != expected_latency_sha256
+        ):
+            raise RuntimeError("promotion evidence changed since gate validation")
         try:
             latency_document = json.loads(latency_report.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -1671,6 +1683,15 @@ def _create_promotion_package(
             latency_document, config.stage_artifact_path,
         ):
             raise RuntimeError("staged artifact changed after CPU benchmark; refusing to package")
+        try:
+            holdout_document = json.loads(
+                config.holdout_report_path.read_text(encoding="utf-8"),
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("holdout evidence could not be re-read before packaging") from exc
+        holdout_decision = holdout_document.get("decision") if isinstance(holdout_document, Mapping) else None
+        if not isinstance(holdout_decision, Mapping) or holdout_decision.get("status") != "promote":
+            raise RuntimeError("holdout evidence decision must have status promote")
         build_submission_archive(
             PROJECT_ROOT,
             archive,
@@ -1950,6 +1971,9 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
             ):
                 print("Staged artifact changed after CPU benchmark; holdout evaluation skipped.")
                 latency_gate_passed = False
+        latency_report_sha256 = (
+            _sha256_path(config.latency_report_path) if latency_gate_passed else None
+        )
         if development_promoted and latency_gate_passed:
             holdout_process, holdout_report = _run_evaluation(
                 config, phase="holdout", command=commands[3],
@@ -1991,6 +2015,9 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
                 print("Holdout evaluation skipped: development report is not complete/promote.")
             else:
                 print("Holdout evaluation skipped: CPU latency gate did not pass.")
+        holdout_report_sha256 = (
+            _sha256_path(config.holdout_report_path) if holdout_complete else None
+        )
 
         promotion_archive: Path | None = None
         promotion_manifest: Path | None = None
@@ -2006,6 +2033,8 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
                 promotion_archive, promotion_manifest = _create_promotion_package(
                     config, latency_report=config.latency_report_path,
                     development_safety_regression=development_safety_regression,
+                    expected_holdout_sha256=holdout_report_sha256,
+                    expected_latency_sha256=latency_report_sha256,
                 )
             except RuntimeError as exc:
                 print(f"Promotion package skipped: {exc}")
