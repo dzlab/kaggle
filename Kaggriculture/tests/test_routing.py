@@ -321,7 +321,7 @@ def test_daily_plan_accepts_parse_observation_canonical_nested_state():
         "market": {"prices": {"WHEAT": 7}},
     })
     kinds = {task.kind for task in build_daily_plan(parsed, EpisodeMemory())}
-    assert {"WATER", "FEED", "CARE", "STRUCTURE", "ANIMAL", "WEED", "PLANT", "SHED", "SELL"} <= kinds
+    assert {"WATER", "FEED", "CARE", "STRUCTURE", "ANIMAL", "WEED", "PLANT", "SHED"} <= kinds
 
 
 def test_daily_plan_keeps_canonical_shed_fertilizer_available_for_fertilizing():

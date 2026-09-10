@@ -61,6 +61,7 @@ def test_colab_notebook_is_a_small_setup_and_helper_launch_wrapper():
     assert launch_source.count("--experiment-config") == 1
     assert launch_source.count("--experiment ") == 1
     assert launch_source.count("--training-seed") == 1
+    assert "experiment_name = 'league_bc_ppo'" in launch_source
     assert "pip" not in clone_source
     assert "git" not in install_source
 
@@ -99,7 +100,7 @@ def test_colab_matrix_has_reproducible_variants_and_shared_matrices():
         "experimental_context_league",
     }
     assert matrix["shared"]["training_seeds"] == [7, 11, 19]
-    assert matrix["shared"]["collection_seeds"] == list(range(8))
+    assert matrix["shared"]["collection_seeds"] == list(range(200, 232))
     assert matrix["shared"]["development_seeds"] == list(range(50))
     assert matrix["shared"]["holdout_seeds"] == list(range(100, 150))
     assert matrix["shared"]["development_seats"] == [0, 1]
@@ -136,7 +137,7 @@ def test_matrix_config_applies_entry_budget_and_shared_seed_configuration(tmp_pa
     assert config.training_steps == 250
     assert config.behavior_clone_steps == 250
     assert config.ppo_target_steps == 128
-    assert config.collection_seed_values == tuple(range(8))
+    assert config.collection_seed_values == tuple(range(200, 232))
     assert config.development_seeds == tuple(range(50))
     assert config.holdout_seeds == tuple(range(100, 150))
     assert config.development_seats == (0, 1)
