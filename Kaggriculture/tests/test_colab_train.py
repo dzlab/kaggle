@@ -750,10 +750,6 @@ def test_colab_workflow_creates_promotion_archive_and_manifest_after_all_gates(t
                 json.dumps(config_report), encoding="utf-8",
             )
         elif script == colab_train.BENCHMARK_SCRIPT.name:
-            result = benchmark_rollouts.summarize_run(
-                worker_count=4, game_count=1, environment_steps=200000,
-                rollout_seconds=1.0, inference_latencies_ms=[1.0],
-            )
             report = {
                 "schema_version": 1,
                 "device": "cpu",
@@ -761,7 +757,14 @@ def test_colab_workflow_creates_promotion_archive_and_manifest_after_all_gates(t
                 "candidate_artifact_sha256": hashlib.sha256(
                     config.stage_artifact_path.read_bytes()
                 ).hexdigest(),
-                "results": [result],
+                "results": [
+                    benchmark_rollouts.summarize_run(
+                        worker_count=workers, game_count=1,
+                        environment_steps=200000,
+                        rollout_seconds=1.0, inference_latencies_ms=[1.0],
+                    )
+                    for workers in (1, 2, 4, 8)
+                ],
                 "gate": {"real_engine_kept": True},
             }
             config.latency_report_path.write_text(json.dumps(report), encoding="utf-8")
@@ -1166,13 +1169,6 @@ def _complete_colab_evaluation_report(config, *, phase):
 def _write_passing_latency_report(config):
     from scripts import benchmark_rollouts
 
-    result = benchmark_rollouts.summarize_run(
-        worker_count=4,
-        game_count=1,
-        environment_steps=200000,
-        rollout_seconds=1.0,
-        inference_latencies_ms=[1.0],
-    )
     report = {
         "schema_version": 1,
         "device": "cpu",
@@ -1180,7 +1176,16 @@ def _write_passing_latency_report(config):
         "candidate_artifact_sha256": hashlib.sha256(
             config.stage_artifact_path.read_bytes()
         ).hexdigest(),
-        "results": [result],
+        "results": [
+            benchmark_rollouts.summarize_run(
+                worker_count=workers,
+                game_count=1,
+                environment_steps=200000,
+                rollout_seconds=1.0,
+                inference_latencies_ms=[1.0],
+            )
+            for workers in (1, 2, 4, 8)
+        ],
         "gate": {"real_engine_kept": True},
     }
     config.latency_report_path.write_text(json.dumps(report), encoding="utf-8")
@@ -1207,7 +1212,7 @@ def test_latency_report_fails_when_staged_artifact_bytes_change_after_benchmark(
         "device": "cpu",
         "candidate_artifact": str(config.stage_artifact_path),
         "candidate_artifact_sha256": hashlib.sha256(b"candidate-v1").hexdigest(),
-        "results": [result],
+        "results": [{**result, "workers": workers} for workers in (1, 2, 4, 8)],
         "gate": {"real_engine_kept": True},
     }
 
@@ -1235,6 +1240,123 @@ def test_malformed_latency_result_fails_closed_without_raising(tmp_path):
         "candidate_artifact": str(config.stage_artifact_path),
         "candidate_artifact_sha256": hashlib.sha256(b"candidate").hexdigest(),
         "results": [1],
+        "gate": {"real_engine_kept": True},
+    }
+
+    assert colab_train._latency_report_is_complete(
+        report, artifact_path=config.stage_artifact_path,
+    ) is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("environment_steps_per_minute", False),
+        ("policy_inference_p95_ms", True),
+        ("environment_steps_per_minute", "200000.0"),
+        ("policy_inference_p95_ms", "1.0"),
+    ],
+)
+def test_latency_report_rejects_non_numeric_json_latency_values(
+    tmp_path, field, value,
+):
+    from scripts import colab_train
+
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+    config.stage_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    config.stage_artifact_path.write_bytes(b"candidate")
+    results = [
+        {
+            "workers": workers,
+            "benchmark_valid": True,
+            "failed_games": 0,
+            "environment_steps_per_minute": 200000.0,
+            "policy_inference_p95_ms": 1.0,
+        }
+        for workers in (1, 2, 4, 8)
+    ]
+    results[2][field] = value
+    report = {
+        "schema_version": 1,
+        "device": "cpu",
+        "candidate_artifact": str(config.stage_artifact_path),
+        "candidate_artifact_sha256": hashlib.sha256(
+            config.stage_artifact_path.read_bytes()
+        ).hexdigest(),
+        "results": results,
+        "gate": {"real_engine_kept": True},
+    }
+
+    assert colab_train._latency_report_is_complete(
+        report, artifact_path=config.stage_artifact_path,
+    ) is False
+
+
+def test_latency_report_rejects_duplicate_worker_four_result(tmp_path):
+    from scripts import colab_train
+
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+    config.stage_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    config.stage_artifact_path.write_bytes(b"candidate")
+    result = {
+        "workers": 4,
+        "benchmark_valid": True,
+        "failed_games": 0,
+        "environment_steps_per_minute": 200000.0,
+        "policy_inference_p95_ms": 1.0,
+    }
+    report = {
+        "schema_version": 1,
+        "device": "cpu",
+        "candidate_artifact": str(config.stage_artifact_path),
+        "candidate_artifact_sha256": hashlib.sha256(
+            config.stage_artifact_path.read_bytes()
+        ).hexdigest(),
+        "results": [
+            {**result, "workers": 1},
+            {**result, "workers": 2},
+            result,
+            {**result, "workers": 4, "policy_inference_p95_ms": 100.0},
+            {**result, "workers": 8},
+        ],
+        "gate": {"real_engine_kept": True},
+    }
+
+    assert colab_train._latency_report_is_complete(
+        report, artifact_path=config.stage_artifact_path,
+    ) is False
+
+
+def test_latency_report_rejects_missing_expected_worker_result(tmp_path):
+    from scripts import colab_train
+
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+    config.stage_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    config.stage_artifact_path.write_bytes(b"candidate")
+    result = {
+        "workers": 4,
+        "benchmark_valid": True,
+        "failed_games": 0,
+        "environment_steps_per_minute": 200000.0,
+        "policy_inference_p95_ms": 1.0,
+    }
+    report = {
+        "schema_version": 1,
+        "device": "cpu",
+        "candidate_artifact": str(config.stage_artifact_path),
+        "candidate_artifact_sha256": hashlib.sha256(
+            config.stage_artifact_path.read_bytes()
+        ).hexdigest(),
+        "results": [{**result, "workers": workers} for workers in (1, 2, 4)],
         "gate": {"real_engine_kept": True},
     }
 

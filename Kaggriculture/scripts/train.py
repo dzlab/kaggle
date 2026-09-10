@@ -1470,6 +1470,7 @@ def _latency_report_is_complete(
     report: Mapping[str, Any], *, artifact_path: Path,
 ) -> bool:
     """Require a fresh CPU benchmark report that passes the release gate."""
+    expected_workers = {1, 2, 4, 8}
     if report.get("schema_version") != 1 or report.get("device") != "cpu":
         return False
     reported_artifact = report.get("candidate_artifact")
@@ -1498,6 +1499,7 @@ def _latency_report_is_complete(
         "workers", "benchmark_valid", "failed_games",
         "environment_steps_per_minute", "policy_inference_p95_ms",
     )
+    seen_workers = set()
     for result in results:
         if not isinstance(result, Mapping):
             return False
@@ -1505,17 +1507,25 @@ def _latency_report_is_complete(
             return False
         if type(result["workers"]) is not int or result["workers"] < 1:
             return False
+        if result["workers"] in seen_workers:
+            return False
+        seen_workers.add(result["workers"])
         if type(result["benchmark_valid"]) is not bool:
             return False
         if type(result["failed_games"]) is not int or result["failed_games"] < 0:
             return False
         for field in ("environment_steps_per_minute", "policy_inference_p95_ms"):
+            value = result[field]
+            if type(value) not in (int, float):
+                return False
             try:
-                value = float(result[field])
-            except (TypeError, ValueError):
+                valid_number = math.isfinite(value) and value >= 0
+            except (OverflowError, TypeError):
                 return False
-            if not math.isfinite(value):
+            if not valid_number:
                 return False
+    if seen_workers != expected_workers:
+        return False
     from scripts.benchmark_rollouts import real_engine_gate_passed
 
     return real_engine_gate_passed(results)
