@@ -693,6 +693,21 @@ def test_basic_need_guard_reserves_next_day_capacity_hire_cash():
     assert guarded == []
 
 
+def test_basic_need_guard_uses_configured_shed_capacity_for_purchase_room():
+    state = _state(
+        cash=100,
+        configuration={"shedCapacity": 2},
+        private={"seeds": {}, "shed": {"WHEAT": 1}, "inventories": [{}]},
+    )
+    policy = Policy(strategy="current")
+
+    guarded, _protected_directions = policy._basic_need_guard(
+        state, [["BUY_PRODUCT", "WHEAT", 2]], [], None,
+    )
+
+    assert guarded == []
+
+
 def test_macro_deadline_capacity_hire_preempts_optional_seed_purchase():
     tiles = [["EMPTY"] * 10 for _ in range(10)]
     for x in range(10):

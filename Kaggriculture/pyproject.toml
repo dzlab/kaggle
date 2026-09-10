@@ -29,6 +29,9 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "performance: execute the 1000-state runtime gate",
+]
 
 [tool.setuptools.packages.find]
 include = ["kagriculture_agent*"]

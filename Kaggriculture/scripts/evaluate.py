@@ -3904,7 +3904,10 @@ class VariantPolicy:
                     preserve_malformed_market=True,
                 )
             adjusted = _apply_ablations(action, obs, self.ablations)
-            return _sanitize_action(adjusted, obs, action, configuration)
+            return _sanitize_action(
+                adjusted, obs, action, configuration,
+                preserve_malformed_market=True,
+            )
         return apply_variant(self._act(obs), obs, self.variant, self.ablations, configuration)
 
 

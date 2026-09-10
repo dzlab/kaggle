@@ -3756,6 +3756,22 @@ def test_route_candidate_preserves_malformed_top_level_market(market):
     assert candidate(observation)["market"] == market
 
 
+def test_route_candidate_preserves_malformed_market_entry():
+    from scripts.evaluate import VariantPolicy
+
+    replay = _strict_two_turn_replay()
+    observation = replay["steps"][0][0]["observation"]
+    candidate = VariantPolicy(
+        "mixed",
+        route_candidate=True,
+        route_policy=lambda _observation: {
+            "farmer": ["PASS"], "hands": [], "market": [["BOGUS"]],
+        },
+    )
+
+    assert candidate(observation)["market"] == [["BOGUS"]]
+
+
 def test_conservative_variant_preserves_mandatory_wheat_and_fertilizer_orders():
     from scripts.evaluate import apply_variant
 

@@ -98,6 +98,14 @@ def _state_for_planner(state: Any) -> dict[str, Any]:
     return normalize_planner_state(state)
 
 
+def _shed_capacity(state: Any) -> int:
+    """Resolve the engine shed capacity from state configuration."""
+    configuration = _mapping(_get(state, "configuration", {}))
+    return max(1, _whole(
+        _get(configuration, "shedCapacity"), DEFAULT_SHED_CAPACITY,
+    ))
+
+
 def _tiles(state: Any) -> Any:
     tiles = _get(state, "tiles")
     if tiles is None:
@@ -619,10 +627,7 @@ def build_market_orders(state: Any, plan: Any,
     orders: list[list[Any]] = []
     product_buys: dict[str, int] = {}
     animal_buys = 0
-    configuration = _mapping(_get(state, "configuration", {}))
-    shed_capacity = max(1, _whole(
-        _get(configuration, "shedCapacity"), DEFAULT_SHED_CAPACITY,
-    ))
+    shed_capacity = _shed_capacity(state)
     shed_room = max(0, shed_capacity - sum(shed.values()))
     intents = _approved_intents(plan)
     allowed_crops = set(strategy.crops) if strategy is not None else set(CROPS)
@@ -956,11 +961,7 @@ def _drop_carried_goods(state: Any, worker_index: int, task: Any, current: Posit
     if not force and required is not None and inventory.get(required, 0) > 0:
         return None
     if shed_room is None:
-        configuration = _mapping(_get(state, "configuration", {}))
-        shed_capacity = max(1, _whole(
-            _get(configuration, "shedCapacity"), DEFAULT_SHED_CAPACITY,
-        ))
-        shed_room = max(0, shed_capacity - sum(_counts(_shed(state)).values()))
+        shed_room = max(0, _shed_capacity(state) - sum(_counts(_shed(state)).values()))
     cleanup = "DROP" if carried_total <= shed_room else next((
         f"PLACE {item} {min(inventory[item], shed_room)}"
         for item in PRODUCTS
@@ -1018,10 +1019,7 @@ def _bound_shed_deposit_commands(
     state: Any, commands: Mapping[int, Sequence[Any]],
 ) -> dict[int, list[Any]]:
     """Reserve configured shed room across every deposit in one action."""
-    configuration = _mapping(_get(state, "configuration", {}))
-    capacity = max(1, _whole(
-        _get(configuration, "shedCapacity"), DEFAULT_SHED_CAPACITY,
-    ))
+    capacity = _shed_capacity(state)
     room = max(0, capacity - sum(_counts(_shed(state)).values()))
     workers = {
         worker["index"]: worker
@@ -1347,7 +1345,7 @@ class Policy:
         capacity_hire_reserve = _purchase_cost("HIRE", None, normalized) + 100.0
         available_shed_room = max(
             0,
-            DEFAULT_SHED_CAPACITY
+            _shed_capacity(normalized)
             - sum(_counts(_shed(normalized)).values())
             + sum(
                 min(_whole(order[2]), _counts(_shed(normalized)).get(str(order[1]).upper(), 0))
@@ -1379,6 +1377,9 @@ class Policy:
                 quantity = _whole(order[2]) if len(order) >= 3 else 0
                 uses_shed_room = kind in {"BUY_PRODUCT", "BUY_ANIMAL"}
                 capacity_ok = not uses_shed_room or quantity <= available_shed_room
+                if not capacity_ok:
+                    guard_blocked = True
+                    continue
                 discretionary = (
                     kind in {"BUY_LAND", "BUY_ANIMAL", "HIRE", "BUY_SEED"}
                     or (kind == "BUY_PRODUCT" and item != "WHEAT")
@@ -1538,10 +1539,7 @@ class Policy:
         )
         if terminal_cleanup:
             commands = {}
-            configuration = _mapping(_get(state, "configuration", {}))
-            shed_capacity = max(1, _whole(
-                _get(configuration, "shedCapacity"), DEFAULT_SHED_CAPACITY,
-            ))
+            shed_capacity = _shed_capacity(state)
             shed_room = max(0, shed_capacity - sum(_counts(_shed(state)).values()))
             for worker in workers:
                 drop = _drop_carried_goods(
