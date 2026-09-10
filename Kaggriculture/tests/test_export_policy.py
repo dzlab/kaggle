@@ -566,6 +566,7 @@ def test_latency_report_explicitly_marks_over_budget_p95():
     )
 
     assert result["policy_inference_p95_ms"] == pytest.approx(MAX_POLICY_INFERENCE_P95_MS + 1.0)
+    assert result["policy_inference_max_ms"] == pytest.approx(MAX_POLICY_INFERENCE_P95_MS + 1.0)
     assert result["policy_inference_p95_budget_ms"] == MAX_POLICY_INFERENCE_P95_MS
     assert result["policy_inference_p95_within_budget"] is False
     assert result["policy_inference_budget_exceeded"] is True
@@ -633,6 +634,59 @@ def test_slow_learned_inference_disables_future_overrides(monkeypatch):
     assert policy.diagnostics["inference_status"] == "slow_inference"
     assert policy.diagnostics["budget_seconds"] == 0.05
     assert policy.diagnostics["learned_overrides_enabled"] is False
+
+
+def test_public_policy_act_preserves_deterministic_action_when_learned_inference_is_slow(monkeypatch):
+    import kagriculture_agent.learned_policy as runtime
+    from kagriculture_agent.learned_policy import (
+        DependencyFreePolicy,
+        PolicyProposal,
+        WorkerProposal,
+    )
+    from kagriculture_agent.policy import Policy
+    from kagriculture_agent.types import Position
+
+    state = {
+        "player": 0,
+        "day": 0,
+        "hour": 0,
+        "farms": [
+            {
+                "tiles": [[None]],
+                "farmer": [0, 0],
+                "hands": [],
+                "money": 3_000,
+                "unlocked_quadrants": ["NW"],
+            },
+            {"tiles": [[None]], "farmer": [0, 0], "hands": []},
+        ],
+        "private": {"shed": {}, "seeds": {"WHEAT": 2}, "inventories": [[]]},
+        "market": {"prices": {"WHEAT": 10, "FERTILIZER": 20}, "inventory": {}},
+        "town": {"unlocked_shops": []},
+    }
+
+    model = object.__new__(DependencyFreePolicy)
+
+    def propose(_self, _state, _features):
+        return PolicyProposal(
+            (WorkerProposal(0, "WATER", Position(0, 0), None, 1.0),),
+            (),
+            1.0,
+            "slow-model",
+        )
+
+    monkeypatch.setattr(DependencyFreePolicy, "propose", propose)
+
+    ticks = iter((10.0, 10.06))
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: next(ticks))
+
+    deterministic = Policy().act(state)
+    learned = Policy(learned_model=model, learned_timeout_seconds=0.05)
+    actual = learned.act(state)
+
+    assert actual == deterministic
+    assert learned.memory.diagnostics["learned_model_status"] == "slow_model"
+    assert learned.learned_policy.diagnostics["learned_overrides_enabled"] is False
 
 
 def test_exported_model_agrees_with_training_fixture_when_torch_is_available(tmp_path):

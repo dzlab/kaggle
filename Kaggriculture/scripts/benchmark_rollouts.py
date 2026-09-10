@@ -167,6 +167,7 @@ def summarize_run(
     latency_valid = bool(latencies) and invalid_latency_samples == 0
     mean_latency = sum(latencies) / len(latencies) if latencies else None
     p95_latency = _percentile(latencies, 95.0) if latencies else None
+    max_latency = max(latencies) if latencies else None
     p95_within_budget = (
         p95_latency is not None and p95_latency < MAX_POLICY_INFERENCE_P95_MS
     )
@@ -188,6 +189,7 @@ def summarize_run(
         "environment_steps_per_minute": float(steps_per_second * 60.0),
         "policy_inference_ms_per_turn": float(mean_latency) if mean_latency is not None else None,
         "policy_inference_p95_ms": float(p95_latency) if p95_latency is not None else None,
+        "policy_inference_max_ms": float(max_latency) if max_latency is not None else None,
         "policy_inference_p95_budget_ms": float(MAX_POLICY_INFERENCE_P95_MS),
         "policy_inference_p95_within_budget": p95_within_budget,
         "policy_inference_budget_exceeded": budget_exceeded,
