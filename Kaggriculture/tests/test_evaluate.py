@@ -890,6 +890,53 @@ def test_promotion_decision_reports_unsafe_baseline_without_vetoing_safe_challen
     assert decision["baseline_safety_gate_reasons"] == ["missed_basic_needs"]
 
 
+def test_promotion_decision_candidate_safety_failure_remains_decisive_with_unsafe_baseline():
+    from scripts.evaluate import promotion_decision
+
+    candidate = [
+        _metric_record(seat=seat, seed=1, outcome="win", differential=10, missed_basic_needs=1)
+        for seat in (0, 1)
+    ]
+    baseline = [
+        _metric_record(
+            seat=seat, seed=1, outcome="loss", differential=1,
+            candidate="current", missed_basic_needs=1,
+        )
+        for seat in (0, 1)
+    ]
+
+    decision = promotion_decision(candidate, baseline, min_valid_games=1)
+
+    assert decision["status"] == "discard"
+    assert decision["reasons"] == ["missed_basic_needs"]
+    assert decision["baseline_safety_gate_reasons"] == ["missed_basic_needs"]
+
+
+def test_promotion_decision_preserves_external_baseline_pairing_requirement():
+    from scripts.evaluate import promotion_decision
+
+    candidate = [
+        _metric_record(seat=seat, seed=1, opponent="pass", outcome="win", differential=10)
+        for seat in (0, 1)
+    ]
+    incomplete_baseline = [
+        _metric_record(
+            seat=0, seed=1, opponent="pass", candidate="current",
+            outcome="loss", differential=1,
+        )
+    ]
+
+    decision = promotion_decision(
+        candidate, incomplete_baseline, min_valid_games=1,
+        expected_matrix=[("pass", 1, 0), ("pass", 1, 1)],
+        baseline_policy="previous-agent",
+    )
+
+    assert decision["status"] == "discard"
+    assert decision["reasons"] == ["baseline_incomplete_pairing"]
+    assert decision["baseline_safety_gate_reasons"] == ["missing_expected_matrix_records"]
+
+
 def test_promotion_decision_rejects_diagnostic_regression_and_reports_deltas():
     from scripts.evaluate import promotion_decision
 
@@ -3615,6 +3662,55 @@ def test_replay_rejects_market_orders_that_cannot_execute_from_prior_state():
 
     assert not _valid_action_schema({**prefix, "market": [["SELL", "WHEAT", 1]]}, observation)
     assert not _valid_action_schema({**prefix, "market": [["BUY_SEED", "WHEAT", 1]]}, observation)
+
+
+def test_lockstep_market_strictness_tracks_candidate_player_index():
+    from scripts.evaluate import _simulate_market_orders_lockstep
+
+    market = {"prices": {"WHEAT": 25}, "inventory": {"WHEAT": 10000}}
+    observations = [
+        {
+            "player": 0,
+            "farms": [{"money": 100, "hires_today": 0, "unlocked_quadrants": ["NW"]}],
+            "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+            "market": market,
+        },
+        {
+            "player": 1,
+            "farms": [{"money": 100}, {"money": 100, "hires_today": 0, "unlocked_quadrants": ["NW"]}],
+            "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+            "market": market,
+        },
+    ]
+
+    assert _simulate_market_orders_lockstep(
+        [[], [["SELL", "WHEAT", 1]]], observations, {}, candidate_player=1,
+    ) is None
+    assert _simulate_market_orders_lockstep(
+        [[["SELL", "WHEAT", 1]], []], observations, {}, candidate_player=1,
+    ) is not None
+
+
+def test_lockstep_market_rejects_invalid_candidate_player_index():
+    from scripts.evaluate import _simulate_market_orders_lockstep
+
+    market = {"prices": {"WHEAT": 25}, "inventory": {"WHEAT": 10000}}
+    observations = [
+        {
+            "player": player,
+            "farms": [{"money": 100, "hires_today": 0, "unlocked_quadrants": ["NW"]}],
+            "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+            "market": market,
+        }
+        for player in (0, 1)
+    ]
+
+    assert _simulate_market_orders_lockstep(
+        [[], []], observations, {}, candidate_player=True,
+    ) is None
+    assert _simulate_market_orders_lockstep(
+        [[], []], observations, {}, candidate_player=2,
+    ) is None
 
 
 def test_replay_market_execution_is_strict_for_candidate_in_seat_one_only():
