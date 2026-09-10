@@ -657,6 +657,42 @@ def test_basic_need_guard_keeps_hire_that_adds_deadline_capacity():
     assert guarded == [["HIRE"]]
 
 
+def test_macro_funds_deadline_hire_without_pre_funding_stored_animal_feed():
+    """Stored-animal feed is a future reserve, not an immediate hire cost."""
+    tiles = [["EMPTY"] * 10 for _ in range(10)]
+    for x in range(1, 10):
+        tiles[0][x] = {
+            "kind": "PLANT",
+            "crop": "WHEAT",
+            "watered_today": False,
+            "fertilized_until_day": 11,
+        }
+    tiles[1][1] = {
+        "kind": "PLANT",
+        "crop": "WHEAT",
+        "watered_today": False,
+        "fertilized_until_day": 11,
+    }
+    state = _state(
+        day=11,
+        hour=0,
+        board_size=10,
+        cash=101,
+        tiles=tiles,
+        private={
+            "seeds": {"WHEAT": 1, "CARROT": 1, "TOMATO": 1, "STRAWBERRY": 1, "MELON": 1},
+            "shed": {"GOOSE": 2},
+            "inventories": [{}],
+        },
+        market={"prices": {"WHEAT": 10}, "inventory": {"WHEAT": 1000}},
+    )
+
+    macro = build_autonomous_macro_plan(state)
+
+    assert ["HIRE"] in macro["market_intents"]
+    assert not any(intent[0] == "BUY_ANIMAL" for intent in macro["market_intents"])
+
+
 @__import__("pytest").mark.parametrize(
     ("cash", "wheat", "expected"),
     [(7, 30, True), (150, 30, True), (7, 0, False)],

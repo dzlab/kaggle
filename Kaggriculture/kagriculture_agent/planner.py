@@ -1038,20 +1038,13 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
             )
         )
         hire_cost = _intent_purchase_cost((["HIRE"],), normalized)
-        planned_feed_intents = [
-            intent for intent in intents
-            if len(intent) >= 3
-            and intent[0] == "BUY_PRODUCT"
-            and intent[1] == "WHEAT"
-        ]
-        unfunded_required_feed, cash_after_required_feed = _feed_purchase_needed(
-            normalized, day, planning_animal_counts, planned_feed_intents,
-            cash, wheat_price,
-            strategy.reserve_wheat if strategy is not None else 0,
-        )
+        # Deadline hiring is an immediate capacity purchase.  The remaining
+        # feed reserve is a future solvency obligation, not a prerequisite to
+        # paying for a helper now.  Feed remains independently guarded above,
+        # and BUY_ANIMAL below still requires the full reserve to be funded.
+        cash_after_planned_intents = cash - _intent_purchase_cost(intents, normalized)
         can_fund_deadline_hire = (
-            unfunded_required_feed == 0
-            and cash_after_required_feed >= hire_cost
+            cash_after_planned_intents >= hire_cost + reserve
         )
         if hand_count < 2 and hires_today == 0:
             if deadline_capacity_hire and can_fund_deadline_hire:
