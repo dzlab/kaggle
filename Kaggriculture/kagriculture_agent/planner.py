@@ -1618,7 +1618,11 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
             and other.deadline == task.deadline
             and other.priority == task.priority
         ]
-        if equal_due_feeds and candidates:
+        # Preserve due-feed coverage when multiple workers can cover the
+        # competing needs. With one worker, no assignment can satisfy both
+        # equal-priority tasks, so retain the documented route tie-breaker
+        # instead of reserving a task solely by kind.
+        if len(infos) > 1 and equal_due_feeds and candidates:
             feed_capacity = feed_matching_size(equal_due_feeds, available)
             candidates = [
                 candidate for candidate in candidates
