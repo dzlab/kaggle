@@ -574,6 +574,12 @@ def test_latency_report_explicitly_marks_over_budget_p95():
 
 @pytest.mark.performance
 def test_numpy_full_state_inference_reports_latency_evidence(tmp_path):
+    """Report host timing as evidence; the release benchmark enforces the budget.
+
+    The configured 10 ms p95 threshold and machine-readable p95/max,
+    within-budget, and budget-exceeded telemetry remain the release gate.
+    Ordinary pytest must not fail solely because this host is slower or noisier.
+    """
     from scripts.benchmark_rollouts import MAX_POLICY_INFERENCE_P95_MS
 
     path = tmp_path / "policy.json"
@@ -652,7 +658,11 @@ def test_public_policy_act_preserves_deterministic_action_when_learned_inference
         "hour": 0,
         "farms": [
             {
-                "tiles": [[None]],
+                "tiles": [[{
+                    "kind": "PLANT",
+                    "crop": "WHEAT",
+                    "watered_today": False,
+                }]],
                 "farmer": [0, 0],
                 "hands": [],
                 "money": 3_000,
@@ -660,7 +670,11 @@ def test_public_policy_act_preserves_deterministic_action_when_learned_inference
             },
             {"tiles": [[None]], "farmer": [0, 0], "hands": []},
         ],
-        "private": {"shed": {}, "seeds": {"WHEAT": 2}, "inventories": [[]]},
+        "private": {
+            "shed": {},
+            "seeds": {"WHEAT": 2},
+            "inventories": [{"FERTILIZER": 1}],
+        },
         "market": {"prices": {"WHEAT": 10, "FERTILIZER": 20}, "inventory": {}},
         "town": {"unlocked_shops": []},
     }
@@ -669,7 +683,7 @@ def test_public_policy_act_preserves_deterministic_action_when_learned_inference
 
     def propose(_self, _state, _features):
         return PolicyProposal(
-            (WorkerProposal(0, "WATER", Position(0, 0), None, 1.0),),
+            (WorkerProposal(0, "FERTILIZE", Position(0, 0), "WHEAT", 1.0),),
             (),
             1.0,
             "slow-model",
@@ -677,10 +691,17 @@ def test_public_policy_act_preserves_deterministic_action_when_learned_inference
 
     monkeypatch.setattr(DependencyFreePolicy, "propose", propose)
 
-    ticks = iter((10.0, 10.06))
-    monkeypatch.setattr(runtime.time, "monotonic", lambda: next(ticks))
-
     deterministic = Policy().act(state)
+
+    fast_ticks = iter((10.0, 10.001))
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: next(fast_ticks))
+    fast = Policy(learned_model=model, learned_timeout_seconds=0.05)
+    fast_action = fast.act(state)
+    assert fast_action != deterministic
+    assert fast_action["farmer"] == ["FERTILIZE"]
+
+    slow_ticks = iter((10.0, 10.06))
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: next(slow_ticks))
     learned = Policy(learned_model=model, learned_timeout_seconds=0.05)
     actual = learned.act(state)
 
