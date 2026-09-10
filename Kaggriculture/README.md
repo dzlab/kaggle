@@ -361,6 +361,10 @@ before holdout and again immediately before packaging; a changed artifact
 fails closed and produces no release archive.
 Promoted archives also include `evidence/holdout.json`,
 `evidence/cpu-latency.json`, and a `manifest.json` integrity record. The
+embedded holdout evidence must be a complete evaluator report for the selected
+candidate and configured holdout matrix, with `decision.status` exactly
+`"promote"`; malformed, incomplete, changed, or non-promoting evidence fails
+closed.
 manifest records SHA-256 values for every archive member except itself and
 records the source hashes and archive member names for both evidence files.
 Archive smoke validation requires the exact runtime/artifact/evidence member
