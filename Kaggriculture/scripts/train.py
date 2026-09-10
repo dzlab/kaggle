@@ -1689,9 +1689,30 @@ def _create_promotion_package(
             )
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise RuntimeError("holdout evidence could not be re-read before packaging") from exc
-        holdout_decision = holdout_document.get("decision") if isinstance(holdout_document, Mapping) else None
-        if not isinstance(holdout_decision, Mapping) or holdout_decision.get("status") != "promote":
-            raise RuntimeError("holdout evidence decision must have status promote")
+        holdout_decision = (
+            holdout_document.get("decision")
+            if isinstance(holdout_document, Mapping)
+            else None
+        )
+        if (
+            not isinstance(holdout_document, Mapping)
+            or not isinstance(holdout_decision, Mapping)
+            or holdout_decision.get("status") != "promote"
+            or not evaluation_report_is_complete(
+                holdout_document,
+                identity=config.candidate_tag,
+                seed_values=config.holdout_seeds,
+                opponents=config.holdout_opponents,
+                seats=config.holdout_seats,
+                artifact_path=config.stage_artifact_path,
+            )
+            or validation_safety_regression(
+                holdout_document, candidate=config.candidate_tag,
+            )
+        ):
+            raise RuntimeError(
+                "holdout evidence is incomplete, unsafe, or decision status is not promote"
+            )
         build_submission_archive(
             PROJECT_ROOT,
             archive,
