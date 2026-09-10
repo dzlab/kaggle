@@ -730,12 +730,21 @@ def test_colab_workflow_skips_holdout_when_cpu_latency_report_is_invalid(tmp_pat
 
 def test_colab_workflow_creates_promotion_archive_and_manifest_after_all_gates(tmp_path, monkeypatch):
     from scripts import benchmark_rollouts, colab_train
+    from scripts import submission_smoke
 
     config = colab_train.build_config(
         run_directory=tmp_path, device="cpu", mount_drive=False,
         development_seeds=(0,), holdout_seeds=(100,),
     )
     invoked = []
+    archive_call = {}
+    real_build_archive = submission_smoke.build_submission_archive
+
+    def capture_build_archive(*args, **kwargs):
+        archive_call.update(kwargs)
+        return real_build_archive(*args, **kwargs)
+
+    monkeypatch.setattr(submission_smoke, "build_submission_archive", capture_build_archive)
 
     def fake_run(command, *, check, capture_output=False):
         script = Path(command[1]).name
@@ -791,6 +800,8 @@ def test_colab_workflow_creates_promotion_archive_and_manifest_after_all_gates(t
     assert result.promotion_ready is True
     assert result.release_ready is True
     assert result.holdout_evaluation_complete is True
+    assert archive_call["holdout_report"] == config.holdout_report_path
+    assert archive_call["latency_report"] == config.latency_report_path
     assert result.promotion_archive_path is not None and result.promotion_archive_path.is_file()
     assert result.promotion_manifest_path is not None and result.promotion_manifest_path.is_file()
     manifest = json.loads(result.promotion_manifest_path.read_text(encoding="utf-8"))
@@ -802,6 +813,53 @@ def test_colab_workflow_creates_promotion_archive_and_manifest_after_all_gates(t
         "latency_passed": True,
         "archive_smoke_test_passed": True,
     }
+
+
+def test_colab_workflow_is_not_release_ready_when_archive_smoke_validation_fails(
+    tmp_path, monkeypatch,
+):
+    from scripts import benchmark_rollouts, colab_train, submission_smoke
+
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+
+    def fake_run(command, *, check, capture_output=False):
+        script = Path(command[1]).name
+        if script == colab_train.COLLECT_SCRIPT.name:
+            config.trajectory_path.write_text("{}\n", encoding="utf-8")
+        elif script == colab_train.EVALUATE_SCRIPT.name:
+            phase = "holdout" if "holdout" in command[-1] else "development"
+            report = _complete_colab_evaluation_report(config, phase=phase)
+            report["decision"] = {"status": "promote"}
+            target = config.holdout_report_path if phase == "holdout" else config.development_report_path
+            target.write_text(json.dumps(report), encoding="utf-8")
+        elif script == colab_train.BENCHMARK_SCRIPT.name:
+            _write_passing_latency_report(config)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_train(config, **kwargs):
+        config.stage_checkpoint_path.write_bytes(b"checkpoint")
+        config.stage_artifact_path.write_text(
+            '{"workers": [], "market_orders": []}', encoding="utf-8",
+        )
+        return {}
+
+    monkeypatch.setattr(colab_train, "run_command", fake_run)
+    monkeypatch.setattr(colab_train, "train_candidate", fake_train)
+    monkeypatch.setattr(colab_train, "initialize_telemetry", lambda config: None)
+    monkeypatch.setattr(colab_train, "smoke_test_artifact", lambda config: None)
+    monkeypatch.setattr(
+        submission_smoke, "smoke_test_archive",
+        lambda archive, artifact: {"archive": str(archive), "passed": False},
+    )
+
+    result = colab_train.run_workflow(config)
+
+    assert result.promotion_archive_path is None
+    assert result.promotion_manifest_path is None
+    assert result.release_ready is False
 
 
 def test_colab_cli_propagates_reward_and_stall_ablations_to_config_and_collection(tmp_path):

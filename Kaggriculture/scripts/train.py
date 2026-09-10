@@ -1672,9 +1672,15 @@ def _create_promotion_package(
         ):
             raise RuntimeError("staged artifact changed after CPU benchmark; refusing to package")
         build_submission_archive(
-            PROJECT_ROOT, archive, artifact=config.stage_artifact_path,
+            PROJECT_ROOT,
+            archive,
+            artifact=config.stage_artifact_path,
+            holdout_report=config.holdout_report_path,
+            latency_report=latency_report,
         )
-        smoke_test_archive(archive, "models/learned_v1.json")
+        smoke_result = smoke_test_archive(archive, "models/learned_v1.json")
+        if not isinstance(smoke_result, Mapping) or smoke_result.get("passed") is not True:
+            raise RuntimeError("promotion archive smoke validation did not pass")
         manifest = {
             "schema_version": 1,
             "candidate": config.candidate_tag,

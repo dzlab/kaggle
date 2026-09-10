@@ -359,6 +359,13 @@ loading fails. The checked-in source `main.py` remains deterministic-only.
 The artifact SHA-256 recorded by the CPU report is rechecked immediately
 before holdout and again immediately before packaging; a changed artifact
 fails closed and produces no release archive.
+Promoted archives also include `evidence/holdout.json`,
+`evidence/cpu-latency.json`, and a `manifest.json` integrity record. The
+manifest records SHA-256 values for every archive member except itself and
+records the source hashes and archive member names for both evidence files.
+Archive smoke validation requires the exact runtime/artifact/evidence member
+set, parses both evidence documents, and verifies every recorded member hash
+before the release is marked ready.
 
 If development is not promoted, training intentionally continues as a
 stage-only result. If development is promoted but a requested latency,

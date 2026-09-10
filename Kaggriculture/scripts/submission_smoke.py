@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -190,12 +191,30 @@ def _validate_artifact(path: Path, root: Path) -> None:
         raise ValueError(f"selected artifact failed runtime validation: {detail}")
 
 
+def _read_json_evidence(path: str | Path, *, label: str) -> tuple[bytes, dict]:
+    evidence_path = Path(path).expanduser().resolve()
+    if not evidence_path.is_file():
+        raise ValueError(f"{label} evidence does not exist: {evidence_path}")
+    if evidence_path.stat().st_size > _MAX_MEMBER_BYTES:
+        raise ValueError(f"{label} evidence is too large")
+    try:
+        content = evidence_path.read_bytes()
+        value = json.loads(content.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} evidence is not valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} evidence must be a JSON object")
+    return content, value
+
+
 def build_submission_archive(
     project_root: str | Path,
     output: str | Path,
     artifact: str | Path | None = None,
+    holdout_report: str | Path | None = None,
+    latency_report: str | Path | None = None,
 ) -> dict:
-    """Create a deterministic archive containing only the submission runtime."""
+    """Create a deterministic runtime archive with optional promotion evidence."""
     root = Path(project_root).resolve()
     output_path = Path(output).resolve()
     main = root / "main.py"
@@ -216,6 +235,19 @@ def build_submission_archive(
         artifact_relative = "models/learned_v1.json"
         _validate_artifact(artifact_path, root)
 
+    if (holdout_report is None) != (latency_report is None):
+        raise ValueError("holdout_report and latency_report must be provided together")
+    if holdout_report is not None and artifact is None:
+        raise ValueError("promotion evidence requires a selected artifact")
+    evidence: dict[str, tuple[bytes, dict, Path]] = {}
+    if holdout_report is not None and latency_report is not None:
+        holdout_bytes, holdout_value = _read_json_evidence(holdout_report, label="holdout")
+        latency_bytes, latency_value = _read_json_evidence(latency_report, label="latency")
+        evidence = {
+            "evidence/holdout.json": (holdout_bytes, holdout_value, Path(holdout_report).expanduser().resolve()),
+            "evidence/cpu-latency.json": (latency_bytes, latency_value, Path(latency_report).expanduser().resolve()),
+        }
+
     if not package.is_dir():
         raise ValueError("kagriculture_agent package does not exist")
 
@@ -225,6 +257,33 @@ def build_submission_archive(
     selected.extend((path, relative, None) for path, relative in _runtime_files(package, root))
     if artifact is not None:
         selected.append((artifact_path, artifact_relative, None))
+    selected.extend((None, relative, content) for relative, (content, _, _) in evidence.items())
+
+    if evidence:
+        integrity = {
+            "schema_version": 1,
+            "members": {},
+            "evidence": {
+                "holdout": {
+                    "member": "evidence/holdout.json",
+                    "source": str(evidence["evidence/holdout.json"][2]),
+                    "sha256": hashlib.sha256(evidence["evidence/holdout.json"][0]).hexdigest(),
+                },
+                "latency": {
+                    "member": "evidence/cpu-latency.json",
+                    "source": str(evidence["evidence/cpu-latency.json"][2]),
+                    "sha256": hashlib.sha256(evidence["evidence/cpu-latency.json"][0]).hexdigest(),
+                },
+            },
+        }
+        for path, relative, content in selected:
+            if content is not None:
+                integrity["members"][relative] = hashlib.sha256(content).hexdigest()
+            else:
+                assert path is not None
+                integrity["members"][relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        integrity_bytes = (json.dumps(integrity, sort_keys=True, indent=2) + "\n").encode("utf-8")
+        selected.append((None, "manifest.json", integrity_bytes))
 
     members = sorted({relative: (path, content) for path, relative, content in selected}.items())
     if any(path is not None and output_path == path.resolve() for path, _, _ in selected):
@@ -274,6 +333,11 @@ def build_submission_archive(
         "artifact": artifact_relative,
         "runtime_dependencies": [],
         "engine_version": _engine_version(root),
+        "integrity_manifest": "manifest.json" if evidence else None,
+        "evidence": {
+            "holdout": "evidence/holdout.json",
+            "latency": "evidence/cpu-latency.json",
+        } if evidence else {},
     }
 
 
@@ -308,6 +372,12 @@ def smoke_test_archive(archive: str | Path, artifact: str | None = None) -> dict
             allowed.update(f"kagriculture_agent/{filename}" for filename in _RUNTIME_MODULES)
             if artifact is not None:
                 allowed.add(artifact)
+            if "manifest.json" in names:
+                allowed.update({
+                    "manifest.json",
+                    "evidence/holdout.json",
+                    "evidence/cpu-latency.json",
+                })
             unexpected = sorted(set(names) - allowed)
             if unexpected:
                 raise RuntimeError(f"archive contains unexpected members: {unexpected}")
@@ -329,6 +399,51 @@ def smoke_test_archive(archive: str | Path, artifact: str | None = None) -> dict
                             raise RuntimeError(f"archive member ended early: {member.name}")
                         destination.write(chunk)
                         remaining -= len(chunk)
+
+            if artifact is not None and "manifest.json" not in names:
+                raise RuntimeError("promoted archive is missing manifest.json")
+            if "manifest.json" in names:
+                required_evidence = {"evidence/holdout.json", "evidence/cpu-latency.json"}
+                if "models/learned_v1.json" not in names or not required_evidence.issubset(names):
+                    raise RuntimeError("archive is missing promotion evidence")
+                try:
+                    integrity = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(f"archive integrity manifest is invalid: {exc}") from exc
+                if not isinstance(integrity, dict) or integrity.get("schema_version") != 1:
+                    raise RuntimeError("archive integrity manifest schema is invalid")
+                members_digest = integrity.get("members")
+                if not isinstance(members_digest, dict) or "manifest.json" in members_digest:
+                    raise RuntimeError("archive integrity manifest is circular or malformed")
+                expected_members = set(names) - {"manifest.json"}
+                if set(members_digest) != expected_members:
+                    raise RuntimeError("archive integrity manifest member set is incomplete")
+                for name, expected_digest in members_digest.items():
+                    if not isinstance(expected_digest, str) or len(expected_digest) != 64:
+                        raise RuntimeError(f"archive integrity digest is malformed: {name}")
+                    actual_digest = hashlib.sha256((root / name).read_bytes()).hexdigest()
+                    if actual_digest != expected_digest:
+                        raise RuntimeError(f"archive integrity digest mismatch: {name}")
+                evidence_digest = integrity.get("evidence")
+                if not isinstance(evidence_digest, dict):
+                    raise RuntimeError("archive evidence manifest is missing")
+                for label, member_name in (
+                    ("holdout", "evidence/holdout.json"),
+                    ("latency", "evidence/cpu-latency.json"),
+                ):
+                    entry = evidence_digest.get(label)
+                    if not isinstance(entry, dict):
+                        raise RuntimeError(f"archive {label} evidence manifest is missing")
+                    if entry.get("member") != member_name:
+                        raise RuntimeError(f"archive {label} evidence member is invalid")
+                    if entry.get("sha256") != members_digest[member_name]:
+                        raise RuntimeError(f"archive {label} evidence hash is invalid")
+                    try:
+                        evidence_value = json.loads((root / member_name).read_text(encoding="utf-8"))
+                    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                        raise RuntimeError(f"archive {label} evidence is invalid: {exc}") from exc
+                    if not isinstance(evidence_value, dict):
+                        raise RuntimeError(f"archive {label} evidence must be an object")
 
         code = (
             "import socket\n"
@@ -374,9 +489,17 @@ def main() -> None:
     parser.add_argument("project_root")
     parser.add_argument("--output", required=True)
     parser.add_argument("--artifact")
+    parser.add_argument("--holdout-report")
+    parser.add_argument("--latency-report")
     parser.add_argument("--smoke-test", action="store_true")
     args = parser.parse_args()
-    result = build_submission_archive(args.project_root, args.output, args.artifact)
+    result = build_submission_archive(
+        args.project_root,
+        args.output,
+        args.artifact,
+        holdout_report=args.holdout_report,
+        latency_report=args.latency_report,
+    )
     if args.smoke_test:
         result = {**result, "smoke_test": smoke_test_archive(args.output, result["artifact"])}
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))

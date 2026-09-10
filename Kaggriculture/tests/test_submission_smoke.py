@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import os
 import subprocess
@@ -142,9 +143,19 @@ def test_promoted_archive_entrypoint_uses_bundled_artifact_candidate(tmp_path):
         '{"workers": [], "market_orders": [], "marker": "learned"}',
         encoding="utf-8",
     )
+    holdout = tmp_path / "holdout.json"
+    holdout.write_text('{"decision": {"status": "promote"}}', encoding="utf-8")
+    latency = tmp_path / "latency.json"
+    latency.write_text('{"device": "cpu"}', encoding="utf-8")
     archive = tmp_path / "submission.tar.gz"
 
-    build_submission_archive(project, archive, artifact=artifact)
+    build_submission_archive(
+        project,
+        archive,
+        artifact=artifact,
+        holdout_report=holdout,
+        latency_report=latency,
+    )
     smoke_test_archive(archive, "models/learned_v1.json")
     extracted = tmp_path / "extracted"
     extracted.mkdir()
@@ -162,6 +173,59 @@ def test_promoted_archive_entrypoint_uses_bundled_artifact_candidate(tmp_path):
         check=False,
     )
     assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_promoted_archive_embeds_evidence_and_self_excluding_integrity_manifest(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "main.py").write_text(
+        "def agent(obs): return {'farmer':['PASS'], 'hands':[], 'market':[]}\n",
+    )
+    package = project / "kagriculture_agent"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "policy.py").write_text(
+        "class Policy:\n"
+        "    def act(self, obs):\n"
+        "        return {'farmer':['PASS'], 'hands':[], 'market':[]}\n",
+    )
+    artifact = tmp_path / "stage-artifact.json"
+    artifact.write_text('{"workers": [], "market_orders": []}', encoding="utf-8")
+    holdout = tmp_path / "holdout.json"
+    holdout.write_text('{"decision": {"status": "promote"}}\n', encoding="utf-8")
+    latency = tmp_path / "cpu-latency.json"
+    latency.write_text('{"device": "cpu", "gate": {"real_engine_kept": true}}\n', encoding="utf-8")
+    archive = tmp_path / "submission.tar.gz"
+
+    build_submission_archive(
+        project,
+        archive,
+        artifact=artifact,
+        holdout_report=holdout,
+        latency_report=latency,
+    )
+    smoke_test_archive(archive, "models/learned_v1.json")
+
+    with tarfile.open(archive, "r:gz") as tar:
+        names = set(tar.getnames())
+        integrity = json.loads(tar.extractfile("manifest.json").read())
+        embedded_holdout = tar.extractfile("evidence/holdout.json").read()
+        embedded_latency = tar.extractfile("evidence/cpu-latency.json").read()
+        member_bytes = {
+            name: tar.extractfile(name).read()
+            for name in names if name != "manifest.json"
+        }
+
+    assert {"evidence/holdout.json", "evidence/cpu-latency.json", "manifest.json"} <= names
+    assert "manifest.json" not in integrity["members"]
+    assert integrity["members"]["evidence/holdout.json"] == hashlib.sha256(embedded_holdout).hexdigest()
+    assert integrity["members"]["evidence/cpu-latency.json"] == hashlib.sha256(embedded_latency).hexdigest()
+    assert integrity["evidence"]["holdout"]["sha256"] == hashlib.sha256(holdout.read_bytes()).hexdigest()
+    assert integrity["evidence"]["latency"]["sha256"] == hashlib.sha256(latency.read_bytes()).hexdigest()
+    assert all(
+        integrity["members"][name] == hashlib.sha256(content).hexdigest()
+        for name, content in member_bytes.items()
+    )
 
 
 def test_submission_archive_rejects_missing_selected_artifact(tmp_path):
