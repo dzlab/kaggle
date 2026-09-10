@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sys
@@ -208,6 +209,8 @@ def summarize_run(
 
 def real_engine_gate_passed(results: Sequence[Mapping[str, Any]]) -> bool:
     for result in results:
+        if not isinstance(result, Mapping):
+            return False
         if result.get("workers") != 4:
             continue
         if "benchmark_valid" in result and result.get("benchmark_valid") is not True:
@@ -419,25 +422,31 @@ def run_benchmark(
         temporary_directory = tempfile.TemporaryDirectory(prefix="kagriculture-rollout-benchmark-")
         output_dir = temporary_directory.name
     try:
-        results = [
-            dict(benchmark_fn(
-                games=games,
-                steps=steps,
-                worker_count=worker_count,
-                start_seed=start_seed,
-                opponent=opponent,
-                output_dir=Path(output_dir) / f"workers-{worker_count}",
-                game_timeout=game_timeout,
-                candidate_artifact=candidate_artifact,
-            ))
-            for worker_count in workers
-        ]
+        candidate_path = Path(candidate_artifact).resolve() if candidate_artifact is not None else None
+        candidate_sha256 = (
+            hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+            if candidate_path is not None else None
+        )
+        results = []
+        for worker_count in workers:
+            benchmark_kwargs = {
+                "games": games,
+                "steps": steps,
+                "worker_count": worker_count,
+                "start_seed": start_seed,
+                "opponent": opponent,
+                "output_dir": Path(output_dir) / f"workers-{worker_count}",
+                "game_timeout": game_timeout,
+            }
+            if candidate_artifact is not None:
+                benchmark_kwargs["candidate_artifact"] = candidate_artifact
+            results.append(dict(benchmark_fn(**benchmark_kwargs)))
         keep_real_engine = real_engine_gate_passed(results)
-        return {
+        report = {
             "schema_version": 1,
             "engine_version": str(ENGINE_VERSION),
             "device": device,
-            "candidate_artifact": str(Path(candidate_artifact).resolve()) if candidate_artifact is not None else None,
+            "candidate_artifact": str(candidate_path) if candidate_path is not None else None,
             "opponent": opponent,
             "games": int(games),
             "steps": int(steps),
@@ -451,6 +460,9 @@ def run_benchmark(
                 "simulator_required": not keep_real_engine,
             },
         }
+        if candidate_sha256 is not None:
+            report["candidate_artifact_sha256"] = candidate_sha256
+        return report
     finally:
         if temporary_directory is not None:
             temporary_directory.cleanup()

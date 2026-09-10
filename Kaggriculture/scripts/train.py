@@ -361,6 +361,8 @@ class WorkflowResult:
     latency_report_path: Path | None = None
     promotion_archive_path: Path | None = None
     promotion_manifest_path: Path | None = None
+    promotion_ready: bool = False
+    release_ready: bool = False
 
 
 @dataclass(frozen=True)
@@ -1478,12 +1480,42 @@ def _latency_report_is_complete(
             return False
     except OSError:
         return False
+    reported_artifact_sha256 = report.get("candidate_artifact_sha256")
+    if not isinstance(reported_artifact_sha256, str):
+        return False
+    try:
+        if reported_artifact_sha256 != _sha256_path(artifact_path):
+            return False
+    except OSError:
+        return False
     results = report.get("results")
     gate = report.get("gate")
     if not isinstance(results, list) or not isinstance(gate, Mapping):
         return False
     if gate.get("real_engine_kept") is not True:
         return False
+    required_fields = (
+        "workers", "benchmark_valid", "failed_games",
+        "environment_steps_per_minute", "policy_inference_p95_ms",
+    )
+    for result in results:
+        if not isinstance(result, Mapping):
+            return False
+        if any(field not in result for field in required_fields):
+            return False
+        if type(result["workers"]) is not int or result["workers"] < 1:
+            return False
+        if type(result["benchmark_valid"]) is not bool:
+            return False
+        if type(result["failed_games"]) is not int or result["failed_games"] < 0:
+            return False
+        for field in ("environment_steps_per_minute", "policy_inference_p95_ms"):
+            try:
+                value = float(result[field])
+            except (TypeError, ValueError):
+                return False
+            if not math.isfinite(value):
+                return False
     from scripts.benchmark_rollouts import real_engine_gate_passed
 
     return real_engine_gate_passed(results)
@@ -1542,6 +1574,7 @@ def _write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
 
 def _create_promotion_package(
     config: ColabConfig, *, latency_report: Path,
+    development_safety_regression: bool,
 ) -> tuple[Path, Path]:
     """Build, smoke-test, and document the deterministic submission package."""
     from scripts.submission_smoke import build_submission_archive, smoke_test_archive
@@ -1579,6 +1612,7 @@ def _create_promotion_package(
             },
             "gates": {
                 "development_promoted": True,
+                "development_safety_regression": development_safety_regression,
                 "holdout_promoted": True,
                 "holdout_safety_regression": False,
                 "latency_passed": True,
@@ -1871,6 +1905,7 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
         ):
             promotion_archive, promotion_manifest = _create_promotion_package(
                 config, latency_report=config.latency_report_path,
+                development_safety_regression=development_safety_regression,
             )
             print("Promotion package:", promotion_archive)
             print("Promotion manifest:", promotion_manifest)
@@ -1885,6 +1920,8 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
             latency_report_path=config.latency_report_path,
             promotion_archive_path=promotion_archive,
             promotion_manifest_path=promotion_manifest,
+            promotion_ready=promotion_archive is not None,
+            release_ready=promotion_archive is not None,
         )
     finally:
         if telemetry is not None:
@@ -1907,6 +1944,8 @@ def main(argv: list[str] | None = None) -> int:
         "latency_report_path": str(result.latency_report_path) if result.latency_report_path else None,
         "promotion_archive_path": str(result.promotion_archive_path) if result.promotion_archive_path else None,
         "promotion_manifest_path": str(result.promotion_manifest_path) if result.promotion_manifest_path else None,
+        "promotion_ready": result.promotion_ready,
+        "release_ready": result.release_ready,
     }, default=str, sort_keys=True))
     return 0
 

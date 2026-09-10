@@ -354,7 +354,12 @@ archive contains `main.py`, the runtime `kagriculture_agent/` package, and the
 selected artifact at exactly `models/learned_v1.json`; the staged artifact is
 copied into the archive without overwriting the checked-out production model.
 If any gate fails, the candidate remains stage-scoped and no package is
-produced.
+produced. The workflow and its final JSON status expose both
+`promotion_ready` and `release_ready`; these are `false` for a valid
+stage-only training result and `true` only when the holdout, safety, CPU
+latency, packaging, and archive smoke gates all produce a submittable
+artifact. A zero training-process exit does not imply release readiness when
+the workflow intentionally continues with a stage-only candidate.
 The `behavior_clone` and `ppo` events include optimizer health and learning
 signals such as loss, entropy, KL, clip fraction, explained variance,
 return/advantage statistics, gradient norm, parameter norm, learning rate, and

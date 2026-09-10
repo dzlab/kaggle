@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -260,6 +261,48 @@ def test_benchmark_passes_candidate_artifact_to_game_and_latency_sampler(tmp_pat
 
     assert game_artifacts == [candidate]
     assert latency_artifacts == [candidate]
+
+
+def test_run_benchmark_records_candidate_artifact_sha256_and_supports_legacy_benchmark_fn(tmp_path):
+    from scripts import benchmark_rollouts
+
+    candidate = tmp_path / "stage.json"
+    candidate.write_bytes(b"candidate-v1")
+    calls = []
+
+    def benchmark_fn(*, games, steps, worker_count, start_seed, opponent, output_dir, game_timeout, candidate_artifact):
+        calls.append(worker_count)
+        return {"workers": worker_count}
+
+    report = benchmark_rollouts.run_benchmark(
+        games=1,
+        steps=4,
+        workers=[1],
+        output_dir=tmp_path / "rollouts",
+        benchmark_fn=benchmark_fn,
+        candidate_artifact=candidate,
+    )
+
+    assert calls == [1]
+    assert report["candidate_artifact_sha256"] == hashlib.sha256(b"candidate-v1").hexdigest()
+
+
+def test_run_benchmark_omits_candidate_artifact_for_legacy_callback_without_candidate(tmp_path):
+    from scripts import benchmark_rollouts
+
+    def legacy_benchmark_fn(*, games, steps, worker_count, start_seed, opponent, output_dir, game_timeout):
+        return {"workers": worker_count}
+
+    report = benchmark_rollouts.run_benchmark(
+        games=1,
+        steps=4,
+        workers=[1],
+        output_dir=tmp_path / "rollouts",
+        benchmark_fn=legacy_benchmark_fn,
+    )
+
+    assert report["candidate_artifact"] is None
+    assert "candidate_artifact_sha256" not in report
 
 
 def test_benchmark_cli_requires_explicit_cpu_and_candidate_artifact_flags():
