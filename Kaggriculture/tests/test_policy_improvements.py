@@ -19,6 +19,7 @@ from kagriculture_agent.policy import (
     Policy,
     _assignment_valid,
     _drop_carried_goods,
+    _suppress_final_hour_fertilize_on_due_water,
     worker_action,
 )
 from kagriculture_agent.learned_policy import (
@@ -655,6 +656,126 @@ def test_basic_need_guard_keeps_hire_that_adds_deadline_capacity():
     )
 
     assert guarded == [["HIRE"]]
+
+
+def test_basic_need_guard_reserves_next_day_capacity_hire_cash():
+    tiles = [["EMPTY"] * 10 for _ in range(10)]
+    for x in range(10):
+        tiles[0][x] = {
+            "kind": "PLANT",
+            "crop": "STRAWBERRY",
+            "watered_today": True,
+        }
+    for x in range(6):
+        tiles[9][x] = {
+            "kind": "PLANT",
+            "crop": "STRAWBERRY",
+            "watered_today": True,
+        }
+    state = _state(
+        day=11,
+        hour=21,
+        board_size=10,
+        cash=149,
+        tiles=tiles,
+        workers=_workers(
+            ("FARMER", Position(9, 9)),
+            ("WORKER", Position(0, 9)),
+        ),
+        private={"seeds": {}, "shed": {}, "inventories": [{}, {}]},
+    )
+    policy = Policy(strategy="current")
+
+    guarded, _protected_directions = policy._basic_need_guard(
+        state, [["BUY_SEED", "STRAWBERRY", 1]], [], None,
+    )
+
+    assert guarded == []
+
+
+def test_macro_deadline_capacity_hire_preempts_optional_seed_purchase():
+    tiles = [["EMPTY"] * 10 for _ in range(10)]
+    for x in range(10):
+        tiles[0][x] = {
+            "kind": "PLANT",
+            "crop": "WHEAT",
+            "watered_today": False,
+            "fertilized_until_day": -1,
+        }
+    for x in range(6):
+        tiles[9][x] = {
+            "kind": "PLANT",
+            "crop": "WHEAT",
+            "watered_today": False,
+            "fertilized_until_day": -1,
+        }
+    state = _state(
+        day=12,
+        hour=0,
+        board_size=10,
+        cash=139,
+        tiles=tiles,
+        workers=_workers(("FARMER", Position(9, 9))),
+        private={"seeds": {"WHEAT": 1}, "shed": {}, "inventories": [{}]},
+        market={
+            "prices": {"MELON": 250, "FERTILIZER": 100},
+            "inventory": {"MELON": 10_000, "FERTILIZER": 10_000},
+        },
+    )
+
+    macro = build_autonomous_macro_plan(state)
+
+    assert ["HIRE"] in macro["market_intents"]
+
+
+def test_policy_suppresses_final_hour_fertilize_on_due_water_tile():
+    target = Position(4, 4)
+    state = _state(
+        day=24,
+        hour=23,
+        board_size=10,
+        workers=_workers(
+            ("FARMER", target),
+            ("WORKER", target),
+        ),
+        private={"seeds": {}, "shed": {}, "inventories": [{"FERTILIZER": 1}, {}]},
+    )
+    state["tiles"][4][4] = {
+        "kind": "PLANT",
+        "crop": "CARROT",
+        "watered_today": False,
+    }
+
+    commands = _suppress_final_hour_fertilize_on_due_water(
+        state, {0: ["FERTILIZE"], 1: ["WATER"]},
+    )
+
+    assert commands == {0: ["PASS"], 1: ["WATER"]}
+
+
+def test_assign_tasks_keeps_same_tile_water_and_fertilize_when_time_remains():
+    target = Position(4, 4)
+    state = _state(
+        day=24,
+        hour=10,
+        board_size=10,
+        workers=_workers(
+            ("FARMER", Position(9, 9)),
+            ("WORKER", target),
+        ),
+        private={"seeds": {}, "shed": {}, "inventories": [{"FERTILIZER": 1}, {}]},
+    )
+    plan = [
+        Task("FERTILIZE", target, 97, None, 1, item="CARROT"),
+        Task("WATER", target, 100, 24, 1, item="CARROT"),
+    ]
+
+    assignments = assign_tasks(plan, state["workers"], state)
+
+    assert [(assignment.task.kind, assignment.task.target) for assignment in assignments] == [
+        ("WATER", target),
+        ("FERTILIZE", target),
+    ]
 
 
 def test_macro_funds_deadline_hire_without_pre_funding_stored_animal_feed():

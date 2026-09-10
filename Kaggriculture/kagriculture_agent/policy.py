@@ -9,12 +9,14 @@ from typing import Any
 from .constants import (
     ANIMALS, CROPS, LAND_PRICES, MAX_POLICY_INFERENCE_P95_MS, PRODUCTS,
     max_market_orders, season_days, shed_capacity as DEFAULT_SHED_CAPACITY,
+    turns_per_day,
 )
 from .economics import feed_reserve, market_price, market_regime
 from .learned_policy import LearnedPolicy, compile_proposal
 from .memory import PolicyMemory, market_order_allowed
 from .observation import is_shed_adjacent, parse_observation as _parse_observation, shed_access_tiles
 from .planner import (
+    _due_needs_exceed_single_worker_capacity,
     _feed_purchase_needed,
     _fits_same_day_deadline,
     _feed_animal_counts,
@@ -290,6 +292,95 @@ def _sale_proceeds(item: str, quantity: int, state: Any) -> float:
 
 def _animals(state: Any) -> dict[str, int]:
     return _feed_animal_counts(_state_for_planner(state))
+
+
+def _projected_next_day_basic_need_tile(tile: Any) -> Any:
+    if not isinstance(tile, Mapping):
+        return tile
+    projected = dict(tile)
+    if _crop(projected):
+        projected["watered_today"] = False
+        projected["needs_water"] = True
+    animal = _animal(projected)
+    if animal is not None:
+        projected["fed_today"] = False
+        projected["needs_feed"] = True
+        nested = projected.get("animal")
+        if isinstance(nested, Mapping):
+            nested_projected = dict(nested)
+            nested_projected["fed_today"] = False
+            nested_projected["needs_feed"] = True
+            projected["animal"] = nested_projected
+    return projected
+
+
+def _projected_next_day_basic_need_tiles(state: Mapping[str, Any]) -> Any:
+    tiles = _get(state, "tiles", [])
+    if isinstance(tiles, Mapping):
+        return {
+            raw_position: _projected_next_day_basic_need_tile(tile)
+            for raw_position, tile in tiles.items()
+        }
+    if not isinstance(tiles, Sequence) or isinstance(tiles, (str, bytes)):
+        return tiles
+    return [
+        [
+            _projected_next_day_basic_need_tile(tile)
+            for tile in row
+        ] if isinstance(row, Sequence) and not isinstance(row, (str, bytes)) else row
+        for row in tiles
+    ]
+
+
+def _projected_next_day_basic_need_animal(animal: Any) -> Any:
+    if not isinstance(animal, Mapping) or not _is_live_owned_placed_animal(animal):
+        return animal
+    projected = dict(animal)
+    projected["fed_today"] = False
+    projected["needs_feed"] = True
+    return projected
+
+
+def _needs_next_day_capacity_hire(
+    state: Mapping[str, Any],
+    strategy: StrategySpec | None,
+) -> bool:
+    day = _whole(_get(state, "day"))
+    if day >= season_days - 1:
+        return False
+    farmer = next(
+        (record for record in _worker_records(state) if record["role"] == "FARMER"),
+        None,
+    )
+    if farmer is None or farmer["position"] is None:
+        return False
+    projected = dict(state)
+    projected_day = day + 1
+    projected["day"] = projected_day
+    projected["hour"] = 0
+    projected["tiles"] = _projected_next_day_basic_need_tiles(state)
+    animals = _get(state, "animals", ())
+    if isinstance(animals, Sequence) and not isinstance(animals, (str, bytes)):
+        projected["animals"] = [
+            _projected_next_day_basic_need_animal(animal)
+            for animal in animals
+        ]
+    private = dict(_mapping(_get(state, "private", {})))
+    inventories = private.get("inventories")
+    if isinstance(inventories, Sequence) and not isinstance(inventories, (str, bytes)):
+        private["inventories"] = list(inventories[:1])
+    projected["private"] = private
+    farm = dict(_mapping(_get(state, "farm", {})))
+    farm["hands"] = []
+    farm["hires_today"] = 0
+    projected["farm"] = farm
+    projected["workers"] = [{
+        "index": farmer["index"],
+        "role": "FARMER",
+        "position": farmer["position"],
+    }]
+    due_tasks = due_basic_need_tasks(projected, projected_day, strategy)
+    return _due_needs_exceed_single_worker_capacity(projected, due_tasks, projected_day, 0)
 
 
 def _existing_animal_units(state: Any) -> int:
@@ -1096,6 +1187,41 @@ def _assignment_valid(state: Any, assignment: WorkerAssignment) -> bool:
     return _task_action(state, worker_index, assignment.task, target) != PASS
 
 
+def _suppress_final_hour_fertilize_on_due_water(
+    state: Any,
+    commands: Mapping[int, list[Any]],
+    strategy: StrategySpec | None = None,
+) -> dict[int, list[Any]]:
+    """Drop optional same-tile FERTILIZE when boundary WATER carries the tile."""
+    normalized = _state_for_planner(state)
+    day = _whole(_get(normalized, "day"))
+    if _whole(_get(normalized, "hour")) < turns_per_day - 1:
+        return dict(commands)
+    due_water_targets = {
+        _position(_task_target(task))
+        for task in due_basic_need_tasks(normalized, day, strategy)
+        if str(_get(task, "kind", "")).upper() == "WATER"
+        and _position(_task_target(task)) is not None
+    }
+    if not due_water_targets:
+        return dict(commands)
+    water_positions = {
+        worker["position"]
+        for worker in _worker_records(normalized)
+        if worker["position"] in due_water_targets
+        and commands.get(worker["index"], [PASS])
+        and commands.get(worker["index"], [PASS])[0] == "WATER"
+    }
+    if not water_positions:
+        return dict(commands)
+    filtered = dict(commands)
+    for worker in _worker_records(normalized):
+        command = filtered.get(worker["index"], [PASS])
+        if command and command[0] == "FERTILIZE" and worker["position"] in water_positions:
+            filtered[worker["index"]] = [PASS]
+    return filtered
+
+
 class Policy:
     """Stateful deterministic policy with reset-safe episode memory."""
 
@@ -1213,6 +1339,8 @@ class Policy:
         protected_directions: set[tuple[str, str]] = set()
         due_guard_blocked = bool(due_tasks) and not due_assignments_valid
         guard_blocked = due_guard_blocked
+        next_day_capacity_hire_needed = _needs_next_day_capacity_hire(normalized, strategy)
+        capacity_hire_reserve = _purchase_cost("HIRE", None, normalized) + 100.0
         available_shed_room = max(
             0,
             DEFAULT_SHED_CAPACITY
@@ -1257,6 +1385,11 @@ class Policy:
                 if discretionary and (
                     cash_after < 0
                     or (due_guard_blocked and not deadline_capacity_hire)
+                    or (
+                        next_day_capacity_hire_needed
+                        and kind != "HIRE"
+                        and cash_after < capacity_hire_reserve
+                    )
                 ):
                     guard_blocked = True
                     continue
@@ -1445,6 +1578,9 @@ class Policy:
                     commands[worker["index"]] = _unit_command(drop)
         commands = _bound_shed_deposit_commands(state, commands)
         commands = _bound_pickup_commands(state, commands)
+        commands = _suppress_final_hour_fertilize_on_due_water(
+            state, commands, strategy_spec,
+        )
         farmer = commands.get(0, [PASS])
         market_plan = build_daily_plan(_state_for_planner(state), self.memory, strategy_spec)
         market_plan.extend(macro.get("market_intents", ()))

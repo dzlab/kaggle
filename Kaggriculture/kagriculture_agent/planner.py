@@ -1042,7 +1042,19 @@ def build_autonomous_macro_plan(state: Any, memory: EpisodeMemory | Any = None,
         # feed reserve is a future solvency obligation, not a prerequisite to
         # paying for a helper now.  Feed remains independently guarded above,
         # and BUY_ANIMAL below still requires the full reserve to be funded.
-        cash_after_planned_intents = cash - _intent_purchase_cost(intents, normalized)
+        capacity_preserving_intents = [
+            intent for intent in intents
+            if (
+                isinstance(intent, Sequence)
+                and not isinstance(intent, (str, bytes))
+                and len(intent) >= 2
+                and str(intent[0]).upper() == "BUY_PRODUCT"
+                and str(intent[1]).upper() == "WHEAT"
+            )
+        ]
+        cash_after_planned_intents = cash - _intent_purchase_cost(
+            capacity_preserving_intents, normalized,
+        )
         can_fund_deadline_hire = (
             cash_after_planned_intents >= hire_cost + reserve
         )
@@ -1661,6 +1673,7 @@ def assign_tasks(plan: Iterable[Task], workers: Iterable[Any] | None, state: Any
         crop = str(task.item or "").upper()
         if (
             task.kind == "PLANT"
+            and crop
             and allocated_seeds.get(crop, 0) >= _safe_quantity(seed_inventory.get(crop, 0))
         ):
             continue
