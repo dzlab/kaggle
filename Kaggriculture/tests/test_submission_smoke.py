@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import subprocess
 import sys
@@ -82,9 +83,35 @@ def test_submission_archive_can_include_selected_artifact_only(tmp_path):
 
     with tarfile.open(archive, "r:gz") as tar:
         names = set(tar.getnames())
-    assert "artifacts/learned_v1.json" in names
+    assert "models/learned_v1.json" in names
     assert "kagriculture_agent/credentials.json" not in names
-    assert manifest["artifact"] == "artifacts/learned_v1.json"
+    assert manifest["artifact"] == "models/learned_v1.json"
+
+
+def test_submission_archive_maps_external_artifact_without_overwriting_project_model(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "main.py").write_text("def agent(obs): return {'farmer':['PASS'], 'hands':[], 'market':[]}")
+    package = project / "kagriculture_agent"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    models = project / "models"
+    models.mkdir()
+    production = models / "learned_v1.json"
+    production.write_text('{"workers": [], "market_orders": []}', encoding="utf-8")
+    external = tmp_path / "stage-artifact.json"
+    external.write_text('{"workers": [{"action": "PASS"}], "market_orders": []}', encoding="utf-8")
+    archive = tmp_path / "submission.tar.gz"
+
+    manifest = build_submission_archive(project, archive, artifact=external)
+
+    with tarfile.open(archive, "r:gz") as tar:
+        names = tar.getnames()
+        extracted = json.loads(tar.extractfile("models/learned_v1.json").read())
+    assert names.count("models/learned_v1.json") == 1
+    assert extracted["workers"] == [{"action": "PASS"}]
+    assert manifest["artifact"] == "models/learned_v1.json"
+    assert json.loads(production.read_text(encoding="utf-8"))["workers"] == []
 
 
 def test_submission_archive_rejects_missing_selected_artifact(tmp_path):

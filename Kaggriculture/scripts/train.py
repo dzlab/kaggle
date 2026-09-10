@@ -6,9 +6,11 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -53,6 +55,7 @@ from scripts.training_identity import (
 COLLECT_SCRIPT = Path(__file__).with_name("collect_trajectories.py")
 EVALUATE_SCRIPT = Path(__file__).with_name("evaluate_artifact.py")
 RUN_LOCAL_SCRIPT = Path(__file__).with_name("run_local.py")
+BENCHMARK_SCRIPT = Path(__file__).with_name("benchmark_rollouts.py")
 DEFAULT_RUN_DIRECTORY = Path("/content/drive/MyDrive/kagriculture-training")
 PROTECTED_TRAINING_DIRECTORY_NAMES = frozenset({
     "report", "reports", "submission", "submissions",
@@ -316,6 +319,22 @@ class ColabConfig:
     def smoke_replay_path(self) -> Path:
         return self.run_directory / "candidate-smoke.json"
 
+    @property
+    def latency_report_path(self) -> Path:
+        return self.run_directory / f"{self.candidate_tag}-cpu-latency.json"
+
+    @property
+    def latency_output_dir(self) -> Path:
+        return self.run_directory / f"{self.candidate_tag}-cpu-latency-rollouts"
+
+    @property
+    def promotion_archive_path(self) -> Path:
+        return self.run_directory / f"{self.candidate_tag}-submission.tar.gz"
+
+    @property
+    def promotion_manifest_path(self) -> Path:
+        return self.run_directory / f"{self.candidate_tag}-promotion-manifest.json"
+
 
 def default_wandb_run_name(
     config: ColabConfig, *, timestamp: datetime | None = None,
@@ -338,6 +357,10 @@ class WorkflowResult:
     development_evaluation_promoted: bool | None = None
     holdout_evaluation_complete: bool | None = None
     stage_artifact_path: Path | None = None
+    latency_gate_passed: bool | None = None
+    latency_report_path: Path | None = None
+    promotion_archive_path: Path | None = None
+    promotion_manifest_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -1030,6 +1053,23 @@ def build_smoke_command(config: ColabConfig) -> list[str]:
     ]
 
 
+def build_latency_benchmark_command(config: ColabConfig) -> list[str]:
+    """Build the explicit CPU benchmark command for the stage artifact."""
+    if not config.rollout_seed_values:
+        raise ValueError("rollout_seed_values must not be empty")
+    return [
+        sys.executable, str(BENCHMARK_SCRIPT),
+        "--games", str(len(config.rollout_seed_values)),
+        "--steps", str(config.rollout_steps),
+        "--workers", "1", "2", "4", "8",
+        "--opponent", "current",
+        "--output-dir", str(config.latency_output_dir),
+        "--output", str(config.latency_report_path),
+        "--candidate-artifact", str(config.stage_artifact_path),
+        "--cpu",
+    ]
+
+
 def run_command(command: Sequence[str], *, check: bool, capture_output: bool = False) -> subprocess.CompletedProcess[str]:
     """Run one repository command through an injectable boundary."""
     return subprocess.run(
@@ -1424,6 +1464,135 @@ def _run_evaluation(
     return completed, report
 
 
+def _latency_report_is_complete(
+    report: Mapping[str, Any], *, artifact_path: Path,
+) -> bool:
+    """Require a fresh CPU benchmark report that passes the release gate."""
+    if report.get("schema_version") != 1 or report.get("device") != "cpu":
+        return False
+    reported_artifact = report.get("candidate_artifact")
+    if not isinstance(reported_artifact, str):
+        return False
+    try:
+        if Path(reported_artifact).expanduser().resolve() != artifact_path.resolve():
+            return False
+    except OSError:
+        return False
+    results = report.get("results")
+    gate = report.get("gate")
+    if not isinstance(results, list) or not isinstance(gate, Mapping):
+        return False
+    if gate.get("real_engine_kept") is not True:
+        return False
+    from scripts.benchmark_rollouts import real_engine_gate_passed
+
+    return real_engine_gate_passed(results)
+
+
+def _run_latency_benchmark(
+    config: ColabConfig, *, command: Sequence[str], report_path: Path,
+) -> tuple[subprocess.CompletedProcess[str] | None, dict[str, Any] | None, bool]:
+    """Run and validate the candidate CPU latency benchmark fail-closed."""
+    _invalidate_evaluation_report(report_path)
+    started_ns = time.time_ns()
+    try:
+        completed = run_command(command, check=False)
+    except Exception as exc:
+        print(f"CPU latency benchmark failed to start: {exc}")
+        return None, None, False
+    if completed.returncode != 0:
+        print(f"CPU latency benchmark failed with exit code {completed.returncode}")
+        return completed, None, False
+    if not report_path.exists() or report_path.stat().st_mtime_ns < started_ns:
+        print(f"CPU latency benchmark did not write a fresh report: {report_path}")
+        return completed, None, False
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        print(f"CPU latency benchmark report is invalid: {exc}")
+        return completed, None, False
+    if not isinstance(report, Mapping) or not _latency_report_is_complete(
+        report, artifact_path=config.stage_artifact_path,
+    ):
+        print("CPU latency benchmark did not pass the release gate")
+        return completed, dict(report) if isinstance(report, Mapping) else None, False
+    return completed, dict(report), True
+
+
+def _sha256_path(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, sort_keys=True, indent=2, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _create_promotion_package(
+    config: ColabConfig, *, latency_report: Path,
+) -> tuple[Path, Path]:
+    """Build, smoke-test, and document the deterministic submission package."""
+    from scripts.submission_smoke import build_submission_archive, smoke_test_archive
+
+    archive = config.promotion_archive_path
+    manifest_path = config.promotion_manifest_path
+    archive.unlink(missing_ok=True)
+    manifest_path.unlink(missing_ok=True)
+    try:
+        build_submission_archive(
+            PROJECT_ROOT, archive, artifact=config.stage_artifact_path,
+        )
+        smoke_test_archive(archive, "models/learned_v1.json")
+        manifest = {
+            "schema_version": 1,
+            "candidate": config.candidate_tag,
+            "experiment": _identity_fields(config),
+            "artifact": {
+                "path": str(config.stage_artifact_path),
+                "sha256": _sha256_path(config.stage_artifact_path),
+            },
+            "holdout": {
+                "path": str(config.holdout_report_path),
+                "sha256": _sha256_path(config.holdout_report_path),
+                "status": "promote",
+            },
+            "latency": {
+                "path": str(latency_report),
+                "sha256": _sha256_path(latency_report),
+                "status": "pass",
+            },
+            "archive": {
+                "path": str(archive),
+                "sha256": _sha256_path(archive),
+            },
+            "gates": {
+                "development_promoted": True,
+                "holdout_promoted": True,
+                "holdout_safety_regression": False,
+                "latency_passed": True,
+                "archive_smoke_test_passed": True,
+            },
+        }
+        _write_json_atomic(manifest_path, manifest)
+    except Exception:
+        archive.unlink(missing_ok=True)
+        manifest_path.unlink(missing_ok=True)
+        raise
+    return archive, manifest_path
+
+
 def smoke_test_artifact(config: ColabConfig) -> None:
     """Verify the exported dependency-free artifact in the local simulator."""
     smoke = run_command(build_smoke_command(config), check=True, capture_output=True)
@@ -1482,15 +1651,21 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
     commands = (
         tuple(build_collection_command(config)),
         tuple(build_evaluation_command(config, phase="development")),
+        tuple(build_latency_benchmark_command(config)),
         tuple(build_evaluation_command(config, phase="holdout")),
         tuple(build_smoke_command(config)),
     )
     if dry_run:
-        return WorkflowResult(dry_run=True, commands=commands)
+        return WorkflowResult(
+            dry_run=True, commands=commands,
+            latency_report_path=config.latency_report_path,
+        )
 
     if config.mount_drive:
         mount_drive(config)
     config.run_directory.mkdir(parents=True, exist_ok=True)
+    config.promotion_archive_path.unlink(missing_ok=True)
+    config.promotion_manifest_path.unlink(missing_ok=True)
     run_command(commands[0], check=True)
 
     from scripts import train_policy
@@ -1631,6 +1806,7 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
             reason = "; safety regression detected" if development_safety_regression else ""
             print(f"Development candidate discarded or incomplete{reason}; continue training, not promotion.")
 
+        latency_gate_passed: bool | None = None
         holdout_complete: bool | None = None
         if development_promoted:
             _invalidate_evaluation_report(config.holdout_report_path)
@@ -1638,8 +1814,12 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
         if config.plot:
             plot_training_metrics(config)
         if development_promoted:
+            _, _, latency_gate_passed = _run_latency_benchmark(
+                config, command=commands[2], report_path=config.latency_report_path,
+            )
+        if development_promoted and latency_gate_passed:
             holdout_process, holdout_report = _run_evaluation(
-                config, phase="holdout", command=commands[2],
+                config, phase="holdout", command=commands[3],
                 report_path=config.holdout_report_path,
             )
             if telemetry is not None:
@@ -1674,14 +1854,37 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
             print("Holdout evaluator exit:", holdout_process.returncode)
             print("Holdout status:", holdout_decision.get("status"))
         else:
-            print("Holdout evaluation skipped: development report is not complete/promote.")
+            if not development_promoted:
+                print("Holdout evaluation skipped: development report is not complete/promote.")
+            else:
+                print("Holdout evaluation skipped: CPU latency gate did not pass.")
 
-        print("Candidate remains stage-scoped; no automatic promotion to policy.json or policy.pt was performed.")
+        promotion_archive: Path | None = None
+        promotion_manifest: Path | None = None
+        if (
+            development_promoted
+            and latency_gate_passed
+            and holdout_complete
+            and isinstance(holdout_report, Mapping)
+            and isinstance(holdout_report.get("decision"), Mapping)
+            and holdout_report["decision"].get("status") == "promote"
+        ):
+            promotion_archive, promotion_manifest = _create_promotion_package(
+                config, latency_report=config.latency_report_path,
+            )
+            print("Promotion package:", promotion_archive)
+            print("Promotion manifest:", promotion_manifest)
+        else:
+            print("Candidate remains stage-scoped; promotion package was not produced.")
         return WorkflowResult(
             dry_run=False, commands=commands, resume_checkpoint=resume_checkpoint,
             development_evaluation_promoted=development_promoted,
             holdout_evaluation_complete=holdout_complete,
             stage_artifact_path=config.stage_artifact_path,
+            latency_gate_passed=latency_gate_passed,
+            latency_report_path=config.latency_report_path,
+            promotion_archive_path=promotion_archive,
+            promotion_manifest_path=promotion_manifest,
         )
     finally:
         if telemetry is not None:
@@ -1700,6 +1903,10 @@ def main(argv: list[str] | None = None) -> int:
         "development_evaluation_promoted": result.development_evaluation_promoted,
         "holdout_evaluation_complete": result.holdout_evaluation_complete,
         "stage_artifact_path": str(result.stage_artifact_path) if result.stage_artifact_path else None,
+        "latency_gate_passed": result.latency_gate_passed,
+        "latency_report_path": str(result.latency_report_path) if result.latency_report_path else None,
+        "promotion_archive_path": str(result.promotion_archive_path) if result.promotion_archive_path else None,
+        "promotion_manifest_path": str(result.promotion_manifest_path) if result.promotion_manifest_path else None,
     }, default=str, sort_keys=True))
     return 0
 

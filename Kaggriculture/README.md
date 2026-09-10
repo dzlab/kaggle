@@ -341,6 +341,20 @@ or stage more PPO training, rerun the same command with a larger
 
 Training writes `<candidate>-training-metrics.jsonl` in the run directory and
 keeps the same telemetry run open through development and holdout evaluation.
+After a development promotion, the workflow automatically runs
+`benchmark_rollouts.py` against the staged artifact on CPU, writing
+`<candidate>-cpu-latency.json`. The benchmark must pass the configured 10 ms
+p95 release gate before holdout evaluation is started; missing, malformed, or
+over-budget latency evidence fails closed.
+
+When development and holdout both promote without a safety regression and the
+CPU gate passes, the workflow creates `<candidate>-submission.tar.gz` and a
+matching `<candidate>-promotion-manifest.json` in the run directory. The
+archive contains `main.py`, the runtime `kagriculture_agent/` package, and the
+selected artifact at exactly `models/learned_v1.json`; the staged artifact is
+copied into the archive without overwriting the checked-out production model.
+If any gate fails, the candidate remains stage-scoped and no package is
+produced.
 The `behavior_clone` and `ppo` events include optimizer health and learning
 signals such as loss, entropy, KL, clip fraction, explained variance,
 return/advantage statistics, gradient norm, parameter norm, learning rate, and

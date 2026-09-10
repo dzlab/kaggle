@@ -120,9 +120,6 @@ def _validate_artifact(path: Path, root: Path) -> None:
     """Validate a selected proposal or exported network artifact before packaging."""
     if path.suffix.lower() != ".json":
         raise ValueError("selected artifact must be a JSON file")
-    relative_parts = path.relative_to(root).parts
-    if len(relative_parts) < 2 or relative_parts[0] not in _ARTIFACT_DIRECTORIES:
-        raise ValueError("selected artifact must be under artifacts/ or models/")
     if path.stat().st_size > _MAX_MEMBER_BYTES:
         raise ValueError("selected artifact is too large")
     try:
@@ -185,11 +182,10 @@ def build_submission_archive(
             raise ValueError("artifact does not exist")
         if artifact_path.is_symlink():
             raise ValueError("artifact must not be a symlink")
-        if not _inside(artifact_path, root):
-            raise ValueError("artifact is outside project_root")
-        artifact_relative = artifact_path.relative_to(root).as_posix()
-        if _member_is_forbidden(artifact_relative):
-            raise ValueError(f"forbidden archive member: {artifact_relative}")
+        # Training artifacts live under a run directory (often on Drive), so
+        # copy the selected bytes into the stable production member name
+        # without modifying the checked-out models directory.
+        artifact_relative = "models/learned_v1.json"
         _validate_artifact(artifact_path, root)
 
     if not package.is_dir():

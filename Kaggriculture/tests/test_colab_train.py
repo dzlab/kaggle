@@ -680,6 +680,113 @@ def test_colab_workflow_builds_parameterized_commands(tmp_path, monkeypatch):
     assert smoke[smoke.index("--steps") + 1] == "49"
     assert smoke[smoke.index("--candidate-artifact") + 1] == str(config.stage_artifact_path)
 
+    latency = colab_train.build_latency_benchmark_command(config)
+    assert latency[latency.index("--candidate-artifact") + 1] == str(config.stage_artifact_path)
+    assert latency[latency.index("--output") + 1] == str(config.latency_report_path)
+    assert "--cpu" in latency
+
+
+def test_colab_workflow_skips_holdout_when_cpu_latency_report_is_invalid(tmp_path, monkeypatch):
+    from scripts import colab_train
+
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+    invoked = []
+
+    def fake_run(command, *, check, capture_output=False):
+        script = Path(command[1]).name
+        invoked.append(script)
+        if script == colab_train.COLLECT_SCRIPT.name:
+            config.trajectory_path.write_text("{}\n", encoding="utf-8")
+        elif script == colab_train.EVALUATE_SCRIPT.name:
+            config.development_report_path.write_text(
+                json.dumps(_complete_colab_evaluation_report(config, phase="development")),
+                encoding="utf-8",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_train(config, **kwargs):
+        config.stage_checkpoint_path.write_bytes(b"checkpoint")
+        config.stage_artifact_path.write_text('{"workers": [], "market_orders": []}', encoding="utf-8")
+        return {}
+
+    monkeypatch.setattr(colab_train, "run_command", fake_run)
+    monkeypatch.setattr(colab_train, "train_candidate", fake_train)
+    monkeypatch.setattr(colab_train, "initialize_telemetry", lambda config: None)
+    monkeypatch.setattr(colab_train, "smoke_test_artifact", lambda config: None)
+
+    result = colab_train.run_workflow(config)
+
+    assert result.development_evaluation_promoted is True
+    assert result.latency_gate_passed is False
+    assert result.holdout_evaluation_complete is None
+    assert colab_train.EVALUATE_SCRIPT.name not in invoked[invoked.index(colab_train.BENCHMARK_SCRIPT.name) + 1:]
+    assert result.promotion_archive_path is None
+
+
+def test_colab_workflow_creates_promotion_archive_and_manifest_after_all_gates(tmp_path, monkeypatch):
+    from scripts import benchmark_rollouts, colab_train
+
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+    invoked = []
+
+    def fake_run(command, *, check, capture_output=False):
+        script = Path(command[1]).name
+        invoked.append(script)
+        if script == colab_train.COLLECT_SCRIPT.name:
+            config.trajectory_path.write_text("{}\n", encoding="utf-8")
+        elif script == colab_train.EVALUATE_SCRIPT.name:
+            phase = "holdout" if "holdout" in command[-1] else "development"
+            config_report = _complete_colab_evaluation_report(config, phase=phase)
+            config_report["decision"] = {"status": "promote"}
+            (config.holdout_report_path if phase == "holdout" else config.development_report_path).write_text(
+                json.dumps(config_report), encoding="utf-8",
+            )
+        elif script == colab_train.BENCHMARK_SCRIPT.name:
+            result = benchmark_rollouts.summarize_run(
+                worker_count=4, game_count=1, environment_steps=200000,
+                rollout_seconds=1.0, inference_latencies_ms=[1.0],
+            )
+            report = {
+                "schema_version": 1,
+                "device": "cpu",
+                "candidate_artifact": str(config.stage_artifact_path),
+                "results": [result],
+                "gate": {"real_engine_kept": True},
+            }
+            config.latency_report_path.write_text(json.dumps(report), encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_train(config, **kwargs):
+        config.stage_checkpoint_path.write_bytes(b"checkpoint")
+        config.stage_artifact_path.write_text('{"workers": [], "market_orders": []}', encoding="utf-8")
+        return {}
+
+    monkeypatch.setattr(colab_train, "run_command", fake_run)
+    monkeypatch.setattr(colab_train, "train_candidate", fake_train)
+    monkeypatch.setattr(colab_train, "initialize_telemetry", lambda config: None)
+    monkeypatch.setattr(colab_train, "smoke_test_artifact", lambda config: None)
+
+    result = colab_train.run_workflow(config)
+
+    assert result.latency_gate_passed is True
+    assert result.holdout_evaluation_complete is True
+    assert result.promotion_archive_path is not None and result.promotion_archive_path.is_file()
+    assert result.promotion_manifest_path is not None and result.promotion_manifest_path.is_file()
+    manifest = json.loads(result.promotion_manifest_path.read_text(encoding="utf-8"))
+    assert manifest["gates"] == {
+        "development_promoted": True,
+        "holdout_promoted": True,
+        "holdout_safety_regression": False,
+        "latency_passed": True,
+        "archive_smoke_test_passed": True,
+    }
+
 
 def test_colab_cli_propagates_reward_and_stall_ablations_to_config_and_collection(tmp_path):
     from scripts import colab_train

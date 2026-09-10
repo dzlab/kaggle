@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from kagriculture_agent.constants import ENGINE_VERSION, MAX_POLICY_INFERENCE_P95_MS
+from kagriculture_agent.candidates import artifact_candidate_policy
 from kagriculture_agent.policy import Policy
 from scripts.collect_trajectories import DEFAULT_GAME_TIMEOUT_SECONDS, _run_game_isolated
 
@@ -109,9 +110,14 @@ def sample_policy_latencies(
     replays: Sequence[Mapping[str, Any]],
     policy_factory: Callable[[], Any] | None = None,
     clock: Callable[[], float] | None = None,
+    candidate_artifact: str | Path | None = None,
 ) -> list[float]:
     """Replay public candidate observations through the policy and time each act call."""
-    policy_factory = policy_factory or Policy
+    if policy_factory is None:
+        policy_factory = (
+            (lambda: artifact_candidate_policy(candidate_artifact))
+            if candidate_artifact is not None else Policy
+        )
     clock = clock or time.perf_counter
     latencies: list[float] = []
     for replay in replays:
@@ -231,8 +237,8 @@ def _finite_result_number(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _game_job(args: tuple[str, int, int, int, str, float]) -> tuple[dict[str, Any] | None, int, str | None]:
-    opponent, seed, steps, candidate_player, replay_path, timeout = args
+def _game_job(args: tuple[str, int, int, int, str, float, str | None]) -> tuple[dict[str, Any] | None, int, str | None]:
+    opponent, seed, steps, candidate_player, replay_path, timeout, candidate_artifact = args
     try:
         replay = _run_game_isolated(
             opponent=opponent,
@@ -241,6 +247,7 @@ def _game_job(args: tuple[str, int, int, int, str, float]) -> tuple[dict[str, An
             candidate_player=candidate_player,
             replay_path=Path(replay_path),
             timeout=timeout,
+            candidate_artifact=candidate_artifact,
         )
     except Exception:
         return None, 0, "RUNNER_ERROR"
@@ -254,15 +261,15 @@ def _game_job(args: tuple[str, int, int, int, str, float]) -> tuple[dict[str, An
 
 
 def _run_jobs(
-    jobs: Sequence[tuple[str, int, int, int, str, float]],
+    jobs: Sequence[tuple[str, int, int, int, str, float, str | None]],
     worker_count: int,
     game_runner: Callable[..., Mapping[str, Any]] | None,
 ) -> list[tuple[Mapping[str, Any] | None, int, str | None]]:
     if game_runner is not None:
         results = []
-        for opponent, seed, steps, candidate_player, replay_path, timeout in jobs:
+        for opponent, seed, steps, candidate_player, replay_path, timeout, candidate_artifact in jobs:
             try:
-                replay = game_runner(
+                runner_kwargs = dict(
                     opponent=opponent,
                     seed=seed,
                     steps=steps,
@@ -270,6 +277,9 @@ def _run_jobs(
                     replay_path=Path(replay_path),
                     timeout=timeout,
                 )
+                if candidate_artifact is not None:
+                    runner_kwargs["candidate_artifact"] = Path(candidate_artifact)
+                replay = game_runner(**runner_kwargs)
             except Exception:
                 results.append((None, 0, "RUNNER_ERROR"))
                 continue
@@ -341,6 +351,7 @@ def benchmark_worker_count(
     game_runner: Callable[..., Mapping[str, Any]] | None = None,
     latency_sampler: Callable[..., Sequence[float]] = sample_policy_latencies,
     clock: Callable[[], float] | None = None,
+    candidate_artifact: str | Path | None = None,
 ) -> dict[str, Any]:
     clock = clock or time.perf_counter
     output_path = Path(output_dir)
@@ -353,6 +364,7 @@ def benchmark_worker_count(
             index % 2,
             str(output_path / f"workers-{worker_count}-game-{index}.json"),
             float(game_timeout),
+            str(candidate_artifact) if candidate_artifact is not None else None,
         )
         for index in range(games)
     ]
@@ -371,7 +383,10 @@ def benchmark_worker_count(
             successful_replays.append(replay)
         environment_steps += replay_steps
     failed_games = sum(failure_counts.values())
-    latencies = list(latency_sampler(successful_replays))
+    latency_kwargs = {}
+    if candidate_artifact is not None:
+        latency_kwargs["candidate_artifact"] = Path(candidate_artifact)
+    latencies = list(latency_sampler(successful_replays, **latency_kwargs))
     return summarize_run(
         worker_count=worker_count,
         game_count=games,
@@ -394,6 +409,8 @@ def run_benchmark(
     output_dir: str | Path | None = None,
     game_timeout: float = DEFAULT_GAME_TIMEOUT_SECONDS,
     benchmark_fn: Callable[..., Mapping[str, Any]] = benchmark_worker_count,
+    candidate_artifact: str | Path | None = None,
+    device: str = "cpu",
 ) -> dict[str, Any]:
     if len(workers) != len(set(workers)):
         raise ValueError("workers must not contain duplicate values")
@@ -411,12 +428,16 @@ def run_benchmark(
                 opponent=opponent,
                 output_dir=Path(output_dir) / f"workers-{worker_count}",
                 game_timeout=game_timeout,
+                candidate_artifact=candidate_artifact,
             ))
             for worker_count in workers
         ]
         keep_real_engine = real_engine_gate_passed(results)
         return {
+            "schema_version": 1,
             "engine_version": str(ENGINE_VERSION),
+            "device": device,
+            "candidate_artifact": str(Path(candidate_artifact).resolve()) if candidate_artifact is not None else None,
             "opponent": opponent,
             "games": int(games),
             "steps": int(steps),
@@ -445,6 +466,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--game-timeout", type=_positive_float, default=DEFAULT_GAME_TIMEOUT_SECONDS)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None, help="optional path for the JSON benchmark report")
+    parser.add_argument("--candidate-artifact", type=Path, default=None)
+    parser.add_argument("--cpu", action="store_true", help="run the dependency-free CPU policy benchmark")
     return parser
 
 
@@ -458,6 +481,8 @@ def main(argv: list[str] | None = None) -> int:
         opponent=args.opponent,
         output_dir=args.output_dir,
         game_timeout=args.game_timeout,
+        candidate_artifact=args.candidate_artifact,
+        device="cpu" if args.cpu else "unspecified",
     )
     serialized = json.dumps(report, sort_keys=True, indent=2, allow_nan=False)
     print(serialized)

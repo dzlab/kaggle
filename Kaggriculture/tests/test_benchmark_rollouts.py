@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -222,6 +223,52 @@ def test_benchmark_uses_real_collector_runner_and_alternates_seats(tmp_path):
     assert result["policy_inference_ms_per_turn"] == pytest.approx(1.0)
     assert result["successful_games"] == 3
     assert result["failed_games"] == 0
+
+
+def test_benchmark_passes_candidate_artifact_to_game_and_latency_sampler(tmp_path):
+    from scripts import benchmark_rollouts
+
+    candidate = tmp_path / "stage.json"
+    candidate.write_text('{"workers": [], "market_orders": []}', encoding="utf-8")
+    game_artifacts = []
+    latency_artifacts = []
+
+    def fake_runner(*, candidate_artifact, **kwargs):
+        game_artifacts.append(Path(candidate_artifact))
+        return {
+            "steps": [
+                [{"status": "ACTIVE"}, {"status": "ACTIVE"}],
+                [{"status": "DONE"}, {"status": "DONE"}],
+            ],
+            "statuses": ["DONE", "DONE"],
+        }
+
+    def fake_latency(replays, *, candidate_artifact, **kwargs):
+        latency_artifacts.append(Path(candidate_artifact))
+        return [1.0]
+
+    benchmark_rollouts.benchmark_worker_count(
+        games=1,
+        steps=4,
+        worker_count=1,
+        output_dir=tmp_path / "rollouts",
+        candidate_artifact=candidate,
+        game_runner=fake_runner,
+        latency_sampler=fake_latency,
+        clock=benchmark_rollouts.SequenceClock([10.0, 11.0]),
+    )
+
+    assert game_artifacts == [candidate]
+    assert latency_artifacts == [candidate]
+
+
+def test_benchmark_cli_requires_explicit_cpu_and_candidate_artifact_flags():
+    from scripts.benchmark_rollouts import _parser
+
+    args = _parser().parse_args(["--cpu", "--candidate-artifact", "stage.json"])
+
+    assert args.cpu is True
+    assert args.candidate_artifact == Path("stage.json")
 
 
 def test_benchmark_counts_only_successful_terminal_games_for_throughput(tmp_path):
