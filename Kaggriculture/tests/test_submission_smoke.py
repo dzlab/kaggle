@@ -114,6 +114,56 @@ def test_submission_archive_maps_external_artifact_without_overwriting_project_m
     assert json.loads(production.read_text(encoding="utf-8"))["workers"] == []
 
 
+def test_promoted_archive_entrypoint_uses_bundled_artifact_candidate(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "main.py").write_text(
+        "def agent(obs): return {'farmer':['PASS'], 'hands':[], 'market':[]}\n",
+    )
+    package = project / "kagriculture_agent"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "policy.py").write_text(
+        "class Policy:\n"
+        "    def act(self, obs):\n"
+        "        return {'farmer':['PASS'], 'hands':[], 'market':[]}\n",
+    )
+    (package / "candidates.py").write_text(
+        "import json\n"
+        "def artifact_candidate_policy(path):\n"
+        "    with open(path, encoding='utf-8') as handle:\n"
+        "        payload = json.load(handle)\n"
+        "    if payload.get('marker') != 'learned':\n"
+        "        raise ValueError('not learned')\n"
+        "    return lambda obs: {'farmer':['FERTILIZE'], 'hands':[], 'market':[]}\n",
+    )
+    artifact = tmp_path / "stage-artifact.json"
+    artifact.write_text(
+        '{"workers": [], "market_orders": [], "marker": "learned"}',
+        encoding="utf-8",
+    )
+    archive = tmp_path / "submission.tar.gz"
+
+    build_submission_archive(project, archive, artifact=artifact)
+    smoke_test_archive(archive, "models/learned_v1.json")
+    extracted = tmp_path / "extracted"
+    extracted.mkdir()
+    with tarfile.open(archive, "r:gz") as tar:
+        tar.extractall(extracted)
+    result = subprocess.run(
+        [
+            sys.executable, "-S", "-c",
+            "import main; assert main.agent({})['farmer'] == ['FERTILIZE']",
+        ],
+        cwd=extracted,
+        env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(extracted)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
 def test_submission_archive_rejects_missing_selected_artifact(tmp_path):
     project = tmp_path / "project"
     project.mkdir()

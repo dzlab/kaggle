@@ -353,13 +353,23 @@ matching `<candidate>-promotion-manifest.json` in the run directory. The
 archive contains `main.py`, the runtime `kagriculture_agent/` package, and the
 selected artifact at exactly `models/learned_v1.json`; the staged artifact is
 copied into the archive without overwriting the checked-out production model.
-If any gate fails, the candidate remains stage-scoped and no package is
-produced. The workflow and its final JSON status expose both
-`promotion_ready` and `release_ready`; these are `false` for a valid
-stage-only training result and `true` only when the holdout, safety, CPU
-latency, packaging, and archive smoke gates all produce a submittable
-artifact. A zero training-process exit does not imply release readiness when
-the workflow intentionally continues with a stage-only candidate.
+For promoted archives, the generated `main.py` loads that bundled artifact via
+`artifact_candidate_policy` and falls back to the deterministic `Policy` if
+loading fails. The checked-in source `main.py` remains deterministic-only.
+The artifact SHA-256 recorded by the CPU report is rechecked immediately
+before holdout and again immediately before packaging; a changed artifact
+fails closed and produces no release archive.
+
+If development is not promoted, training intentionally continues as a
+stage-only result. If development is promoted but a requested latency,
+holdout, artifact-integrity, packaging, or smoke gate fails, the result is a
+release-gate failure and no package is produced. The final JSON status is one
+of `dry-run`, `stage-only`, `release-ready`, or `release-gate-failed`.
+The CLI exits `0` for dry runs, stage-only continuation, and release-ready
+results; it exits `2` for release-gate failures so automation cannot treat a
+failed promotion as a successful release. `promotion_ready` and
+`release_ready` are `true` only when all release gates produce a submittable
+artifact.
 The `behavior_clone` and `ppo` events include optimizer health and learning
 signals such as loss, entropy, KL, clip fraction, explained variance,
 return/advantage statistics, gradient norm, parameter norm, learning rate, and

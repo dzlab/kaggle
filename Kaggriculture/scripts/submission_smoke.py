@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import io
 import json
 import os
 import subprocess
@@ -36,6 +37,7 @@ _MAX_MEMBER_NAME_BYTES = 240
 _ARTIFACT_DIRECTORIES = {"artifacts", "models"}
 _RUNTIME_MODULES = (
     "__init__.py",
+    "candidates.py",
     "constants.py",
     "economics.py",
     "experimental_features.py",
@@ -50,6 +52,32 @@ _RUNTIME_MODULES = (
     "strategy.py",
     "types.py",
 )
+
+
+def _promoted_main_source() -> bytes:
+    """Return the artifact-aware entrypoint used only in promoted archives."""
+    return (
+        "from pathlib import Path\n"
+        "from kagriculture_agent.policy import Policy\n"
+        "\n"
+        "_artifact_agent = None\n"
+        "try:\n"
+        "    from kagriculture_agent.candidates import artifact_candidate_policy\n"
+        "    _artifact_agent = artifact_candidate_policy(\n"
+        "        Path(__file__).parent / 'models' / 'learned_v1.json'\n"
+        "    )\n"
+        "except Exception:\n"
+        "    # A malformed or unavailable learned artifact must never prevent a\n"
+        "    # deterministic submission from running.\n"
+        "    _artifact_agent = None\n"
+        "\n"
+        "_fallback_policy = Policy()\n"
+        "\n"
+        "def agent(obs):\n"
+        "    if _artifact_agent is not None:\n"
+        "        return _artifact_agent(obs)\n"
+        "    return _fallback_policy.act(obs)\n"
+    ).encode("utf-8")
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -191,14 +219,15 @@ def build_submission_archive(
     if not package.is_dir():
         raise ValueError("kagriculture_agent package does not exist")
 
-    selected: list[tuple[Path, str]] = []
-    selected.extend(_files_under(main, root))
-    selected.extend(_runtime_files(package, root))
+    selected: list[tuple[Path | None, str, bytes | None]] = []
+    for path, relative in _files_under(main, root):
+        selected.append((path, relative, _promoted_main_source() if artifact is not None else None))
+    selected.extend((path, relative, None) for path, relative in _runtime_files(package, root))
     if artifact is not None:
-        selected.append((artifact_path, artifact_relative))
+        selected.append((artifact_path, artifact_relative, None))
 
-    members = sorted({relative: path for path, relative in selected}.items())
-    if any(output_path == path.resolve() for path, _ in selected):
+    members = sorted({relative: (path, content) for path, relative, content in selected}.items())
+    if any(path is not None and output_path == path.resolve() for path, _, _ in selected):
         raise ValueError("output path overlaps an input file")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
@@ -211,15 +240,24 @@ def build_submission_archive(
         with temporary_path.open("wb") as raw:
             with gzip.GzipFile(fileobj=raw, mode="wb", filename="", mtime=0) as compressed:
                 with tarfile.open(fileobj=compressed, mode="w") as tar:
-                    for relative, path in members:
-                        info = tar.gettarinfo(str(path), arcname=relative)
+                    for relative, (path, content) in members:
+                        if content is not None:
+                            info = tarfile.TarInfo(relative)
+                            info.size = len(content)
+                        else:
+                            assert path is not None
+                            info = tar.gettarinfo(str(path), arcname=relative)
                         info.uid = info.gid = 0
                         info.uname = info.gname = ""
                         info.mtime = 0
                         if info.isfile():
                             info.mode = 0o644
-                            with path.open("rb") as stream:
-                                tar.addfile(info, stream)
+                            if content is not None:
+                                tar.addfile(info, io.BytesIO(content))
+                            else:
+                                assert path is not None
+                                with path.open("rb") as stream:
+                                    tar.addfile(info, stream)
                         else:
                             tar.addfile(info)
             raw.flush()

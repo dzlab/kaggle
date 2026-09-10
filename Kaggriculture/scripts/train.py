@@ -1495,9 +1495,23 @@ def _latency_report_is_complete(
         return False
     if gate.get("real_engine_kept") is not True:
         return False
+    if gate.get("four_worker_result_present") is not True:
+        return False
+    if gate.get("simulator_required") is not False:
+        return False
+    if type(gate.get("inference_p95_ms_threshold")) not in (int, float):
+        return False
+    if float(gate["inference_p95_ms_threshold"]) != 10.0:
+        return False
     required_fields = (
-        "workers", "benchmark_valid", "failed_games",
-        "environment_steps_per_minute", "policy_inference_p95_ms",
+        "workers", "games", "successful_games", "failed_games", "failure_counts",
+        "environment_steps", "rollout_seconds", "games_per_hour",
+        "environment_steps_per_second", "environment_steps_per_minute",
+        "policy_inference_ms_per_turn", "policy_inference_p95_ms",
+        "policy_inference_max_ms", "policy_inference_p95_budget_ms",
+        "policy_inference_p95_within_budget", "policy_inference_budget_exceeded",
+        "policy_inference_valid_samples", "policy_inference_invalid_samples",
+        "policy_inference_latency_valid", "benchmark_valid",
     )
     seen_workers = set()
     for result in results:
@@ -1512,9 +1526,24 @@ def _latency_report_is_complete(
         seen_workers.add(result["workers"])
         if type(result["benchmark_valid"]) is not bool:
             return False
+        if type(result["games"]) is not int or result["games"] < 1:
+            return False
+        if type(result["successful_games"]) is not int or result["successful_games"] < 0:
+            return False
         if type(result["failed_games"]) is not int or result["failed_games"] < 0:
             return False
-        for field in ("environment_steps_per_minute", "policy_inference_p95_ms"):
+        if result["successful_games"] + result["failed_games"] > result["games"]:
+            return False
+        if not isinstance(result["failure_counts"], Mapping):
+            return False
+        if type(result["environment_steps"]) is not int or result["environment_steps"] < 0:
+            return False
+        for field in (
+            "rollout_seconds", "games_per_hour", "environment_steps_per_second",
+            "environment_steps_per_minute", "policy_inference_ms_per_turn",
+            "policy_inference_p95_ms", "policy_inference_max_ms",
+            "policy_inference_p95_budget_ms",
+        ):
             value = result[field]
             if type(value) not in (int, float):
                 return False
@@ -1524,11 +1553,49 @@ def _latency_report_is_complete(
                 return False
             if not valid_number:
                 return False
+        if result["rollout_seconds"] <= 0:
+            return False
+        if result["policy_inference_p95_budget_ms"] != 10.0:
+            return False
+        if result["policy_inference_max_ms"] < result["policy_inference_p95_ms"]:
+            return False
+        if type(result["policy_inference_p95_within_budget"]) is not bool:
+            return False
+        if type(result["policy_inference_budget_exceeded"]) is not bool:
+            return False
+        if type(result["policy_inference_valid_samples"]) is not int or result["policy_inference_valid_samples"] < 1:
+            return False
+        if type(result["policy_inference_invalid_samples"]) is not int or result["policy_inference_invalid_samples"] != 0:
+            return False
+        if result["policy_inference_latency_valid"] is not True:
+            return False
+        expected_within_budget = result["policy_inference_p95_ms"] < 10.0
+        if result["policy_inference_p95_within_budget"] is not expected_within_budget:
+            return False
+        if result["policy_inference_budget_exceeded"] is not (not expected_within_budget):
+            return False
+        if result["benchmark_valid"] is not True:
+            return False
     if seen_workers != expected_workers:
         return False
     from scripts.benchmark_rollouts import real_engine_gate_passed
 
     return real_engine_gate_passed(results)
+
+
+def _artifact_matches_latency_report(
+    report: Mapping[str, Any] | None, artifact_path: Path,
+) -> bool:
+    """Ensure the bytes being evaluated/package are exactly benchmarked bytes."""
+    if not isinstance(report, Mapping):
+        return False
+    reported_sha256 = report.get("candidate_artifact_sha256")
+    if not isinstance(reported_sha256, str):
+        return False
+    try:
+        return reported_sha256 == _sha256_path(artifact_path)
+    except OSError:
+        return False
 
 
 def _run_latency_benchmark(
@@ -1594,6 +1661,16 @@ def _create_promotion_package(
     archive.unlink(missing_ok=True)
     manifest_path.unlink(missing_ok=True)
     try:
+        try:
+            latency_document = json.loads(latency_report.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("latency evidence could not be re-read before packaging") from exc
+        if not _latency_report_is_complete(
+            latency_document, artifact_path=config.stage_artifact_path,
+        ) or not _artifact_matches_latency_report(
+            latency_document, config.stage_artifact_path,
+        ):
+            raise RuntimeError("staged artifact changed after CPU benchmark; refusing to package")
         build_submission_archive(
             PROJECT_ROOT, archive, artifact=config.stage_artifact_path,
         )
@@ -1851,6 +1928,7 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
             print(f"Development candidate discarded or incomplete{reason}; continue training, not promotion.")
 
         latency_gate_passed: bool | None = None
+        latency_report: dict[str, Any] | None = None
         holdout_complete: bool | None = None
         if development_promoted:
             _invalidate_evaluation_report(config.holdout_report_path)
@@ -1858,9 +1936,14 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
         if config.plot:
             plot_training_metrics(config)
         if development_promoted:
-            _, _, latency_gate_passed = _run_latency_benchmark(
+            _, latency_report, latency_gate_passed = _run_latency_benchmark(
                 config, command=commands[2], report_path=config.latency_report_path,
             )
+            if latency_gate_passed and not _artifact_matches_latency_report(
+                latency_report, config.stage_artifact_path,
+            ):
+                print("Staged artifact changed after CPU benchmark; holdout evaluation skipped.")
+                latency_gate_passed = False
         if development_promoted and latency_gate_passed:
             holdout_process, holdout_report = _run_evaluation(
                 config, phase="holdout", command=commands[3],
@@ -1913,12 +1996,17 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
             and isinstance(holdout_report.get("decision"), Mapping)
             and holdout_report["decision"].get("status") == "promote"
         ):
-            promotion_archive, promotion_manifest = _create_promotion_package(
-                config, latency_report=config.latency_report_path,
-                development_safety_regression=development_safety_regression,
-            )
-            print("Promotion package:", promotion_archive)
-            print("Promotion manifest:", promotion_manifest)
+            try:
+                promotion_archive, promotion_manifest = _create_promotion_package(
+                    config, latency_report=config.latency_report_path,
+                    development_safety_regression=development_safety_regression,
+                )
+            except RuntimeError as exc:
+                print(f"Promotion package skipped: {exc}")
+                latency_gate_passed = False
+            else:
+                print("Promotion package:", promotion_archive)
+                print("Promotion manifest:", promotion_manifest)
         else:
             print("Candidate remains stage-scoped; promotion package was not produced.")
         return WorkflowResult(
@@ -1938,10 +2026,27 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
             telemetry.finish()
 
 
+def _workflow_status(result: WorkflowResult) -> str:
+    if result.dry_run:
+        return "dry-run"
+    if result.release_ready:
+        return "release-ready"
+    if result.development_evaluation_promoted is False:
+        return "stage-only"
+    if result.development_evaluation_promoted is True:
+        return "release-gate-failed"
+    return "stage-only"
+
+
+def _workflow_exit_code(result: WorkflowResult) -> int:
+    return 2 if _workflow_status(result) == "release-gate-failed" else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     config = config_from_args(args)
     result = run_workflow(config, dry_run=args.dry_run)
+    status = _workflow_status(result)
     print(json.dumps({
         "config": asdict(config),
         "dry_run": result.dry_run,
@@ -1956,8 +2061,9 @@ def main(argv: list[str] | None = None) -> int:
         "promotion_manifest_path": str(result.promotion_manifest_path) if result.promotion_manifest_path else None,
         "promotion_ready": result.promotion_ready,
         "release_ready": result.release_ready,
+        "status": status,
     }, default=str, sort_keys=True))
-    return 0
+    return _workflow_exit_code(result)
 
 
 if __name__ == "__main__":
