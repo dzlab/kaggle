@@ -1039,9 +1039,7 @@ def promotion_decision(
         }
         if baseline_policy and any(reason in baseline_pairing_issues for reason in baseline_safety_reasons):
             reasons.append("baseline_incomplete_pairing")
-        else:
-            reasons.append("baseline_not_eligible")
-    elif not reasons and (
+    if not reasons and (
         baseline["seat_balanced_win_rate"] is None
         or baseline["median_paired_bank_differential"] is None
         or candidate["seat_balanced_win_rate"] <= baseline["seat_balanced_win_rate"]
@@ -1354,6 +1352,7 @@ def _valid_replay(replay: Mapping[str, Any], own_states: Sequence[Mapping[str, A
         market_result = _simulate_market_orders_lockstep(
             [actions[0].get("market", ()), actions[1].get("market", ())], observations, configuration,
             force_model=bool(actions[1].get("market", ())),
+            candidate_player=candidate_player,
         )
         if market_result is None:
             return False
@@ -1745,6 +1744,7 @@ def _price_floor_sales(state: Mapping[str, Any], observation: Mapping[str, Any] 
         [observation, other_observation or observation],
         configuration,
         force_model=bool(other_action.get("market", ())),
+        candidate_player=0,
     )
     return int(result["floor_sales"][0]) if result is not None else 0
 
@@ -2334,9 +2334,12 @@ def _market_sim_state(observation: Mapping[str, Any]) -> dict[str, Any] | None:
 
 def _simulate_market_orders_lockstep(orders_by_player: Sequence[Any], observations: Sequence[Mapping[str, Any]],
                                      configuration: Mapping[str, Any] | None = None,
-                                     *, force_model: bool = False) -> dict[str, Any] | None:
+                                     *, force_model: bool = False,
+                                     candidate_player: int = 0) -> dict[str, Any] | None:
     """Simulate both market queues against one shared inventory snapshot."""
     if len(orders_by_player) != 2 or len(observations) != 2:
+        return None
+    if type(candidate_player) is not int or candidate_player not in (0, 1):
         return None
     order_limit, config_valid = _market_order_limit(configuration)
     if not config_valid:
@@ -2380,7 +2383,7 @@ def _simulate_market_orders_lockstep(orders_by_player: Sequence[Any], observatio
             if operation == "HIRE":
                 cost = _fib(state["hires"]) * hire_mult
                 if cost > state["money"]:
-                    if player == 0:
+                    if player == candidate_player:
                         return None
                     active[player] = None
                     continue
@@ -2390,7 +2393,7 @@ def _simulate_market_orders_lockstep(orders_by_player: Sequence[Any], observatio
             if operation == "BUY_LAND":
                 next_index = len(state["unlocked"]) - 1
                 if next_index < 0 or next_index >= len(LAND_ORDER) or state["money"] < LAND_PRICES[next_index]:
-                    if player == 0:
+                    if player == candidate_player:
                         return None
                     active[player] = None
                     continue
@@ -2430,7 +2433,7 @@ def _simulate_market_orders_lockstep(orders_by_player: Sequence[Any], observatio
                 shed_total = sum(state["shed"].values())
                 if operation == "SELL":
                     if state["shed"].get(item, 0.0) < 1:
-                        if player == 0:
+                        if player == candidate_player:
                             return None
                         active[player] = None
                         continue
@@ -2442,7 +2445,7 @@ def _simulate_market_orders_lockstep(orders_by_player: Sequence[Any], observatio
                         floor_sales[player] += 1
                 elif operation == "BUY_PRODUCT":
                     if market_inventory.get(item, 0.0) < 1 or state["money"] < price or shed_total >= capacity:
-                        if player == 0:
+                        if player == candidate_player:
                             return None
                         active[player] = None
                         continue
@@ -2451,7 +2454,7 @@ def _simulate_market_orders_lockstep(orders_by_player: Sequence[Any], observatio
                     market_inventory[item] -= 1
                 elif operation == "BUY_SEED":
                     if state["money"] < price:
-                        if player == 0:
+                        if player == candidate_player:
                             return None
                         active[player] = None
                         continue
@@ -2459,7 +2462,7 @@ def _simulate_market_orders_lockstep(orders_by_player: Sequence[Any], observatio
                     state["seeds"][item] = state["seeds"].get(item, 0.0) + 1
                 elif operation == "BUY_ANIMAL":
                     if state["money"] < price or shed_total >= capacity:
-                        if player == 0:
+                        if player == candidate_player:
                             return None
                         active[player] = None
                         continue
@@ -2477,6 +2480,7 @@ def _valid_market_orders_lockstep(orders_by_player: Sequence[Any], observations:
     other_orders = orders_by_player[1] if len(orders_by_player) > 1 else ()
     return _simulate_market_orders_lockstep(
         orders_by_player, observations, configuration, force_model=bool(other_orders),
+        candidate_player=0,
     ) is not None
 
 

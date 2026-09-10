@@ -868,6 +868,28 @@ def test_promotion_decision_compares_baseline_only_after_gates():
     assert decision["reasons"] == []
 
 
+def test_promotion_decision_reports_unsafe_baseline_without_vetoing_safe_challenger():
+    from scripts.evaluate import promotion_decision
+
+    candidate = [
+        _metric_record(seat=seat, seed=1, outcome="win", differential=10)
+        for seat in (0, 1)
+    ]
+    baseline = [
+        _metric_record(
+            seat=seat, seed=1, outcome="loss", differential=1,
+            candidate="current", missed_basic_needs=1,
+        )
+        for seat in (0, 1)
+    ]
+
+    decision = promotion_decision(candidate, baseline, min_valid_games=1)
+
+    assert decision["status"] == "promote"
+    assert decision["reasons"] == []
+    assert decision["baseline_safety_gate_reasons"] == ["missed_basic_needs"]
+
+
 def test_promotion_decision_rejects_diagnostic_regression_and_reports_deltas():
     from scripts.evaluate import promotion_decision
 
@@ -3593,6 +3615,28 @@ def test_replay_rejects_market_orders_that_cannot_execute_from_prior_state():
 
     assert not _valid_action_schema({**prefix, "market": [["SELL", "WHEAT", 1]]}, observation)
     assert not _valid_action_schema({**prefix, "market": [["BUY_SEED", "WHEAT", 1]]}, observation)
+
+
+def test_replay_market_execution_is_strict_for_candidate_in_seat_one_only():
+    from scripts.evaluate import replay_record
+
+    candidate_invalid = _strict_two_turn_replay()
+    candidate_invalid["steps"][1][1]["action"]["market"] = [["SELL", "WHEAT", 1]]
+
+    candidate_record = replay_record(
+        candidate_invalid, variant="mixed", opponent="pass", seed=1, seat=1,
+    )
+
+    assert candidate_record["framework_error"] is True
+
+    opponent_invalid = _strict_two_turn_replay()
+    opponent_invalid["steps"][1][0]["action"]["market"] = [["SELL", "WHEAT", 1]]
+
+    opponent_record = replay_record(
+        opponent_invalid, variant="mixed", opponent="pass", seed=1, seat=1,
+    )
+
+    assert opponent_record["framework_error"] is False
 
 
 def test_malformed_market_order_limit_is_a_framework_failure_not_an_exception():
