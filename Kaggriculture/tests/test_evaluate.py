@@ -2965,6 +2965,35 @@ def test_transition_effects_accepts_water_followed_by_lifespan_decay():
     )
 
 
+def test_transition_effects_accepts_end_of_day_fertilize_then_weed_decay():
+    from scripts.evaluate import _transition_effects_valid
+
+    plant = {
+        "kind": "PLANT", "crop": "MELON", "planted_day": 0,
+        "watered_today": False, "consecutive_unwatered": 1,
+        "yield_units": 1, "max_lifespan_step": 312,
+        "fertilized_until_day": -1,
+    }
+    farm = {"money": 100, "farmer": [0, 0], "hands": [], "hires_today": 0,
+            "tiles": [[plant]], "unlocked_quadrants": ["NW"]}
+    pre = {"player": 0, "step": 23, "day": 0, "hour": 23, "farms": [farm],
+           "private": {"seeds": {}, "shed": {}, "inventories": [{"FERTILIZER": 1}]},
+           "market": {"inventory": {}, "prices": {}}}
+    post = {"player": 0, "step": 24, "day": 1, "hour": 0,
+            "farms": [{**farm, "tiles": [[{"kind": "WEED"}]]}],
+            "private": {"seeds": {}, "shed": {}, "inventories": [{}]},
+            "market": {"inventory": {}, "prices": {}}}
+    market_result = {
+        "states": [{"money": 100, "shed": {}, "seeds": {}, "hires": 0, "unlocked": ["NW"]}],
+        "market_inventory": {},
+    }
+
+    assert _transition_effects_valid(
+        pre, post, {"farmer": ["FERTILIZE"], "hands": [], "market": []},
+        {"boardSize": 1, "turnsPerDay": 24}, market_result,
+    )
+
+
 def test_transition_effects_accept_end_of_day_hire_hand_reset():
     from scripts.evaluate import _transition_effects_valid
 
@@ -3843,7 +3872,11 @@ def test_route_scheduling_ablation_produces_a_valid_replay():
                    "shop_adaptation": True, "land_purchase": True, "animals": True},
     )
 
-    assert record["framework_error"] is False
+    # Route scheduling is deliberately disabled, so this ablation can miss a
+    # watering deadline. The replay itself must still be structurally valid;
+    # lifecycle validation must not misclassify the boundary FERTILIZE/WEED
+    # transition as malformed replay.
+    assert record["framework_error_reasons"] == ["missed_basic_needs"]
 
 
 def test_demand_reactive_preserves_needs_safe_planner_schedule():

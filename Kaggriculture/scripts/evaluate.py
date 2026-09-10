@@ -2678,6 +2678,13 @@ def _targeted_boundary_tile_expected(before: Any, operation: str, day: int, step
             if window_start <= age_days <= int(crop_data["max_yield_day"]):
                 bonus = 2 if fertilized_until >= day else 1
                 expected["yield_units"] = min(int(crop_data["max_yield"]), int(yield_units) + bonus)
+    elif operation == "FERTILIZE":
+        if _tile_kind(before) != "PLANT":
+            return object()
+        current = _number(before.get("fertilized_until_day", -1))
+        if current is None:
+            return object()
+        expected["fertilized_until_day"] = max(current, day + 2)
     elif operation == "FEED":
         if not _animal_state(before) or before.get("fed_today") is not False:
             return object()
@@ -3451,6 +3458,20 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
             )
             if post_tile is None and harvest_follows:
                 pass
+            elif boundary:
+                # Fertilizing does not suppress the end-of-day refresh.  An
+                # unwatered plant can therefore become WEED in the same
+                # transition, and the targeted boundary model captures that
+                # deterministic action-plus-refresh result.
+                expected_tile = _targeted_boundary_tile_expected(
+                    pre_tile, operation, int(_number(pre.get("day")) or 0),
+                    _observation_step(pre, configuration),
+                    int(_number(_config_value(configuration, "turnsPerDay", 24)) or 24),
+                )
+                if not _tile_state_matches_expected(
+                    post_tile, expected_tile, allow_compact=allow_compact,
+                ):
+                    return False
             elif not isinstance(post_tile, Mapping) or (_number(post_tile.get("fertilized_until_day")) or -1) < (_number(pre.get("day")) or 0) + 2:
                 return False
         elif operation == "COLLECT_FERTILIZER" and not boundary:
