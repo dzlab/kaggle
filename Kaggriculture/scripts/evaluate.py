@@ -3361,6 +3361,7 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
         if values[item] <= 0:
             values.pop(item, None)
 
+    effective_tiles: dict[tuple[int, int], Any] = {}
     for worker_index, command in enumerate(commands):
         if not isinstance(command, Sequence) or isinstance(command, (str, bytes)) or not command:
             return False
@@ -3391,7 +3392,7 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
             # the combined demand exceeds the player's available seeds.
             continue
 
-        pre_tile = _tile_at_position(pre, position)
+        pre_tile = effective_tiles[position] if position in effective_tiles else _tile_at_position(pre, position)
         post_tile = _tile_at_position(post, position)
         if operation == "PLANT":
             plant_persisted = (
@@ -3413,9 +3414,11 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
             if not isinstance(post_tile, Mapping):
                 # Unit actions are resolved in one engine turn.  If a farmer
                 # harvests a tile before a hand's WATER/FEED/CARE command is
-                # resolved, the second command is a legal no-op because the
-                # harvested tile is already gone.  Do not demand a post-tile
-                # effect that the engine cannot produce in this conflict.
+                # resolved, the second command is a legal no-op.  If the
+                # harvest follows this command, the first command still
+                # mutates the tile before the harvest removes it.  In either
+                # order, do not demand a post-tile effect that the engine
+                # cannot preserve in this conflict.
                 blocked_by_harvest = any(
                     other_index != worker_index
                     and isinstance(other_command, Sequence)
@@ -3425,10 +3428,10 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
                     and _worker_position(pre, other_index) == position
                     for other_index, other_command in enumerate(commands)
                 )
-                if post_tile is None and blocked_by_harvest and isinstance(pre_tile, Mapping):
-                    continue
-                return False
-            if operation == "WATER" and _tile_kind(post_tile) == "WEED" and isinstance(pre_tile, Mapping):
+                if not (post_tile is None and blocked_by_harvest and
+                        (isinstance(pre_tile, Mapping) or position in effective_tiles)):
+                    return False
+            elif operation == "WATER" and _tile_kind(post_tile) == "WEED" and isinstance(pre_tile, Mapping):
                 lifespan = _number(pre_tile.get("max_lifespan_step"))
                 step = _number(pre.get("step"))
                 yield_units = _number(pre_tile.get("yield_units"))
@@ -3442,7 +3445,9 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
                     # its lifespan decay can replace the last unit with WEED
                     # in the same transition.
                     continue
-            if boundary:
+            if not isinstance(post_tile, Mapping):
+                pass
+            elif boundary:
                 expected_tile = _targeted_boundary_tile_expected(
                     pre_tile, operation, int(_number(pre.get("day")) or 0),
                     _observation_step(pre, configuration),
@@ -3547,6 +3552,13 @@ def _transition_effects_valid(pre: Mapping[str, Any], post: Mapping[str, Any], a
                 add_quantity(expected_shed, drop_item, taken)
                 room -= taken
             inventory.clear()
+
+        tile_valid, effective_tile = _action_target_tile_expected(
+            pre_tile, command, pre, post, configuration,
+            apply_boundary_refresh=False,
+        )
+        if tile_valid:
+            effective_tiles[position] = effective_tile
 
     if expected_inventories is not None and boundary:
         for inventory in expected_inventories:

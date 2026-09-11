@@ -84,6 +84,19 @@ def test_malformed_replay_raises_structured_value_error(tmp_path):
 
 
 @pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
+def test_collector_accepts_water_then_same_tile_harvest(tmp_path):
+    from kagriculture_agent.trajectory import transitions_from_replay
+
+    replay_path = tmp_path / "water-harvest.json"
+    run_episode(opponent="pass", seed=200, steps=96, replay_path=replay_path)
+    replay = json.loads(replay_path.read_text())
+
+    transitions = transitions_from_replay(replay, candidate_player=0, requested_seed=200)
+
+    assert len(transitions) == len(replay["steps"]) - 1
+
+
+@pytest.mark.skipif(make is None, reason="local engine dependency is unavailable")
 def test_requested_seed_mismatch_is_rejected(tmp_path):
     from kagriculture_agent.trajectory import ReplayValidationError, transitions_from_replay
 
