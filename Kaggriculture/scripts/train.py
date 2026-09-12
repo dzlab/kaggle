@@ -1366,8 +1366,19 @@ def _run_evaluation(
     started_ns = time.time_ns()
     completed = run_command(command, check=False)
     if completed.returncode != 0:
+        detail = ""
+        if report_path.exists() and report_path.stat().st_mtime_ns >= started_ns:
+            try:
+                failure_report = _read_evaluation_report(report_path)
+                decision = failure_report.get("decision", {})
+                if isinstance(decision, Mapping):
+                    reasons = decision.get("reasons", ())
+                    if isinstance(reasons, Sequence) and not isinstance(reasons, (str, bytes)):
+                        detail = f"; decision={decision.get('status')!r}; reasons={list(reasons)!r}"
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
         raise RuntimeError(
-            f"{phase} evaluator failed with exit code {completed.returncode}"
+            f"{phase} evaluator failed with exit code {completed.returncode}{detail}"
         )
     if not report_path.exists() or report_path.stat().st_mtime_ns < started_ns:
         raise RuntimeError(f"{phase} evaluator did not write a fresh report: {report_path}")

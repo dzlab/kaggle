@@ -46,6 +46,8 @@ def test_colab_notebook_is_a_small_setup_and_helper_launch_wrapper():
         "--experiment-config",
         "--experiment",
         "--training-seed",
+        "--workers",
+        "--evaluation-timeout",
         "--device",
         "--wandb",
     )
@@ -2063,6 +2065,34 @@ def test_colab_rejects_stale_complete_report_when_development_evaluator_fails(tm
     assert not config.development_report_path.exists()
     assert colab_train.EVALUATE_SCRIPT.name in invoked
     assert colab_train.RUN_LOCAL_SCRIPT.name not in invoked
+
+
+def test_run_evaluation_reports_discard_reasons_when_evaluator_fails(tmp_path, monkeypatch):
+    from scripts import colab_train
+
+    monkeypatch.setattr(colab_train, "resolve_device", lambda value: "cpu")
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+    report = _complete_colab_evaluation_report(config, phase="development")
+    report["decision"] = {
+        "status": "discard",
+        "reasons": ["framework_error", "evaluation_timeout"],
+    }
+    report_path = config.development_report_path
+
+    def fake_run(command, *, check):
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(colab_train, "run_command", fake_run)
+
+    with pytest.raises(RuntimeError, match="framework_error.*evaluation_timeout"):
+        colab_train._run_evaluation(
+            config, phase="development", command=("fake-evaluator",),
+            report_path=report_path,
+        )
 
 
 def test_colab_smoke_failure_prevents_holdout_evaluation(tmp_path, monkeypatch):
