@@ -40,6 +40,7 @@ def test_colab_notebook_is_a_small_setup_and_helper_launch_wrapper():
     assert "pip" in install_source
     assert ".[training,observability]" in install_source
     assert "Kaggriculture" in install_source
+    assert "drive.mount('/content/drive')" in install_source
 
     required_flags = (
         "--mount-drive",
@@ -53,6 +54,8 @@ def test_colab_notebook_is_a_small_setup_and_helper_launch_wrapper():
     )
     assert "scripts/train.py" in launch_source
     assert all(flag in launch_source for flag in required_flags)
+    assert "--workers 8" in launch_source
+    assert "--evaluation-timeout 3600" in launch_source
     assert "--wandb-run-name" not in launch_source
     assert "--no-wandb" not in launch_source
     assert "WANDB_API_KEY" not in launch_source
