@@ -87,7 +87,7 @@ _NORMALIZED_RECORD_FIELDS = frozenset({
 _NORMALIZED_NUMERIC_FIELDS = frozenset({
     "final_bank", "opponent_final_bank", "bank_differential", "shed_overflow",
     "price_floor_sales", "missed_basic_needs", "terminal_cash",
-    "terminal_inventory_value", "market_transaction_count",
+    "terminal_inventory_value", "wealth_differential", "market_transaction_count",
     "submitted_market_order_count", "same_item_market_churn",
     "same_item_sell_buy_churn",
 })
@@ -101,6 +101,7 @@ FRAMEWORK_REASON_ORDER = (
     "market_transaction_cap", "terminal_cash_floor", "terminal_inventory_floor",
     "incomplete_pairing",
 )
+MIN_LEARNED_ACTIVE_TURN_FRACTION = 0.05
 _STRICT_NUMERIC_FIELDS = frozenset({
     "seed", "step", "day", "hour", "money", "hires_today", "yield_units",
     "max_lifespan_step", "consecutive_unwatered", "planted_day",
@@ -382,6 +383,10 @@ def _diagnostic_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     max_no_progress_steps = 0
     time_limit_endings = 0
     safety_regression_count = 0
+    learned_configured_games = 0
+    learned_inactive_games = 0
+    learned_active_turns = 0
+    learned_policy_turns = 0
     for record in records:
         reason = record.get("termination_reason")
         if reason is not None and str(reason):
@@ -406,6 +411,17 @@ def _diagnostic_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         )
         if record.get("safety_regression") is True or has_safety_flag:
             safety_regression_count += 1
+        if record.get("learned_model_configured") is True:
+            learned_configured_games += 1
+            active_turns = _number(record.get("learned_active_turns"))
+            policy_turns = _number(record.get("policy_turns"))
+            if active_turns is not None:
+                learned_active_turns += max(0, int(active_turns))
+            if policy_turns is not None:
+                learned_policy_turns += max(0, int(policy_turns))
+            fraction = _number(record.get("learned_active_turn_fraction"))
+            if fraction is None or fraction < MIN_LEARNED_ACTIVE_TURN_FRACTION:
+                learned_inactive_games += 1
     resolved_count = sum(
         count for reason, count in termination_reasons.items()
         if reason.strip().lower().replace("-", "_") == "resolved"
@@ -432,6 +448,14 @@ def _diagnostic_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "time_limit_rate": time_limit_endings / denominator,
         "safety_regression_count": safety_regression_count,
         "safety_regression_rate": safety_regression_count / denominator,
+        "learned_model_configured_games": learned_configured_games,
+        "learned_inactive_games": learned_inactive_games,
+        "learned_active_turns": learned_active_turns,
+        "learned_policy_turns": learned_policy_turns,
+        "learned_active_turn_fraction": (
+            learned_active_turns / learned_policy_turns
+            if learned_policy_turns else None
+        ),
     }
 
 
@@ -566,6 +590,10 @@ def aggregate_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "total_same_item_market_churn": sum(churn_values),
         "max_same_item_market_churn": max(churn_values, default=0),
         "mean_bank_differential": _average(valid_records, "bank_differential"),
+        "mean_wealth_differential": float(mean([
+            float(record.get("wealth_differential", record.get("bank_differential", 0.0)) or 0.0)
+            for record in valid_records
+        ])) if valid_records else 0.0,
         "framework_error_rate": sum(bool(record.get("framework_error")) for record in records) / count if count else 0.0,
         "average_shed_overflow": _average(records, "shed_overflow"),
         "average_price_floor_sales": _average(records, "price_floor_sales"),
@@ -595,8 +623,13 @@ def _metric_record_is_valid(record: Mapping[str, Any]) -> bool:
         and record["seat"] in (0, 1)
         and record.get("framework_error") is False
         and record.get("outcome") in {"win", "loss", "tie"}
-        and _metric_number(record.get("bank_differential")) is not None
+        and _metric_number(record.get("wealth_differential", record.get("bank_differential"))) is not None
     )
+
+
+def _metric_differential(record: Mapping[str, Any]) -> float | None:
+    """Return terminal-wealth differential, with legacy cash fallback."""
+    return _metric_number(record.get("wealth_differential", record.get("bank_differential")))
 
 
 def _record_has_missed_basic_needs(record: Mapping[str, Any]) -> bool:
@@ -678,6 +711,7 @@ def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 
     pair_scores = []
     pair_differentials = []
+    pair_wealth_differentials = []
     pair_market_transactions = []
     pair_market_transaction_totals = []
     pair_churn = []
@@ -690,6 +724,9 @@ def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         pair_scores.append((scores[seat_zero["outcome"]] + scores[seat_one["outcome"]]) / 2.0)
         pair_differentials.append(
             (_metric_number(seat_zero["bank_differential"]) + _metric_number(seat_one["bank_differential"])) / 2.0
+        )
+        pair_wealth_differentials.append(
+            (_metric_differential(seat_zero) + _metric_differential(seat_one)) / 2.0
         )
         seat_market_transactions = [
             float(seat_zero.get("submitted_market_order_count", seat_zero.get("market_transaction_count", 0)) or 0),
@@ -724,6 +761,7 @@ def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     )
     bootstrap_win_rate = _bootstrap_interval(pair_scores, pair_keys)
     bootstrap = _bootstrap_interval(pair_differentials, pair_keys)
+    wealth_bootstrap = _bootstrap_interval(pair_wealth_differentials, pair_keys)
     elo_matches = [
         {
             "player_a": _record_candidate(record),
@@ -749,6 +787,9 @@ def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "mean_paired_bank_differential": float(mean(pair_differentials)) if pair_differentials else None,
         "median_paired_bank_differential": float(median(pair_differentials)) if pair_differentials else None,
         "fifth_percentile_bank_differential": percentile(pair_differentials, 5),
+        "mean_paired_wealth_differential": float(mean(pair_wealth_differentials)) if pair_wealth_differentials else None,
+        "median_paired_wealth_differential": float(median(pair_wealth_differentials)) if pair_wealth_differentials else None,
+        "fifth_percentile_wealth_differential": percentile(pair_wealth_differentials, 5),
         "total_market_transaction_count": int(sum(pair_market_transaction_totals)),
         "mean_paired_market_transaction_count": float(mean(pair_market_transactions)) if pair_market_transactions else None,
         "median_paired_market_transaction_count": float(median(pair_market_transactions)) if pair_market_transactions else None,
@@ -771,14 +812,17 @@ def paired_seed_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "median_paired_terminal_inventory_value": float(median(pair_terminal_inventory_value)) if pair_terminal_inventory_value else None,
         "wilson_win_rate": wilson,
         "lower_tail_bank_differential": percentile(pair_differentials, 5),
+        "lower_tail_wealth_differential": percentile(pair_wealth_differentials, 5),
         "elo": elo,
         "confidence": {
             "wilson_win_rate": wilson,
             "bootstrap_seat_balanced_win_rate": bootstrap_win_rate,
             "bootstrap_bank_differential": bootstrap,
+            "bootstrap_wealth_differential": wealth_bootstrap,
         },
         "bootstrap_seat_balanced_win_rate": bootstrap_win_rate,
         "bootstrap_bank_differential": bootstrap,
+        "bootstrap_wealth_differential": wealth_bootstrap,
         "diagnostics": diagnostics,
     }
 
@@ -884,9 +928,24 @@ def _safety_gate_reasons(records: Sequence[Mapping[str, Any]], summary: Mapping[
             return ["missing_seat_pairs"]
         if summary["duplicate_seat_pairs"]:
             return ["duplicate_seat_pairs"]
+        inactive_learned_games = [
+            record for record in mappings
+            if record.get("learned_model_configured") is True
+            and (
+                _metric_number(record.get("learned_active_turn_fraction")) is None
+                or float(record.get("learned_active_turn_fraction"))
+                < MIN_LEARNED_ACTIVE_TURN_FRACTION
+            )
+        ]
+        if inactive_learned_games:
+            return ["learned_model_inactive"]
+        wealth_tail = summary.get(
+            "fifth_percentile_wealth_differential",
+            summary["fifth_percentile_bank_differential"],
+        )
         if (
-            summary["fifth_percentile_bank_differential"] is None
-            or summary["fifth_percentile_bank_differential"] < 0
+            wealth_tail is None
+            or wealth_tail < 0
         ):
             return ["negative_tail"]
     economic_summary = summary if seat_aware else aggregate_records(mappings)
@@ -1047,9 +1106,18 @@ def promotion_decision(
         reasons.append("baseline_incomplete_pairing")
     if not reasons and (
         baseline["seat_balanced_win_rate"] is None
-        or baseline["median_paired_bank_differential"] is None
+        or baseline.get(
+            "median_paired_wealth_differential",
+            baseline["median_paired_bank_differential"],
+        ) is None
         or candidate["seat_balanced_win_rate"] <= baseline["seat_balanced_win_rate"]
-        or candidate["median_paired_bank_differential"] <= baseline["median_paired_bank_differential"]
+        or candidate.get(
+            "median_paired_wealth_differential",
+            candidate["median_paired_bank_differential"],
+        ) <= baseline.get(
+            "median_paired_wealth_differential",
+            baseline["median_paired_bank_differential"],
+        )
     ):
         reasons.append("no_paired_improvement")
     return {
@@ -1769,6 +1837,7 @@ def _framework_error_record(*, variant: str, opponent: str, seed: int, seat: int
         "final_bank": None,
         "opponent_final_bank": None,
         "bank_differential": 0.0,
+        "wealth_differential": 0.0,
         "framework_error": True,
         "framework_error_reasons": [reason] if reason in FRAMEWORK_REASON_ORDER else ["engine_error"],
         "shed_overflow": 0.0,
@@ -1801,10 +1870,13 @@ def _replay_diagnostics(
     sources: list[tuple[str, Mapping[str, Any]]] = [("replay", replay)]
     replay_info = _mapping(replay.get("info"))
     replay_diagnostics = _mapping(replay.get("diagnostics"))
+    policy_diagnostics = _mapping(replay.get("policy_diagnostics"))
     if replay_info:
         sources.append(("replay.info", replay_info))
     if replay_diagnostics:
         sources.append(("replay.diagnostics", replay_diagnostics))
+    if policy_diagnostics:
+        sources.append(("replay.policy_diagnostics", policy_diagnostics))
     for index, state in enumerate(own_states):
         source_name = f"state[{index}]"
         sources.append((source_name, state))
@@ -1822,6 +1894,11 @@ def _replay_diagnostics(
     shaping_count = 0
     safety_flags: list[str] = []
     safety_regression = False
+    learned_model_configured = False
+    learned_active_turns: int | None = None
+    policy_turns: int | None = None
+    learned_active_turn_fraction: float | None = None
+    learned_model_status_counts: dict[str, int] = {}
     for source_name, source in sources:
         if "termination_reason" in source:
             raw_reason = source["termination_reason"]
@@ -1907,6 +1984,54 @@ def _replay_diagnostics(
                 if "safety_regression" in flag.lower():
                     safety_regression = True
 
+        if "learned_model_configured" in source:
+            raw_configured = source["learned_model_configured"]
+            if type(raw_configured) is not bool:
+                raise ValueError(
+                    f"{source_name}.learned_model_configured must be boolean"
+                )
+            learned_model_configured = learned_model_configured or raw_configured
+        if "policy_turns" in source:
+            raw_policy_turns = source["policy_turns"]
+            if type(raw_policy_turns) is not int or raw_policy_turns < 0:
+                raise ValueError(
+                    f"{source_name}.policy_turns must be a nonnegative integer"
+                )
+            policy_turns = raw_policy_turns
+        if "learned_active_turns" in source:
+            raw_active_turns = source["learned_active_turns"]
+            if type(raw_active_turns) is not int or raw_active_turns < 0:
+                raise ValueError(
+                    f"{source_name}.learned_active_turns must be a nonnegative integer"
+                )
+            learned_active_turns = raw_active_turns
+        if "learned_active_turn_fraction" in source:
+            raw_fraction = source["learned_active_turn_fraction"]
+            fraction = _number(raw_fraction)
+            if fraction is None or not 0.0 <= fraction <= 1.0:
+                raise ValueError(
+                    f"{source_name}.learned_active_turn_fraction must be in [0, 1]"
+                )
+            learned_active_turn_fraction = fraction
+        if "learned_model_status_counts" in source:
+            raw_counts = source["learned_model_status_counts"]
+            if not isinstance(raw_counts, Mapping):
+                raise ValueError(
+                    f"{source_name}.learned_model_status_counts must be an object"
+                )
+            for raw_status, raw_count in raw_counts.items():
+                if type(raw_status) is not str or not raw_status:
+                    raise ValueError(
+                        f"{source_name}.learned_model_status_counts keys must be non-empty strings"
+                    )
+                if type(raw_count) is not int or raw_count < 0:
+                    raise ValueError(
+                        f"{source_name}.learned_model_status_counts values must be nonnegative integers"
+                    )
+                learned_model_status_counts[raw_status] = (
+                    learned_model_status_counts.get(raw_status, 0) + raw_count
+                )
+
     final_state = own_states[-1] if own_states else {}
     final_observation = _mapping(final_state.get("observation"))
     final_step = _number(final_observation.get("step"))
@@ -1918,7 +2043,16 @@ def _replay_diagnostics(
     time_limit_ending = time_limit_ending or inferred_time_limit
     if termination_reason is None:
         termination_reason = "time_limit" if time_limit_ending else "terminal"
-    return {
+    if learned_model_configured:
+        if learned_active_turns is None or policy_turns is None:
+            raise ValueError(
+                "learned policy diagnostics must include policy_turns and learned_active_turns"
+            )
+        if learned_active_turn_fraction is None:
+            learned_active_turn_fraction = (
+                learned_active_turns / policy_turns if policy_turns else 0.0
+            )
+    result = {
         "termination_reason": termination_reason,
         "bootstrap_truncated": bootstrap_truncated,
         "no_progress_steps": no_progress_steps,
@@ -1927,6 +2061,15 @@ def _replay_diagnostics(
         "safety_regression": safety_regression,
         "shaping_count": shaping_count,
     }
+    if learned_model_configured:
+        result.update({
+            "learned_model_configured": True,
+            "policy_turns": policy_turns,
+            "learned_active_turns": learned_active_turns,
+            "learned_active_turn_fraction": learned_active_turn_fraction,
+            "learned_model_status_counts": learned_model_status_counts,
+        })
+    return result
 
 
 def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, seed: int,
@@ -1956,15 +2099,35 @@ def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, se
     )
     own_bank = _final_bank(own_states[-1] if own_states else None)
     other_bank = _final_bank(other_states[-1] if other_states else None)
+    own_terminal_inventory_value = (
+        _terminal_inventory_value(
+            _mapping(own_states[-1].get("observation")), replay_configuration,
+        )
+        if own_states else None
+    )
+    other_terminal_inventory_value = (
+        _terminal_inventory_value(
+            _mapping(other_states[-1].get("observation")), replay_configuration,
+        )
+        if other_states else None
+    )
     if framework_error or own_bank is None or other_bank is None:
         outcome = "framework_error"
-        differential = 0.0
-    elif own_bank > other_bank:
-        outcome, differential = "win", own_bank - other_bank
-    elif own_bank < other_bank:
-        outcome, differential = "loss", own_bank - other_bank
+        bank_differential = 0.0
+        wealth_differential = 0.0
     else:
-        outcome, differential = "tie", 0.0
+        bank_differential = own_bank - other_bank
+        wealth_differential = (
+            own_bank + (own_terminal_inventory_value or 0.0)
+            - other_bank - (other_terminal_inventory_value or 0.0)
+        )
+        if wealth_differential > 0:
+            outcome = "win"
+        elif wealth_differential < 0:
+            outcome = "loss"
+        else:
+            outcome = "tie"
+    differential = wealth_differential
 
     shed_overflow = 0.0
     floor_sales = 0
@@ -2023,7 +2186,10 @@ def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, se
     }
     reasons = framework_error_reasons(diagnostic_record)
     if reasons:
-        outcome, differential = "framework_error", 0.0
+        outcome = "framework_error"
+        bank_differential = 0.0
+        wealth_differential = 0.0
+        differential = 0.0
     record = {
         "candidate": variant,
         "variant": variant,
@@ -2033,17 +2199,15 @@ def _replay_record(replay: Mapping[str, Any], *, variant: str, opponent: str, se
         "outcome": outcome,
         "final_bank": own_bank,
         "opponent_final_bank": other_bank,
-        "bank_differential": differential,
+        "bank_differential": bank_differential,
+        "wealth_differential": wealth_differential,
         "framework_error": bool(reasons),
         "framework_error_reasons": reasons,
         "shed_overflow": shed_overflow,
         "price_floor_sales": floor_sales,
         "missed_basic_needs": missed_needs,
         "terminal_cash": own_bank,
-        "terminal_inventory_value": (
-            _terminal_inventory_value(_mapping(own_states[-1].get("observation")), replay_configuration)
-            if own_states else None
-        ),
+        "terminal_inventory_value": own_terminal_inventory_value,
         **market_metrics,
         **diagnostics,
     }

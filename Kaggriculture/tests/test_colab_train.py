@@ -56,6 +56,7 @@ def test_colab_notebook_is_a_small_setup_and_helper_launch_wrapper():
     assert all(flag in launch_source for flag in required_flags)
     assert "--workers 8" in launch_source
     assert "--evaluation-timeout 3600" in launch_source
+    assert "--model-width 64" in launch_source
     assert "--wandb-run-name" not in launch_source
     assert "--no-wandb" not in launch_source
     assert "WANDB_API_KEY" not in launch_source
@@ -110,6 +111,8 @@ def test_colab_matrix_has_reproducible_variants_and_shared_matrices():
     assert matrix["shared"]["holdout_seeds"] == list(range(100, 150))
     assert matrix["shared"]["development_seats"] == [0, 1]
     assert matrix["shared"]["holdout_seats"] == [0, 1]
+    assert matrix["shared"]["development_steps"] == 720
+    assert matrix["shared"]["holdout_steps"] == 720
     assert matrix["experiments"]["baseline_bc_ppo"]["bc_steps"] == 25
     assert matrix["experiments"]["baseline_bc_ppo"]["ppo_steps"] == 16
     assert matrix["experiments"]["longer_bc_ppo"]["bc_steps"] == 250

@@ -687,6 +687,90 @@ def test_paired_seed_summary_has_confidence_metrics_and_both_seats():
     json.dumps(summary, allow_nan=False)
 
 
+def test_terminal_wealth_differential_is_used_by_promotion_gate():
+    from scripts.evaluate import promotion_decision
+
+    def record(candidate, seat, outcome, wealth):
+        return {
+            "candidate": candidate, "variant": candidate, "opponent": "pass",
+            "seat": seat, "seed": 1, "outcome": outcome,
+            "final_bank": 100.0, "opponent_final_bank": 120.0,
+            "bank_differential": -20.0, "wealth_differential": wealth,
+            "framework_error": False, "shed_overflow": 0.0,
+            "price_floor_sales": 0.0, "missed_basic_needs": 0,
+        }
+
+    candidate = [record("learned_artifact", seat, "win", 30.0) for seat in (0, 1)]
+    baseline = [record("current", seat, "tie", 0.0) for seat in (0, 1)]
+
+    decision = promotion_decision(
+        candidate, baseline, min_valid_games=1,
+        expected_matrix=[("pass", 1, 0), ("pass", 1, 1)],
+    )
+
+    assert decision["status"] == "promote"
+    assert decision["candidate"]["median_paired_wealth_differential"] == 30.0
+
+
+def test_learned_candidate_with_no_active_turns_is_rejected():
+    from scripts.evaluate import promotion_decision
+
+    def record(candidate, seat):
+        return {
+            "candidate": candidate, "variant": candidate, "opponent": "pass",
+            "seat": seat, "seed": 1, "outcome": "tie",
+            "final_bank": 100.0, "opponent_final_bank": 100.0,
+            "bank_differential": 0.0, "framework_error": False,
+            "shed_overflow": 0.0, "price_floor_sales": 0.0,
+            "missed_basic_needs": 0, "learned_model_configured": candidate != "current",
+            "learned_active_turns": 0 if candidate != "current" else None,
+            "policy_turns": 96 if candidate != "current" else None,
+            "learned_active_turn_fraction": 0.0 if candidate != "current" else None,
+        }
+
+    candidate = [record("learned_artifact", seat) for seat in (0, 1)]
+    baseline = [record("current", seat) for seat in (0, 1)]
+
+    decision = promotion_decision(
+        candidate, baseline, min_valid_games=1,
+        expected_matrix=[("pass", 1, 0), ("pass", 1, 1)],
+    )
+
+    assert decision["status"] == "discard"
+    assert decision["reasons"] == ["learned_model_inactive"]
+
+
+def test_current_baseline_passes_the_full_season_development_gate_contract():
+    from scripts.evaluate import (
+        _safety_gate_reasons,
+        paired_seed_summary,
+    )
+
+    opponents = ["pass", "random", "starter"]
+    records = [
+        {
+            "candidate": "current", "variant": "current", "opponent": opponent,
+            "seed": 0, "seat": seat, "outcome": "win",
+            "final_bank": 3000.0, "opponent_final_bank": 100.0,
+            "bank_differential": 2900.0, "wealth_differential": 2900.0,
+            "framework_error": False, "shed_overflow": 0.0,
+            "price_floor_sales": 0, "missed_basic_needs": 0,
+        }
+        for opponent in opponents
+        for seat in (0, 1)
+    ]
+    summary = paired_seed_summary(records)
+    expected_matrix = [
+        (opponent, 0, seat)
+        for opponent in opponents
+        for seat in (0, 1)
+    ]
+
+    assert _safety_gate_reasons(
+        records, summary, min_valid_games=1, expected_matrix=expected_matrix,
+    ) == []
+
+
 def test_paired_seed_summary_exposes_canonical_candidate_diagnostics():
     from scripts.evaluate import paired_seed_summary
 
@@ -1255,6 +1339,53 @@ def test_worker_orders_candidate_and_opponent_by_seat():
 
     assert _ordered_agents(candidate, opponent, 0) == [candidate, opponent]
     assert _ordered_agents(candidate, opponent, 1) == [opponent, candidate]
+
+
+def test_guarded_candidate_records_learned_activity():
+    from scripts.evaluation_worker import _GuardedCandidate
+
+    class Memory:
+        diagnostics = {
+            "learned_model_status": "slow_model",
+            "learned_active": False,
+        }
+
+    class Candidate:
+        memory = Memory()
+
+        def __call__(self, _observation):
+            return {"farmer": ["PASS"], "hands": [], "market": []}
+
+    guarded = _GuardedCandidate(Candidate())
+    guarded("observation")
+
+    assert guarded.activity_diagnostics() == {
+        "learned_model_configured": True,
+        "policy_turns": 1,
+        "learned_active_turns": 0,
+        "learned_active_turn_fraction": 0.0,
+        "learned_model_status_counts": {"slow_model": 1},
+    }
+
+
+def test_replay_record_preserves_learned_activity_diagnostics():
+    from scripts.evaluate import replay_record
+
+    replay = _strict_two_turn_replay()
+    replay["policy_diagnostics"] = {
+        "learned_model_configured": True,
+        "policy_turns": 1,
+        "learned_active_turns": 1,
+        "learned_active_turn_fraction": 1.0,
+        "learned_model_status_counts": {"ok": 1},
+    }
+
+    record = replay_record(replay, variant="learned_artifact", opponent="pass", seed=1)
+
+    assert record["learned_model_configured"] is True
+    assert record["learned_active_turns"] == 1
+    assert record["learned_active_turn_fraction"] == 1.0
+    assert record["learned_model_status_counts"] == {"ok": 1}
 
 
 def test_nonzero_worker_exit_is_normalized_as_framework_failure(monkeypatch):

@@ -224,8 +224,16 @@ def _run_game_direct(request: Mapping[str, Any]) -> dict[str, Any]:
             else:
                 run_kwargs["candidate_artifact"] = request["artifact_path"]
             environment = run_episode(**run_kwargs)
+            replay = environment.toJSON()
+            policy_diagnostics = getattr(
+                environment, "_kagriculture_policy_diagnostics", None,
+            )
+            if isinstance(policy_diagnostics, Mapping) and policy_diagnostics.get(
+                "learned_model_configured"
+            ):
+                replay["policy_diagnostics"] = dict(policy_diagnostics)
             record = replay_record(
-                environment.toJSON(),
+                replay,
                 variant=request["candidate"],
                 opponent=request["opponent"],
                 seed=request["seed"],

@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import json
 import sys
+from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -47,12 +48,72 @@ class _GuardedCandidate:
             and _callable_accepts_configuration(candidate, fallback=accepts_configuration)
         )
         self.failure: EvaluatorFailure | None = None
+        self._policy_turns = 0
+        self._learned_active_turns = 0
+        self._learned_model_configured = self._has_learned_model()
+        self._learned_model_status_counts: Counter[str] = Counter()
+
+    def _has_learned_model(self) -> bool:
+        for candidate in (
+            self.candidate,
+            getattr(self.candidate, "policy", None),
+            getattr(self.candidate, "__self__", None),
+        ):
+            learned_policy = getattr(candidate, "learned_policy", None)
+            if learned_policy is not None and getattr(learned_policy, "model_path", None) is not None:
+                return True
+        return False
+
+    def _memory_diagnostics(self) -> Mapping[str, Any]:
+        """Find diagnostics on direct, wrapped, and bound policy objects."""
+        candidates = (
+            self.candidate,
+            getattr(self.candidate, "policy", None),
+            getattr(self.candidate, "__self__", None),
+        )
+        for candidate in candidates:
+            memory = getattr(candidate, "memory", None)
+            diagnostics = getattr(memory, "diagnostics", None)
+            if isinstance(diagnostics, Mapping):
+                return diagnostics
+        return {}
+
+    def _record_policy_activity(self) -> None:
+        diagnostics = self._memory_diagnostics()
+        if not diagnostics:
+            return
+        if "learned_active" in diagnostics or "learned_model_status" in diagnostics:
+            self._learned_model_configured = True
+        if diagnostics.get("learned_active") is True:
+            self._learned_active_turns += 1
+        status = diagnostics.get("learned_model_status")
+        if isinstance(status, str) and status:
+            self._learned_model_status_counts[status] += 1
+
+    def activity_diagnostics(self) -> dict[str, Any]:
+        """Return per-game learned-policy activity for evaluator records."""
+        if not self._learned_model_configured:
+            return {"learned_model_configured": False}
+        policy_turns = self._policy_turns
+        return {
+            "learned_model_configured": True,
+            "policy_turns": policy_turns,
+            "learned_active_turns": self._learned_active_turns,
+            "learned_active_turn_fraction": (
+                self._learned_active_turns / policy_turns if policy_turns else 0.0
+            ),
+            "learned_model_status_counts": dict(self._learned_model_status_counts),
+        }
 
     def __call__(self, observation: Any, configuration: Any = None) -> Any:
         try:
             if self.accepts_configuration:
-                return self.candidate(observation, configuration)
-            return self.candidate(observation)
+                result = self.candidate(observation, configuration)
+            else:
+                result = self.candidate(observation)
+            self._policy_turns += 1
+            self._record_policy_activity()
+            return result
         except Exception as exc:
             self.failure = EvaluatorFailure(
                 f"candidate policy failure: {type(exc).__name__}: {exc}"
@@ -224,6 +285,9 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
             seat=seat,
             error=f"{type(exc).__name__}: {exc}",
         )
+    policy_diagnostics = guarded_candidate.activity_diagnostics()
+    if policy_diagnostics.get("learned_model_configured"):
+        replay["policy_diagnostics"] = policy_diagnostics
     return replay_record(
         replay, variant=variant, opponent=opponent, seed=seed, seat=seat,
         churn_window=churn_window,

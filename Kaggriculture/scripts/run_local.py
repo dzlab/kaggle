@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+from collections.abc import Mapping
 import json
+import inspect
 import random
 import sys
 from pathlib import Path
@@ -19,6 +22,82 @@ from main import agent
 
 
 OPPONENTS = ("pass", "random", "starter")
+
+
+class _ActivityTrackedCandidate:
+    """Track learned-policy activity without changing the candidate contract."""
+
+    def __init__(self, candidate: Any) -> None:
+        self.candidate = candidate
+        self.accepts_configuration = _callable_accepts_configuration(candidate)
+        self.policy_turns = 0
+        self.learned_active_turns = 0
+        self.learned_model_configured = self._has_learned_model()
+        self.status_counts: Counter[str] = Counter()
+
+    def _policy_objects(self) -> tuple[Any, ...]:
+        return (
+            self.candidate,
+            getattr(self.candidate, "policy", None),
+            getattr(self.candidate, "__self__", None),
+        )
+
+    def _has_learned_model(self) -> bool:
+        return any(
+            getattr(getattr(candidate, "learned_policy", None), "model_path", None) is not None
+            for candidate in self._policy_objects()
+        )
+
+    def _record_activity(self) -> None:
+        for candidate in self._policy_objects():
+            memory = getattr(candidate, "memory", None)
+            diagnostics = getattr(memory, "diagnostics", None)
+            if not isinstance(diagnostics, Mapping):
+                continue
+            if "learned_active" in diagnostics or "learned_model_status" in diagnostics:
+                self.learned_model_configured = True
+            if diagnostics.get("learned_active") is True:
+                self.learned_active_turns += 1
+            status = diagnostics.get("learned_model_status")
+            if isinstance(status, str) and status:
+                self.status_counts[status] += 1
+            break
+
+    def diagnostics(self) -> dict[str, Any]:
+        if not self.learned_model_configured:
+            return {"learned_model_configured": False}
+        return {
+            "learned_model_configured": True,
+            "policy_turns": self.policy_turns,
+            "learned_active_turns": self.learned_active_turns,
+            "learned_active_turn_fraction": (
+                self.learned_active_turns / self.policy_turns
+                if self.policy_turns else 0.0
+            ),
+            "learned_model_status_counts": dict(self.status_counts),
+        }
+
+    def __call__(self, observation: Any, configuration: Any = None) -> Any:
+        if self.accepts_configuration:
+            result = self.candidate(observation, configuration)
+        else:
+            result = self.candidate(observation)
+        self.policy_turns += 1
+        self._record_activity()
+        return result
+
+
+def _callable_accepts_configuration(candidate: Any) -> bool:
+    try:
+        signature = inspect.signature(candidate)
+    except (TypeError, ValueError):
+        return False
+    marker = object()
+    try:
+        signature.bind(marker, marker)
+    except TypeError:
+        return False
+    return True
 
 
 def _validate_engine_version(module: Any) -> None:
@@ -145,12 +224,23 @@ def run_episode(
             opponent_agent = opponent
     if opponent_candidate is not None:
         opponent_agent = opponent_candidate
-    env.run(_ordered_agents(opponent_agent, candidate_player, candidate))
+    tracked_candidate = _ActivityTrackedCandidate(candidate)
+    candidate_for_env = (
+        tracked_candidate if tracked_candidate.learned_model_configured else candidate
+    )
+    env.run(_ordered_agents(opponent_agent, candidate_player, candidate_for_env))
 
     replay = Path(replay_path)
     replay.parent.mkdir(parents=True, exist_ok=True)
+    policy_diagnostics = tracked_candidate.diagnostics()
+    if policy_diagnostics.get("learned_model_configured"):
+        replay_document = env.toJSON()
+        replay_document["policy_diagnostics"] = policy_diagnostics
+    else:
+        replay_document = env.toJSON()
+    setattr(env, "_kagriculture_policy_diagnostics", policy_diagnostics)
     with replay.open("w", encoding="utf-8") as handle:
-        json.dump(env.toJSON(), handle, indent=2 if debug else None, sort_keys=debug)
+        json.dump(replay_document, handle, indent=2 if debug else None, sort_keys=debug)
         handle.write("\n")
     return env
 
