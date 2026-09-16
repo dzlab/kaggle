@@ -57,6 +57,8 @@ def test_colab_notebook_is_a_small_setup_and_helper_launch_wrapper():
     assert "--workers 8" in launch_source
     assert "--evaluation-timeout 3600" in launch_source
     assert "--model-width 64" in launch_source
+    assert "run_directory = f'/content/drive/MyDrive/kagriculture-orbit-experiments/{experiment_name}-width64'" in launch_source
+    assert '--run-directory "$run_directory"' in launch_source
     assert "--wandb-run-name" not in launch_source
     assert "--no-wandb" not in launch_source
     assert "WANDB_API_KEY" not in launch_source
