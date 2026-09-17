@@ -1,8 +1,8 @@
 import hashlib
 import json
-from concurrent.futures import Future
 from pathlib import Path
 import subprocess
+import sys
 import time
 
 import pytest
@@ -68,9 +68,69 @@ def test_parse_args_preserves_both_seats_and_quick_defaults(tmp_path):
     assert args.seeds == 2
     assert args.steps == 96
     assert args.evaluation_timeout == 30.0
+    assert args.game_timeout == 30.0
 
     with pytest.raises(SystemExit):
         parse_args(["--artifact", str(tmp_path / "artifact.json"), "--seats", "0", "0"])
+
+
+def test_parse_args_preserves_legacy_timeout_and_accepts_separate_deadline(tmp_path):
+    from scripts.evaluate_artifact import parse_args
+
+    args = parse_args([
+        "--artifact", str(tmp_path / "artifact.json"),
+        "--evaluation-timeout", "7",
+        "--evaluation-deadline", "28",
+    ])
+
+    assert args.evaluation_timeout == 7.0
+    assert args.game_timeout == 600.0
+    assert args.evaluation_deadline == 28.0
+
+
+@pytest.mark.parametrize("timeout", [600.0, 3600.0])
+def test_legacy_cli_timeout_is_reported_as_total_deadline(tmp_path, timeout):
+    from scripts import evaluate_artifact
+
+    args = evaluate_artifact.parse_args([
+        "--artifact", str(tmp_path / "artifact.json"),
+        "--evaluation-timeout", str(timeout),
+    ])
+    configuration = evaluate_artifact._configuration_from_args(args)
+
+    assert configuration["evaluation_timeout"] == timeout
+    assert configuration["evaluation_deadline"] == timeout
+    assert configuration["game_timeout"] == evaluate_artifact.DEFAULT_GAME_TIMEOUT
+
+
+@pytest.mark.parametrize(
+    "option, value",
+    [
+        ("--evaluation-timeout", "0"),
+        ("--game-timeout", "nan"),
+        ("--evaluation-deadline", "inf"),
+    ],
+)
+def test_parse_args_rejects_invalid_supplied_timeouts(tmp_path, option, value):
+    from scripts.evaluate_artifact import parse_args
+
+    with pytest.raises(SystemExit):
+        parse_args(["--artifact", str(tmp_path / "artifact.json"), option, value])
+
+
+@pytest.mark.parametrize(
+    "argument, value, message",
+    [
+        ("evaluation_timeout", 0, "evaluation_timeout"),
+        ("game_timeout", float("inf"), "game_timeout"),
+        ("evaluation_deadline", True, "evaluation_deadline"),
+    ],
+)
+def test_evaluate_rejects_invalid_supplied_timeouts(tmp_path, argument, value, message):
+    from scripts.evaluate_artifact import evaluate
+
+    with pytest.raises(ValueError, match=message):
+        evaluate(artifact=tmp_path / "artifact.json", **{argument: value})
 
 
 def test_parse_args_accepts_and_validates_training_identity(tmp_path):
@@ -135,6 +195,75 @@ def test_evaluate_configuration_contains_training_identity(tmp_path, monkeypatch
         "feature_variant": "experimental_context_v1",
         "training_mode": "reduced_behavior_clone_then_ppo",
     }
+
+
+def test_evaluate_keeps_legacy_total_timeout_and_separate_game_timeout(tmp_path, monkeypatch):
+    from scripts import evaluate_artifact
+
+    artifact = _artifact(tmp_path / "artifact.json")
+    monkeypatch.setattr(evaluate_artifact, "load_exported_policy", lambda path: object())
+    calls = []
+
+    def fake_game(request):
+        calls.append(dict(request))
+        return _record(request["candidate"], request["opponent"], request["seed"], request["seat"])
+
+    legacy_result = evaluate_artifact.evaluate(
+        artifact=artifact, seeds=[3], opponents=["pass"], seats=[0, 1],
+        steps=4, workers=1, min_valid_games=1, evaluation_timeout=7,
+        game_runner=fake_game,
+    )
+    assert {request["game_timeout"] for request in calls} == {evaluate_artifact.DEFAULT_GAME_TIMEOUT}
+    assert legacy_result["configuration"]["evaluation_timeout"] == 7.0
+    assert legacy_result["configuration"]["game_timeout"] == evaluate_artifact.DEFAULT_GAME_TIMEOUT
+    assert legacy_result["configuration"]["evaluation_deadline"] == 7.0
+
+    calls.clear()
+    override_result = evaluate_artifact.evaluate(
+        artifact=artifact, seeds=[3], opponents=["pass"], seats=[0, 1],
+        steps=4, workers=1, min_valid_games=1, evaluation_timeout=7,
+        game_timeout=11, evaluation_deadline=13, game_runner=fake_game,
+    )
+    assert {request["game_timeout"] for request in calls} == {11.0}
+    assert override_result["configuration"]["evaluation_timeout"] == 7.0
+    assert override_result["configuration"]["game_timeout"] == 11.0
+    assert override_result["configuration"]["evaluation_deadline"] == 13.0
+
+
+def test_build_report_preserves_timeout_diagnostics_in_records_and_decision(tmp_path, monkeypatch):
+    from scripts import evaluate_artifact
+
+    artifact = _artifact(tmp_path / "artifact.json")
+    monkeypatch.setattr(evaluate_artifact, "load_exported_policy", lambda path: object())
+
+    class RunningProcess:
+        pid = 0
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    monkeypatch.setattr(evaluate_artifact, "_start_game_process", lambda request: RunningProcess())
+    result = evaluate_artifact.evaluate(
+        artifact=artifact, seeds=[3], opponents=["pass"], seats=[0],
+        steps=4, workers=1, evaluation_timeout=0.01, game_timeout=7, min_valid_games=1,
+    )
+
+    report = evaluate_artifact.build_report(result)
+    record = report["records"]["current"][0]
+    assert record["error_type"] == "evaluation_timeout"
+    assert record["timeout_details"]["evaluation_deadline_seconds"] == 0.01
+    assert report["configuration"]["evaluation_timeout"] == 0.01
+    assert report["configuration"]["game_timeout"] == 7.0
+    assert report["configuration"]["evaluation_deadline"] == 0.01
+    assert report["decision"]["timeout_details"][0]["error_type"] == "evaluation_timeout"
+    assert report["decision"]["timeout_details"][0]["timeout_seconds"] == 0.01
 
 
 def test_validate_artifact_returns_identity_and_sha256(tmp_path, monkeypatch):
@@ -270,31 +399,32 @@ def test_report_contains_configuration_artifact_records_summaries_and_decision(t
     assert report["decision"]["status"] == "discard"
 
 
-def test_evaluate_timeout_marks_pending_futures_and_does_not_wait_for_pool(tmp_path, monkeypatch):
+def test_evaluate_timeout_marks_running_and_pending_games(tmp_path, monkeypatch):
     from scripts import evaluate_artifact
 
     artifact = _artifact(tmp_path / "artifact.json")
     monkeypatch.setattr(evaluate_artifact, "load_exported_policy", lambda path: object())
-    state = {}
+    state = {"started": 0, "terminated": 0}
 
-    class FakeExecutor:
-        def __init__(self, *, max_workers):
-            state["max_workers"] = max_workers
-            state["futures"] = []
+    class RunningProcess:
+        pid = 0
+        returncode = None
 
-        def submit(self, function, request):
-            future = Future()
-            state["futures"].append(future)
-            if len(state["futures"]) > 1:
-                future.set_result(_record(
-                    request["candidate"], request["opponent"], request["seed"], request["seat"],
-                ))
-            return future
+        def poll(self):
+            return self.returncode
 
-        def shutdown(self, *, wait, cancel_futures):
-            state["shutdown"] = (wait, cancel_futures)
+        def terminate(self):
+            state["terminated"] += 1
+            self.returncode = -15
 
-    monkeypatch.setattr(evaluate_artifact, "ProcessPoolExecutor", FakeExecutor)
+        def wait(self, timeout=None):
+            return self.returncode
+
+    def start_process(request):
+        state["started"] += 1
+        return RunningProcess()
+
+    monkeypatch.setattr(evaluate_artifact, "_start_game_process", start_process)
     started = time.monotonic()
     result = evaluate_artifact.evaluate(
         artifact=artifact,
@@ -304,16 +434,216 @@ def test_evaluate_timeout_marks_pending_futures_and_does_not_wait_for_pool(tmp_p
         steps=4,
         workers=1,
         evaluation_timeout=0.01,
+        game_timeout=0.01,
         min_valid_games=1,
     )
 
     assert time.monotonic() - started < 1
-    assert state["max_workers"] == 1
-    assert state["shutdown"] == (False, True)
+    assert state == {"started": 1, "terminated": 1}
     assert result["records"][0]["framework_error"] is True
     assert "timeout" in result["records"][0]["error"]
+    assert result["records"][0]["error_type"] == "evaluation_timeout"
+    assert result["records"][0]["timeout_seconds"] == 0.01
+    assert result["records"][0]["timeout_details"] == {
+        "scope": "evaluation",
+        "evaluation_deadline_seconds": 0.01,
+        "game_timeout_seconds": 0.01,
+        "request_count": 4,
+        "workers": 1,
+    }
     assert result["decision"]["status"] == "discard"
     assert "framework_error" in result["decision"]["reasons"]
+    assert "evaluation_timeout" in result["decision"]["reasons"]
+    assert result["decision"]["timeout_details"][0]["error_type"] == "evaluation_timeout"
+
+
+def test_total_deadline_terminates_long_running_child_promptly(monkeypatch):
+    from scripts import evaluate_artifact
+
+    real_popen = subprocess.Popen
+    children = []
+
+    def long_running_popen(*args, **kwargs):
+        process = real_popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=kwargs.get("stdin"),
+            stdout=kwargs.get("stdout"),
+            stderr=kwargs.get("stderr"),
+            text=kwargs.get("text", False),
+            start_new_session=kwargs.get("start_new_session", False),
+        )
+        children.append(process)
+        return process
+
+    monkeypatch.setattr(evaluate_artifact.subprocess, "Popen", long_running_popen)
+    request = {
+        "candidate": "current",
+        "opponent": "pass",
+        "seed": 3,
+        "seat": 0,
+        "steps": 4,
+        "artifact_path": "artifact.json",
+        "game_timeout": 60.0,
+    }
+
+    started = time.monotonic()
+    records = evaluate_artifact._run_in_pool(
+        [request], workers=1, evaluation_timeout=0.05, game_timeout=60.0,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert children and children[0].poll() is not None
+    assert records[0]["error_type"] == "evaluation_timeout"
+
+
+def test_successful_worker_result_is_collected_after_stdin_is_closed(monkeypatch):
+    from scripts import evaluate_artifact
+
+    class FakeStdin:
+        closed = False
+
+        def write(self, value):
+            return len(value)
+
+        def close(self):
+            self.closed = True
+
+    class SuccessfulProcess:
+        pid = 0
+        returncode = 0
+
+        def __init__(self):
+            self.stdin = FakeStdin()
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            if self.stdin is not None and self.stdin.closed:
+                raise ValueError("I/O operation on closed file")
+            return json.dumps({"framework_error": False, "outcome": "win"}), ""
+
+        def terminate(self):
+            self.returncode = -15
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    process = SuccessfulProcess()
+    monkeypatch.setattr(evaluate_artifact.subprocess, "Popen", lambda *args, **kwargs: process)
+    request = {
+        "candidate": "current",
+        "opponent": "pass",
+        "seed": 3,
+        "seat": 0,
+        "steps": 4,
+        "artifact_path": "artifact.json",
+    }
+
+    records = evaluate_artifact._run_in_pool(
+        [request], workers=1, evaluation_timeout=1.0, game_timeout=1.0,
+    )
+
+    assert records == [{
+        "framework_error": False,
+        "outcome": "win",
+        "candidate": "current",
+        "variant": "current",
+    }]
+
+
+def test_completed_worker_collection_respects_remaining_evaluation_deadline(monkeypatch):
+    from scripts import evaluate_artifact
+
+    class FakeStdin:
+        closed = False
+
+        def write(self, value):
+            return len(value)
+
+        def close(self):
+            self.closed = True
+
+    class PipeStuckProcess:
+        pid = 0
+        returncode = 0
+
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.communicate_timeout = None
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            self.communicate_timeout = timeout
+            if timeout is None:
+                raise AssertionError("output collection must be bounded")
+            raise subprocess.TimeoutExpired("worker", timeout)
+
+        def terminate(self):
+            self.returncode = -15
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    process = PipeStuckProcess()
+    monkeypatch.setattr(evaluate_artifact.subprocess, "Popen", lambda *args, **kwargs: process)
+    request = {
+        "candidate": "current",
+        "opponent": "pass",
+        "seed": 3,
+        "seat": 0,
+        "steps": 4,
+        "artifact_path": "artifact.json",
+    }
+
+    records = evaluate_artifact._run_in_pool(
+        [request], workers=1, evaluation_timeout=0.05, game_timeout=1.0,
+    )
+
+    assert process.communicate_timeout is not None
+    assert process.communicate_timeout <= 0.05
+    assert process.returncode == -15
+    assert records[0]["error_type"] == "evaluation_timeout"
+    assert records[0]["timeout_details"]["scope"] == "evaluation"
+
+
+def test_game_deadline_classifies_long_running_child_as_game_timeout(monkeypatch):
+    from scripts import evaluate_artifact
+
+    real_popen = subprocess.Popen
+
+    def long_running_popen(*args, **kwargs):
+        return real_popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=kwargs.get("stdin"),
+            stdout=kwargs.get("stdout"),
+            stderr=kwargs.get("stderr"),
+            text=kwargs.get("text", False),
+            start_new_session=kwargs.get("start_new_session", False),
+        )
+
+    monkeypatch.setattr(evaluate_artifact.subprocess, "Popen", long_running_popen)
+    request = {
+        "candidate": "current",
+        "opponent": "pass",
+        "seed": 3,
+        "seat": 0,
+        "steps": 4,
+        "artifact_path": "artifact.json",
+    }
+
+    records = evaluate_artifact._run_in_pool(
+        [request], workers=1, evaluation_timeout=1.0, game_timeout=0.05,
+    )
+
+    assert records[0]["error_type"] == "game_timeout"
+    assert records[0]["timeout_seconds"] == 0.05
+    assert records[0]["timeout_details"] == {
+        "scope": "game", "game_timeout_seconds": 0.05,
+    }
 
 
 def test_game_worker_bounds_each_subprocess_game(tmp_path, monkeypatch):
@@ -341,6 +671,8 @@ def test_game_worker_bounds_each_subprocess_game(tmp_path, monkeypatch):
     assert observed["timeout"] == 0.01
     assert record["framework_error"] is True
     assert "timeout" in record["error"]
+    assert record["error_type"] == "game_timeout"
+    assert record["timeout_seconds"] == 0.01
 
 
 def test_evaluate_marks_pool_submission_failure_as_framework_error(tmp_path, monkeypatch):
@@ -349,18 +681,10 @@ def test_evaluate_marks_pool_submission_failure_as_framework_error(tmp_path, mon
     artifact = _artifact(tmp_path / "artifact.json")
     monkeypatch.setattr(evaluate_artifact, "load_exported_policy", lambda path: object())
 
-    class FailingExecutor:
-        def __init__(self, *, max_workers):
-            pass
+    def failing_start(request):
+        raise RuntimeError("submit failed")
 
-        def submit(self, function, request):
-            raise RuntimeError("submit failed")
-
-        def shutdown(self, *, wait, cancel_futures):
-            assert wait is False
-            assert cancel_futures is True
-
-    monkeypatch.setattr(evaluate_artifact, "ProcessPoolExecutor", FailingExecutor)
+    monkeypatch.setattr(evaluate_artifact, "_start_game_process", failing_start)
     result = evaluate_artifact.evaluate(
         artifact=artifact, seeds=[3], opponents=["pass"], seats=[0, 1],
         steps=4, workers=1, evaluation_timeout=1, min_valid_games=1,

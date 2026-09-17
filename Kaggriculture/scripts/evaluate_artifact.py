@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor, wait
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from numbers import Real
 from typing import Any
@@ -47,6 +49,7 @@ DEFAULT_SEEDS = 30
 DEFAULT_STEPS = 720
 DEFAULT_WORKERS = 2
 DEFAULT_MIN_VALID_GAMES = 20
+DEFAULT_GAME_TIMEOUT = 600.0
 DEFAULT_EVALUATION_TIMEOUT = 600.0
 QUICK_EVALUATION_TIMEOUT = 30.0
 DEFAULT_OPPONENTS = ("pass", "random", "starter")
@@ -85,6 +88,13 @@ def _positive_float(value: str) -> float:
     if not math.isfinite(number) or number <= 0:
         raise argparse.ArgumentTypeError("must be a positive finite number")
     return number
+
+
+def _validate_timeout(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real) \
+            or not math.isfinite(float(value)) or float(value) <= 0:
+        raise ValueError(f"{name} must be a positive finite number")
+    return float(value)
 
 
 def validate_seats(values: Sequence[int]) -> list[int]:
@@ -195,7 +205,11 @@ def _snapshot_artifact(artifact: Mapping[str, str]) -> tuple[Path, dict[str, str
         raise
 
 
-def _error_record(request: Mapping[str, Any], error: str) -> dict[str, Any]:
+def _error_record(
+    request: Mapping[str, Any], error: str, *, error_type: str = "framework_error",
+    timeout_seconds: float | None = None,
+    timeout_details: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     candidate = str(request["candidate"])
     record = _framework_error_record(
         variant=candidate,
@@ -204,7 +218,12 @@ def _error_record(request: Mapping[str, Any], error: str) -> dict[str, Any]:
         seat=int(request["seat"]),
         error=error,
     )
-    return {**record, "candidate": candidate, "variant": candidate}
+    record = {**record, "candidate": candidate, "variant": candidate, "error_type": error_type}
+    if timeout_seconds is not None:
+        record["timeout_seconds"] = float(timeout_seconds)
+    if timeout_details is not None:
+        record["timeout_details"] = dict(timeout_details)
+    return record
 
 
 def _run_game_direct(request: Mapping[str, Any]) -> dict[str, Any]:
@@ -251,7 +270,7 @@ def _run_game_direct(request: Mapping[str, Any]) -> dict[str, Any]:
 
 def _run_game_subprocess(request: Mapping[str, Any]) -> dict[str, Any]:
     """Run one game in a killable interpreter with a per-game timeout."""
-    timeout = float(request.get("game_timeout", DEFAULT_EVALUATION_TIMEOUT))
+    timeout = float(request.get("game_timeout", DEFAULT_GAME_TIMEOUT))
     command = [sys.executable, str(Path(__file__).resolve()), "--worker"]
     try:
         completed = subprocess.run(
@@ -274,7 +293,13 @@ def _run_game_subprocess(request: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError("game subprocess did not return an object")
         return {**dict(record), "candidate": request["candidate"], "variant": request["candidate"]}
     except subprocess.TimeoutExpired:
-        return _error_record(request, f"game timeout after {timeout:g} seconds")
+        return _error_record(
+            request,
+            f"game timeout after {timeout:g} seconds",
+            error_type="game_timeout",
+            timeout_seconds=timeout,
+            timeout_details={"scope": "game", "game_timeout_seconds": timeout},
+        )
     except Exception as exc:
         return _error_record(request, f"{type(exc).__name__}: {exc}")
 
@@ -310,56 +335,210 @@ def _is_complete(records: Sequence[Mapping[str, Any]], expected: Sequence[tuple[
     )
 
 
+def _evaluation_timeout_record(
+    request: Mapping[str, Any], *, total_deadline: float, game_timeout: float,
+    request_count: int, workers: int,
+) -> dict[str, Any]:
+    return _error_record(
+        request,
+        f"evaluation timeout after {total_deadline:g} seconds "
+        f"(per-game timeout {game_timeout:g} seconds; "
+        f"{request_count} requests, {workers} workers)",
+        error_type="evaluation_timeout",
+        timeout_seconds=total_deadline,
+        timeout_details={
+            "scope": "evaluation",
+            "evaluation_deadline_seconds": total_deadline,
+            "game_timeout_seconds": game_timeout,
+            "request_count": request_count,
+            "workers": workers,
+        },
+    )
+
+
+def _game_timeout_record(
+    request: Mapping[str, Any], *, game_timeout: float,
+) -> dict[str, Any]:
+    return _error_record(
+        request,
+        f"game timeout after {game_timeout:g} seconds",
+        error_type="game_timeout",
+        timeout_seconds=game_timeout,
+        timeout_details={"scope": "game", "game_timeout_seconds": game_timeout},
+    )
+
+
+def _terminate_process(process: subprocess.Popen[str], *, force: bool = False) -> None:
+    """Terminate a worker and its process group without waiting indefinitely."""
+    if not force and process.poll() is not None:
+        return
+    use_process_group = process.pid > 0 and process.pid != os.getpid()
+    try:
+        if not use_process_group:
+            raise ProcessLookupError
+        os.killpg(process.pid, signal.SIGTERM)
+    except (AttributeError, ProcessLookupError, PermissionError):
+        process.terminate()
+    try:
+        process.wait(timeout=0.2)
+    except subprocess.TimeoutExpired:
+        try:
+            if not use_process_group:
+                raise ProcessLookupError
+            os.killpg(process.pid, signal.SIGKILL)
+        except (AttributeError, ProcessLookupError, PermissionError):
+            process.kill()
+        try:
+            process.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _start_game_process(request: Mapping[str, Any]) -> subprocess.Popen[str]:
+    command = [sys.executable, str(Path(__file__).resolve()), "--worker"]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(dict(request)))
+        process.stdin.close()
+        # communicate() flushes stdin before reading the child output.  The
+        # request is already sent, so detach the closed stream before collect.
+        process.stdin = None
+    except Exception:
+        _terminate_process(process)
+        raise
+    return process
+
+
+def _collect_game_process(
+    process: subprocess.Popen[str], request: Mapping[str, Any], *, timeout: float,
+) -> dict[str, Any]:
+    if process.poll() is None:
+        raise RuntimeError("cannot collect game subprocess before it exits")
+    stdout, stderr = process.communicate(timeout=timeout)
+    if process.returncode != 0:
+        details = (stderr or stdout or "").strip()
+        if details:
+            details = f": {details[:500]}"
+        raise RuntimeError(
+            f"game subprocess exited with status {process.returncode}{details}"
+        )
+    record = json.loads(stdout)
+    if not isinstance(record, Mapping):
+        raise ValueError("game subprocess did not return an object")
+    return {**dict(record), "candidate": request["candidate"], "variant": request["candidate"]}
+
+
 def _run_in_pool(
     requests: Sequence[Mapping[str, Any]],
     *,
     workers: int,
     evaluation_timeout: float,
+    game_timeout: float | None = DEFAULT_GAME_TIMEOUT,
+    evaluation_deadline: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Run requests with a hard parent-side deadline and non-waiting teardown."""
-    executor = None
-    futures = []
+    """Run killable game workers under one wall-clock evaluation deadline."""
+    if type(workers) is not int or workers < 1 or workers > MAX_WORKERS:
+        raise ValueError(f"workers must be between 1 and {MAX_WORKERS}")
+    if not requests:
+        raise ValueError("requests must not be empty")
+    total_timeout = _validate_timeout(evaluation_timeout, "evaluation_timeout")
+    game_timeout = _validate_timeout(
+        DEFAULT_GAME_TIMEOUT if game_timeout is None else game_timeout, "game_timeout",
+    )
+    total_deadline = (
+        total_timeout
+        if evaluation_deadline is None
+        else _validate_timeout(evaluation_deadline, "evaluation_deadline")
+    )
+    started = time.monotonic()
+    next_index = 0
+    active: dict[int, tuple[subprocess.Popen[str], float]] = {}
+    records: dict[int, dict[str, Any]] = {}
     try:
-        try:
-            executor = ProcessPoolExecutor(max_workers=workers)
-            for request in requests:
-                futures.append(executor.submit(_run_game, request))
-        except Exception as exc:
-            return [_error_record(request, f"worker submission failure: {type(exc).__name__}: {exc}")
-                    for request in requests]
-
-        try:
-            done, not_done = wait(futures, timeout=evaluation_timeout)
-        except Exception as exc:
-            return [_error_record(request, f"worker wait failure: {type(exc).__name__}: {exc}")
-                    for request in requests]
-
-        records = []
-        for request, future in zip(requests, futures):
-            if future in not_done:
-                future.cancel()
-                records.append(_error_record(
-                    request,
-                    f"evaluation timeout after {evaluation_timeout:g} seconds",
-                ))
-                continue
-            try:
-                record = future.result()
-                if not isinstance(record, Mapping):
-                    raise ValueError("worker result was not an object")
-                records.append(dict(record))
-            except Exception as exc:
-                records.append(_error_record(
-                    request, f"worker failure: {type(exc).__name__}: {exc}",
-                ))
-        return records
+        while next_index < len(requests) or active:
+            remaining = total_deadline - (time.monotonic() - started)
+            if remaining <= 0:
+                break
+            while len(active) < workers:
+                if next_index >= len(requests):
+                    break
+                index = next_index
+                request = requests[index]
+                next_index += 1
+                request_with_timeout = {**request, "game_timeout": game_timeout}
+                try:
+                    active[index] = (_start_game_process(request_with_timeout), time.monotonic())
+                except Exception as exc:
+                    records[index] = _error_record(
+                        request,
+                        f"worker submission failure: {type(exc).__name__}: {exc}",
+                    )
+            completed = []
+            timed_out = []
+            for index, (process, game_started) in active.items():
+                if process.poll() is not None:
+                    completed.append(index)
+                elif time.monotonic() - game_started >= game_timeout:
+                    timed_out.append(index)
+            for index in timed_out:
+                process, _ = active.pop(index)
+                _terminate_process(process)
+                records[index] = _game_timeout_record(
+                    requests[index], game_timeout=game_timeout,
+                )
+            for index in completed:
+                process, _ = active.pop(index)
+                request = requests[index]
+                remaining = total_deadline - (time.monotonic() - started)
+                if remaining <= 0:
+                    _terminate_process(process, force=True)
+                    records[index] = _evaluation_timeout_record(
+                        request, total_deadline=total_deadline,
+                        game_timeout=game_timeout, request_count=len(requests), workers=workers,
+                    )
+                    continue
+                try:
+                    records[index] = _collect_game_process(
+                        process, request, timeout=remaining,
+                    )
+                except subprocess.TimeoutExpired:
+                    _terminate_process(process, force=True)
+                    records[index] = _evaluation_timeout_record(
+                        request, total_deadline=total_deadline,
+                        game_timeout=game_timeout, request_count=len(requests), workers=workers,
+                    )
+                except Exception as exc:
+                    records[index] = _error_record(
+                        request, f"worker failure: {type(exc).__name__}: {exc}",
+                    )
+            if not completed and not timed_out and active:
+                remaining = total_deadline - (time.monotonic() - started)
+                if remaining > 0:
+                    time.sleep(min(0.01, remaining))
+        for index, (process, _) in list(active.items()):
+            _terminate_process(process)
+            records[index] = _evaluation_timeout_record(
+                requests[index], total_deadline=total_deadline,
+                game_timeout=game_timeout, request_count=len(requests), workers=workers,
+            )
+        for index in range(next_index, len(requests)):
+            request = requests[index]
+            records[index] = _evaluation_timeout_record(
+                request, total_deadline=total_deadline,
+                game_timeout=game_timeout, request_count=len(requests), workers=workers,
+            )
+        return [records[index] for index in range(len(requests))]
     finally:
-        for future in futures:
-            future.cancel()
-        if executor is not None:
-            # Do not use a context manager: its implicit shutdown(wait=True)
-            # could keep the evaluator blocked behind a hung game.
-            executor.shutdown(wait=False, cancel_futures=True)
+        for process, _ in active.values():
+            _terminate_process(process)
 
 
 def evaluate(
@@ -374,6 +553,8 @@ def evaluate(
     workers: int = DEFAULT_WORKERS,
     min_valid_games: int = DEFAULT_MIN_VALID_GAMES,
     evaluation_timeout: float = DEFAULT_EVALUATION_TIMEOUT,
+    game_timeout: float | None = DEFAULT_GAME_TIMEOUT,
+    evaluation_deadline: float | None = None,
     game_runner: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
     quick: bool = False,
     experiment_id: str = DEFAULT_EXPERIMENT_ID,
@@ -381,7 +562,7 @@ def evaluate(
     training_mode: str = "behavior_clone_then_ppo",
     action_representation: str = DEFAULT_ACTION_REPRESENTATION,
 ) -> dict[str, Any]:
-    """Evaluate current and artifact candidates on one identical matrix."""
+    """Evaluate candidates with separate per-game and total wall-clock budgets."""
     if quick:
         if seeds == DEFAULT_SEEDS:
             seeds = 2
@@ -389,15 +570,23 @@ def evaluate(
             steps = 96
         if evaluation_timeout == DEFAULT_EVALUATION_TIMEOUT:
             evaluation_timeout = QUICK_EVALUATION_TIMEOUT
+        if game_timeout is None or game_timeout == DEFAULT_GAME_TIMEOUT:
+            game_timeout = QUICK_EVALUATION_TIMEOUT
     if type(steps) is not int or steps < 1:
         raise ValueError("steps must be a positive integer")
     if type(workers) is not int or workers < 1 or workers > MAX_WORKERS:
         raise ValueError(f"workers must be between 1 and {MAX_WORKERS}")
     if type(min_valid_games) is not int or min_valid_games < 1:
         raise ValueError("min_valid_games must be a positive integer")
-    if isinstance(evaluation_timeout, bool) or not isinstance(evaluation_timeout, Real) \
-            or not math.isfinite(float(evaluation_timeout)) or float(evaluation_timeout) <= 0:
-        raise ValueError("evaluation_timeout must be a positive finite number")
+    evaluation_timeout = _validate_timeout(evaluation_timeout, "evaluation_timeout")
+    game_timeout = _validate_timeout(
+        DEFAULT_GAME_TIMEOUT if game_timeout is None else game_timeout, "game_timeout",
+    )
+    evaluation_deadline = (
+        evaluation_timeout
+        if evaluation_deadline is None
+        else _validate_timeout(evaluation_deadline, "evaluation_deadline")
+    )
     _validate_training_identity(
         experiment_id, feature_variant, training_mode, action_representation,
     )
@@ -425,7 +614,7 @@ def evaluate(
                 "candidate": candidate,
                 "steps": steps,
                 "artifact_path": snapshot_info["path"],
-                "game_timeout": float(evaluation_timeout),
+                "game_timeout": game_timeout,
             }
             for candidate in (CURRENT_CANDIDATE, snapshot_info["identity"])
             for item in matrix
@@ -434,7 +623,11 @@ def evaluate(
             records = [_run_request(game_runner, request) for request in requests]
         else:
             records = _run_in_pool(
-                requests, workers=workers, evaluation_timeout=float(evaluation_timeout),
+                requests,
+                workers=workers,
+                evaluation_timeout=evaluation_timeout,
+                game_timeout=game_timeout,
+                evaluation_deadline=evaluation_deadline,
             )
 
         current_records = [record for record in records if record.get("candidate") == CURRENT_CANDIDATE]
@@ -448,6 +641,27 @@ def evaluate(
             expected_matrix=expected,
         )
         decision = {**decision, "reasons": list(decision.get("reasons", []))}
+        timeout_records = [
+            record for record in records
+            if record.get("error_type") in {"game_timeout", "evaluation_timeout"}
+        ]
+        if timeout_records:
+            decision["timeout_details"] = [
+                {
+                    key: record[key]
+                    for key in (
+                        "candidate", "opponent", "seed", "seat", "error_type",
+                        "error", "timeout_seconds", "timeout_details",
+                    )
+                    if key in record
+                }
+                for record in timeout_records
+            ]
+            for timeout_type in ("evaluation_timeout", "game_timeout"):
+                if any(record.get("error_type") == timeout_type for record in timeout_records):
+                    if timeout_type not in decision["reasons"]:
+                        decision["reasons"].append(timeout_type)
+            decision["status"] = "discard"
         if any(record.get("framework_error") for record in records):
             decision["status"] = "discard"
             if "framework_error" not in decision["reasons"]:
@@ -470,7 +684,9 @@ def evaluate(
             "candidates": [CURRENT_CANDIDATE, snapshot_info["identity"]],
             "workers": workers,
             "min_valid_games": min_valid_games,
-            "evaluation_timeout": float(evaluation_timeout),
+            "evaluation_timeout": evaluation_timeout,
+            "game_timeout": game_timeout,
+            "evaluation_deadline": evaluation_deadline,
             "quick": quick,
         }
         return {
@@ -517,6 +733,14 @@ def build_report(result: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _configuration_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    game_timeout = args.game_timeout
+    if game_timeout is None:
+        game_timeout = QUICK_EVALUATION_TIMEOUT if args.quick else DEFAULT_GAME_TIMEOUT
+    evaluation_deadline = (
+        args.evaluation_timeout
+        if args.evaluation_deadline is None
+        else args.evaluation_deadline
+    )
     return {
         "experiment_id": args.experiment_id,
         "feature_variant": args.feature_variant,
@@ -532,6 +756,8 @@ def _configuration_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "workers": args.workers,
         "min_valid_games": args.min_valid_games,
         "evaluation_timeout": args.evaluation_timeout,
+        "game_timeout": game_timeout,
+        "evaluation_deadline": evaluation_deadline,
         "quick": args.quick,
     }
 
@@ -610,7 +836,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--evaluation-timeout", "--timeout", dest="evaluation_timeout",
         type=_positive_float, default=DEFAULT_EVALUATION_TIMEOUT,
-        help="maximum seconds to wait for the complete evaluation matrix",
+        help="maximum total seconds for the evaluation (legacy option name)",
+    )
+    parser.add_argument(
+        "--game-timeout", dest="game_timeout", type=_positive_float,
+        default=DEFAULT_GAME_TIMEOUT,
+        help="maximum seconds allowed for each game",
+    )
+    parser.add_argument(
+        "--evaluation-deadline", dest="evaluation_deadline", type=_positive_float,
+        default=None,
+        help="maximum seconds for the complete evaluation; defaults to --evaluation-timeout",
     )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--quick", action="store_true")
@@ -638,6 +874,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             args.steps = 96
         if args.evaluation_timeout == DEFAULT_EVALUATION_TIMEOUT:
             args.evaluation_timeout = QUICK_EVALUATION_TIMEOUT
+        if args.game_timeout is None or args.game_timeout == DEFAULT_GAME_TIMEOUT:
+            args.game_timeout = QUICK_EVALUATION_TIMEOUT
     return args
 
 
@@ -702,7 +940,7 @@ def _is_valid_comparison(result: Mapping[str, Any]) -> bool:
     reasons = decision.get("reasons", ())
     if not isinstance(reasons, Sequence) or isinstance(reasons, (str, bytes)):
         return False
-    if {"framework_error", "timeout", "evaluation_timeout"} & set(reasons):
+    if {"framework_error", "timeout", "game_timeout", "evaluation_timeout"} & set(reasons):
         return False
     completeness = result.get("matrix_completeness")
     if not isinstance(completeness, Mapping):
@@ -756,6 +994,8 @@ def main(argv: list[str] | None = None) -> int:
             workers=args.workers,
             min_valid_games=args.min_valid_games,
             evaluation_timeout=args.evaluation_timeout,
+            game_timeout=args.game_timeout,
+            evaluation_deadline=args.evaluation_deadline,
             quick=args.quick,
             experiment_id=args.experiment_id,
             feature_variant=args.feature_variant,

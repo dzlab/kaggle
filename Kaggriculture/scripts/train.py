@@ -1685,9 +1685,86 @@ def _create_promotion_package(
     return archive, manifest_path
 
 
+def _validate_smoke_replay(config: ColabConfig, *, started_ns: int) -> Mapping[str, Any]:
+    """Require fresh, usable evidence from the candidate local smoke run."""
+    replay_path = config.smoke_replay_path
+    if not replay_path.is_file() or replay_path.stat().st_mtime_ns < started_ns:
+        raise RuntimeError(
+            f"candidate preflight failed: local runner did not write a fresh smoke replay; "
+            f"replay={replay_path}"
+        )
+    try:
+        replay = json.loads(replay_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"candidate preflight failed: smoke replay is not valid JSON: {exc}; "
+            f"replay={replay_path}"
+        ) from exc
+    if not isinstance(replay, Mapping):
+        raise RuntimeError(
+            f"candidate preflight failed: smoke replay must contain an object; "
+            f"replay={replay_path}"
+        )
+    steps = replay.get("steps")
+    if not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)) or not steps:
+        raise RuntimeError(
+            f"candidate preflight failed: smoke replay contains no candidate evidence; "
+            f"replay={replay_path}"
+        )
+
+    diagnostics = replay.get("policy_diagnostics")
+    if diagnostics is None:
+        raise RuntimeError(
+            f"candidate preflight failed: learned artifact activation diagnostic is missing; "
+            f"replay={replay_path}"
+        )
+    if not isinstance(diagnostics, Mapping):
+        raise RuntimeError(
+            f"candidate preflight failed: policy diagnostics are malformed; "
+            f"replay={replay_path}"
+        )
+    configured = diagnostics.get("learned_model_configured")
+    if configured is False:
+        raise RuntimeError(
+            f"candidate preflight failed: learned artifact silently fell back to a non-learned policy; "
+            f"replay={replay_path}"
+        )
+    if configured is not True:
+        raise RuntimeError(
+            f"candidate preflight failed: learned artifact activation diagnostic is missing; "
+            f"replay={replay_path}"
+        )
+    policy_turns = diagnostics.get("policy_turns")
+    active_turns = diagnostics.get("learned_active_turns")
+    if type(policy_turns) is not int or policy_turns < 1:
+        raise RuntimeError(
+            f"candidate preflight failed: learned artifact produced no policy turns; "
+            f"replay={replay_path}"
+        )
+    if type(active_turns) is not int or active_turns < 1:
+        raise RuntimeError(
+            f"candidate preflight failed: learned artifact never became active for a turn; "
+            f"replay={replay_path}"
+        )
+    if active_turns > policy_turns:
+        raise RuntimeError(
+            f"candidate preflight failed: learned artifact diagnostics are inconsistent "
+            f"(active_turns={active_turns}, policy_turns={policy_turns}); replay={replay_path}"
+        )
+    return replay
+
+
 def smoke_test_artifact(config: ColabConfig) -> None:
     """Verify the exported dependency-free artifact in the local simulator."""
-    smoke = run_command(build_smoke_command(config), check=True, capture_output=True)
+    config.smoke_replay_path.unlink(missing_ok=True)
+    started_ns = time.time_ns()
+    try:
+        smoke = run_command(build_smoke_command(config), check=True, capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"candidate preflight failed: local artifact smoke command exited with "
+            f"code {exc.returncode}; replay={config.smoke_replay_path}"
+        ) from exc
     print(smoke.stdout, end="")
     clean_stderr = re.sub(
         r"OpenSpiel exception: Unknown game 'python_ant_foraging'\. Available games are:\n.*?\nzerosum\n?",
@@ -1695,6 +1772,7 @@ def smoke_test_artifact(config: ColabConfig) -> None:
     )
     if clean_stderr:
         print(clean_stderr, file=sys.stderr, end="")
+    _validate_smoke_replay(config, started_ns=started_ns)
 
 
 def plot_training_metrics(config: ColabConfig) -> Path | None:
@@ -1815,6 +1893,7 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
             allow_ppo_extension=allow_ppo_extension,
             opponent_pool=opponent_pool, telemetry=telemetry,
         )
+        smoke_test_artifact(config)
         training_metadata: Mapping[str, Any] = (
             training_result if isinstance(training_result, Mapping) else {}
         )
@@ -1903,7 +1982,6 @@ def run_workflow(config: ColabConfig, *, dry_run: bool = False) -> WorkflowResul
         holdout_complete: bool | None = None
         if development_promoted:
             _invalidate_evaluation_report(config.holdout_report_path)
-        smoke_test_artifact(config)
         if config.plot:
             plot_training_metrics(config)
         if development_promoted:

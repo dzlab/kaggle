@@ -697,6 +697,145 @@ def test_colab_workflow_builds_parameterized_commands(tmp_path, monkeypatch):
     assert "--cpu" in latency
 
 
+def test_colab_candidate_preflight_runs_before_development_evaluation(tmp_path, monkeypatch):
+    from scripts import colab_train
+
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+    events = []
+
+    def fake_run(command, *, check, capture_output=False):
+        events.append(Path(command[1]).name)
+        if Path(command[1]).name == colab_train.COLLECT_SCRIPT.name:
+            config.trajectory_path.write_text("{}\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_smoke(config):
+        events.append("candidate-preflight")
+
+    def fake_evaluation(*args, **kwargs):
+        events.append("development-evaluation")
+        return SimpleNamespace(returncode=0), {"decision": {"status": "discard"}}
+
+    monkeypatch.setattr(colab_train, "run_command", fake_run)
+    monkeypatch.setattr(colab_train, "train_candidate", lambda *args, **kwargs: {})
+    monkeypatch.setattr(colab_train, "initialize_telemetry", lambda config: None)
+    monkeypatch.setattr(colab_train, "smoke_test_artifact", fake_smoke)
+    monkeypatch.setattr(colab_train, "_run_evaluation", fake_evaluation)
+
+    colab_train.run_workflow(config)
+
+    assert events == [
+        colab_train.COLLECT_SCRIPT.name,
+        "candidate-preflight",
+        "development-evaluation",
+    ]
+
+
+def test_colab_candidate_preflight_is_invoked_once(tmp_path, monkeypatch):
+    from scripts import colab_train
+
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+    smoke_calls = []
+
+    monkeypatch.setattr(
+        colab_train, "run_command",
+        lambda command, **kwargs: (
+            config.trajectory_path.write_text("{}\n", encoding="utf-8")
+            if Path(command[1]).name == colab_train.COLLECT_SCRIPT.name else None
+        ) or SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(colab_train, "train_candidate", lambda *args, **kwargs: {})
+    monkeypatch.setattr(colab_train, "initialize_telemetry", lambda config: None)
+    monkeypatch.setattr(
+        colab_train, "smoke_test_artifact",
+        lambda config: smoke_calls.append(config.stage_artifact_path),
+    )
+    monkeypatch.setattr(
+        colab_train, "_run_evaluation",
+        lambda *args, **kwargs: (
+            SimpleNamespace(returncode=0), {"decision": {"status": "discard"}},
+        ),
+    )
+
+    colab_train.run_workflow(config)
+
+    assert smoke_calls == [config.stage_artifact_path]
+
+
+@pytest.mark.parametrize(
+    "replay, expected_message",
+    [
+        ({"steps": []}, "candidate evidence"),
+        (
+            {
+                "steps": [{"action": "PASS"}],
+                "policy_diagnostics": {"learned_model_configured": False},
+            },
+            "silently fell back",
+        ),
+        (
+            {
+                "steps": [{"action": "PASS"}],
+                "policy_diagnostics": {
+                    "learned_model_configured": True,
+                    "policy_turns": 1,
+                    "learned_active_turns": 0,
+                },
+            },
+            "never became active",
+        ),
+    ],
+)
+def test_colab_candidate_preflight_fails_closed_without_usable_evidence(
+    tmp_path, monkeypatch, replay, expected_message,
+):
+    from scripts import colab_train
+
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+
+    def fake_run(command, *, check, capture_output=False):
+        config.smoke_replay_path.write_text(json.dumps(replay), encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="smoke output\n", stderr="")
+
+    monkeypatch.setattr(colab_train, "run_command", fake_run)
+
+    with pytest.raises(RuntimeError, match=expected_message) as exc_info:
+        colab_train.smoke_test_artifact(config)
+
+    assert str(config.smoke_replay_path) in str(exc_info.value)
+
+
+def test_colab_candidate_preflight_rejects_missing_policy_diagnostics(tmp_path, monkeypatch):
+    from scripts import colab_train
+
+    config = colab_train.build_config(
+        run_directory=tmp_path, device="cpu", mount_drive=False,
+        development_seeds=(0,), holdout_seeds=(100,),
+    )
+
+    def fake_run(command, *, check, capture_output=False):
+        config.smoke_replay_path.write_text(
+            json.dumps({"steps": [{"action": "PASS"}]}), encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout="smoke output\n", stderr="")
+
+    monkeypatch.setattr(colab_train, "run_command", fake_run)
+
+    with pytest.raises(RuntimeError, match="activation diagnostic is missing") as exc_info:
+        colab_train.smoke_test_artifact(config)
+
+    assert str(config.smoke_replay_path) in str(exc_info.value)
+
+
 def test_colab_workflow_skips_holdout_when_cpu_latency_report_is_invalid(tmp_path, monkeypatch):
     from scripts import colab_train
 
@@ -2142,9 +2281,9 @@ def test_colab_smoke_failure_prevents_holdout_evaluation(tmp_path, monkeypatch):
 
     assert invoked == [
         colab_train.COLLECT_SCRIPT.name,
-        colab_train.EVALUATE_SCRIPT.name,
         "smoke",
     ]
+    assert colab_train.EVALUATE_SCRIPT.name not in invoked
     assert not config.holdout_report_path.exists()
 
 
